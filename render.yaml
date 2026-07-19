@@ -1,0 +1,162 @@
+# ================================================================
+# render.yaml – Telegram Bot v13.0 (Render Free Web Service)
+# ================================================================
+# ملاحظة أمنية: هذا الملف لا يحتوي أي أسرار.
+# جميع القيم السرية (API_HASH, الهواتف, SESSION_STRING) تُضاف من
+# لوحة تحكم Render > Environment (sync: false)
+# ================================================================
+
+services:
+  - type: web
+    name: telegram-bot
+    runtime: python
+    plan: free
+    region: frankfurt
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      # ========== Runtime ==========
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: LOG_LEVEL
+        value: INFO
+
+      # ========== Core (secret) ==========
+      - key: TARGET_GROUP_ID
+        sync: false
+      - key: ADMIN_CHAT_ID
+        sync: false
+
+      # ========== Database (SQLite ephemeral on free tier) ==========
+      - key: DB_TYPE
+        value: sqlite
+      - key: DB_FILE
+        value: telegram_bot.db
+      # DATABASE_URL: أضفه يدوياً إذا أنشأت PostgreSQL
+
+      # ========== Security (auto-generated on blueprint deploy) ==========
+      - key: SECRET_KEY_OVERRIDE
+        generateValue: true
+      - key: DASHBOARD_AUTH_TOKEN
+        generateValue: true
+
+      # ========== Dashboard ==========
+      - key: DASHBOARD_ENABLED
+        value: "true"
+
+      # ========== Performance (Render free: 512MB RAM) ==========
+      - key: PROCESSING_WORKERS
+        value: "2"
+      - key: MEMORY_THRESHOLD_MB
+        value: "400"
+      - key: GC_INTERVAL
+        value: "120"
+      - key: ENTITY_CACHE_MAX_SIZE
+        value: "1500"
+      - key: PROCESSED_HASHES_MAX_SIZE
+        value: "8000"
+      - key: TEXT_CACHE_SIZE
+        value: "3000"
+      - key: TEXT_CACHE_TTL
+        value: "180"
+      - key: PREFILTER_ENABLED
+        value: "true"
+      - key: MAX_ALERTS_PER_MINUTE
+        value: "10"
+      - key: MAX_ALERTS_PER_HOUR
+        value: "100"
+      - key: STATS_INTERVAL
+        value: "3600"
+      - key: HEALTH_CHECK_INTERVAL
+        value: "60"
+
+      # ========== IntentEngine ==========
+      - key: CONFIDENCE_ACCEPT_THRESHOLD
+        value: "0.65"
+      - key: CONFIDENCE_REVIEW_THRESHOLD
+        value: "0.40"
+      - key: NEGATION_ENABLED
+        value: "true"
+      - key: FUZZY_MATCHING_ENABLED
+        value: "true"
+      - key: DISTANCE_SCORING_ENABLED
+        value: "true"
+      - key: AD_DETECTION_ENABLED
+        value: "true"
+
+      # ========== Render API self-management (for /login page) ==========
+      - key: RENDER_API_KEY
+        sync: false
+      - key: RENDER_SERVICE_ID
+        sync: false
+
+      # ========== Telegram Accounts (secret - fill via dashboard) ==========
+      # لكل حساب: {PREFIX}_API_ID / {PREFIX}_API_HASH / {PREFIX}_PHONE /
+      #           {PREFIX}_SESSION_NAME / {PREFIX}_SESSION_STRING
+      - key: MAIN_API_ID
+        sync: false
+      - key: MAIN_API_HASH
+        sync: false
+      - key: MAIN_PHONE
+        sync: false
+      - key: MAIN_SESSION_NAME
+        value: main_account
+      - key: MAIN_SESSION_STRING
+        sync: false
+
+      - key: ACCOUNT_1_API_ID
+        sync: false
+      - key: ACCOUNT_1_API_HASH
+        sync: false
+      - key: ACCOUNT_1_PHONE
+        sync: false
+      - key: ACCOUNT_1_SESSION_NAME
+        value: account1
+      - key: ACCOUNT_1_SESSION_STRING
+        sync: false
+
+      - key: ACCOUNT_2_API_ID
+        sync: false
+      - key: ACCOUNT_2_API_HASH
+        sync: false
+      - key: ACCOUNT_2_PHONE
+        sync: false
+      - key: ACCOUNT_2_SESSION_NAME
+        value: account2
+      - key: ACCOUNT_2_SESSION_STRING
+        sync: false
+
+      - key: ACCOUNT_3_API_ID
+        sync: false
+      - key: ACCOUNT_3_API_HASH
+        sync: false
+      - key: ACCOUNT_3_PHONE
+        sync: false
+      - key: ACCOUNT_3_SESSION_NAME
+        value: account3
+      - key: ACCOUNT_3_SESSION_STRING
+        sync: false
+
+      - key: ACCOUNT_4_API_ID
+        sync: false
+      - key: ACCOUNT_4_API_HASH
+        sync: false
+      - key: ACCOUNT_4_PHONE
+        sync: false
+      - key: ACCOUNT_4_SESSION_NAME
+        value: account4
+      - key: ACCOUNT_4_SESSION_STRING
+        sync: false
+
+      - key: ACCOUNT_5_API_ID
+        sync: false
+      - key: ACCOUNT_5_API_HASH
+        sync: false
+      - key: ACCOUNT_5_PHONE
+        sync: false
+      - key: ACCOUNT_5_SESSION_NAME
+        value: account5
+      - key: ACCOUNT_5_SESSION_STRING
+        sync: false
