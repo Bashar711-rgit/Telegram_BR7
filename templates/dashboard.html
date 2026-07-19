@@ -1,0 +1,1110 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🚀 لوحة تحكم البوت – Telegram Bot Dashboard</title>
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Chart.js -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <!-- Font Awesome -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
+    <style>
+        * { scroll-behavior: smooth; }
+        body { background-color: #0f172a; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+        ::-webkit-scrollbar { width: 8px; }
+        ::-webkit-scrollbar-track { background: #1e293b; }
+        ::-webkit-scrollbar-thumb { background: #334155; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #475569; }
+
+        .tab-link.active {
+            background-color: rgba(16, 185, 129, 0.2);
+            color: #34d399;
+            border-right: 3px solid #34d399;
+        }
+        .tab-link:hover:not(.active) {
+            background-color: rgba(255,255,255,0.05);
+        }
+        .stat-card {
+            transition: transform 0.2s ease, box-shadow 0.2s ease;
+        }
+        .stat-card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 25px -5px rgba(0,0,0,0.3);
+        }
+        .log-entry {
+            border-bottom: 1px solid #1e293b;
+            padding: 4px 0;
+            font-family: 'Courier New', monospace;
+            font-size: 13px;
+        }
+        .log-entry .time { color: #64748b; }
+        .log-entry.INFO { color: #60a5fa; }
+        .log-entry.WARNING { color: #fbbf24; }
+        .log-entry.ERROR { color: #f87171; }
+        .modal-overlay {
+            background: rgba(0,0,0,0.7);
+            backdrop-filter: blur(4px);
+        }
+        .badge-online { background: #22c55e; }
+        .badge-offline { background: #ef4444; }
+        .badge-warning { background: #f59e0b; }
+
+        .table-container {
+            max-height: 400px;
+            overflow-y: auto;
+        }
+        .table-container table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        .table-container th {
+            position: sticky;
+            top: 0;
+            background: #1e293b;
+            z-index: 10;
+            padding: 10px 8px;
+            text-align: right;
+            border-bottom: 2px solid #334155;
+        }
+        .table-container td {
+            padding: 8px;
+            border-bottom: 1px solid #1e293b;
+        }
+        .table-container tr:hover {
+            background: #1e293b;
+        }
+        .token-modal {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0,0,0,0.8);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 9999;
+        }
+        .token-modal.hidden { display: none; }
+        .token-box {
+            background: #1e293b;
+            padding: 30px;
+            border-radius: 16px;
+            max-width: 400px;
+            width: 90%;
+            border: 1px solid #334155;
+        }
+        .token-box input {
+            width: 100%;
+            padding: 10px;
+            border-radius: 8px;
+            background: #0f172a;
+            border: 1px solid #334155;
+            color: white;
+            margin: 10px 0;
+            direction: ltr;
+        }
+        .btn-primary {
+            background: #22c55e;
+            color: white;
+            padding: 10px 20px;
+            border-radius: 8px;
+            border: none;
+            cursor: pointer;
+            font-weight: bold;
+            transition: background 0.2s;
+        }
+        .btn-primary:hover { background: #16a34a; }
+        .btn-danger {
+            background: #ef4444;
+            color: white;
+            padding: 8px 16px;
+            border-radius: 8px;
+            border: none;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+        .btn-danger:hover { background: #dc2626; }
+        .btn-secondary {
+            background: #334155;
+            color: white;
+            padding: 8px 16px;
+            border-radius: 8px;
+            border: none;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+        .btn-secondary:hover { background: #475569; }
+        .btn-warning {
+            background: #f59e0b;
+            color: white;
+            padding: 8px 16px;
+            border-radius: 8px;
+            border: none;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+        .btn-warning:hover { background: #d97706; }
+        .status-dot {
+            display: inline-block;
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            margin-left: 6px;
+        }
+        .status-dot.online { background: #22c55e; }
+        .status-dot.offline { background: #ef4444; }
+    </style>
+</head>
+<body>
+
+<!-- ============================================================ -->
+<!-- TOKEN MODAL -->
+<!-- ============================================================ -->
+<div id="tokenModal" class="token-modal">
+    <div class="token-box">
+        <h2 class="text-xl font-bold text-white mb-2">🔑 أدخل التوكن</h2>
+        <p class="text-gray-400 text-sm mb-3">التوكن الافتراضي: <code class="bg-gray-700 px-2 py-1 rounded text-emerald-400">MySecurebot123@#</code></p>
+        <input type="password" id="tokenInput" placeholder="أدخل التوكن..." />
+        <button onclick="authenticate()" class="btn-primary w-full">دخول</button>
+        <p id="tokenError" class="text-red-400 text-sm mt-2 hidden">❌ توكن غير صحيح</p>
+    </div>
+</div>
+
+<!-- ============================================================ -->
+<!-- NAVBAR -->
+<!-- ============================================================ -->
+<nav class="bg-gray-800 border-b border-gray-700 px-4 py-3 flex flex-wrap items-center justify-between sticky top-0 z-50">
+    <div class="flex items-center gap-4">
+        <h1 class="text-2xl font-bold text-emerald-400"><i class="fas fa-robot ml-2"></i>Bot Dashboard</h1>
+        <span class="text-sm text-gray-400" id="uptime"><i class="far fa-clock ml-1"></i>⏱ 00:00:00</span>
+    </div>
+    <div class="flex items-center gap-4">
+        <span id="status-badge" class="px-3 py-1 rounded-full text-sm bg-emerald-500/20 text-emerald-400 border border-emerald-500/30">
+            <i class="fas fa-circle text-emerald-400 text-xs ml-1"></i> يعمل
+        </span>
+        <button onclick="logout()" class="text-red-400 hover:text-red-300 text-sm transition">
+            <i class="fas fa-sign-out-alt ml-1"></i> خروج
+        </button>
+    </div>
+</nav>
+
+<!-- ============================================================ -->
+<!-- MAIN CONTENT -->
+<!-- ============================================================ -->
+<div class="flex flex-col md:flex-row min-h-screen">
+    <!-- Sidebar -->
+    <aside class="w-full md:w-64 bg-gray-800 border-b md:border-b-0 md:border-l border-gray-700 p-4">
+        <nav class="space-y-1">
+            <a href="#" onclick="showTab('dashboard')" class="tab-link active block px-4 py-2.5 rounded-lg transition flex items-center gap-3 text-gray-300 hover:text-white">
+                <i class="fas fa-chart-pie w-5"></i> لوحة التحكم
+            </a>
+            <a href="#" onclick="showTab('accounts')" class="tab-link block px-4 py-2.5 rounded-lg transition flex items-center gap-3 text-gray-300 hover:text-white">
+                <i class="fas fa-users w-5"></i> الحسابات
+            </a>
+            <a href="#" onclick="showTab('messages')" class="tab-link block px-4 py-2.5 rounded-lg transition flex items-center gap-3 text-gray-300 hover:text-white">
+                <i class="fas fa-envelope w-5"></i> الرسائل
+            </a>
+            <a href="#" onclick="showTab('alerts')" class="tab-link block px-4 py-2.5 rounded-lg transition flex items-center gap-3 text-gray-300 hover:text-white">
+                <i class="fas fa-bell w-5"></i> التنبيهات
+            </a>
+            <a href="#" onclick="showTab('keywords')" class="tab-link block px-4 py-2.5 rounded-lg transition flex items-center gap-3 text-gray-300 hover:text-white">
+                <i class="fas fa-key w-5"></i> الكلمات المفتاحية
+            </a>
+            <a href="#" onclick="showTab('blocked')" class="tab-link block px-4 py-2.5 rounded-lg transition flex items-center gap-3 text-gray-300 hover:text-white">
+                <i class="fas fa-ban w-5"></i> الحظر
+            </a>
+            <a href="#" onclick="showTab('settings')" class="tab-link block px-4 py-2.5 rounded-lg transition flex items-center gap-3 text-gray-300 hover:text-white">
+                <i class="fas fa-cog w-5"></i> الإعدادات
+            </a>
+        </nav>
+    </aside>
+
+    <!-- Content -->
+    <main class="flex-1 p-4 md:p-6 overflow-y-auto h-screen">
+
+        <!-- ========================================================== -->
+        <!-- TAB: DASHBOARD -->
+        <!-- ========================================================== -->
+        <div id="tab-dashboard" class="tab-content">
+            <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+                <div class="stat-card bg-gray-800 p-4 rounded-lg border border-gray-700">
+                    <div class="text-gray-400 text-sm"><i class="far fa-envelope ml-1"></i> الرسائل المعالجة</div>
+                    <div class="text-3xl font-bold text-emerald-400" id="total-messages">0</div>
+                </div>
+                <div class="stat-card bg-gray-800 p-4 rounded-lg border border-gray-700">
+                    <div class="text-gray-400 text-sm"><i class="fas fa-bell ml-1"></i> التنبيهات المرسلة</div>
+                    <div class="text-3xl font-bold text-blue-400" id="total-alerts">0</div>
+                </div>
+                <div class="stat-card bg-gray-800 p-4 rounded-lg border border-gray-700">
+                    <div class="text-gray-400 text-sm"><i class="fas fa-users ml-1"></i> الحسابات المتصلة</div>
+                    <div class="text-3xl font-bold text-purple-400" id="connected-accounts">0/0</div>
+                </div>
+                <div class="stat-card bg-gray-800 p-4 rounded-lg border border-gray-700">
+                    <div class="text-gray-400 text-sm"><i class="fas fa-queue ml-1"></i> حجم الطابور</div>
+                    <div class="text-3xl font-bold text-yellow-400" id="queue-size">0</div>
+                </div>
+                <div class="stat-card bg-gray-800 p-4 rounded-lg border border-gray-700">
+                    <div class="text-gray-400 text-sm"><i class="fas fa-memory ml-1"></i> الذاكرة المستخدمة</div>
+                    <div class="text-3xl font-bold text-cyan-400" id="memory-used">0MB</div>
+                </div>
+                <div class="stat-card bg-gray-800 p-4 rounded-lg border border-gray-700">
+                    <div class="text-gray-400 text-sm"><i class="fas fa-user ml-1"></i> المستخدمين الفريدين</div>
+                    <div class="text-3xl font-bold text-orange-400" id="unique-senders">0</div>
+                </div>
+                <div class="stat-card bg-gray-800 p-4 rounded-lg border border-gray-700">
+                    <div class="text-gray-400 text-sm"><i class="fas fa-clock ml-1"></i> آخر ساعة</div>
+                    <div class="text-3xl font-bold text-pink-400" id="last-hour">0</div>
+                </div>
+                <div class="stat-card bg-gray-800 p-4 rounded-lg border border-gray-700">
+                    <div class="text-gray-400 text-sm"><i class="fas fa-shield-alt ml-1"></i> متوسط السمعة</div>
+                    <div class="text-3xl font-bold text-indigo-400" id="avg-reputation">0</div>
+                </div>
+            </div>
+
+            <div class="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-6">
+                <div class="bg-gray-800 p-4 rounded-lg border border-gray-700">
+                    <h3 class="text-gray-400 mb-2"><i class="fas fa-chart-line ml-1"></i> النشاط (آخر 24 ساعة)</h3>
+                    <canvas id="activityChart" height="200"></canvas>
+                </div>
+                <div class="bg-gray-800 p-4 rounded-lg border border-gray-700">
+                    <h3 class="text-gray-400 mb-2"><i class="fas fa-chart-pie ml-1"></i> حالة الحسابات</h3>
+                    <canvas id="accountsChart" height="200"></canvas>
+                </div>
+            </div>
+
+            <div class="bg-gray-800 p-4 rounded-lg border border-gray-700">
+                <h3 class="text-gray-400 mb-2"><i class="fas fa-bell ml-1"></i> آخر التنبيهات</h3>
+                <div id="recent-alerts-list" class="space-y-2 max-h-60 overflow-y-auto"></div>
+            </div>
+        </div>
+
+        <!-- ========================================================== -->
+        <!-- TAB: ACCOUNTS -->
+        <!-- ========================================================== -->
+        <div id="tab-accounts" class="tab-content hidden">
+            <div class="flex flex-wrap justify-between items-center gap-2 mb-4">
+                <h2 class="text-xl font-bold"><i class="fas fa-users ml-2"></i> إدارة الحسابات</h2>
+                <button onclick="showAddAccount()" class="bg-emerald-500 hover:bg-emerald-600 px-4 py-2 rounded-lg text-white transition flex items-center gap-2">
+                    <i class="fas fa-plus"></i> إضافة حساب
+                </button>
+            </div>
+            <div id="accounts-list" class="space-y-2"></div>
+        </div>
+
+        <!-- ========================================================== -->
+        <!-- TAB: MESSAGES -->
+        <!-- ========================================================== -->
+        <div id="tab-messages" class="tab-content hidden">
+            <div class="flex flex-wrap gap-2 mb-4">
+                <input type="text" id="msg-search" placeholder="🔍 بحث في الرسائل..." class="flex-1 min-w-[200px] bg-gray-700 border border-gray-600 rounded-lg px-4 py-2 text-white">
+                <button onclick="searchMessages()" class="bg-blue-500 hover:bg-blue-600 px-4 py-2 rounded-lg transition">بحث</button>
+                <button onclick="loadMessages()" class="bg-gray-600 hover:bg-gray-500 px-4 py-2 rounded-lg transition"><i class="fas fa-sync-alt"></i></button>
+            </div>
+            <div id="messages-list" class="space-y-2 max-h-[70vh] overflow-y-auto"></div>
+        </div>
+
+        <!-- ========================================================== -->
+        <!-- TAB: ALERTS -->
+        <!-- ========================================================== -->
+        <div id="tab-alerts" class="tab-content hidden">
+            <div class="flex flex-wrap gap-2 mb-4">
+                <input type="text" id="alert-search" placeholder="🔍 بحث في التنبيهات..." class="flex-1 min-w-[200px] bg-gray-700 border border-gray-600 rounded-lg px-4 py-2 text-white">
+                <button onclick="searchAlerts()" class="bg-purple-500 hover:bg-purple-600 px-4 py-2 rounded-lg transition">بحث</button>
+                <button onclick="loadAlerts()" class="bg-gray-600 hover:bg-gray-500 px-4 py-2 rounded-lg transition"><i class="fas fa-sync-alt"></i></button>
+            </div>
+            <div id="alerts-list" class="space-y-2 max-h-[70vh] overflow-y-auto"></div>
+        </div>
+
+        <!-- ========================================================== -->
+        <!-- TAB: KEYWORDS -->
+        <!-- ========================================================== -->
+        <div id="tab-keywords" class="tab-content hidden">
+            <div class="flex flex-wrap gap-2 mb-4">
+                <select id="keyword-category" class="bg-gray-700 border border-gray-600 rounded-lg px-4 py-2 text-white">
+                    <option value="request">طلب مباشر</option>
+                    <option value="request_context">سياق أكاديمي</option>
+                    <option value="indirect_request">طلب ضمني</option>
+                    <option value="urgency">استعجال</option>
+                    <option value="advertisement">إعلان</option>
+                    <option value="ignore">تجاهل</option>
+                    <option value="spam_patterns">سبام</option>
+                    <option value="emoji_advertisement">إيموجي إعلاني</option>
+                    <option value="education_providers">مزودي خدمات</option>
+                    <option value="ad_blockers">روابط محظورة</option>
+                </select>
+                <input type="text" id="new-keyword" placeholder="أضف كلمة جديدة..." class="flex-1 min-w-[150px] bg-gray-700 border border-gray-600 rounded-lg px-4 py-2 text-white">
+                <button onclick="addKeyword()" class="bg-emerald-500 hover:bg-emerald-600 px-4 py-2 rounded-lg transition"><i class="fas fa-plus ml-1"></i> إضافة</button>
+            </div>
+            <div id="keywords-list" class="space-y-1 max-h-[60vh] overflow-y-auto"></div>
+        </div>
+
+        <!-- ========================================================== -->
+        <!-- TAB: BLOCKED -->
+        <!-- ========================================================== -->
+        <div id="tab-blocked" class="tab-content hidden">
+            <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                <div>
+                    <h3 class="text-lg font-bold mb-2"><i class="fas fa-user-slash ml-1"></i> المستخدمون المحظورون</h3>
+                    <div id="blocked-senders-list" class="space-y-1 max-h-64 overflow-y-auto"></div>
+                    <div class="mt-2 flex gap-2">
+                        <input type="number" id="block-user-id" placeholder="معرف المستخدم" class="bg-gray-700 border border-gray-600 rounded-lg px-3 py-1.5 text-sm flex-1">
+                        <input type="text" id="block-user-reason" placeholder="السبب" class="bg-gray-700 border border-gray-600 rounded-lg px-3 py-1.5 text-sm flex-1">
+                        <button onclick="blockSender()" class="bg-red-500 hover:bg-red-600 px-3 py-1.5 rounded-lg text-sm transition">حظر</button>
+                    </div>
+                </div>
+                <div>
+                    <h3 class="text-lg font-bold mb-2"><i class="fas fa-comment-slash ml-1"></i> المجموعات المحظورة</h3>
+                    <div id="blocked-chats-list" class="space-y-1 max-h-64 overflow-y-auto"></div>
+                    <div class="mt-2 flex gap-2">
+                        <input type="number" id="block-chat-id" placeholder="معرف المجموعة" class="bg-gray-700 border border-gray-600 rounded-lg px-3 py-1.5 text-sm flex-1">
+                        <input type="text" id="block-chat-reason" placeholder="السبب" class="bg-gray-700 border border-gray-600 rounded-lg px-3 py-1.5 text-sm flex-1">
+                        <button onclick="blockChat()" class="bg-red-500 hover:bg-red-600 px-3 py-1.5 rounded-lg text-sm transition">حظر</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- ========================================================== -->
+        <!-- TAB: SETTINGS -->
+        <!-- ========================================================== -->
+        <div id="tab-settings" class="tab-content hidden">
+            <div class="space-y-4 max-w-2xl">
+                <div class="flex flex-wrap items-center gap-4">
+                    <label class="text-gray-400 w-44"><i class="fas fa-bell ml-1"></i> التنبيهات/دقيقة</label>
+                    <input type="number" id="setting-alerts-per-minute" class="bg-gray-700 border border-gray-600 rounded-lg px-4 py-2 w-28 text-white">
+                </div>
+                <div class="flex flex-wrap items-center gap-4">
+                    <label class="text-gray-400 w-44"><i class="fas fa-clock ml-1"></i> فترة التهدئة (ث)</label>
+                    <input type="number" id="setting-cooldown" class="bg-gray-700 border border-gray-600 rounded-lg px-4 py-2 w-28 text-white">
+                </div>
+                <div class="flex flex-wrap items-center gap-4">
+                    <label class="text-gray-400 w-44"><i class="fas fa-filter ml-1"></i> Prefilter</label>
+                    <input type="checkbox" id="setting-prefilter" class="w-5 h-5 accent-emerald-500">
+                </div>
+                <div class="flex flex-wrap items-center gap-4">
+                    <label class="text-gray-400 w-44"><i class="fas fa-language ml-1"></i> فلترة اللغة</label>
+                    <input type="checkbox" id="setting-language-filter" class="w-5 h-5 accent-emerald-500">
+                </div>
+                <div class="flex flex-wrap gap-4">
+                    <button onclick="saveSettings()" class="bg-emerald-500 hover:bg-emerald-600 px-6 py-2 rounded-lg transition"><i class="fas fa-save ml-1"></i> حفظ الإعدادات</button>
+                    <button onclick="purgeQueue()" class="bg-red-500 hover:bg-red-600 px-6 py-2 rounded-lg transition"><i class="fas fa-trash ml-1"></i> تفريغ الطابور</button>
+                    <button onclick="restartBot()" class="btn-warning px-6 py-2 rounded-lg transition"><i class="fas fa-sync ml-1"></i> إعادة تشغيل البوت</button>
+                    <button onclick="stopBot()" class="btn-danger px-6 py-2 rounded-lg transition"><i class="fas fa-stop ml-1"></i> إيقاف البوت</button>
+                </div>
+            </div>
+        </div>
+
+    </main>
+</div>
+
+<!-- ============================================================ -->
+<!-- MODAL: ADD ACCOUNT -->
+<!-- ============================================================ -->
+<div id="add-account-modal" class="fixed inset-0 modal-overlay flex items-center justify-center hidden z-50">
+    <div class="bg-gray-800 p-6 rounded-lg w-full max-w-md border border-gray-700 shadow-2xl">
+        <h2 class="text-xl font-bold mb-4"><i class="fas fa-user-plus ml-2"></i> إضافة حساب جديد</h2>
+        <div class="space-y-3">
+            <input type="text" id="new-account-name" placeholder="اسم الحساب" class="w-full bg-gray-700 border border-gray-600 rounded-lg px-4 py-2 text-white">
+            <input type="number" id="new-account-api-id" placeholder="API ID" class="w-full bg-gray-700 border border-gray-600 rounded-lg px-4 py-2 text-white">
+            <input type="text" id="new-account-api-hash" placeholder="API Hash" class="w-full bg-gray-700 border border-gray-600 rounded-lg px-4 py-2 text-white">
+            <input type="text" id="new-account-phone" placeholder="رقم الهاتف (مع رمز الدولة)" class="w-full bg-gray-700 border border-gray-600 rounded-lg px-4 py-2 text-white">
+            <input type="text" id="new-account-session" placeholder="اسم الجلسة" class="w-full bg-gray-700 border border-gray-600 rounded-lg px-4 py-2 text-white">
+            <input type="number" id="new-account-priority" placeholder="الأولوية (1-10)" value="5" class="w-full bg-gray-700 border border-gray-600 rounded-lg px-4 py-2 text-white">
+        </div>
+        <div class="flex gap-3 mt-4">
+            <button onclick="addAccount()" class="flex-1 bg-emerald-500 hover:bg-emerald-600 py-2 rounded-lg transition"><i class="fas fa-check ml-1"></i> إضافة</button>
+            <button onclick="closeModal('add-account-modal')" class="flex-1 bg-gray-600 hover:bg-gray-700 py-2 rounded-lg transition">إلغاء</button>
+        </div>
+    </div>
+</div>
+
+<!-- ============================================================ -->
+<!-- JAVASCRIPT -->
+<!-- ============================================================ -->
+<script>
+// ================================================================
+// CONFIGURATION
+// ================================================================
+const API_BASE = window.location.origin;
+let AUTH_TOKEN = localStorage.getItem('dashboard_token') || '';
+let WS = null;
+let currentTab = 'dashboard';
+let statsData = {};
+let activityChart = null;
+let accountsChart = null;
+
+// ================================================================
+// AUTHENTICATION
+// ================================================================
+function authenticate() {
+    const token = document.getElementById('tokenInput').value.trim();
+    if (token) {
+        AUTH_TOKEN = token;
+        localStorage.setItem('dashboard_token', token);
+        document.getElementById('tokenModal').classList.add('hidden');
+        document.getElementById('tokenError').classList.add('hidden');
+        initApp();
+    } else {
+        document.getElementById('tokenError').classList.remove('hidden');
+    }
+}
+
+function logout() {
+    localStorage.removeItem('dashboard_token');
+    AUTH_TOKEN = '';
+    document.getElementById('tokenModal').classList.remove('hidden');
+    if (WS) {
+        WS.close();
+        WS = null;
+    }
+}
+
+// Check token on load
+document.addEventListener('DOMContentLoaded', function() {
+    if (!AUTH_TOKEN) {
+        document.getElementById('tokenModal').classList.remove('hidden');
+    } else {
+        initApp();
+    }
+});
+
+// ================================================================
+// API HELPER
+// ================================================================
+async function apiFetch(endpoint, options = {}) {
+    const headers = {
+        'Authorization': `Bearer ${AUTH_TOKEN}`,
+        'Content-Type': 'application/json',
+        ...options.headers
+    };
+    const response = await fetch(`${API_BASE}${endpoint}`, {
+        ...options,
+        headers
+    });
+    if (response.status === 401) {
+        logout();
+        throw new Error('Unauthorized');
+    }
+    return response.json();
+}
+
+// ================================================================
+// WEBSOCKET
+// ================================================================
+function connectWebSocket() {
+    const wsUrl = `ws://${window.location.host}/ws`;
+    WS = new WebSocket(wsUrl);
+    
+    WS.onopen = () => {
+        console.log('✅ WebSocket connected');
+        document.getElementById('status-badge').innerHTML = '<i class="fas fa-circle text-emerald-400 text-xs ml-1"></i> يعمل';
+    };
+    
+    WS.onmessage = (event) => {
+        try {
+            const data = JSON.parse(event.data);
+            if (data.type === 'stats') {
+                statsData = data.data;
+                updateDashboard(data.data);
+                updateCharts(data.data);
+            }
+        } catch (e) {
+            console.error('WebSocket message error:', e);
+        }
+    };
+    
+    WS.onclose = () => {
+        console.warn('WebSocket disconnected, reconnecting...');
+        document.getElementById('status-badge').innerHTML = '<i class="fas fa-circle text-red-400 text-xs ml-1"></i> غير متصل';
+        setTimeout(connectWebSocket, 3000);
+    };
+    
+    WS.onerror = (e) => {
+        console.error('WebSocket error:', e);
+        WS.close();
+    };
+}
+
+// ================================================================
+// UPDATE DASHBOARD
+// ================================================================
+function updateDashboard(data) {
+    document.getElementById('total-messages').textContent = (data.total_messages || 0).toLocaleString();
+    document.getElementById('total-alerts').textContent = (data.alerts_sent || 0).toLocaleString();
+    document.getElementById('connected-accounts').textContent = `${data.connected_accounts || 0}/${data.total_accounts || 0}`;
+    document.getElementById('queue-size').textContent = data.queue_size || 0;
+    document.getElementById('memory-used').textContent = `${data.memory_used || 0}MB`;
+    document.getElementById('unique-senders').textContent = (data.unique_senders || 0).toLocaleString();
+    document.getElementById('last-hour').textContent = (data.alerts_last_hour || 0).toLocaleString();
+    document.getElementById('avg-reputation').textContent = (data.avg_reputation || 0).toFixed(1);
+    
+    // Uptime
+    if (data.uptime) {
+        const h = Math.floor(data.uptime / 3600);
+        const m = Math.floor((data.uptime % 3600) / 60);
+        const s = data.uptime % 60;
+        document.getElementById('uptime').textContent = `⏱ ${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+    }
+    
+    // Accounts
+    if (currentTab === 'accounts' && data.accounts) {
+        renderAccounts(data.accounts);
+    }
+    
+    // Recent alerts
+    if (data.recent_alerts) {
+        renderRecentAlerts(data.recent_alerts);
+    }
+}
+
+// ================================================================
+// RENDER ACCOUNTS
+// ================================================================
+function renderAccounts(accounts) {
+    const container = document.getElementById('accounts-list');
+    if (!container) return;
+    if (!accounts || accounts.length === 0) {
+        container.innerHTML = '<div class="text-gray-500 text-center py-4">لا توجد حسابات</div>';
+        return;
+    }
+    container.innerHTML = accounts.map(acc => `
+        <div class="bg-gray-700/50 p-3 rounded-lg flex flex-wrap justify-between items-center border border-gray-600">
+            <div class="flex flex-wrap items-center gap-3">
+                <span class="status-dot ${acc.connected ? 'online' : 'offline'}"></span>
+                <span class="font-bold text-white">${acc.name}</span>
+                <span class="text-sm text-gray-400">${acc.phone}</span>
+                <span class="text-xs bg-gray-600 px-2 py-0.5 rounded">الأولوية ${acc.priority}</span>
+            </div>
+            <div class="flex flex-wrap items-center gap-3 text-sm">
+                <span class="text-gray-400"><i class="fas fa-bell ml-1"></i> ${acc.alerts}</span>
+                <span class="text-gray-400"><i class="fas fa-queue ml-1"></i> ${acc.queued}</span>
+                ${acc.last_error ? `<span class="text-red-400 text-xs" title="${acc.last_error}"><i class="fas fa-exclamation-triangle ml-1"></i></span>` : ''}
+            </div>
+        </div>
+    `).join('');
+}
+
+// ================================================================
+// RENDER RECENT ALERTS
+// ================================================================
+function renderRecentAlerts(alerts) {
+    const container = document.getElementById('recent-alerts-list');
+    if (!container) return;
+    if (!alerts || alerts.length === 0) {
+        container.innerHTML = '<div class="text-gray-500 text-center py-4">لا توجد تنبيهات حديثة</div>';
+        return;
+    }
+    container.innerHTML = alerts.slice(0, 10).map(a => `
+        <div class="bg-gray-700/30 p-2 rounded-lg flex flex-wrap justify-between items-center border border-gray-700 text-sm">
+            <span><i class="fas fa-bell text-yellow-400 ml-1"></i> <span class="font-medium">${a.keyword || 'غير معروف'}</span></span>
+            <span class="text-gray-400">${a.account_name || ''}</span>
+            <span class="text-gray-500 text-xs">${a.created_at || ''}</span>
+        </div>
+    `).join('');
+}
+
+// ================================================================
+// TAB MANAGEMENT
+// ================================================================
+function showTab(tab) {
+    currentTab = tab;
+    document.querySelectorAll('.tab-content').forEach(el => el.classList.add('hidden'));
+    document.querySelectorAll('.tab-link').forEach(el => el.classList.remove('active'));
+    document.getElementById(`tab-${tab}`).classList.remove('hidden');
+    const link = document.querySelector(`.tab-link[onclick*="${tab}"]`);
+    if (link) link.classList.add('active');
+    
+    // Load data on tab switch
+    if (tab === 'accounts') {
+        loadAccounts();
+    } else if (tab === 'messages') {
+        loadMessages();
+    } else if (tab === 'alerts') {
+        loadAlerts();
+    } else if (tab === 'keywords') {
+        loadKeywords();
+    } else if (tab === 'blocked') {
+        loadBlocked();
+    } else if (tab === 'settings') {
+        loadSettings();
+    }
+}
+
+// ================================================================
+// LOAD ACCOUNTS
+// ================================================================
+async function loadAccounts() {
+    try {
+        const data = await apiFetch('/api/accounts');
+        renderAccounts(data.accounts || []);
+    } catch (e) {
+        console.error('Failed to load accounts:', e);
+    }
+}
+
+// ================================================================
+// LOAD MESSAGES
+// ================================================================
+async function loadMessages() {
+    const container = document.getElementById('messages-list');
+    container.innerHTML = '<div class="text-center text-gray-500 py-4">جاري التحميل...</div>';
+    try {
+        const data = await apiFetch('/api/messages?limit=50');
+        if (data.messages && data.messages.length > 0) {
+            container.innerHTML = data.messages.map(m => `
+                <div class="bg-gray-700/30 p-3 rounded-lg border border-gray-700 text-sm">
+                    <div class="flex flex-wrap justify-between text-gray-400 text-xs mb-1">
+                        <span><i class="fas fa-user ml-1"></i> ${m.sender_id || 'غير معروف'}</span>
+                        <span>${new Date(m.created_at || Date.now()).toLocaleString('ar')}</span>
+                    </div>
+                    <div class="text-white">${m.message_text || '(بدون نص)'}</div>
+                </div>
+            `).join('');
+        } else {
+            container.innerHTML = '<div class="text-gray-500 text-center py-4">لا توجد رسائل</div>';
+        }
+    } catch (e) {
+        container.innerHTML = `<div class="text-red-400 text-center py-4">خطأ: ${e.message}</div>`;
+    }
+}
+
+async function searchMessages() {
+    const query = document.getElementById('msg-search').value.trim();
+    if (!query) { loadMessages(); return; }
+    const container = document.getElementById('messages-list');
+    container.innerHTML = '<div class="text-center text-gray-500 py-4">جاري البحث...</div>';
+    try {
+        const data = await apiFetch(`/api/messages?keyword=${encodeURIComponent(query)}&limit=100`);
+        if (data.messages && data.messages.length > 0) {
+            container.innerHTML = data.messages.map(m => `
+                <div class="bg-gray-700/30 p-3 rounded-lg border border-gray-700 text-sm">
+                    <div class="flex flex-wrap justify-between text-gray-400 text-xs mb-1">
+                        <span><i class="fas fa-user ml-1"></i> ${m.sender_id || 'غير معروف'}</span>
+                        <span>${new Date(m.created_at || Date.now()).toLocaleString('ar')}</span>
+                    </div>
+                    <div class="text-white">${m.message_text || '(بدون نص)'}</div>
+                </div>
+            `).join('');
+        } else {
+            container.innerHTML = '<div class="text-gray-500 text-center py-4">لا توجد نتائج</div>';
+        }
+    } catch (e) {
+        container.innerHTML = `<div class="text-red-400 text-center py-4">خطأ: ${e.message}</div>`;
+    }
+}
+
+// ================================================================
+// LOAD ALERTS
+// ================================================================
+async function loadAlerts() {
+    const container = document.getElementById('alerts-list');
+    container.innerHTML = '<div class="text-center text-gray-500 py-4">جاري التحميل...</div>';
+    try {
+        const data = await apiFetch('/api/alerts?limit=50');
+        if (data.alerts && data.alerts.length > 0) {
+            container.innerHTML = data.alerts.map(a => `
+                <div class="bg-gray-700/30 p-3 rounded-lg border border-gray-700 text-sm">
+                    <div class="flex flex-wrap justify-between text-gray-400 text-xs mb-1">
+                        <span><i class="fas fa-bell text-yellow-400 ml-1"></i> <span class="text-emerald-400">${a.keyword || 'غير معروف'}</span></span>
+                        <span>${a.account_name || ''}</span>
+                        <span>${new Date(a.created_at || Date.now()).toLocaleString('ar')}</span>
+                    </div>
+                    <div class="text-white text-xs truncate">${a.alert_text || '(بدون نص)'}</div>
+                </div>
+            `).join('');
+        } else {
+            container.innerHTML = '<div class="text-gray-500 text-center py-4">لا توجد تنبيهات</div>';
+        }
+    } catch (e) {
+        container.innerHTML = `<div class="text-red-400 text-center py-4">خطأ: ${e.message}</div>`;
+    }
+}
+
+async function searchAlerts() {
+    const query = document.getElementById('alert-search').value.trim();
+    if (!query) { loadAlerts(); return; }
+    const container = document.getElementById('alerts-list');
+    container.innerHTML = '<div class="text-center text-gray-500 py-4">جاري البحث...</div>';
+    try {
+        const data = await apiFetch(`/api/alerts?keyword=${encodeURIComponent(query)}&limit=100`);
+        if (data.alerts && data.alerts.length > 0) {
+            container.innerHTML = data.alerts.map(a => `
+                <div class="bg-gray-700/30 p-3 rounded-lg border border-gray-700 text-sm">
+                    <div class="flex flex-wrap justify-between text-gray-400 text-xs mb-1">
+                        <span><i class="fas fa-bell text-yellow-400 ml-1"></i> <span class="text-emerald-400">${a.keyword || 'غير معروف'}</span></span>
+                        <span>${a.account_name || ''}</span>
+                        <span>${new Date(a.created_at || Date.now()).toLocaleString('ar')}</span>
+                    </div>
+                    <div class="text-white text-xs truncate">${a.alert_text || '(بدون نص)'}</div>
+                </div>
+            `).join('');
+        } else {
+            container.innerHTML = '<div class="text-gray-500 text-center py-4">لا توجد نتائج</div>';
+        }
+    } catch (e) {
+        container.innerHTML = `<div class="text-red-400 text-center py-4">خطأ: ${e.message}</div>`;
+    }
+}
+
+// ================================================================
+// KEYWORDS
+// ================================================================
+async function loadKeywords() {
+    const container = document.getElementById('keywords-list');
+    const category = document.getElementById('keyword-category').value;
+    container.innerHTML = '<div class="text-center text-gray-500 py-4">جاري التحميل...</div>';
+    try {
+        const data = await apiFetch('/api/keywords');
+        const words = data.keywords[category] || [];
+        if (words.length === 0) {
+            container.innerHTML = '<div class="text-gray-500 text-center py-4">لا توجد كلمات في هذه الفئة</div>';
+            return;
+        }
+        container.innerHTML = words.map(w => `
+            <div class="bg-gray-700/30 p-2 rounded-lg flex justify-between items-center border border-gray-700">
+                <span class="text-sm">${w}</span>
+                <button onclick="deleteKeyword('${category}','${w}')" class="text-red-400 hover:text-red-300 text-sm transition"><i class="fas fa-times"></i></button>
+            </div>
+        `).join('');
+    } catch (e) {
+        container.innerHTML = `<div class="text-red-400 text-center py-4">خطأ: ${e.message}</div>`;
+    }
+}
+
+async function addKeyword() {
+    const category = document.getElementById('keyword-category').value;
+    const keyword = document.getElementById('new-keyword').value.trim();
+    if (!keyword) { alert('الرجاء إدخال كلمة'); return; }
+    try {
+        const result = await apiFetch('/api/keywords', {
+            method: 'POST',
+            body: JSON.stringify({ category, keyword })
+        });
+        if (result.success) {
+            document.getElementById('new-keyword').value = '';
+            loadKeywords();
+        } else {
+            alert('❌ ' + (result.error || 'فشل الإضافة'));
+        }
+    } catch (e) {
+        alert('❌ خطأ: ' + e.message);
+    }
+}
+
+async function deleteKeyword(category, keyword) {
+    if (!confirm(`هل أنت متأكد من حذف "${keyword}"؟`)) return;
+    try {
+        const result = await apiFetch('/api/keywords', {
+            method: 'DELETE',
+            body: JSON.stringify({ category, keyword })
+        });
+        if (result.success) {
+            loadKeywords();
+        } else {
+            alert('❌ ' + (result.error || 'فشل الحذف'));
+        }
+    } catch (e) {
+        alert('❌ خطأ: ' + e.message);
+    }
+}
+
+// ================================================================
+// BLOCKED
+// ================================================================
+async function loadBlocked() {
+    try {
+        const [senders, chats] = await Promise.all([
+            apiFetch('/api/blocked/senders'),
+            apiFetch('/api/blocked/chats')
+        ]);
+        
+        const sendersContainer = document.getElementById('blocked-senders-list');
+        if (senders.senders && senders.senders.length > 0) {
+            sendersContainer.innerHTML = senders.senders.map(s => `
+                <div class="bg-gray-700/30 p-2 rounded-lg flex justify-between items-center border border-gray-700 text-sm">
+                    <span><i class="fas fa-user ml-1"></i> ${s.sender_id}</span>
+                    <span class="text-gray-400 text-xs">${s.reason || 'لا يوجد سبب'}</span>
+                    <button onclick="unblockSender(${s.sender_id})" class="text-emerald-400 hover:text-emerald-300 text-sm"><i class="fas fa-undo"></i></button>
+                </div>
+            `).join('');
+        } else {
+            sendersContainer.innerHTML = '<div class="text-gray-500 text-center py-2 text-sm">لا يوجد مستخدمون محظورون</div>';
+        }
+        
+        const chatsContainer = document.getElementById('blocked-chats-list');
+        if (chats.chats && chats.chats.length > 0) {
+            chatsContainer.innerHTML = chats.chats.map(c => `
+                <div class="bg-gray-700/30 p-2 rounded-lg flex justify-between items-center border border-gray-700 text-sm">
+                    <span><i class="fas fa-comment ml-1"></i> ${c.chat_id}</span>
+                    <span class="text-gray-400 text-xs">${c.reason || 'لا يوجد سبب'}</span>
+                    <button onclick="unblockChat(${c.chat_id})" class="text-emerald-400 hover:text-emerald-300 text-sm"><i class="fas fa-undo"></i></button>
+                </div>
+            `).join('');
+        } else {
+            chatsContainer.innerHTML = '<div class="text-gray-500 text-center py-2 text-sm">لا توجد مجموعات محظورة</div>';
+        }
+    } catch (e) {
+        console.error('Failed to load blocked lists:', e);
+    }
+}
+
+async function blockSender() {
+    const user_id = parseInt(document.getElementById('block-user-id').value);
+    const reason = document.getElementById('block-user-reason').value.trim();
+    if (!user_id) { alert('الرجاء إدخال معرف المستخدم'); return; }
+    try {
+        const result = await apiFetch('/api/blocked/senders', {
+            method: 'POST',
+            body: JSON.stringify({ user_id, reason })
+        });
+        if (result.success) {
+            document.getElementById('block-user-id').value = '';
+            document.getElementById('block-user-reason').value = '';
+            loadBlocked();
+        } else {
+            alert('❌ فشل الحظر');
+        }
+    } catch (e) { alert('❌ خطأ: ' + e.message); }
+}
+
+async function unblockSender(user_id) {
+    if (!confirm(`رفع الحظر عن المستخدم ${user_id}؟`)) return;
+    try {
+        const result = await apiFetch(`/api/blocked/senders/${user_id}`, { method: 'DELETE' });
+        if (result.success) loadBlocked();
+        else alert('❌ فشل رفع الحظر');
+    } catch (e) { alert('❌ خطأ: ' + e.message); }
+}
+
+async function blockChat() {
+    const chat_id = parseInt(document.getElementById('block-chat-id').value);
+    const reason = document.getElementById('block-chat-reason').value.trim();
+    if (!chat_id) { alert('الرجاء إدخال معرف المجموعة'); return; }
+    try {
+        const result = await apiFetch('/api/blocked/chats', {
+            method: 'POST',
+            body: JSON.stringify({ chat_id, reason })
+        });
+        if (result.success) {
+            document.getElementById('block-chat-id').value = '';
+            document.getElementById('block-chat-reason').value = '';
+            loadBlocked();
+        } else {
+            alert('❌ فشل حظر المجموعة');
+        }
+    } catch (e) { alert('❌ خطأ: ' + e.message); }
+}
+
+async function unblockChat(chat_id) {
+    if (!confirm(`رفع الحظر عن المجموعة ${chat_id}؟`)) return;
+    try {
+        const result = await apiFetch(`/api/blocked/chats/${chat_id}`, { method: 'DELETE' });
+        if (result.success) loadBlocked();
+        else alert('❌ فشل رفع الحظر');
+    } catch (e) { alert('❌ خطأ: ' + e.message); }
+}
+
+// ================================================================
+// SETTINGS
+// ================================================================
+function loadSettings() {
+    document.getElementById('setting-alerts-per-minute').value = 20;
+    document.getElementById('setting-cooldown').value = 300;
+    document.getElementById('setting-prefilter').checked = true;
+    document.getElementById('setting-language-filter').checked = true;
+}
+
+async function saveSettings() {
+    const data = {
+        max_alerts_per_minute: parseInt(document.getElementById('setting-alerts-per-minute').value) || undefined,
+        alert_cooldown: parseInt(document.getElementById('setting-cooldown').value) || undefined,
+        prefilter_enabled: document.getElementById('setting-prefilter').checked,
+        language_filter: document.getElementById('setting-language-filter').checked,
+    };
+    try {
+        const result = await apiFetch('/api/settings', {
+            method: 'POST',
+            body: JSON.stringify(data)
+        });
+        if (result.success) alert('✅ تم حفظ الإعدادات');
+        else alert('❌ فشل حفظ الإعدادات');
+    } catch (e) {
+        alert('❌ خطأ: ' + e.message);
+    }
+}
+
+async function purgeQueue() {
+    if (!confirm('⚠️ هل أنت متأكد من تفريغ الطابور بالكامل؟')) return;
+    try {
+        const result = await apiFetch('/api/purge', { method: 'POST' });
+        if (result.success) alert(`✅ تم تفريغ ${result.purged || 0} رسالة`);
+        else alert('❌ فشل التفريغ');
+    } catch (e) { alert('❌ خطأ: ' + e.message); }
+}
+
+// ================================================================
+// RESTART & STOP BOT (مع التعديلات المطلوبة)
+// ================================================================
+async function restartBot() {
+    if (!confirm('⚠️ سيتم إعادة تشغيل البوت، هل أنت متأكد؟')) return;
+    try {
+        const response = await fetch('/api/restart', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            }
+        });
+        const result = await response.json();
+        if (result.success) {
+            alert('✅ ' + result.message);
+            // تحديث الصفحة بعد 3 ثواني
+            setTimeout(() => location.reload(), 3000);
+        } else {
+            alert('❌ ' + (result.error || 'فشل إعادة التشغيل'));
+        }
+    } catch (e) {
+        alert('❌ خطأ في الاتصال: ' + e.message);
+    }
+}
+
+async function stopBot() {
+    if (!confirm('⚠️ سيتم إيقاف البوت نهائياً، هل أنت متأكد؟')) return;
+    try {
+        const response = await fetch('/api/stop', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            }
+        });
+        const result = await response.json();
+        if (result.success) {
+            alert('✅ ' + result.message);
+        } else {
+            alert('❌ ' + (result.error || 'فشل إيقاف البوت'));
+        }
+    } catch (e) {
+        alert('❌ خطأ في الاتصال: ' + e.message);
+    }
+}
+
+// ================================================================
+// ADD ACCOUNT
+// ================================================================
+function showAddAccount() {
+    document.getElementById('add-account-modal').classList.remove('hidden');
+}
+
+function closeModal(id) {
+    document.getElementById(id).classList.add('hidden');
+}
+
+async function addAccount() {
+    const data = {
+        name: document.getElementById('new-account-name').value.trim(),
+        api_id: parseInt(document.getElementById('new-account-api-id').value),
+        api_hash: document.getElementById('new-account-api-hash').value.trim(),
+        phone: document.getElementById('new-account-phone').value.trim(),
+        session_name: document.getElementById('new-account-session').value.trim(),
+        priority: parseInt(document.getElementById('new-account-priority').value) || 5,
+    };
+    if (!data.name || !data.api_id || !data.api_hash || !data.phone || !data.session_name) {
+        alert('❌ الرجاء ملء جميع الحقول');
+        return;
+    }
+    try {
+        const result = await apiFetch('/api/accounts', {
+            method: 'POST',
+            body: JSON.stringify(data)
+        });
+        if (result.success) {
+            closeModal('add-account-modal');
+            alert('✅ تم إضافة الحساب بنجاح');
+            loadAccounts();
+        } else {
+            alert('❌ فشل الإضافة: ' + (result.error || 'خطأ غير معروف'));
+        }
+    } catch (e) {
+        alert('❌ خطأ: ' + e.message);
+    }
+}
+
+// ================================================================
+// CHARTS
+// ================================================================
+function initCharts() {
+    const ctx1 = document.getElementById('activityChart').getContext('2d');
+    activityChart = new Chart(ctx1, {
+        type: 'line',
+        data: {
+            labels: ['0h', '2h', '4h', '6h', '8h', '10h', '12h', '14h', '16h', '18h', '20h', '22h'],
+            datasets: [
+                { label: 'الرسائل', data: [0,0,0,0,0,0,0,0,0,0,0,0], borderColor: '#22c55e', backgroundColor: 'rgba(34,197,94,0.1)', fill: true, tension: 0.3 },
+                { label: 'التنبيهات', data: [0,0,0,0,0,0,0,0,0,0,0,0], borderColor: '#3b82f6', backgroundColor: 'rgba(59,130,246,0.1)', fill: true, tension: 0.3 }
+            ]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {
+                legend: { labels: { color: '#9ca3af' } }
+            },
+            scales: {
+                x: { ticks: { color: '#6b7280' }, grid: { color: '#374151' } },
+                y: { ticks: { color: '#6b7280' }, grid: { color: '#374151' } }
+            }
+        }
+    });
+    
+    const ctx2 = document.getElementById('accountsChart').getContext('2d');
+    accountsChart = new Chart(ctx2, {
+        type: 'doughnut',
+        data: {
+            labels: ['متصل', 'غير متصل'],
+            datasets: [{ data: [0, 0], backgroundColor: ['#22c55e', '#ef4444'] }]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {
+                legend: { labels: { color: '#9ca3af' } }
+            }
+        }
+    });
+}
+
+function updateCharts(data) {
+    if (accountsChart && data.connected_accounts !== undefined && data.total_accounts) {
+        accountsChart.data.datasets[0].data = [
+            data.connected_accounts || 0,
+            (data.total_accounts || 0) - (data.connected_accounts || 0)
+        ];
+        accountsChart.update();
+    }
+}
+
+// ================================================================
+// INIT APP
+// ================================================================
+function initApp() {
+    connectWebSocket();
+    initCharts();
+    loadSettings();
+    
+    // Keyword category change
+    document.getElementById('keyword-category').addEventListener('change', loadKeywords);
+    
+    // Load initial data
+    setTimeout(() => {
+        loadMessages();
+        loadAlerts();
+        loadBlocked();
+        loadKeywords();
+        loadAccounts();
+    }, 500);
+}
+</script>
+</body>
+</html>
