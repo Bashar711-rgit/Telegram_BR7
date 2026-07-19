@@ -1,0 +1,30 @@
+# ========== Secrets & Credentials (NEVER commit) ==========
+accounts.env
+.env
+.secret_key
+
+# ========== Telegram Sessions ==========
+*.session
+*.session-journal
+sessions/
+
+# ========== Databases ==========
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# ========== Logs & Downloads ==========
+*.log
+downloads/
+
+# ========== Python ==========
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# ========== OS ==========
+.DS_Store
+Thumbs.db
