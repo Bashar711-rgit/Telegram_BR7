@@ -7,6 +7,7 @@ Compatible with: keywords.json v13.0.2, filter_engine.py v13.0
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -84,29 +85,46 @@ def setup_logging(
     retention: str = "7 days",
 ) -> None:
     logger.remove()
-    logger.add(
-        sys.stdout,
-        level=level,
-        format=(
-            "<green>{time:YYYY-MM-DD HH:mm:ss}</green} | "
-            "<level>{level: <8}</level> | "
-            "<cyan>{name}</cyan>:<cyan>{line}</cyan> | "
-            "<level>{message}</level>"
-        ),
-        colorize=True,
-        enqueue=True,
+    plain_format = "{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{line} | {message}"
+    console_format = (
+        "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | "
+        "<level>{level: <8}</level> | "
+        "<cyan>{name}</cyan>:<cyan>{line}</cyan> | "
+        "<level>{message}</level>"
     )
-    logger.add(
-        log_file,
-        level="DEBUG",
-        format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{line} | {message}",
-        rotation=rotation,
-        retention=retention,
-        compression="gz",
-        enqueue=True,
-        backtrace=True,
-        diagnose=True,
-    )
+    try:
+        logger.add(
+            sys.stdout,
+            level=level,
+            format=console_format,
+            colorize=True,
+            enqueue=True,
+        )
+    except ValueError:
+        # Some Python 3.11 builds fail to parse loguru color markup
+        # ("Single '}' encountered in format string") - fall back to a
+        # plain format so logging setup can never crash the app.
+        logger.add(
+            sys.stdout,
+            level=level,
+            format=plain_format,
+            colorize=False,
+            enqueue=True,
+        )
+    try:
+        logger.add(
+            log_file,
+            level="DEBUG",
+            format=plain_format,
+            rotation=rotation,
+            retention=retention,
+            compression="gz",
+            enqueue=True,
+            backtrace=True,
+            diagnose=True,
+        )
+    except (ValueError, OSError) as e:
+        logger.warning(f"File log sink disabled: {e}")
     logger.info(f"Logging initialized (JSON: {JSON_AVAILABLE})")
 
 # =============================================================================
