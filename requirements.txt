@@ -40,6 +40,7 @@ fastapi>=0.100.0,<1.0.0           # Dashboard API
 uvicorn>=0.23.0,<1.0.0            # ASGI server
 websockets>=12.0,<13.0            # WebSocket support
 python-multipart>=0.0.6,<1.0.0    # Form data support
+itsdangerous>=2.1.0,<3.0.0        # Signed session cookies (admin dashboard)
 
 # ========== Optional: Better performance ==========
 # brotli>=1.1.0,<2.0.0            # Compression (optional)

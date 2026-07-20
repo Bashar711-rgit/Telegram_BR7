@@ -1,0 +1,958 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl" class="h-full">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="referrer" content="no-referrer">
+<title>لوحة إدارة البوت</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script>
+tailwind.config = {
+  darkMode: 'class',
+  theme: { extend: { fontFamily: { sans: ['Tahoma','Segoe UI','sans-serif'] } } }
+};
+</script>
+<style type="text/tailwindcss">
+  html { font-family: Tahoma, 'Segoe UI', sans-serif; }
+  :root { --bg-card: #ffffff; --border: #e2e8f0; }
+  .dark { --bg-card: #1e293b; --border: #334155; }
+  .fade-in { animation: fadeIn .25s ease-in; }
+  @keyframes fadeIn { from { opacity: 0; transform: translateY(6px);} to { opacity: 1; transform: none;} }
+  .toast-in { animation: toastIn .2s ease-out; }
+  @keyframes toastIn { from { opacity: 0; transform: translateY(-8px);} to { opacity: 1; } }
+  ::-webkit-scrollbar { width: 8px; height: 8px; }
+  ::-webkit-scrollbar-thumb { background: #94a3b8; border-radius: 8px; }
+  .dark ::-webkit-scrollbar-thumb { background: #475569; }
+  input[type="datetime-local"] { direction: ltr; }
+  .ltr { direction: ltr; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+  .chip { @apply inline-block text-xs px-2 py-0.5 rounded-full; }
+  .card { @apply rounded-2xl p-4 shadow-sm fade-in; background: var(--bg-card); border: 1px solid var(--border); }
+  .inp { @apply w-full px-3 py-2 rounded-xl text-sm outline-none focus:ring-2 focus:ring-sky-500; background: var(--bg-card); border: 1px solid var(--border); color: inherit; }
+  .lbl { @apply block text-xs font-bold mb-1 opacity-70; }
+  .lnk { @apply text-sky-600 hover:underline cursor-pointer; }
+  .dark .lnk { @apply text-sky-400; }
+  .muted2 { @apply opacity-60; }
+
+  .badge { @apply inline-block text-[11px] font-bold px-2 py-0.5 rounded-full whitespace-nowrap; }
+  .badge.ok { @apply bg-emerald-100 text-emerald-700; }
+  .dark .badge.ok { @apply bg-emerald-900/50 text-emerald-300; }
+  .badge.warn { @apply bg-amber-100 text-amber-700; }
+  .dark .badge.warn { @apply bg-amber-900/50 text-amber-300; }
+  .badge.bad { @apply bg-rose-100 text-rose-700; }
+  .dark .badge.bad { @apply bg-rose-900/50 text-rose-300; }
+  .badge.info { @apply bg-sky-100 text-sky-700; }
+  .dark .badge.info { @apply bg-sky-900/50 text-sky-300; }
+
+  .tbl { @apply w-full text-sm; border-collapse: collapse; }
+  .tbl th { @apply text-right text-xs font-bold pb-2 px-1 opacity-60 whitespace-nowrap; border-bottom: 1px solid var(--border); }
+  .tbl td { @apply py-2.5 px-1 align-top; border-bottom: 1px solid var(--border); }
+  .tbl tr:last-child td { border-bottom: none; }
+
+  .log-line { white-space: pre-wrap; word-break: break-word; padding: 2px 0; border-bottom: 1px dashed rgba(148,163,184,.15); }
+  .log-err { color: #f87171; }
+  .log-warn { color: #fbbf24; }
+  .log-info { color: #34d399; }
+  .log-debug { color: #94a3b8; }
+</style>
+</head>
+<body class="h-full bg-slate-100 text-slate-800 dark:bg-slate-900 dark:text-slate-100 transition-colors">
+
+<!-- Toasts -->
+<div id="toasts" class="fixed top-3 left-3 z-50 space-y-2 w-80 max-w-[90vw]"></div>
+
+<!-- Confirm modal -->
+<div id="confirmModal" class="hidden fixed inset-0 z-40 bg-black/50 flex items-center justify-center p-4">
+  <div class="bg-white dark:bg-slate-800 rounded-xl shadow-xl p-6 w-full max-w-sm fade-in">
+    <h3 id="confirmTitle" class="font-bold text-lg mb-2">تأكيد</h3>
+    <p id="confirmText" class="text-sm text-slate-600 dark:text-slate-300 mb-5"></p>
+    <div class="flex gap-2 justify-end">
+      <button id="confirmCancel" class="px-4 py-2 rounded-lg bg-slate-200 dark:bg-slate-700 hover:bg-slate-300 dark:hover:bg-slate-600">إلغاء</button>
+      <button id="confirmOk" class="px-4 py-2 rounded-lg bg-red-600 text-white hover:bg-red-700">تأكيد</button>
+    </div>
+  </div>
+</div>
+
+<!-- Login view -->
+<div id="loginView" class="hidden min-h-full flex items-center justify-center p-4">
+  <div class="bg-white dark:bg-slate-800 rounded-2xl shadow-xl p-8 w-full max-w-sm fade-in">
+    <div class="text-center mb-6">
+      <div class="text-4xl mb-2">🤖</div>
+      <h1 class="text-xl font-bold">لوحة إدارة البوت</h1>
+      <p class="text-sm text-slate-500 dark:text-slate-400 mt-1">سجّل الدخول للمتابعة</p>
+    </div>
+    <form id="loginForm" class="space-y-4">
+      <div>
+        <label class="block text-sm mb-1">اسم المستخدم</label>
+        <input id="loginUser" autocomplete="username" required
+          class="w-full rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-700 px-3 py-2 focus:ring-2 focus:ring-blue-500 outline-none">
+      </div>
+      <div>
+        <label class="block text-sm mb-1">كلمة المرور</label>
+        <input id="loginPass" type="password" autocomplete="current-password" required
+          class="w-full rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-700 px-3 py-2 focus:ring-2 focus:ring-blue-500 outline-none">
+      </div>
+      <p id="loginError" class="hidden text-sm text-red-600 dark:text-red-400"></p>
+      <button id="loginBtn" class="w-full py-2.5 rounded-lg bg-blue-600 text-white font-bold hover:bg-blue-700 disabled:opacity-50">دخول</button>
+    </form>
+  </div>
+</div>
+
+<!-- App view -->
+<div id="appView" class="hidden min-h-full md:flex">
+  <!-- Sidebar -->
+  <aside id="sidebar" class="fixed md:static inset-y-0 right-0 z-30 w-64 bg-white dark:bg-slate-800 border-l border-slate-200 dark:border-slate-700 transform translate-x-full md:translate-x-0 transition-transform md:flex flex-col">
+    <div class="p-4 border-b border-slate-200 dark:border-slate-700 flex items-center gap-2">
+      <span class="text-2xl">🤖</span>
+      <div>
+        <div class="font-bold">لوحة الإدارة</div>
+        <div class="text-xs text-slate-500 dark:text-slate-400">Telegram Bot Admin</div>
+      </div>
+    </div>
+    <nav id="nav" class="flex-1 p-3 space-y-1 overflow-y-auto"></nav>
+    <div class="p-3 border-t border-slate-200 dark:border-slate-700 space-y-2">
+      <button id="themeToggle" class="w-full px-3 py-2 rounded-lg bg-slate-200 dark:bg-slate-700 text-sm hover:bg-slate-300 dark:hover:bg-slate-600">🌙 الوضع الداكن</button>
+      <button id="logoutBtn" class="w-full px-3 py-2 rounded-lg bg-red-100 dark:bg-red-900/40 text-red-700 dark:text-red-300 text-sm hover:bg-red-200 dark:hover:bg-red-900/70">🚪 تسجيل الخروج</button>
+    </div>
+  </aside>
+  <div id="sidebarOverlay" class="hidden fixed inset-0 bg-black/40 z-20 md:hidden"></div>
+
+  <!-- Main -->
+  <main class="flex-1 min-w-0">
+    <header class="sticky top-0 z-10 bg-white/80 dark:bg-slate-800/80 backdrop-blur border-b border-slate-200 dark:border-slate-700 px-4 py-3 flex items-center gap-3">
+      <button id="menuBtn" class="md:hidden text-2xl">☰</button>
+      <h1 id="pageTitle" class="font-bold text-lg">لوحة القيادة</h1>
+      <span id="liveBadge" class="chip bg-emerald-100 text-emerald-700 dark:bg-emerald-900/50 dark:text-emerald-300 mr-auto">● مباشر</span>
+    </header>
+    <div id="content" class="p-4 max-w-7xl mx-auto"></div>
+  </main>
+</div>
+
+<script>
+/* ==========================================================================
+ * Core helpers
+ * ==========================================================================*/
+const state = {
+  csrf: null,
+  section: 'dashboard',
+  timers: {},
+  dark: localStorage.getItem('wa_theme') === 'dark',
+  logsPaused: false,
+  logsLevel: '',
+  chart: null,
+  kwData: null,
+};
+const el = { main: document.getElementById('content') };
+
+function applyTheme() {
+  document.documentElement.classList.toggle('dark', state.dark);
+  document.getElementById('themeToggle').textContent = state.dark ? '☀️ الوضع الفاتح' : '🌙 الوضع الداكن';
+  localStorage.setItem('wa_theme', state.dark ? 'dark' : 'light');
+}
+
+function toast(msg, type = 'success') {
+  const colors = {
+    success: 'bg-emerald-600', error: 'bg-red-600', info: 'bg-blue-600', warning: 'bg-amber-600'
+  };
+  const el = document.createElement('div');
+  el.className = `toast-in text-white text-sm rounded-lg shadow-lg px-4 py-3 ${colors[type] || colors.info}`;
+  el.textContent = msg;
+  document.getElementById('toasts').appendChild(el);
+  setTimeout(() => { el.style.opacity = '0'; el.style.transition = 'opacity .3s'; setTimeout(() => el.remove(), 300); }, 3500);
+}
+
+function confirmDialog(text, title = 'تأكيد العملية') {
+  return new Promise(resolve => {
+    const modal = document.getElementById('confirmModal');
+    document.getElementById('confirmText').textContent = text;
+    document.getElementById('confirmTitle').textContent = title;
+    modal.classList.remove('hidden');
+    const done = v => { modal.classList.add('hidden'); resolve(v); };
+    document.getElementById('confirmOk').onclick = () => done(true);
+    document.getElementById('confirmCancel').onclick = () => done(false);
+  });
+}
+
+function promptDialog(title, text) {
+  return new Promise(resolve => {
+    const wrap = document.createElement('div');
+    wrap.className = 'fixed inset-0 z-50 flex items-center justify-center p-4';
+    wrap.style.background = 'rgba(0,0,0,.5)';
+    wrap.innerHTML = `<div class="card w-full max-w-md">
+      <h3 class="font-black mb-2">${esc(title)}</h3>
+      <p class="text-sm muted2 mb-3">${esc(text)}</p>
+      <input id="_prompt_inp" class="inp w-full" dir="ltr" placeholder="+9639xxxxxxxx">
+      <div class="flex gap-2 mt-4 justify-end">
+        <button id="_prompt_cancel" class="px-4 py-2 rounded-xl text-sm font-bold" style="border:1px solid var(--border)">إلغاء</button>
+        <button id="_prompt_ok" class="px-4 py-2 rounded-xl bg-sky-600 text-white text-sm font-bold">تأكيد</button>
+      </div></div>`;
+    document.body.appendChild(wrap);
+    const inp = wrap.querySelector('#_prompt_inp');
+    inp.focus();
+    const done = v => { wrap.remove(); resolve(v); };
+    wrap.querySelector('#_prompt_ok').onclick = () => done(inp.value.trim() || null);
+    wrap.querySelector('#_prompt_cancel').onclick = () => done(null);
+    inp.onkeydown = e => { if (e.key === 'Enter') done(inp.value.trim() || null); if (e.key === 'Escape') done(null); };
+  });
+}
+
+async function api(path, opts = {}) {
+  const headers = Object.assign({ 'Accept': 'application/json' }, opts.headers || {});
+  if (opts.body && typeof opts.body !== 'string' && !(opts.body instanceof FormData)) {
+    headers['Content-Type'] = 'application/json';
+    opts.body = JSON.stringify(opts.body);
+  }
+  if (state.csrf) headers['x-csrf-token'] = state.csrf;
+  const res = await fetch(path, Object.assign({}, opts, { headers, credentials: 'same-origin' }));
+  if (res.status === 401 && !path.includes('/auth/')) { showLogin(); throw new Error('unauthorized'); }
+  let data = null;
+  const ct = res.headers.get('content-type') || '';
+  if (ct.includes('application/json')) data = await res.json();
+  if (!res.ok) {
+    const detail = data && (data.detail || data.error) || `HTTP ${res.status}`;
+    throw new Error(typeof detail === 'string' ? detail : JSON.stringify(detail));
+  }
+  return data;
+}
+
+function esc(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+function fmtUptime(sec) {
+  sec = Math.max(0, sec | 0);
+  const d = Math.floor(sec / 86400), h = Math.floor(sec % 86400 / 3600), m = Math.floor(sec % 3600 / 60), s = sec % 60;
+  return (d ? d + 'ي ' : '') + (h ? h + 'س ' : '') + (m ? m + 'د ' : '') + s + 'ث';
+}
+
+function fmtNum(n) { return (n ?? 0).toLocaleString('en-US'); }
+function fmtBytes(mb) { return mb ? Math.round(mb) + ' MB' : '—'; }
+function fmtTs(ts) { return ts ? new Date(ts * 1000).toLocaleString('ar-EG-u-nu-latn') : '—'; }
+
+function clearTimers() {
+  Object.values(state.timers).forEach(t => clearInterval(t));
+  state.timers = {};
+  if (state.chart) { state.chart.destroy(); state.chart = null; }
+}
+
+/* ==========================================================================
+ * Auth
+ * ==========================================================================*/
+function showLogin() {
+  clearTimers();
+  document.getElementById('appView').classList.add('hidden');
+  document.getElementById('appView').classList.remove('md:flex');
+  document.getElementById('loginView').classList.remove('hidden');
+}
+
+function showApp() {
+  document.getElementById('loginView').classList.add('hidden');
+  document.getElementById('appView').classList.remove('hidden');
+  document.getElementById('appView').classList.add('md:flex');
+  buildNav();
+  navigate(state.section || 'dashboard');
+}
+
+document.getElementById('loginForm').addEventListener('submit', async e => {
+  e.preventDefault();
+  const btn = document.getElementById('loginBtn');
+  const err = document.getElementById('loginError');
+  err.classList.add('hidden');
+  btn.disabled = true;
+  try {
+    const data = await api('/admin/api/auth/login', {
+      method: 'POST',
+      body: { username: document.getElementById('loginUser').value.trim(),
+              password: document.getElementById('loginPass').value }
+    });
+    state.csrf = data.csrf;
+    toast('تم تسجيل الدخول بنجاح');
+    showApp();
+  } catch (ex) {
+    err.textContent = ex.message;
+    err.classList.remove('hidden');
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+document.getElementById('logoutBtn').addEventListener('click', async () => {
+  try { await api('/admin/api/auth/logout', { method: 'POST' }); } catch (e) {}
+  state.csrf = null;
+  showLogin();
+});
+
+document.getElementById('themeToggle').addEventListener('click', () => { state.dark = !state.dark; applyTheme(); });
+
+/* ==========================================================================
+ * Navigation
+ * ==========================================================================*/
+const SECTIONS = [
+  { id: 'dashboard', icon: '📊', title: 'لوحة القيادة' },
+  { id: 'keywords',  icon: '🔑', title: 'الكلمات المفتاحية' },
+  { id: 'alerts',    icon: '🚨', title: 'مركز التنبيهات' },
+  { id: 'accounts',  icon: '👥', title: 'إدارة الحسابات' },
+  { id: 'settings',  icon: '⚙️', title: 'إعدادات البوت' },
+  { id: 'logs',      icon: '📜', title: 'السجلات' },
+  { id: 'control',   icon: '🎛️', title: 'مركز التحكم' },
+];
+
+function buildNav() {
+  const nav = document.getElementById('nav');
+  nav.innerHTML = '';
+  SECTIONS.forEach(s => {
+    const btn = document.createElement('button');
+    btn.id = 'nav-' + s.id;
+    btn.className = 'w-full text-right px-3 py-2.5 rounded-lg text-sm flex items-center gap-2 hover:bg-slate-100 dark:hover:bg-slate-700';
+    btn.innerHTML = `<span>${s.icon}</span><span>${s.title}</span>`;
+    btn.onclick = () => navigate(s.id);
+    nav.appendChild(btn);
+  });
+}
+
+function navigate(section) {
+  state.section = section;
+  clearTimers();
+  SECTIONS.forEach(s => {
+    const el = document.getElementById('nav-' + s.id);
+    el.classList.toggle('bg-blue-600', s.id === section);
+    el.classList.toggle('text-white', s.id === section);
+  });
+  document.getElementById('pageTitle').textContent = SECTIONS.find(s => s.id === section).title;
+  document.getElementById('sidebar').classList.add('translate-x-full');
+  document.getElementById('sidebar').classList.remove('md:translate-x-0');
+  document.getElementById('sidebar').classList.add('md:translate-x-0');
+  document.getElementById('sidebarOverlay').classList.add('hidden');
+  const render = { dashboard: renderDashboard, keywords: renderKeywords, alerts: renderAlerts,
+                   accounts: renderAccounts, settings: renderSettings, logs: renderLogs, control: renderControl }[section];
+  render();
+}
+
+document.getElementById('menuBtn').onclick = () => {
+  document.getElementById('sidebar').classList.remove('translate-x-full');
+  document.getElementById('sidebarOverlay').classList.remove('hidden');
+};
+document.getElementById('sidebarOverlay').onclick = () => {
+  document.getElementById('sidebar').classList.add('translate-x-full');
+  document.getElementById('sidebarOverlay').classList.add('hidden');
+};
+</script>
+<script>
+/* ==========================================================================
+ * Section: Dashboard
+ * ==========================================================================*/
+async function renderDashboard() {
+  const c = document.getElementById('content');
+  c.innerHTML = `
+    <div id="statCards" class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3 mb-4"></div>
+    <div class="grid grid-cols-1 lg:grid-cols-3 gap-4 mb-4">
+      <div class="lg:col-span-2 bg-white dark:bg-slate-800 rounded-xl shadow p-4">
+        <h2 class="font-bold mb-3">التنبيهات خلال 24 ساعة</h2>
+        <div class="h-64"><canvas id="alertsChart"></canvas></div>
+      </div>
+      <div class="bg-white dark:bg-slate-800 rounded-xl shadow p-4">
+        <h2 class="font-bold mb-3">آخر 5 تنبيهات</h2>
+        <div id="recentAlerts" class="space-y-2 text-sm"></div>
+      </div>
+    </div>
+    <h2 class="font-bold mb-2">حالة الحسابات</h2>
+    <div id="accountCards" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3"></div>`;
+  await refreshDashboard();
+  state.timers.dash = setInterval(refreshDashboard, 5000);
+}
+
+async function refreshDashboard() {
+  let d;
+  try { d = await api('/stats'); } catch (e) { return; }
+  const db = d.db || {}, flt = d.filter || {}, sum = d.summary || {};
+  const cards = [
+    { label: 'الرسائل المعالجة', value: fmtNum(db.total_messages ?? flt.processed), icon: '📨', color: 'text-blue-600' },
+    { label: 'التنبيهات المرسلة', value: fmtNum(db.alerts_sent ?? flt.accepted), icon: '🚨', color: 'text-emerald-600' },
+    { label: 'الرسائل المتجاهلة', value: fmtNum(flt.ignored ?? flt.rejected), icon: '🚫', color: 'text-slate-500' },
+    { label: 'الأخطاء / السبام', value: fmtNum((flt.rejected ?? 0) + (flt.spam ?? 0)), icon: '⚠️', color: 'text-red-600' },
+    { label: 'مدة التشغيل', value: fmtUptime(d.uptime), icon: '⏱️', color: 'text-violet-600' },
+    { label: 'الطابور', value: fmtNum(d.queue_size), icon: '🗂️', color: 'text-amber-600' },
+  ];
+  document.getElementById('statCards').innerHTML = cards.map(k => `
+    <div class="bg-white dark:bg-slate-800 rounded-xl shadow p-4 fade-in">
+      <div class="text-2xl">${k.icon}</div>
+      <div class="text-lg font-bold ${k.color} dark:opacity-90 mt-1">${k.value}</div>
+      <div class="text-xs text-slate-500 dark:text-slate-400 mt-1">${k.label}</div>
+    </div>`).join('');
+
+  // Chart
+  const hourly = d.hourly || [];
+  const labels = hourly.map(h => (h.hour || h.bucket || '').toString().slice(11, 16) || '');
+  const values = hourly.map(h => h.alerts_count ?? h.alerts ?? h.count ?? 0);
+  const ctx = document.getElementById('alertsChart');
+  if (ctx) {
+    if (state.chart) state.chart.destroy();
+    state.chart = new Chart(ctx, {
+      type: 'line',
+      data: { labels, datasets: [{ label: 'التنبيهات', data: values, borderColor: '#2563eb',
+        backgroundColor: 'rgba(37,99,235,.15)', fill: true, tension: .35, pointRadius: 2 }] },
+      options: { responsive: true, maintainAspectRatio: false,
+        plugins: { legend: { display: false } },
+        scales: { x: { ticks: { color: state.dark ? '#cbd5e1' : '#475569' } },
+                  y: { beginAtZero: true, ticks: { precision: 0, color: state.dark ? '#cbd5e1' : '#475569' } } } }
+    });
+  }
+
+  // Recent alerts
+  const recent = d.recent_alerts || [];
+  document.getElementById('recentAlerts').innerHTML = recent.length ? recent.map(a => `
+    <div class="border-r-4 border-blue-500 bg-slate-50 dark:bg-slate-700/50 rounded-lg p-2.5">
+      <div class="flex justify-between gap-2">
+        <span class="font-bold text-blue-600 dark:text-blue-400 truncate">${esc(a.keyword || '—')}</span>
+        <span class="text-xs text-slate-400 whitespace-nowrap">${fmtTs(a.timestamp)}</span>
+      </div>
+      <div class="text-xs text-slate-600 dark:text-slate-300 mt-1 line-clamp-2">${esc((a.alert_text || '').slice(0, 120))}</div>
+    </div>`).join('') : '<p class="text-slate-400 text-center py-6">لا توجد تنبيهات بعد</p>';
+
+  // Account cards
+  const mons = d.monitors || [];
+  document.getElementById('accountCards').innerHTML = mons.length ? mons.map(m => `
+    <div class="bg-white dark:bg-slate-800 rounded-xl shadow p-4 flex items-center gap-3 fade-in">
+      <div class="text-2xl">${m.connected ? '🟢' : '🔴'}</div>
+      <div class="min-w-0">
+        <div class="font-bold truncate">${esc(m.name)} ${m.is_main ? '👑' : ''}</div>
+        <div class="text-xs text-slate-500 dark:text-slate-400 ltr text-right">${esc(m.phone || '')}</div>
+        ${m.last_error ? `<div class="text-xs text-red-500 truncate mt-1">${esc(m.last_error)}</div>` : ''}
+      </div>
+      <span class="chip mr-auto ${m.connected ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/50 dark:text-emerald-300' : 'bg-red-100 text-red-700 dark:bg-red-900/50 dark:text-red-300'}">${m.status}</span>
+    </div>`).join('') : '<p class="text-slate-400">لا توجد حسابات نشطة</p>';
+}
+
+/* ==========================================================================
+ * Section: Keywords
+ * ==========================================================================*/
+async function renderKeywords() {
+  const c = document.getElementById('content');
+  c.innerHTML = `
+    <div class="bg-white dark:bg-slate-800 rounded-xl shadow p-4 mb-4 flex flex-wrap gap-3 items-center">
+      <input id="kwSearch" placeholder="🔍 بحث في الكلمات..." class="flex-1 min-w-[200px] rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-700 px-3 py-2 outline-none focus:ring-2 focus:ring-blue-500">
+      <button id="kwExportBtn" class="px-4 py-2 rounded-lg bg-emerald-600 text-white text-sm hover:bg-emerald-700">⬇️ تصدير</button>
+      <label class="px-4 py-2 rounded-lg bg-violet-600 text-white text-sm hover:bg-violet-700 cursor-pointer">
+        ⬆️ استيراد <input id="kwImportFile" type="file" accept=".json,application/json" class="hidden">
+      </label>
+    </div>
+    <div id="kwResults"></div>
+    <div id="kwTree" class="space-y-3"></div>`;
+  document.getElementById('kwExportBtn').onclick = () => { window.location = '/keywords/export'; };
+  document.getElementById('kwImportFile').onchange = importKeywordsFile;
+  let searchTimer;
+  document.getElementById('kwSearch').oninput = e => {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => searchKeywords(e.target.value), 350);
+  };
+  await loadKeywordTree();
+}
+
+async function loadKeywordTree() {
+  const tree = document.getElementById('kwTree');
+  tree.innerHTML = '<p class="text-center text-slate-400 py-8">جارٍ التحميل...</p>';
+  let d;
+  try { d = await api('/keywords'); } catch (e) { tree.innerHTML = `<p class="text-red-500">${esc(e.message)}</p>`; return; }
+  state.kwData = d.categories || [];
+  if (!state.kwData.length) { tree.innerHTML = '<p class="text-slate-400 text-center py-8">لا توجد قوائم كلمات قابلة للتحرير</p>'; return; }
+  tree.innerHTML = state.kwData.map((cat, ci) => `
+    <div class="bg-white dark:bg-slate-800 rounded-xl shadow overflow-hidden">
+      <button class="w-full px-4 py-3 flex items-center gap-2 font-bold hover:bg-slate-50 dark:hover:bg-slate-700/50" onclick="toggleEl('kwcat-${ci}')">
+        <span class="transition-transform" id="kwcat-${ci}-arrow">▾</span>
+        <span class="ltr">${esc(cat.category)}</span>
+        <span class="chip bg-blue-100 text-blue-700 dark:bg-blue-900/50 dark:text-blue-300 mr-auto">${fmtNum(cat.total)} كلمة · ${cat.lists.length} قائمة</span>
+      </button>
+      <div id="kwcat-${ci}" class="border-t border-slate-200 dark:border-slate-700">
+        ${cat.lists.map((lst, li) => `
+          <div class="border-b border-slate-100 dark:border-slate-700/60 last:border-0">
+            <button class="w-full px-5 py-2.5 flex items-center gap-2 text-sm hover:bg-slate-50 dark:hover:bg-slate-700/40" onclick="toggleEl('kwlst-${ci}-${li}')">
+              <span id="kwlst-${ci}-${li}-arrow">▸</span>
+              <span class="ltr text-slate-600 dark:text-slate-300">${esc(lst.label)}</span>
+              <span class="text-xs text-slate-400 mr-auto">${lst.count}</span>
+            </button>
+            <div id="kwlst-${ci}-${li}" class="hidden px-5 pb-3">
+              <div class="flex flex-wrap gap-1.5 mb-3" id="kwitems-${ci}-${li}">
+                ${lst.items.map(item => kwChip(ci, li, lst.path, item)).join('') || '<span class="text-xs text-slate-400">قائمة فارغة</span>'}
+              </div>
+              <div class="flex gap-2">
+                <input id="kwadd-${ci}-${li}" placeholder="إضافة كلمة جديدة..." class="flex-1 rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-700 px-3 py-1.5 text-sm outline-none focus:ring-2 focus:ring-blue-500"
+                  onkeydown="if(event.key==='Enter')kwAdd(${ci},${li},'${esc(lst.path)}')">
+                <button class="px-3 py-1.5 rounded-lg bg-blue-600 text-white text-sm hover:bg-blue-700" onclick="kwAdd(${ci},${li},'${esc(lst.path)}')">➕ إضافة</button>
+              </div>
+            </div>
+          </div>`).join('')}
+      </div>
+    </div>`).join('');
+}
+
+function kwChip(ci, li, path, item) {
+  return `<span class="chip bg-slate-100 dark:bg-slate-700 text-slate-700 dark:text-slate-200 gap-1 items-center" title="${esc(path)}">
+    <span class="cursor-pointer hover:text-blue-600" onclick="kwEdit(this,'${esc(path)}')">${esc(item)}</span>
+    <button class="text-red-500 hover:text-red-700 font-bold" onclick="kwDelete('${esc(path)}','${esc(item)}')">×</button>
+  </span>`;
+}
+
+function toggleEl(id) {
+  const el = document.getElementById(id);
+  const arrow = document.getElementById(id + '-arrow');
+  el.classList.toggle('hidden');
+  if (arrow) arrow.textContent = el.classList.contains('hidden') ? '▸' : '▾';
+}
+
+async function kwAdd(ci, li, path) {
+  const input = document.getElementById(`kwadd-${ci}-${li}`);
+  const value = input.value.trim();
+  if (!value) return;
+  try {
+    await api('/keywords/add', { method: 'POST', body: { path, value } });
+    toast('أُضيفت الكلمة وأُعيد تحميلها في البوت');
+    await loadKeywordTree();
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+function kwEdit(spanEl, path) {
+  const oldValue = spanEl.textContent;
+  const input = document.createElement('input');
+  input.value = oldValue;
+  input.className = 'rounded border border-blue-400 bg-white dark:bg-slate-600 px-1 text-xs w-40 outline-none';
+  spanEl.replaceWith(input);
+  input.focus();
+  const commit = async () => {
+    const newValue = input.value.trim();
+    if (!newValue || newValue === oldValue) { await loadKeywordTree(); return; }
+    try {
+      await api('/keywords/update', { method: 'POST', body: { path, old: oldValue, new: newValue } });
+      toast('عُدّلت الكلمة');
+    } catch (e) { toast(e.message, 'error'); }
+    await loadKeywordTree();
+  };
+  input.onkeydown = e => { if (e.key === 'Enter') commit(); if (e.key === 'Escape') loadKeywordTree(); };
+  input.onblur = commit;
+}
+
+async function kwDelete(path, value) {
+  if (!await confirmDialog(`حذف الكلمة «${value}»؟`)) return;
+  try {
+    await api('/keywords/delete', { method: 'POST', body: { path, value } });
+    toast('حُذفت الكلمة وأُعيد التحميل');
+    await loadKeywordTree();
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+async function searchKeywords(q) {
+  const box = document.getElementById('kwResults');
+  q = q.trim();
+  if (!q) { box.innerHTML = ''; return; }
+  try {
+    const d = await api('/keywords?q=' + encodeURIComponent(q));
+    const rows = d.results || [];
+    box.innerHTML = `<div class="bg-white dark:bg-slate-800 rounded-xl shadow p-4 mb-4">
+      <h3 class="font-bold mb-2">نتائج البحث (${rows.length})</h3>
+      ${rows.length ? rows.map(r => `
+        <div class="flex items-center gap-2 py-1.5 border-b border-slate-100 dark:border-slate-700/60 last:border-0 text-sm">
+          <span>${esc(r.value)}</span>
+          <span class="ltr text-xs text-slate-400 mr-auto">${esc(r.path)}</span>
+          <button class="text-red-500 hover:text-red-700" onclick="kwDelete('${esc(r.path)}','${esc(r.value)}')">حذف</button>
+        </div>`).join('') : '<p class="text-slate-400 text-sm">لا نتائج</p>'}
+    </div>`;
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+async function importKeywordsFile(e) {
+  const file = e.target.files[0];
+  if (!file) return;
+  if (!await confirmDialog('سيتم استبدال كامل ملف keywords.json بالمحتوى المستورد. متابعة؟')) { e.target.value = ''; return; }
+  try {
+    const text = await file.text();
+    const data = JSON.parse(text);
+    await api('/keywords/import', { method: 'POST', body: data });
+    toast('تم الاستيراد وإعادة التحميل بنجاح');
+    await loadKeywordTree();
+  } catch (ex) {
+    toast('فشل الاستيراد: ' + ex.message, 'error');
+  } finally { e.target.value = ''; }
+}
+
+/* ============================ Alerts ============================ */
+const alertFilters={search:'',decision:'',category:'',date_from:'',date_to:'',limit:100};
+function renderAlerts(){
+  el.main.innerHTML=`
+  <div class="flex flex-wrap items-end gap-2 mb-4">
+    <div><label class="lbl">بحث (كلمة / نص)</label><input id="af-search" class="inp" placeholder="ابحث..." value="${esc(alertFilters.search)}"></div>
+    <div><label class="lbl">القرار</label><select id="af-decision" class="inp"><option value="">الكل</option><option value="accept">مقبول</option><option value="review">مراجعة</option><option value="reject">مرفوض</option></select></div>
+    <div><label class="lbl">قائمة الكلمات</label><select id="af-category" class="inp"><option value="">الكل</option></select></div>
+    <div><label class="lbl">من تاريخ</label><input id="af-from" type="date" class="inp" value="${esc(alertFilters.date_from)}"></div>
+    <div><label class="lbl">إلى تاريخ</label><input id="af-to" type="date" class="inp" value="${esc(alertFilters.date_to)}"></div>
+    <button id="af-apply" class="px-4 py-2 rounded-xl bg-sky-600 hover:bg-sky-700 text-white text-sm font-bold">تطبيق</button>
+    <button id="af-reset" class="px-4 py-2 rounded-xl text-sm font-bold" style="background:var(--bg-card);border:1px solid var(--border)">مسح</button>
+    <button id="af-csv" class="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-sm font-bold">⬇ تصدير CSV</button>
+  </div>
+  <div class="card overflow-x-auto"><table class="tbl min-w-[1000px]"><thead><tr>
+    <th>الوقت</th><th>المرسل</th><th>الحساب</th><th>الكلمة المطابقة</th><th>القرار</th><th>الثقة</th><th>معاينة الرسالة</th><th>روابط</th>
+  </tr></thead><tbody id="alerts-body"><tr><td colspan="8" class="text-center muted2 py-8">جارِ التحميل…</td></tr></tbody></table></div>
+  <div class="flex items-center justify-between mt-3 text-xs muted2"><span id="alerts-count"></span>
+    <button id="al-more" class="px-3 py-1.5 rounded-lg" style="border:1px solid var(--border)">عرض المزيد +100</button></div>`;
+  document.getElementById('af-decision').value=alertFilters.decision;
+  // Populate keyword-list filter from the keywords index (top-level categories)
+  api('/keywords').then(d=>{
+    const sel=document.getElementById('af-category');
+    if(!sel)return;
+    (d.categories||[]).forEach(c=>{
+      const o=document.createElement('option');
+      o.value=c.category;o.textContent=`${c.category} (${c.total})`;
+      sel.appendChild(o);
+    });
+    sel.value=alertFilters.category;
+  }).catch(()=>{});
+  document.getElementById('af-apply').onclick=()=>{
+    alertFilters.search=document.getElementById('af-search').value;
+    alertFilters.decision=document.getElementById('af-decision').value;
+    alertFilters.category=document.getElementById('af-category').value;
+    alertFilters.date_from=document.getElementById('af-from').value;
+    alertFilters.date_to=document.getElementById('af-to').value;
+    alertFilters.limit=100;
+    loadAlerts();
+  };
+  document.getElementById('af-search').onkeydown=e=>{if(e.key==='Enter')document.getElementById('af-apply').click();};
+  document.getElementById('af-reset').onclick=()=>{Object.assign(alertFilters,{search:'',decision:'',category:'',date_from:'',date_to:'',limit:100});renderAlerts();};
+  document.getElementById('af-csv').onclick=()=>{
+    const p=new URLSearchParams();
+    if(alertFilters.search)p.set('search',alertFilters.search);
+    if(alertFilters.decision)p.set('decision',alertFilters.decision);
+    const ft=_toTs(alertFilters.date_from,false),tt=_toTs(alertFilters.date_to,true);
+    if(ft)p.set('from_ts',ft);if(tt)p.set('to_ts',tt);
+    window.open('/alerts/export.csv?'+p.toString(),'_blank');
+  };
+  document.getElementById('al-more').onclick=()=>{
+    if(alertFilters.limit>=200){toast('الحد الأقصى للعرض 200 سجل — استخدم تصدير CSV للمزيد','info');return;}
+    alertFilters.limit=Math.min(alertFilters.limit+100,200);loadAlerts();
+  };
+  loadAlerts();
+}
+function _toTs(dateStr,endOfDay){
+  if(!dateStr)return null;
+  const d=new Date(dateStr+'T'+(endOfDay?'23:59:59':'00:00:00'));
+  const t=d.getTime()/1000;
+  return isNaN(t)?null:t;
+}
+function alertsQuery(){
+  const p=new URLSearchParams();
+  if(alertFilters.search)p.set('search',alertFilters.search);
+  if(alertFilters.decision)p.set('decision',alertFilters.decision);
+  if(alertFilters.category)p.set('category',alertFilters.category);
+  const ft=_toTs(alertFilters.date_from,false),tt=_toTs(alertFilters.date_to,true);
+  if(ft)p.set('from_ts',ft);if(tt)p.set('to_ts',tt);
+  p.set('limit',alertFilters.limit);
+  return p.toString();
+}
+async function loadAlerts(){
+  try{
+    const d=await api('/alerts?'+alertsQuery());
+    const tb=document.getElementById('alerts-body');
+    if(!tb)return;
+    if(!d.alerts.length){tb.innerHTML='<tr><td colspan="8" class="text-center muted2 py-8">لا توجد نتائج</td></tr>';}
+    else tb.innerHTML=d.alerts.map(a=>{
+      const dec=a.decision==='accept'?['مقبول','ok']:a.decision==='review'?['مراجعة','warn']:a.decision==='reject'?['مرفوض','bad']:[a.decision||'—','info'];
+      const sender=a.sender_name||(a.username?'@'+a.username:null)||(a.sender_id?('#'+a.sender_id):'مجهول');
+      const conf=a.confidence!=null?Math.round(a.confidence*100)+'%':'—';
+      const L=a.links||{};
+      let links='';
+      if(L.message)links+=`<a class="lnk block" target="_blank" rel="noopener" href="${esc(L.message)}">💬 الرسالة</a>`;
+      if(L.chat)links+=`<a class="lnk block" target="_blank" rel="noopener" href="${esc(L.chat)}">👥 المجموعة</a>`;
+      if(L.profile)links+=`<a class="lnk block" target="_blank" rel="noopener" href="${esc(L.profile)}">👤 الملف الشخصي</a>`;
+      return `<tr>
+        <td class="whitespace-nowrap text-xs muted2">${esc(a.time_iso||fmtTs(a.time))}</td>
+        <td class="font-bold text-sm">${esc(sender)}</td>
+        <td class="text-xs muted2">${esc(a.account||'—')}</td>
+        <td class="text-sm">${esc(a.keyword||'—')}</td>
+        <td><span class="badge ${dec[1]}">${dec[0]}</span></td>
+        <td class="text-xs">${conf}</td>
+        <td class="text-sm" style="max-width:320px"><span class="block truncate" title="${esc(a.preview||'')}">${esc(a.preview||'')}</span></td>
+        <td class="text-xs whitespace-nowrap">${links||'—'}</td></tr>`;
+    }).join('');
+    document.getElementById('alerts-count').textContent=`المعروض: ${d.count} سجل`;
+  }catch(e){}
+}
+
+/* ============================ Accounts ============================ */
+function renderAccounts(){
+  el.main.innerHTML=`
+  <div class="flex flex-wrap items-center justify-between gap-2 mb-4">
+    <p class="text-sm muted2">إدارة حسابات تيليجرام المتصلة. الإضافة/الحذف/التعطيل تُحدِّث متغيرات البيئة على Render تلقائياً.</p>
+    <div class="flex gap-2">
+      <button id="accs-refresh" class="px-4 py-2 rounded-xl text-sm font-bold" style="background:var(--bg-card);border:1px solid var(--border)">🔄 تحديث</button>
+      <button id="acc-add-btn" class="px-4 py-2 rounded-xl bg-sky-600 hover:bg-sky-700 text-white text-sm font-bold">+ إضافة حساب</button>
+    </div></div>
+  <div id="acc-render-warn" class="hidden mb-3 p-3 rounded-xl bg-amber-50 dark:bg-amber-900/30 text-amber-700 dark:text-amber-300 text-sm">⚠️ RENDER_API_KEY / RENDER_SERVICE_ID غير مضبوطة — عمليات الحفظ على Render ستفشل.</div>
+  <div id="accounts-body" class="grid sm:grid-cols-2 xl:grid-cols-3 gap-3"><div class="muted2 text-sm">جارِ التحميل…</div></div>`;
+  document.getElementById('accs-refresh').onclick=loadAccounts;
+  document.getElementById('acc-add-btn').onclick=addAccountModal;
+  loadAccounts();
+}
+function addAccountModal(){
+  const wrap=document.createElement('div');
+  wrap.className='fixed inset-0 z-50 flex items-center justify-center p-4';
+  wrap.style.background='rgba(0,0,0,.5)';
+  wrap.innerHTML=`<div class="card w-full max-w-md">
+    <h3 class="font-black mb-1">إضافة حساب جديد</h3>
+    <p class="text-xs muted2 mb-4">سيتم إنشاء متغيرات البيئة على Render (ACCOUNT_N_*) — بعد إعادة النشر أكمل تسجيل الجلسة من صفحة <a class="lnk" href="/login" target="_blank">/login</a>.</p>
+    <label class="lbl">API ID</label><input id="_aa_api_id" type="number" class="inp w-full" dir="ltr" placeholder="12345678">
+    <label class="lbl mt-3">API Hash</label><input id="_aa_api_hash" class="inp w-full" dir="ltr" placeholder="0123456789abcdef0123456789abcdef">
+    <label class="lbl mt-3">رقم الهاتف (صيغة دولية)</label><input id="_aa_phone" class="inp w-full" dir="ltr" placeholder="+9639xxxxxxxx">
+    <label class="lbl mt-3">اسم الجلسة (اختياري)</label><input id="_aa_session" class="inp w-full" dir="ltr" placeholder="account_n">
+    <div class="flex gap-2 mt-5 justify-end">
+      <button id="_aa_cancel" class="px-4 py-2 rounded-xl text-sm font-bold" style="border:1px solid var(--border)">إلغاء</button>
+      <button id="_aa_ok" class="px-4 py-2 rounded-xl bg-sky-600 text-white text-sm font-bold">حفظ على Render</button>
+    </div></div>`;
+  document.body.appendChild(wrap);
+  wrap.querySelector('#_aa_cancel').onclick=()=>wrap.remove();
+  wrap.querySelector('#_aa_ok').onclick=async()=>{
+    const apiId=parseInt(wrap.querySelector('#_aa_api_id').value,10);
+    const apiHash=wrap.querySelector('#_aa_api_hash').value.trim();
+    const phone=wrap.querySelector('#_aa_phone').value.trim();
+    const sessionName=wrap.querySelector('#_aa_session').value.trim();
+    if(!apiId||!apiHash||!phone){toast('أكمل الحقول المطلوبة: API ID و API Hash والهاتف','error');return;}
+    const btn=wrap.querySelector('#_aa_ok');btn.disabled=true;btn.textContent='جارِ الحفظ…';
+    try{
+      const body={api_id:apiId,api_hash:apiHash,phone};
+      if(sessionName)body.session_name=sessionName;
+      const r=await api('/accounts/add',{method:'POST',body});
+      toast(r.message||'تم حفظ الحساب على Render.','success');
+      wrap.remove();loadAccounts();
+    }catch(e){btn.disabled=false;btn.textContent='حفظ على Render';}
+  };
+}
+async function loadAccounts(){
+  try{
+    const d=await api('/accounts');
+    if(d.render_api_configured===false)document.getElementById('acc-render-warn')?.classList.remove('hidden');
+    const w=document.getElementById('accounts-body');
+    if(!w)return;
+    if(!d.accounts.length){w.innerHTML='<div class="muted2 text-sm col-span-full text-center py-8">لا توجد حسابات مضافة بعد.</div>';return;}
+    w.innerHTML=d.accounts.map(a=>{
+      const name=a.name||a.session_name||a.prefix;
+      const st=a.is_main?['رئيسي','info']:a.enabled?(a.connected?['متصل','ok']:['غير متصل','warn']):['معطّل','bad'];
+      const dot=a.enabled?(a.connected?'bg-emerald-500':'bg-amber-400'):'bg-slate-500';
+      const lastConn=a.last_connection?(typeof a.last_connection==='number'?fmtTs(a.last_connection):a.last_connection):'—';
+      return `<div class="card">
+        <div class="flex items-start justify-between gap-2">
+          <div class="min-w-0"><div class="font-black truncate">${esc(name)}</div>
+            <div class="text-xs muted2 mono truncate" dir="ltr">${esc(a.phone||'—')}</div>
+            <div class="text-[11px] muted2 mono" dir="ltr">${esc(a.prefix||'')}</div></div>
+          <span class="badge ${st[1]}">${st[0]}</span></div>
+        <div class="flex items-center gap-2 mt-2 text-xs muted2"><span class="w-2 h-2 rounded-full ${dot}"></span>
+          ${esc(a.status||(a.connected?'متصل':'غير متصل'))} · آخر اتصال: ${esc(lastConn)}</div>
+        ${a.last_error?`<div class="text-[11px] text-rose-500 mt-1 truncate" title="${esc(a.last_error)}">⚠️ ${esc(a.last_error)}</div>`:''}
+        <div class="text-[11px] muted2 mt-1">التنبيهات المرسلة: ${fmtNum(a.alerts||0)} · ${a.has_session?'الجلسة محفوظة ✓':'⚠️ لا توجد جلسة — سجّل من /login'}</div>
+        <div class="flex flex-wrap gap-1.5 mt-3">
+          <button class="px-2.5 py-1.5 rounded-lg text-xs font-bold" style="border:1px solid var(--border)" onclick="accAction('${a.prefix}','reconnect')">🔄 إعادة اتصال</button>
+          ${a.enabled
+            ?`<button class="px-2.5 py-1.5 rounded-lg text-xs font-bold text-amber-600" style="border:1px solid var(--border)" onclick="accAction('${a.prefix}','disable')">⏸ تعطيل</button>`
+            :`<button class="px-2.5 py-1.5 rounded-lg text-xs font-bold text-emerald-600" style="border:1px solid var(--border)" onclick="accAction('${a.prefix}','enable')">▶ تمكين</button>`}
+          ${!a.is_main?`<button class="px-2.5 py-1.5 rounded-lg text-xs font-bold text-rose-500" style="border:1px solid var(--border)" onclick="accDelete('${a.prefix}')">🗑 حذف</button>`:''}
+        </div></div>`;
+    }).join('');
+  }catch(e){}
+}
+async function accAction(prefix,action){
+  const msgs={reconnect:'إعادة الاتصال بالحساب؟ (قد تستغرق حتى دقيقتين)',disable:'تعطيل الحساب؟ سيُقطع اتصاله ويُحدَّث متغير البيئة على Render.',enable:'تمكين الحساب؟ سيُحدَّث متغير البيئة على Render.'};
+  if(!await confirmDialog(msgs[action]))return;
+  toast('جارِ تنفيذ العملية…','info');
+  try{
+    const r=await api(`/accounts/${action}`,{method:'POST',body:{prefix}});
+    if(action==='reconnect'){
+      if(r.success)toast('أُعيد الاتصال بنجاح ✓','success');
+      else toast('فشلت إعادة الاتصال: '+(r.last_error||'خطأ غير معروف'),'error');
+    }else{
+      toast(r.note||(`تم ${r.enabled?'تمكين':'تعطيل'} الحساب`+(r.persisted_on_render?' وحُفظ على Render':' (محلياً فقط)')),'success');
+    }
+    setTimeout(loadAccounts,800);
+  }catch(e){}
+}
+async function accDelete(prefix){
+  if(!await confirmDialog('حذف هذا الحساب نهائياً؟ سيتم حذف متغيرات البيئة الخاصة به من Render. لا يمكن التراجع.'))return;
+  try{
+    const r=await api('/accounts/delete',{method:'POST',body:{prefix}});
+    if(r.success===false){toast(r.error||'فشل حذف بعض المتغيرات','error');return;}
+    toast(r.message||'تم حذف الحساب.','success');
+    setTimeout(loadAccounts,800);
+  }catch(e){}
+}
+
+/* ============================ Settings ============================ */
+const SETTING_LABELS={
+  min_message_length:{l:'الحد الأدنى لطول الرسالة',h:'الرسائل الأقصر من هذا تُتجاهل'},
+  max_message_length:{l:'الحد الأقصى لطول الرسالة',h:'الرسائل الأطول من هذا تُتجاهل'},
+  max_words_count:{l:'الحد الأقصى لعدد الكلمات',h:'أقصى عدد كلمات مسموح في الرسالة'},
+  max_lines:{l:'الحد الأقصى لعدد الأسطر',h:'أقصى عدد أسطر مسموح'},
+  cooldown_per_sender:{l:'فترة التهدئة لكل مرسل (ثانية)',h:'الحد الأدنى بين تنبيهين لنفس المرسل'},
+  max_image_size_mb:{l:'الحد الأقصى لحجم الصورة (MB)',h:'أقصى حجم صورة مسموح'},
+  max_video_size_mb:{l:'الحد الأقصى لحجم الفيديو (MB)',h:'أقصى حجم فيديو مسموح'},
+};
+async function renderSettings(){
+  el.main.innerHTML='<div class="muted2 text-sm py-8 text-center">جارِ التحميل…</div>';
+  let d;
+  try{d=await api('/settings');}catch(e){return;}
+  const schema=d.schema||{},vals=d.settings||{};
+  el.main.innerHTML=`
+  <div class="card max-w-2xl">
+    <h3 class="font-black mb-1">إعدادات البوت أثناء التشغيل</h3>
+    <p class="text-xs muted2 mb-4">القيم المميزة بـ <span class="badge ok">فوري</span> تُطبَّق مباشرة دون إعادة تشغيل. الباقي يُحفظ ويُطبَّق عند إعادة تشغيل البوت.</p>
+    <div class="grid sm:grid-cols-2 gap-3">
+      ${Object.keys(schema).map(k=>{
+        const m=schema[k]||{};
+        const lbl=SETTING_LABELS[k]||{l:k,h:''};
+        const isFloat=m.type==='float';
+        return `<div><label class="lbl">${esc(lbl.l)} ${m.live?'<span class="badge ok">فوري</span>':'<span class="badge info">عند إعادة التشغيل</span>'}</label>
+          <input id="set-${k}" type="number" class="inp" ${isFloat?'step="any"':'step="1"'} ${m.min!==undefined?`min="${m.min}"`:''} ${m.max!==undefined?`max="${m.max}"`:''} value="${vals[k]??''}">
+          <p class="text-[11px] muted2 mt-1">${esc(lbl.h)}${m.min!==undefined?` (النطاق: ${m.min} – ${m.max})`:''}</p></div>`;
+      }).join('')}
+    </div>
+    <div class="flex gap-2 mt-5">
+      <button id="set-save" class="px-5 py-2.5 rounded-xl bg-sky-600 hover:bg-sky-700 text-white text-sm font-bold">💾 حفظ وتطبيق</button>
+      <button id="set-reload" class="px-4 py-2.5 rounded-xl text-sm font-bold" style="border:1px solid var(--border)">↺ إعادة تحميل القيم</button>
+    </div>
+  </div>`;
+  document.getElementById('set-save').onclick=()=>saveSettings(schema);
+  document.getElementById('set-reload').onclick=renderSettings;
+}
+async function saveSettings(schema){
+  const updates={};
+  for(const k of Object.keys(schema||{})){
+    const inp=document.getElementById('set-'+k);
+    if(!inp||inp.value===''||inp.value===null)continue;
+    updates[k]=(schema[k]&&schema[k].type==='float')?parseFloat(inp.value):parseInt(inp.value,10);
+  }
+  if(!Object.keys(updates).length){toast('لا توجد قيم للحفظ','info');return;}
+  try{
+    const r=await api('/settings',{method:'POST',body:{updates}});
+    const errKeys=Object.keys(r.errors||{});
+    if(errKeys.length){
+      const first=errKeys.map(k=>`${k}: ${r.errors[k]}`).join(' · ');
+      toast('بعض القيم رُفضت — '+first,'error');
+    }else{
+      const applied=Object.keys(r.applied_live||{}).length,stored=Object.keys(r.stored_only||{}).length;
+      toast(`تم الحفظ ✓ (طبّق فوراً: ${applied}، سيُطبق عند إعادة التشغيل: ${stored})`,'success');
+    }
+    renderSettings();
+  }catch(e){}
+}
+
+/* ============================ Logs ============================ */
+let logsPaused=false,logsLevel='';
+function renderLogs(){
+  el.main.innerHTML=`
+  <div class="flex flex-wrap items-center gap-2 mb-3">
+    <select id="log-level" class="inp !w-auto">
+      <option value="">كل المستويات</option><option value="INFO">INFO</option>
+      <option value="WARNING">WARNING</option><option value="ERROR">ERROR</option></select>
+    <button id="log-refresh" class="px-4 py-2 rounded-xl text-sm font-bold" style="background:var(--bg-card);border:1px solid var(--border)">🔄 تحديث</button>
+    <button id="log-pause" class="px-4 py-2 rounded-xl text-sm font-bold" style="background:var(--bg-card);border:1px solid var(--border)">⏸ إيقاف التحديث التلقائي</button>
+    <span class="text-xs muted2 mr-auto" id="log-meta"></span>
+  </div>
+  <div class="card"><div id="logs-body" class="text-xs max-h-[65vh] overflow-y-auto"><div class="muted2 py-6 text-center">جارِ التحميل…</div></div></div>`;
+  document.getElementById('log-level').value=logsLevel;
+  document.getElementById('log-level').onchange=e=>{logsLevel=e.target.value;loadLogs();};
+  document.getElementById('log-refresh').onclick=loadLogs;
+  document.getElementById('log-pause').onclick=function(){logsPaused=!logsPaused;this.textContent=logsPaused?'▶ استئناف التحديث التلقائي':'⏸ إيقاف التحديث التلقائي';};
+  loadLogs();
+  state.timers.logs=setInterval(()=>{if(state.section==='logs'&&!logsPaused)loadLogs();},10000);
+}
+async function loadLogs(){
+  try{
+    const d=await api('/logs?lines=200'+(logsLevel?`&level=${logsLevel}`:''));
+    const body=document.getElementById('logs-body');
+    if(!body)return;
+    const entries=d.entries||[];
+    if(!entries.length){body.innerHTML='<div class="muted2 py-6 text-center">'+(d.file_exists===false?'ملف السجل غير موجود بعد.':'لا توجد سجلات مطابقة.')+'</div>';}
+    else body.innerHTML=entries.map(ln=>{
+      const cls=ln.level==='ERROR'?'log-err':ln.level==='WARNING'?'log-warn':ln.level==='DEBUG'?'log-debug':'log-info';
+      return `<div class="log-line"><span class="muted2">[${esc(ln.time||'')}]</span> <span class="${cls} font-bold">${esc(ln.level||'')}</span> <span class="muted2">${esc(ln.source||'')}</span> ${esc(ln.message||'')}</div>`;
+    }).join('');
+    const meta=document.getElementById('log-meta');
+    if(meta)meta.textContent=`الملف: ${d.file||'—'} · المعروض: ${d.total_shown??entries.length} سطر`;
+    body.scrollTop=body.scrollHeight;
+  }catch(e){}
+}
+
+/* ============================ Control Center ============================ */
+function renderControl(){
+  el.main.innerHTML=`
+  <div class="grid sm:grid-cols-2 gap-4 max-w-4xl">
+    <div class="card">
+      <h3 class="font-black mb-3">التحكم بالبوت</h3>
+      <div class="space-y-2">
+        <button id="ctl-reload" class="w-full px-4 py-3 rounded-xl bg-sky-600 hover:bg-sky-700 text-white text-sm font-bold text-right">🔄 إعادة تحميل الكلمات المفتاحية <span class="block text-[11px] font-normal opacity-80">إعادة قراءة keywords.json وإعادة بناء الفلاتر دون إعادة تشغيل</span></button>
+        <button id="ctl-restart" class="w-full px-4 py-3 rounded-xl bg-amber-500 hover:bg-amber-600 text-white text-sm font-bold text-right">🔁 إعادة تشغيل البوت <span class="block text-[11px] font-normal opacity-80">عبر Render API، أو إعادة تشغيل ذاتية — قد ينقطع الاتصال لدقائق</span></button>
+        <button id="ctl-backup" class="w-full px-4 py-3 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-sm font-bold text-right">📦 إنشاء نسخة احتياطية كاملة <span class="block text-[11px] font-normal opacity-80">keywords.json + قاعدة البيانات + البيئة + السجلات + الإعدادات</span></button>
+      </div></div>
+    <div class="card">
+      <div class="flex items-center justify-between mb-3"><h3 class="font-black">النسخ الاحتياطية</h3>
+        <button id="ctl-list-refresh" class="text-xs lnk">تحديث</button></div>
+      <div id="backups-body" class="space-y-2 max-h-[50vh] overflow-y-auto"><div class="muted2 text-sm">جارِ التحميل…</div></div>
+    </div></div>`;
+  document.getElementById('ctl-reload').onclick=async()=>{
+    if(!await confirmDialog('إعادة تحميل الكلمات المفتاحية من الملف وإعادة بناء الفلاتر؟'))return;
+    try{
+      const r=await api('/bot/reload',{method:'POST'});
+      if(r.success===false){toast('فشلت إعادة التحميل: '+(r.error||''),'error');return;}
+      const rl=r.reloaded||{};
+      toast(`تمت إعادة التحميل ✓ (الإعدادات: ${rl.config?'✓':'✗'}، الفلاتر: ${rl.filter?'✓':'✗'})`,'success');
+    }catch(e){}
+  };
+  document.getElementById('ctl-restart').onclick=async()=>{
+    if(!await confirmDialog('إعادة تشغيل البوت؟ قد ينقطع الاتصال باللوحة لدقائق أثناء إعادة النشر.'))return;
+    try{const r=await api('/bot/restart',{method:'POST'});toast(r.message||'تم إرسال أمر إعادة التشغيل.','info');}catch(e){}
+  };
+  document.getElementById('ctl-backup').onclick=async()=>{
+    toast('جارِ إنشاء النسخة الاحتياطية…','info');
+    try{
+      const r=await api('/bot/backup',{method:'POST'});
+      if(r.success===false){toast('فشل إنشاء النسخة','error');return;}
+      toast(`تم إنشاء النسخة ✓ ${r.name||''} (${((r.size||0)/1024).toFixed(1)} KB)`,'success');
+      loadBackups();
+    }catch(e){}
+  };
+  document.getElementById('ctl-list-refresh').onclick=loadBackups;
+  loadBackups();
+}
+async function loadBackups(){
+  try{
+    const d=await api('/bot/backups');
+    const w=document.getElementById('backups-body');
+    if(!w)return;
+    if(!d.backups.length){w.innerHTML='<div class="muted2 text-sm text-center py-6">لا توجد نسخ احتياطية بعد.</div>';return;}
+    w.innerHTML=d.backups.map(b=>{
+      const created=typeof b.created_at==='number'?fmtTs(b.created_at):(b.created_at||'—');
+      const size=b.size!=null?(b.size/1024).toFixed(1)+' KB':'—';
+      return `<div class="flex items-center gap-2 p-2.5 rounded-xl" style="border:1px solid var(--border)">
+        <div class="min-w-0 flex-1"><div class="text-xs font-bold mono truncate" dir="ltr">${esc(b.file||b.name)}</div>
+        <div class="text-[11px] muted2">${esc(created)} · ${size}</div></div>
+        <a class="lnk text-xs" href="/bot/backups/${encodeURIComponent(b.name)}/download" title="تنزيل">⬇</a>
+        <button class="px-2.5 py-1.5 rounded-lg text-xs font-bold text-amber-600" style="border:1px solid var(--border)" onclick="restoreBackup('${esc(b.name)}')">استعادة</button>
+      </div>`;
+    }).join('');
+  }catch(e){}
+}
+async function restoreBackup(name){
+  if(!await confirmDialog(`استعادة النسخة "${name}"؟ سيتم استبدال الكلمات المفتاحية وقاعدة البيانات والإعدادات الحالية. لا يمكن التراجع.`))return;
+  try{
+    const r=await api('/bot/restore',{method:'POST',body:{name}});
+    if(r.success===false){toast('فشلت الاستعادة: '+(r.error||((r.errors||[]).join(' · '))||'خطأ غير معروف'),'error');return;}
+    toast('تمت الاستعادة بنجاح ✓ — أُعيد تحميل الكلمات المفتاحية تلقائياً.','success');
+  }catch(e){}
+}
+
+/* ============================ Boot ============================ */
+(async function boot(){
+  try{
+    const me=await api('/admin/api/auth/me');
+    if(me&&me.authenticated){state.csrf=me.csrf||null;showApp();return;}
+  }catch(e){}
+  showLogin();
+})();
+</script>
+</body>
+</html>
