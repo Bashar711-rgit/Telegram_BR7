@@ -113,7 +113,10 @@ async def lifespan(app: FastAPI):
     # Startup
     app.state.db = EnhancedDatabase()
     await app.state.db.connect()
-    app.state.bot_ref = None
+    # Keep an existing bot reference: main.py calls set_bot_reference() BEFORE
+    # uvicorn fires this lifespan startup - resetting to None here would wipe it.
+    if getattr(app.state, "bot_ref", None) is None:
+        app.state.bot_ref = None
     app.state.stats_cache = {}
     app.state.logs_cache = []
     app.state.stats_update_task = asyncio.create_task(_update_stats_loop(app))
@@ -993,6 +996,17 @@ async def start_dashboard(host: str = "0.0.0.0", port: int = 8080):
     config = uvicorn.Config(app, host=host, port=port, log_level="info", loop=loop)
     server = uvicorn.Server(config)
     await server.serve()
+
+# =============================================================================
+# WebAdmin dashboard (modular admin panel: auth, keywords, alerts, logs,
+# accounts, settings, backups) - mounted on the same app/single port.
+# Existing routes (/api/*, /login, /health) remain untouched.
+# =============================================================================
+try:
+    from webadmin import mount_admin
+    mount_admin(app)
+except Exception as _webadmin_err:
+    logger.warning(f"webadmin dashboard not loaded: {_webadmin_err}")
 
 # =============================================================================
 # Main (standalone)
