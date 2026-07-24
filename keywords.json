@@ -1,6 +1,6 @@
 {
   "_meta": {
-    "version": "14.0.0",
+    "version": "14.0.2",
     "codename": "IntentEngine-NLP-Templates",
     "target": "telegram_group_filter",
     "dialect": "saudi_arabic_multilingual",
@@ -44,7 +44,9 @@
       "Replaced high_confidence_boost_patterns with template-based generation for unlimited coverage",
       "Added templates section with need/person/action/expert/availability word sets",
       "Template patterns define combinations; engine generates all permutations at startup",
-      "Massive reduction in file size while exponentially increasing pattern coverage"
+      "Massive reduction in file size while exponentially increasing pattern coverage",
+      "v14.0.1: Added 'ممكن' to availability set to capture polite request forms",
+      "v14.0.2: Added 'social_topics' to ignore_signals (سواق, زواج, عروس, شقة, ايجار, etc.)"
     ]
   },
 
@@ -74,7 +76,7 @@
       "فيه", "مين", "من", "اللي", "تعرفون", "تعرف", "احد يعرف", "فيه احد",
       "من عنده", "اللي عنده", "اللي عندها", "الذي يعرف", "التي تعرف",
       "هل فيه", "هل احد", "يوجد احد", "يوجد شخص", "من يقدر", "مين يقدر",
-      "من ممكن", "مين ممكن", "فيه شخص", "في احد", "في شخص"
+      "من ممكن", "مين ممكن", "فيه شخص", "في احد", "في شخص", "ممكن"
     ]
   },
 
@@ -245,7 +247,12 @@
     "thanks": ["شكرا", "شكراً", "مشكور", "مشكوره", "تسلم", "تسلم ايدك", "ماقصرت", "ما قصرت", "يعطيك العافيه", "يسلمو", "يسلم", "جزاك الله خير", "بارك الله فيك", "thanks", "thank you"],
     "affirmations": ["ok", "okay", "yes", "no", "nope", "نعم", "ايوه", "لا", "لالا", "صح", "صحيح", "فعلا", "عرفت", "تمام", "good", "nice"],
     "wellbeing": ["بخير", "الحمد لله", "الحمدلله", "كيف الحال", "كيفك", "كيفكم", "شلونكم", "عساكم بخير", "نورت", "نورتي", "كويس", "على خير", "لا مشكله", "عادي", "السلام عليكم", "وعليكم السلام", "حياك الله", "سلامات", "مبروك", "بالتوفيق"],
-    "reactions": ["haha", "lol", "lmao", "ههه", "هههه", "😂", "🤣", "👍", "❤️", "🙏", "😊"]
+    "reactions": ["haha", "lol", "lmao", "ههه", "هههه", "😂", "🤣", "👍", "❤️", "🙏", "😊"],
+    "social_topics": [
+      "سواق", "سواقة", "زواج", "زواجة", "عروس", "عريسة", "خطبة", "خطابة",
+      "مخطوبة", "فساتين", "نوم", "حفلة", "ملابس", "ثياب", "شنط", "شنطة",
+      "شقه", "شقة", "ايجار", "سكن"
+    ]
   },
 
   "dialect_mapping": {
@@ -296,7 +303,9 @@
     "negative": [
       { "text": "نسوي لكم مشاريع تخرج باسعار ممتازة", "expected": "ignore" },
       { "text": "تم الحل شكرا", "expected": "ignore" },
-      { "text": "السلام عليكم كيف الحال", "expected": "ignore" }
+      { "text": "السلام عليكم كيف الحال", "expected": "ignore" },
+      { "text": "سواق يوديني للدوام", "expected": "ignore" },
+      { "text": "ابي شقة قريبة من الجامعة", "expected": "ignore" }
     ],
     "borderline": [
       { "text": "ابي حل للمشكلة", "expected": "review" }
