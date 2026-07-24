@@ -1,12 +1,12 @@
 {
   "_meta": {
-    "version": "13.0.3",
-    "codename": "IntentEngine-NLP-Prod",
+    "version": "14.0.0",
+    "codename": "IntentEngine-NLP-Templates",
     "target": "telegram_group_filter",
     "dialect": "saudi_arabic_multilingual",
     "intent": "student_help_requests",
     "updated": "2026-07-24",
-    "engine_compatibility": "filter_engine.py v13.0+ / IntentEngine-NLP",
+    "engine_compatibility": "filter_engine.py v14.0+ (template generation)",
     "architecture": "NLP Pipeline — Tokenization → Entity Extraction → Negation Analysis → Dependency Analysis → Distance Scoring → Ad Detection → Confidence Engine → Explainability",
     "pipeline_stages": [
       "1. pre_processing",
@@ -21,6 +21,7 @@
       "10. decision_engine"
     ],
     "design_principles": [
+      "Template-driven generation replaces static boost patterns",
       "Every lexicon entry has ONE canonical form",
       "Signal priority: phrase_match > entity_match > single_token_match",
       "Ad detection: weak_provider requires 2+ commercial signals",
@@ -38,37 +39,53 @@
       "review": { "min": 0.4, "max": 0.65, "action": "review" },
       "accept": { "min": 0.65, "max": 1.0, "action": "accept" }
     },
-    "total_unique_entries": "optimized",
-    "v13_changes": [
-      "Removed tier_3_contextual intent verbs (too generic, causing high false positives)",
-      "Trimmed high_confidence_boost_patterns to core explicit requests only. Moved ambiguous patterns to request_phrases.",
-      "Reduced context_score to 0.05 to minimize false positives from general academic talk without intent."
+    "total_unique_entries": "dynamic",
+    "v14_changes": [
+      "Replaced high_confidence_boost_patterns with template-based generation for unlimited coverage",
+      "Added templates section with need/person/action/expert/availability word sets",
+      "Template patterns define combinations; engine generates all permutations at startup",
+      "Massive reduction in file size while exponentially increasing pattern coverage"
     ]
   },
 
-  "high_confidence_boost_patterns": {
-    "_description": "Core help-request patterns with explicit action verbs. Any word after these patterns benefits from the boost.",
-    "_boost": 0.25,
-    "patterns": [
-      "احتاج احد يسوي",
-      "احتاج احد يسوي لي",
-      "ابي احد يسوي",
-      "ابي احد يسوي لي",
-      "ابغى احد يسوي",
-      "ابغى احد يسوي لي",
-      "محتاج احد يسوي",
-      "محتاج احد يسوي لي",
-      "ادور احد يسوي",
-      "ادور احد يسوي لي",
-      "بدور احد يسوي",
-      "بدور احد يسوي لي",
-      "احتاج احد يساعدني",
-      "ابي احد يساعدني",
-      "ابغى احد يساعدني",
-      "محتاج احد يساعدني",
-      "ممكن احد يساعدني"
+  "templates": {
+    "_description": "Word sets for template-based pattern generation. Engine combines them according to template_patterns at load time.",
+    "need": [
+      "احتاج", "ابي", "ابغى", "محتاج", "ادور", "بدور", "اريد", "ودي", "نفسي",
+      "نبغى", "نبي", "نحتاج", "ابا", "ابى"
+    ],
+    "person": [
+      "احد", "شخص", "واحد", "حد", "بنات", "شباب", "اللي", "شخص",
+      "شخص واحد", "اي احد", "اي شخص"
+    ],
+    "action": [
+      "يسوي", "يساعد", "يساعدني", "يكتب", "يحل", "يشرح", "يجهز", "ينجز",
+      "يخلص", "يراجع", "يصمم", "يبرمج", "يترجم", "يعدل", "يضبط", "يدرس",
+      "يفهمني", "يفهم", "يعمل", "يقدم", "ينفذ", "يعد", "يتابع", "يسلم",
+      "ينسق", "يرتب", "يحضر", "يوجد", "يلخص", "يحلل", "يقدر", "يعرف",
+      "يفزع", "يساعدكم", "يساعدنا"
+    ],
+    "expert": [
+      "مختص", "متخصص", "خبير", "فاهم", "خصوصي", "متمكن", "محترف",
+      "شاطر", "مدرس", "معلم", "مدرب", "استاذ", "دكتور", "مهندس",
+      "مبرمج", "مصمم", "كاتب", "مترجم", "مراجع", "مدقق"
+    ],
+    "availability": [
+      "فيه", "مين", "من", "اللي", "تعرفون", "تعرف", "احد يعرف", "فيه احد",
+      "من عنده", "اللي عنده", "اللي عندها", "الذي يعرف", "التي تعرف",
+      "هل فيه", "هل احد", "يوجد احد", "يوجد شخص", "من يقدر", "مين يقدر",
+      "من ممكن", "مين ممكن", "فيه شخص", "في احد", "في شخص"
     ]
   },
+
+  "template_patterns": [
+    "<need> <person>",
+    "<need> <person> <action>",
+    "<need> <expert>",
+    "<availability> <person>",
+    "<availability> <action>",
+    "<availability> <expert>"
+  ],
 
   "intent_verbs": {
     "_description": "Canonical first-person verb stems. Tier_3 removed.",
@@ -121,19 +138,6 @@
 
   "request_phrases": {
     "direct_requests": [
-      "ابي احد يساعدني", "ابي احد يسوي", "ابي احد يكتب", "ابي احد يحل", "ابي احد يشرح", "ابي احد يجهز", "ابي احد ينجز", "ابي احد يخلص", "ابي احد فاهم",
-      "ابغى احد يساعدني", "ابغى احد يسوي", "ابغى احد يكتب", "ابغى احد يحل", "ابغى احد يشرح", "ابغى مساعده", "ابغى شرح",
-      "احتاج احد يساعدني", "احتاج احد يسوي", "احتاج احد يكتب", "احتاج احد يحل", "احتاج مساعده", "احتاج شرح",
-      "محتاج احد يساعدني", "محتاج احد يسوي", "محتاج مساعده",
-      "ادور احد يساعد", "بدور احد يساعد",
-      "مين يقدر يساعدني", "مين يقدر يسوي", "مين يقدر يحل", "مين يقدر يكتب", "مين يقدر يشرح",
-      "مين يعرف يحل", "مين يعرف يسوي", "مين يعرف يكتب", "مين يعرف يشرح", "مين يساعدني", "مين يفزع",
-      "فيه احد يساعد", "فيه احد يسوي", "فيه احد يكتب", "فيه احد يحل", "فيه احد يخلص", "فيه احد يضبط", "فيه احد يشرح",
-      "احد يقدر يساعد", "احد يقدر يسوي", "احد يعرف يحل", "احد يعرف يشرح",
-      "تعرفون احد يساعد", "تعرفون احد يسوي", "تعرفون احد يكتب", "تعرفون احد يحل", "تعرفون احد يشرح", "تعرفون احد متخصص", "تعرفون احد فاهم", "تعرفون احد عنده خبره",
-      "احد يعرف شخص",
-      "ياليت احد يفزع", "ياليت احد يساعدني", "الله يسعدكم احد يساعد", "تكفون احد يساعد", "تكفى ساعدني", "تكفون ساعدوني",
-      "ممكن احد يساعدني", "ممكن تساعدوني", "ممكن يساعدني",
       "اللي تعرف شخص",
       "اللي عنده حد",
       "اللي عندها حد",
@@ -175,100 +179,24 @@
   "subject_markers": {
     "_description": "Comprehensive set of markers that identify the speaker as a student seeking help (first-person pronouns, possessive forms, and question subjects). Expanded to cover common Saudi dialect expressions.",
     "student_pronouns": [
-      "أنا",
-      "انا",
-      "عندي",
-      "لي",
-      "ليّ",
-      "مني",
-      "فيني",
-      "علي",
-      "عليّ",
-      "لنا",
-      "عندنا",
-      "احنا",
-      "إحنا",
-      "نحن",
-      "بيدي",
-      "من جهتي",
-      "بالنسبة لي",
-      "شخصيا",
-      "شخصيًا",
-      "حقي",
-      "حقنا",
-      "مشكلتي",
-      "واجبي",
-      "مشروعي",
-      "بحثي",
-      "تقريري",
-      "مادتي",
-      "محاضرتي",
-      "امتحاني",
-      "اختباري",
-      "تكليفي"
+      "أنا", "انا", "عندي", "لي", "ليّ", "مني", "فيني", "علي", "عليّ",
+      "لنا", "عندنا", "احنا", "إحنا", "نحن", "بيدي", "من جهتي",
+      "بالنسبة لي", "شخصيا", "شخصيًا", "حقي", "حقنا",
+      "مشكلتي", "واجبي", "مشروعي", "بحثي", "تقريري", "مادتي", "محاضرتي",
+      "امتحاني", "اختباري", "تكليفي"
     ],
     "student_question_subject": [
-      "مين",
-      "من",
-      "ايش",
-      "وش",
-      "اللي",
-      "الذي",
-      "التي",
-      "شخص",
-      "احد",
-      "حد",
-      "فيه احد",
-      "فيه شخص",
-      "في احد",
-      "في شخص",
-      "اي احد",
-      "اي شخص",
-      "هل فيه",
-      "هل احد",
-      "يوجد احد",
-      "يوجد شخص",
-      "من عنده",
-      "اللي عنده",
-      "اللي عندها",
-      "اللي تعرف",
-      "الذي تعرف",
-      "اللي تعرفون",
-      "الذي تعرفون",
-      "من يعرف",
-      "من يفهم",
-      "من يقدر",
-      "من يحب",
-      "من ممكن",
-      "مين عنده",
-      "مين تعرف",
-      "مين يقدر",
-      "مين فاهم",
-      "مين شارح",
-      "مين متخصص",
-      "مين مختص",
-      "مين موجود",
-      "مين فاضي",
-      "وين الاقي",
-      "كيف الاقي",
-      "من وين",
-      "من فين",
-      "دلوني على",
-      "دلني على",
-      "يدلني على",
-      "يدلنا على",
-      "ساعدوني",
-      "ساعدني",
-      "فهموني",
-      "فهمني",
-      "علموني",
-      "علمني",
-      "وجهوني",
-      "وجهني",
-      "افيدوني",
-      "افدني"
+      "مين", "من", "ايش", "وش", "اللي", "الذي", "التي",
+      "شخص", "احد", "حد", "فيه احد", "فيه شخص", "في احد", "في شخص",
+      "اي احد", "اي شخص", "هل فيه", "هل احد", "يوجد احد", "يوجد شخص",
+      "من عنده", "اللي عنده", "اللي عندها", "اللي تعرف", "الذي تعرف",
+      "اللي تعرفون", "الذي تعرفون", "من يعرف", "من يفهم", "من يقدر",
+      "من يحب", "من ممكن", "مين عنده", "مين تعرف", "مين يقدر",
+      "مين فاهم", "مين شارح", "مين متخصص", "مين مختص", "مين موجود",
+      "مين فاضي", "وين الاقي", "كيف الاقي", "من وين", "من فين",
+      "دلوني على", "دلني على", "يدلني على", "يدلنا على"
     ],
-    "_note": "Possessive suffixes (ي, نا) attached to academic objects (e.g. 'واجبي', 'مشروعنا') are also detected via normalization and mapped to student_pronouns contextually."
+    "_note": "Possessive suffixes (ي, نا) attached to academic objects are also detected via normalization."
   },
 
   "advertisement_signals": {
@@ -279,10 +207,14 @@
       "_rule": "strong_provider/individual_provider + any commercial signal = ad. weak_provider requires 2+ commercial signals."
     },
     "hard_signals": [
-      "نسوي لكم", "نقدم لكم", "نوفر لكم", "نستقبل الطلبات", "تابعونا على", "انضم لقناتنا", "ارسل طلبك", "سجل طلبك", "عرض احتياجاتك", "مكتبنا في", "من خلال حسابنا",
-      "مشروع جاهز", "بحث جاهز", "جاهز للتسليم", "مشاريع جاهزه", "بحوث جاهزه", "حلول دراسيه", "حلول طلابيه", "مكتب خدمات طلابيه", "مكتب حل واجبات",
-      "خبره سنوات", "خبره طويله", "كفاءه عاليه", "نتيجه مضمونه", "نتائج مضمونه", "ضمان الجوده", "جوده عاليه", "سريه تامه", "دقه وسرعه", "خصوصيه المعلومات",
-      "رضا العملاء", "تقييمات العملاء", "شهادات العملاء", "عملاء راضون", "فريق محترف", "نخبه من", "افضل مكتب", "افضل مركز", "مكتب موثوق"
+      "نسوي لكم", "نقدم لكم", "نوفر لكم", "نستقبل الطلبات", "تابعونا على", "انضم لقناتنا",
+      "ارسل طلبك", "سجل طلبك", "عرض احتياجاتك", "مكتبنا في", "من خلال حسابنا",
+      "مشروع جاهز", "بحث جاهز", "جاهز للتسليم", "مشاريع جاهزه", "بحوث جاهزه",
+      "حلول دراسيه", "حلول طلابيه", "مكتب خدمات طلابيه", "مكتب حل واجبات",
+      "خبره سنوات", "خبره طويله", "كفاءه عاليه", "نتيجه مضمونه", "نتائج مضمونه",
+      "ضمان الجوده", "جوده عاليه", "سريه تامه", "دقه وسرعه", "خصوصيه المعلومات",
+      "رضا العملاء", "تقييمات العملاء", "شهادات العملاء", "عملاء راضون",
+      "فريق محترف", "نخبه من", "افضل مكتب", "افضل مركز", "مكتب موثوق"
     ],
     "medium_signals": ["عرض خاص", "عروض مميزه", "اسعار خاصه", "اسعار مميزه", "باقل الاسعار", "بارخص الاسعار", "باسعار مناسبه", "تخفيض", "تخفيضات", "خصومات", "خصم كبير", "خصم خاص", "خصم يصل", "فرصه ذهبيه", "فرصه محدوده", "اماكن محدوده", "مقاعد محدوده", "لفتره محدوده", "الحجز مفتوح", "سجل الان", "اشترك الان", "سارع بالتسجيل", "استفد الان", "احصل على خصم", "احجز الان", "احجز الحين", "دفع اونلاين", "دفع اون لاين", "دفع الكتروني", "استفد من عرض"],
     "price_signals": { "currency_tokens": ["ريال", "ريالات", "sr", "sar"], "payment_methods": { "_flag_when_combined_with_advertiser_subject_only": true, "terms": ["فيزا", "مدى", "تحويل", "حواله", "ايبان", "رقم حساب"] } },
@@ -351,13 +283,15 @@
       "advert_score": { "effect": "multiplies base confidence by (1 - advert_score * 0.9)" }
     }
   },
-  "explainability": { "required_fields": ["decision", "confidence", "reasons"], "example": { "decision": "accept", "confidence": 0.91, "reasons": ["intent_phrase_detected: ابي احد يسوي", "academic_object: مشروع", "distance: 2 tokens", "advert_score: 0.0"] } },
+  "explainability": { "required_fields": ["decision", "confidence", "reasons"], "example": { "decision": "accept", "confidence": 0.91, "reasons": ["template_pattern_matched: احتاج احد يسوي", "academic_object: مشروع", "distance: 2 tokens", "advert_score: 0.0"] } },
   "conversation_history_config": { "open_request_ttl_hours": 24, "resolution_closes_request": true, "max_history_per_user": 5, "conversation_states": ["OPEN_REQUEST", "NEGOTIATION", "RESOLVED", "CLOSED"] },
   "test_cases": {
     "positive": [
       { "text": "ابي احد يسوي مشروع تخرج هندسة", "expected": "accept" },
       { "text": "فيه احد فاهم مادة الشبكات؟", "expected": "accept" },
-      { "text": "عندي واجب ومتوهق فيه", "expected": "accept" }
+      { "text": "عندي واجب ومتوهق فيه", "expected": "accept" },
+      { "text": "مين يقدر يشرح لي الرياضيات", "expected": "accept" },
+      { "text": "احتاج خبير تمريض", "expected": "accept" }
     ],
     "negative": [
       { "text": "نسوي لكم مشاريع تخرج باسعار ممتازة", "expected": "ignore" },
