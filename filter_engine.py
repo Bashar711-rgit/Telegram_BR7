@@ -336,16 +336,7 @@ class EnhancedFilter:
     }
 
     def __init__(self) -> None:
-        self._load_keyword_sets()
-        self._build_tries()
-
-        # Bloom Filter & Caches
-        self._bloom = OptimizedBloomFilter(CFG.BLOOM_FILTER_SIZE, CFG.BLOOM_FILTER_FP)
-        self._cache = ShardedLRUCache(CFG.MAX_CACHE_SIZE, CFG.CACHE_TTL)
-        self._text_cache = TTLCache(maxsize=CFG.TEXT_CACHE_SIZE, ttl=CFG.TEXT_CACHE_TTL)
-        self._cache_lock = asyncio.Lock()
-
-        # Stats v14.0
+        # تهيئة الإحصائيات مبكراً (قبل أي تحميل)
         self._stats: Dict[str, int] = {
             "processed": 0,
             "valid": 0,
@@ -367,6 +358,15 @@ class EnhancedFilter:
         }
         self._stats_lock = asyncio.Lock()
         self._last_stats_reset = time.time()
+
+        self._load_keyword_sets()
+        self._build_tries()
+
+        # Bloom Filter & Caches
+        self._bloom = OptimizedBloomFilter(CFG.BLOOM_FILTER_SIZE, CFG.BLOOM_FILTER_FP)
+        self._cache = ShardedLRUCache(CFG.MAX_CACHE_SIZE, CFG.CACHE_TTL)
+        self._text_cache = TTLCache(maxsize=CFG.TEXT_CACHE_SIZE, ttl=CFG.TEXT_CACHE_TTL)
+        self._cache_lock = asyncio.Lock()
 
         logger.info(
             "Filter v14.0 ready | intent_verbs={} | academic_objects={} | negation={} | boost_patterns={}",
@@ -550,6 +550,7 @@ class EnhancedFilter:
         # ── v14.0: Generate patterns from templates ────────────────────────
         template_generated = self._generate_template_patterns()
         self._boost_patterns.update(template_generated)
+        # Use self._stats safely now (initialized before this call)
         self._stats["template_patterns_generated"] = len(template_generated)
 
         # 7. Advertisement Signals
