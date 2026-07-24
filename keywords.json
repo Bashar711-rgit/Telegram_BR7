@@ -1,6 +1,6 @@
 {
   "_meta": {
-    "version": "14.0.2",
+    "version": "14.0.3",
     "codename": "IntentEngine-NLP-Templates",
     "target": "telegram_group_filter",
     "dialect": "saudi_arabic_multilingual",
@@ -46,7 +46,8 @@
       "Template patterns define combinations; engine generates all permutations at startup",
       "Massive reduction in file size while exponentially increasing pattern coverage",
       "v14.0.1: Added 'ممكن' to availability set to capture polite request forms",
-      "v14.0.2: Added 'social_topics' to ignore_signals (سواق, زواج, عروس, شقة, ايجار, etc.)"
+      "v14.0.2: Added 'social_topics' to ignore_signals (سواق, زواج, عروس, شقة, ايجار, etc.)",
+      "v14.0.3: Removed service-ad phrases from boost patterns. Enriched academic_objects with new student-needed terms (تحليل احصائي, رسالة ماجستير, etc.)"
     ]
   },
 
@@ -121,19 +122,19 @@
   },
 
   "academic_objects": {
-    "_description": "Specific academic items; ambiguous single words removed.",
+    "_description": "Specific academic items; ambiguous single words removed. Enriched with new student-needed terms.",
     "assignments": { "_weight_hint": 1.0, "terms": ["واجب", "واجبات", "واجب عملي", "واجب نظري", "واجب جامعي", "واجب بلاك بورد", "تكليف", "تكاليف", "تكليف جامعي", "مهمه دراسيه", "تمارين", "assignment", "homework"] },
     "projects": { "_weight_hint": 1.0, "terms": ["مشروع", "مشروع تخرج", "مشروع التخرج", "مشروع جامعي", "مشروع ماده", "مشروع مقرر", "مشروع برمجي", "كابستون", "برجكت", "بروجكت", "بروجيكت", "capstone", "capstone project", "graduation project", "final project"] },
     "reports": { "_weight_hint": 0.9, "terms": ["تقرير", "تقرير تدريبي", "تقرير فني", "تقرير ميداني", "تقرير مختبر", "تقرير طبي", "تقرير جامعي", "تقرير اكاديمي", "تقرير مرضي", "تقرير نهائي", "تقرير شهري", "تقرير يومي", "تقرير اسبوعي", "تقرير تعاوني", "تقرير مرحلي", "تقرير التدريب", "تقرير امتياز", "تقرير مشروع", "تقرير ماده", "ريبورت", "report", "lab report", "field report", "technical report", "training report", "internship report"] },
-    "research": { "_weight_hint": 0.9, "terms": ["بحث", "بحث علمي", "بحث تخرج", "بحث جامعي", "ورقه بحثيه", "مقال", "مراجعه ادبيه", "research", "research paper", "literature review", "proposal", "reflection paper"] },
+    "research": { "_weight_hint": 0.9, "terms": ["بحث", "بحث علمي", "بحث تخرج", "بحث جامعي", "ورقه بحثيه", "مقال", "مراجعه ادبيه", "research", "research paper", "literature review", "proposal", "reflection paper", "رساله ماجستير", "رسالة ماجستير", "رسائل ماجستير", "رسايل ماجستير", "اطروحه دكتوراه", "بحث ترقيه", "تحليل احصائي", "تحليل إحصائي"] },
     "presentations": { "_weight_hint": 0.85, "terms": ["عرض تقديمي", "بوربوينت", "سلايدات", "بوستر", "برزنتيشن", "خريطه مفاهيم", "فلوتشارت", "انفوجرافيك", "presentation", "powerpoint", "poster", "infographic", "flowchart", "mind map"] },
     "exams_quizzes": { "_weight_hint": 0.8, "terms": ["كويز", "كويزات", "اختبار", "امتحان", "فاينل", "ميد", "ميدترم", "اسئله سابقه", "تجميعات", "تجميعات اختبار", "نماذج اختبار", "حل اسئله", "حل اختبار", "حل تمارين", "حل مسائل", "quiz", "exam", "final_exam", "mid_exam"] },
     "summaries_notes": { "_weight_hint": 0.75, "terms": ["ملخص", "ملخصات", "ملخص الماده", "تلخيص", "تلخيص محاضره", "مذكره", "مذاكره", "ملفات الماده", "شرح المحاضرات", "شرح المنهج"] },
     "medical_documents": { "_weight_hint": 0.95, "terms": ["سك ليف", "سكلف", "سكليف", "سيكليف", "سكليفات", "اجازه مرضيه", "شهاده مرضيه", "عذر طبي", "عذر مرضي", "عذر صحي", "عذر للجامعه", "اثبات مرض", "غياب بعذر", "عذر غياب", "موعد مستشفى", "تقرير مستشفى", "sick leave", "sick-leave", "sickleave", "medical report", "medical certificate", "medical leave", "doctor note", "doctor certificate"] },
     "clinical_nursing": { "_weight_hint": 0.95, "terms": ["خطه رعايه", "خطه علاجيه", "حاله دراسيه", "دراسه حاله", "تحليل حاله", "حل حاله", "تقرير حاله", "care plan", "nursing care plan", "ncp", "soap note", "clinical worksheet", "case study", "clinical case", "case report", "case presentation", "osce", "worksheet"] },
-    "programming_tech": { "_weight_hint": 0.85, "terms": ["كود", "برمجه", "برنامج", "تطبيق", "موقع", "تطوير", "تطوير ويب", "تطوير تطبيق", "قاعده بيانات", "api", "database", "python", "java", "javascript", "php", "c++", "c#", "react", "flutter", "django", "laravel", "sql", "mysql", "oracle", "excel", "matlab", "spss", "power bi", "figma", "autocad", "revit", "solidworks", "lumion", "packet tracer", "wireshark"] },
-    "design_visual": { "_weight_hint": 0.8, "terms": ["تصميم", "رسم هندسي", "مخطط", "مخططات", "ui", "ux", "portfolio", "cv", "سيره ذاتيه", "resume"] },
-    "general_academic": { "_weight_hint": 0.6, "terms": ["ماده", "محاضره", "مختبر", "درس", "منهج", "فصل دراسي", "مقرر", "مقررات", "كورس", "كورسات", "شعبه", "سكشن", "لاب", "ساعات مكتبيه", "مناقشه", "مناقشه مشروع", "مناقشه تخرج", "دكتور الماده", "دكتوره الماده", "بلاك بورد", "blackboard", "course", "lab", "discussion", "discussion board"] }
+    "programming_tech": { "_weight_hint": 0.85, "terms": ["كود", "برمجه", "برنامج", "تطبيق", "موقع", "تطوير", "تطوير ويب", "تطوير تطبيق", "قاعده بيانات", "api", "database", "python", "java", "javascript", "php", "c++", "c#", "react", "flutter", "django", "laravel", "sql", "mysql", "oracle", "excel", "matlab", "spss", "power bi", "figma", "autocad", "revit", "solidworks", "lumion", "packet tracer", "wireshark", "اكسس", "access"] },
+    "design_visual": { "_weight_hint": 0.8, "terms": ["تصميم", "رسم هندسي", "مخطط", "مخططات", "ui", "ux", "portfolio", "cv", "سيره ذاتيه", "resume", "جرافيكس", "لوقو", "انيميشن", "after effects", "blender"] },
+    "general_academic": { "_weight_hint": 0.6, "terms": ["ماده", "محاضره", "مختبر", "درس", "منهج", "فصل دراسي", "مقرر", "مقررات", "كورس", "كورسات", "شعبه", "سكشن", "لاب", "ساعات مكتبيه", "مناقشه", "مناقشه مشروع", "مناقشه تخرج", "دكتور الماده", "دكتوره الماده", "بلاك بورد", "blackboard", "course", "lab", "discussion", "discussion board", "حضور محاضرات", "ورقه عمل", "ورقة علميه", "سيره ذاتيه", "cv"] }
   },
 
   "academic_object_weight": { "exact_phrase_multiplier": 1.0, "single_word_multiplier": 0.6 },
@@ -298,14 +299,16 @@
       { "text": "فيه احد فاهم مادة الشبكات؟", "expected": "accept" },
       { "text": "عندي واجب ومتوهق فيه", "expected": "accept" },
       { "text": "مين يقدر يشرح لي الرياضيات", "expected": "accept" },
-      { "text": "احتاج خبير تمريض", "expected": "accept" }
+      { "text": "احتاج خبير تمريض", "expected": "accept" },
+      { "text": "ابي تحليل احصائي", "expected": "accept" }
     ],
     "negative": [
       { "text": "نسوي لكم مشاريع تخرج باسعار ممتازة", "expected": "ignore" },
       { "text": "تم الحل شكرا", "expected": "ignore" },
       { "text": "السلام عليكم كيف الحال", "expected": "ignore" },
       { "text": "سواق يوديني للدوام", "expected": "ignore" },
-      { "text": "ابي شقة قريبة من الجامعة", "expected": "ignore" }
+      { "text": "ابي شقة قريبة من الجامعة", "expected": "ignore" },
+      { "text": "شروحات لكل المواد وفي كل التخصصات (يوجد حصة مجانية)", "expected": "ignore" }
     ],
     "borderline": [
       { "text": "ابي حل للمشكلة", "expected": "review" }
