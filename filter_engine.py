@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-filter_engine.py – Smart Filter Engine v13.0 (IntentEngine-NLP Compatible)
+filter_engine.py – Smart Filter Engine v14.0 (Template-Driven IntentEngine-NLP)
 Architecture: Prefilter + Fast Path + Fuzzy Path + Bloom Filter + Sharded Cache + Trie + TTLCache
-Supports: keywords.json v13.0.2, config.py v13.0
+New in v14.0: Template-based pattern generation from keywords.json templates section
+Supports: keywords.json v14.0, config.py v13.0
 """
 
 from __future__ import annotations
@@ -52,7 +53,7 @@ except ImportError:
 
 
 # =============================================================================
-# FilterResult (lightweight slots) – محسّن v13.0
+# FilterResult (lightweight slots) – محسّن v14.0
 # =============================================================================
 @dataclass(slots=True)
 class FilterResult:
@@ -72,8 +73,7 @@ class FilterResult:
     context_confidence: float = 0.5
     analysis_time_ms: float = 0.0
 
-    # v13.0: حقول جديدة (للتوافق مع EnhancedFilter)
-    decision: str = "ignore"          # accept / review / ignore
+    decision: str = "ignore"
     confidence: float = 0.0
     reasons: List[str] = field(default_factory=list)
     score_details: Dict[str, float] = field(default_factory=dict)
@@ -100,7 +100,6 @@ class FilterResult:
             "context_type": self.context_type,
             "context_confidence": self.context_confidence,
             "analysis_time_ms": self.analysis_time_ms,
-            # v13.0
             "decision": self.decision,
             "confidence": self.confidence,
             "reasons": self.reasons,
@@ -219,7 +218,7 @@ class OptimizedBloomFilter:
 
 
 # =============================================================================
-# Sharded LRU Cache (16 shards) – محسّن v13.0
+# Sharded LRU Cache (16 shards) – محسّن v14.0
 # =============================================================================
 class ShardedLRUCache:
     def __init__(self, max_size: int = 10_000, ttl: int = 300, shards: int = 16) -> None:
@@ -256,7 +255,7 @@ class ShardedLRUCache:
 
 
 # =============================================================================
-# Trie Index (مع دعم الأوزان) – محسّن v13.0
+# Trie Index (مع دعم الأوزان) – محسّن v14.0
 # =============================================================================
 class TrieNode:
     __slots__ = ("children", "is_end", "word", "weight")
@@ -321,7 +320,7 @@ class WeightedTrie:
 
 
 # =============================================================================
-# Main Filter Engine v13.0 – متوافق مع keywords.json v13.0.2
+# Main Filter Engine v14.0 – Template-Driven IntentEngine-NLP
 # =============================================================================
 class EnhancedFilter:
     ARABIC_CHARS: Final[Set[str]] = set("ابتثجحخدذرزسشصضطظعغفقكلمنهويأإؤئآة")
@@ -346,7 +345,7 @@ class EnhancedFilter:
         self._text_cache = TTLCache(maxsize=CFG.TEXT_CACHE_SIZE, ttl=CFG.TEXT_CACHE_TTL)
         self._cache_lock = asyncio.Lock()
 
-        # Stats v13.0
+        # Stats v14.0
         self._stats: Dict[str, int] = {
             "processed": 0,
             "valid": 0,
@@ -364,31 +363,121 @@ class EnhancedFilter:
             "avg_time_ms": 0,
             "max_time_ms": 0,
             "min_time_ms": 999999,
+            "template_patterns_generated": 0,
         }
         self._stats_lock = asyncio.Lock()
         self._last_stats_reset = time.time()
 
-        # v13.0: map for categories
-        self._category_map = {
-            "intent_verbs": "طلب",
-            "academic_objects": "سياق أكاديمي",
-            "urgency_markers": "استعجال",
-            "advertisement_signals": "إعلان",
-            "spam_categories": "سبام",
-            "ignore_signals": "تجاهل",
-        }
-
         logger.info(
-            "Filter v13.0 ready | intent_verbs={} | academic_objects={} | negation={}",
+            "Filter v14.0 ready | intent_verbs={} | academic_objects={} | negation={} | boost_patterns={}",
             len(self._intent_verbs_all),
             len(self._academic_objects_all),
             len(self._negation_all),
+            len(self._boost_patterns),
         )
 
     # ─── Load & Build ──────────────────────────────────────────────────────────
 
+    def _generate_template_patterns(self) -> Set[str]:
+        """
+        v14.0: Generate boost patterns from templates defined in keywords.json.
+        This replaces the static high_confidence_boost_patterns list with
+        dynamically generated combinations from word sets.
+        """
+        generated: Set[str] = set()
+        templates_data = KEYWORDS.get("templates", {})
+        if not templates_data or not isinstance(templates_data, dict):
+            return generated
+
+        template_patterns_list = KEYWORDS.get("template_patterns", [])
+        if not template_patterns_list or not isinstance(template_patterns_list, list):
+            return generated
+
+        # Extract word sets
+        need: List[str] = templates_data.get("need", [])
+        person: List[str] = templates_data.get("person", [])
+        action: List[str] = templates_data.get("action", [])
+        expert: List[str] = templates_data.get("expert", [])
+        availability: List[str] = templates_data.get("availability", [])
+
+        if not isinstance(need, list):
+            need = []
+        if not isinstance(person, list):
+            person = []
+        if not isinstance(action, list):
+            action = []
+        if not isinstance(expert, list):
+            expert = []
+        if not isinstance(availability, list):
+            availability = []
+
+        # Generate combinations for each pattern template
+        for pattern in template_patterns_list:
+            if not isinstance(pattern, str):
+                continue
+            parts = pattern.strip().split()
+
+            # ── 2-part templates ──────────────────────────────────────────
+            if len(parts) == 2:
+                tag1, tag2 = parts[0], parts[1]
+
+                if tag1 == "<need>" and tag2 == "<person>":
+                    for n in need:
+                        for p in person:
+                            generated.add(f"{n} {p}")
+
+                elif tag1 == "<need>" and tag2 == "<expert>":
+                    for n in need:
+                        for e in expert:
+                            generated.add(f"{n} {e}")
+
+                elif tag1 == "<availability>" and tag2 == "<person>":
+                    for a in availability:
+                        for p in person:
+                            generated.add(f"{a} {p}")
+
+                elif tag1 == "<availability>" and tag2 == "<action>":
+                    for a in availability:
+                        for act in action:
+                            generated.add(f"{a} {act}")
+
+                elif tag1 == "<availability>" and tag2 == "<expert>":
+                    for a in availability:
+                        for e in expert:
+                            generated.add(f"{a} {e}")
+
+            # ── 3-part templates ──────────────────────────────────────────
+            elif len(parts) == 3:
+                tag1, tag2, tag3 = parts[0], parts[1], parts[2]
+
+                if tag1 == "<need>" and tag2 == "<person>" and tag3 == "<action>":
+                    for n in need:
+                        for p in person:
+                            for act in action:
+                                generated.add(f"{n} {p} {act}")
+
+                elif tag1 == "<availability>" and tag2 == "<person>" and tag3 == "<action>":
+                    for a in availability:
+                        for p in person:
+                            for act in action:
+                                generated.add(f"{a} {p} {act}")
+
+        logger.info(
+            "Template engine generated {} boost patterns from {} template(s) | "
+            "need={} person={} action={} expert={} availability={}",
+            len(generated),
+            len(template_patterns_list),
+            len(need),
+            len(person),
+            len(action),
+            len(expert),
+            len(availability),
+        )
+
+        return generated
+
     def _load_keyword_sets(self) -> None:
-        """تحميل جميع القوائم من KEYWORDS (متوافق مع v13.0.2)."""
+        """تحميل جميع القوائم من KEYWORDS (متوافق مع v14.0)."""
         # 1. Intent Verbs (موزون)
         self._intent_verbs: Dict[str, Dict[str, Any]] = KEYWORDS.get("intent_verbs", {})
         self._intent_verbs_all: Set[str] = set()
@@ -450,13 +539,18 @@ class EnhancedFilter:
         if isinstance(resolution, list):
             self._resolution_phrases.update(resolution)
 
-        # 6. High Confidence Boost Patterns
+        # 6. High Confidence Boost Patterns (static + template-generated)
         boost_data = KEYWORDS.get("high_confidence_boost_patterns", {})
         self._boost_patterns: Set[str] = set()
         if isinstance(boost_data, dict):
             patterns = boost_data.get("patterns", [])
             if isinstance(patterns, list):
                 self._boost_patterns.update(patterns)
+
+        # ── v14.0: Generate patterns from templates ────────────────────────
+        template_generated = self._generate_template_patterns()
+        self._boost_patterns.update(template_generated)
+        self._stats["template_patterns_generated"] = len(template_generated)
 
         # 7. Advertisement Signals
         self._ad_signals: Dict[str, Any] = KEYWORDS.get("advertisement_signals", {})
@@ -562,43 +656,24 @@ class EnhancedFilter:
 
         # ── تحويل البيانات الجديدة إلى القوائم القديمة (للتوافق) ──
 
-        # request_words = جميع أفعال الطلب + عبارات الطلب المباشرة
         self.request_words: Set[str] = set(self._intent_verbs_all).union(self._request_phrases_all)
-
-        # context_words = جميع الأكاديمية + السياق الجامعي
         self.context_words: Set[str] = set(self._academic_objects_all).union(self._university_context)
-
-        # indirect_words = عبارات الطلب غير المباشرة + التعابير الضمنية
         self.indirect_words: Set[str] = set(self._indirect_request_all).union(self._implicit_request_all)
-
-        # urgency_words = مؤشرات الاستعجال
         self.urgency_words: Set[str] = self._urgency_all
-
-        # ignore_words = تجاهل
         self.ignore_words: Set[str] = self._ignore_all
 
-        # advertisement_words = إشارات الإعلانات (صلبة + متوسطة + مؤسسات)
         self.advertisement_words: Set[str] = set()
-        # إضافة الإشارات الصلبة والمتوسطة من ad_signals
         for signal_list in ["hard_signals", "medium_signals"]:
             signals = self._ad_signals.get(signal_list, [])
             if isinstance(signals, list):
                 self.advertisement_words.update(signals)
 
-        # education_words = مقدمي الخدمات التعليمية (من ad_signals.institution_terms)
         self.education_words: Set[str] = set(self._ad_signals.get("institution_terms", []))
-
-        # emoji_advertisement = إيموجيات إعلانية
         self.emoji_advertisement: Set[str] = self._ad_emoji
-
-        # ad_blockers = قوائم حظر الروابط
         self.ad_blockers: Set[str] = self._ad_blockers
-
-        # spam_patterns = كل عبارات السبام
         self.spam_patterns: Set[str] = self._spam_all
 
-        # إضافة كلمات من الفئات القديمة إذا لم تكن موجودة
-        # (للتأكد من التغطية الكاملة)
+        # ── Backward compatibility: old-format keywords ────────────────────
         old_request = set(KEYWORDS.get("request", []))
         old_context = set(KEYWORDS.get("request_context", []))
         old_indirect = set(KEYWORDS.get("indirect_request", []))
@@ -621,7 +696,7 @@ class EnhancedFilter:
         self.ad_blockers.update(old_blockers)
         self.spam_patterns.update(old_spam)
 
-        # التأكد من أن جميع القوائم من النوع Set
+        # Ensure all sets are actual sets
         self.request_words = set(self.request_words)
         self.context_words = set(self.context_words)
         self.indirect_words = set(self.indirect_words)
@@ -632,8 +707,9 @@ class EnhancedFilter:
         self.emoji_advertisement = set(self.emoji_advertisement)
         self.ad_blockers = set(self.ad_blockers)
         self.spam_patterns = set(self.spam_patterns)
+        self._boost_patterns = set(self._boost_patterns)
 
-        # بناء Tries للقوائم القديمة (للمعالجة السريعة)
+        # Build all tries
         self._request_trie = WeightedTrie(self.request_words)
         self._context_trie = WeightedTrie(self.context_words)
         self._indirect_trie = WeightedTrie(self.indirect_words)
@@ -642,7 +718,6 @@ class EnhancedFilter:
         self._ad_trie = WeightedTrie(self.advertisement_words)
         self._education_trie = WeightedTrie(self.education_words)
 
-        # Tries الجديدة المستخدمة في التحسينات
         self._negation_trie = WeightedTrie(self._negation_all)
         self._resolution_trie = WeightedTrie(self._resolution_phrases)
         self._boost_trie = WeightedTrie(self._boost_patterns)
@@ -652,7 +727,7 @@ class EnhancedFilter:
 
     def _build_tries(self) -> None:
         """بناء جميع Tries الموزونة (تم في _load_keyword_sets)."""
-        pass  # تم البناء بالفعل في _load_keyword_sets
+        pass
 
     # ─── Normalization ─────────────────────────────────────────────────────────
 
@@ -724,7 +799,6 @@ class EnhancedFilter:
         ad_score = 0.0
         reasons = []
 
-        # Hard signals (قوية جداً)
         hard_signals = self._ad_signals.get("hard_signals", [])
         if isinstance(hard_signals, list):
             for signal in hard_signals:
@@ -732,7 +806,6 @@ class EnhancedFilter:
                     ad_score += 0.4
                     reasons.append(f"hard_ad_signal: {signal}")
 
-        # Medium signals
         medium_signals = self._ad_signals.get("medium_signals", [])
         if isinstance(medium_signals, list):
             for signal in medium_signals:
@@ -799,14 +872,12 @@ class EnhancedFilter:
         negation_score = 0.0
         reasons = []
 
-        # 1. Resolution phrases
         resolution_match = self._resolution_trie.search_first(text)
         if resolution_match:
             negation_score = 1.0
             reasons.append(f"resolution_phrase: {resolution_match[0]}")
             return True, negation_score, reasons
 
-        # 2. Post-clause negators
         post_clause = self._negation.get("post_clause_negators", [])
         if isinstance(post_clause, list):
             for neg in post_clause:
@@ -818,7 +889,6 @@ class EnhancedFilter:
                     reasons.append(f"post_clause_negator: {neg}")
                     return True, negation_score, reasons
 
-        # 3. Pre-verb negators
         pre_verb_data = self._negation.get("pre_verb_negators", {})
         if isinstance(pre_verb_data, dict):
             pre_verbs = pre_verb_data.get("terms", [])
@@ -828,7 +898,6 @@ class EnhancedFilter:
                         for ex in self._negation_exceptions:
                             if ex in text:
                                 return False, 0.0, []
-                        # Check clause boundaries
                         if CFG.NEGATION_CLAUSE_BOUNDARIES_ENABLED:
                             pos = text.find(pv)
                             before_text = text[:pos]
@@ -858,7 +927,6 @@ class EnhancedFilter:
                 if distance >= 16:
                     return float(data.get("score_multiplier", 0.15))
 
-        # Fallback based on text length
         if text_len > 100:
             if distance <= 10:
                 return 0.9
@@ -880,7 +948,7 @@ class EnhancedFilter:
         for (start, end), value in self._length_modifier.items():
             if start <= token_count <= end:
                 return value
-        return 0.9  # default
+        return 0.9
 
     # ─── Main Analysis ─────────────────────────────────────────────────────────
 
@@ -959,7 +1027,7 @@ class EnhancedFilter:
             if is_negated and neg_score > 0.7:
                 return self._result("ignore", 1.0 - neg_score, neg_reasons)
 
-            # Intent verb (باستخدام trie القديم)
+            # Intent verb
             intent_match = self._request_trie.search_first(cleaned)
             intent_verb = intent_match[0] if intent_match else None
             intent_weight = self._intent_weights.get(intent_verb, 0.7) if intent_verb else 0.0
@@ -980,7 +1048,7 @@ class EnhancedFilter:
             implicit_match = self._implicit_trie.search_first(cleaned)
             is_implicit = implicit_match is not None
 
-            # High confidence boost
+            # High confidence boost (includes template-generated patterns)
             boost_match = self._boost_trie.search_first(cleaned)
             boost = 0.25 if boost_match else 0.0
 
@@ -991,42 +1059,34 @@ class EnhancedFilter:
                 return self._result("ignore", 1.0 - ad_score, ad_reasons)
 
             # ─── Fast Path ───────────────────────────────────────────────
-            # بناء النتيجة باستخدام المنطق القديم ولكن مع دعم القوائم الجديدة
             result = FilterResult()
 
-            # فحص الحظر
             if self._is_blocked(cleaned, result):
                 return self._convert_result(result, is_arabic, arabic_ratio, ad_score, start)
 
-            # البحث عن كلمة مفتاحية (طلب مباشر أو غير مباشر)
             keyword = self._request_trie.search_first(cleaned)
-            indirect_match = self._indirect_trie.search_first(cleaned) if not keyword else None
+            indirect_match_val = self._indirect_trie.search_first(cleaned) if not keyword else None
 
-            if not keyword and not indirect_match:
-                # لا يوجد طلب، نرفض
+            if not keyword and not indirect_match_val:
                 result.valid = False
                 result.reason = "no_keyword"
                 return self._convert_result(result, is_arabic, arabic_ratio, ad_score, start)
 
-            # حساب النقاط
             score = CFG.SCORE_DIRECT_MATCH if keyword else 0
 
-            # سياق
             context_matches = self._context_trie.search_all(cleaned)
             context_boost = min(len(context_matches) * 5, CFG.SCORE_CONTEXT_MAX)
             score += context_boost
 
-            # استعجال
             urgent = bool(self._urgency_trie.search_first(cleaned))
             if urgent:
                 score += CFG.SCORE_URGENCY
 
-            if indirect_match:
-                keyword = keyword or indirect_match
+            if indirect_match_val:
+                keyword = keyword or indirect_match_val
                 score += CFG.SCORE_INDIRECT
                 result.indirect = True
 
-            # التحقق من العتبة
             result.valid = score >= CFG.SCORE_MIN_VALID
             result.keyword = keyword
             result.score = score
@@ -1034,7 +1094,7 @@ class EnhancedFilter:
             result.urgent = urgent
             result.reason = (
                 "keyword_found" if keyword
-                else ("indirect_request" if indirect_match else "no_keyword")
+                else ("indirect_request" if indirect_match_val else "no_keyword")
             )
             result.context_type = (
                 "academic_request" if context_matches
@@ -1042,9 +1102,8 @@ class EnhancedFilter:
             )
             result.context_confidence = 0.90 if context_matches else (0.85 if urgent else 0.75)
 
-            # إضافة معلومات v13.0
             result.decision = "accept" if result.valid else "review" if score >= 0 else "ignore"
-            result.confidence = score / 100.0  # تحويل النقاط إلى ثقة
+            result.confidence = score / 100.0
             result.intent_verb = keyword
             result.academic_object = academic_object
             result.urgency_marker = urgency_marker
@@ -1063,25 +1122,22 @@ class EnhancedFilter:
                 result.reasons.extend(neg_reasons)
             if ad_score > 0.3:
                 result.reasons.extend(ad_reasons)
+            if boost_match:
+                result.reasons.append(f"template_boost: {boost_match[0]}")
 
-            # معامل الطول
             token_count = len(cleaned.split())
             length_modifier = self._get_length_modifier(token_count)
             result.confidence *= length_modifier
 
-            # تأثير النفي والإعلان
             if is_negated:
                 result.confidence *= (1 - neg_score * 0.7)
             result.confidence *= (1 - ad_score * 0.9)
 
-            # Boost
             if boost_match:
                 result.confidence += boost
-                result.reasons.append("high_confidence_boost")
 
             result.confidence = max(0.0, min(1.0, result.confidence))
 
-            # تحديث القرار بناءً على الثقة
             if result.confidence >= CFG.CONFIDENCE_ACCEPT_THRESHOLD:
                 result.decision = "accept"
             elif result.confidence >= CFG.CONFIDENCE_REVIEW_THRESHOLD:
@@ -1090,7 +1146,6 @@ class EnhancedFilter:
                 result.decision = "ignore"
                 result.valid = False
 
-            # تحديث الإحصائيات
             async with self._stats_lock:
                 if result.valid:
                     self._stats["valid"] += 1
@@ -1108,12 +1163,9 @@ class EnhancedFilter:
 
             result.analysis_time_ms = round((time.perf_counter() - start) * 1000, 2)
 
-            # تحويل النتيجة إلى قاموس
             result_dict = result.to_dict()
-            # التأكد من وجود حقل valid
             result_dict["valid"] = result.valid
 
-            # Cache
             async with self._cache_lock:
                 self._text_cache[cache_key] = result_dict
 
@@ -1126,7 +1178,6 @@ class EnhancedFilter:
     # ─── Helpers ──────────────────────────────────────────────────────────────
 
     def _is_blocked(self, text: str, result: FilterResult) -> bool:
-        """فحص الحظر (الإعلانات، التعليم، التجاهل، الروابط، الإيموجيات)."""
         for blocker in self.ad_blockers:
             if blocker in text:
                 result.reason = "ad_blocker"
@@ -1146,7 +1197,6 @@ class EnhancedFilter:
         return False
 
     def _convert_result(self, result: FilterResult, is_arabic: bool, arabic_ratio: float, ad_score: float, start: float) -> Dict[str, Any]:
-        """تحويل FilterResult إلى قاموس."""
         result.language = "ar" if is_arabic else "unknown"
         result.lang_conf = arabic_ratio
         result.spam_score = ad_score
@@ -1156,7 +1206,6 @@ class EnhancedFilter:
         return result.to_dict()
 
     def _result(self, decision: str, confidence: float, reasons: List[str]) -> Dict[str, Any]:
-        """إنشاء نتيجة سريعة."""
         return {
             "valid": decision == "accept",
             "reason": reasons[0] if reasons else decision,
@@ -1197,4 +1246,4 @@ class EnhancedFilter:
         await self._bloom.clear()
         async with self._cache_lock:
             self._text_cache.clear()
-        logger.info("Filter caches cleared")
+        logger.info("Filter v14.0 caches cleared")
