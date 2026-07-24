@@ -1,6 +1,6 @@
 {
   "_meta": {
-    "version": "13.0.2",
+    "version": "13.0.3",
     "codename": "IntentEngine-NLP-Prod",
     "target": "telegram_group_filter",
     "dialect": "saudi_arabic_multilingual",
@@ -41,13 +41,13 @@
     "total_unique_entries": "optimized",
     "v13_changes": [
       "Removed tier_3_contextual intent verbs (too generic, causing high false positives)",
-      "Trimmed high_confidence_boost_patterns to core 'احتاج/ابي/ابغى/محتاج احد يسوي' forms plus explicit request phrases like 'اللي تعرف شخص', 'أحتاج خصوصي' etc.",
-      "Boost now applies to any following word after core help-request patterns"
+      "Trimmed high_confidence_boost_patterns to core explicit requests only. Moved ambiguous patterns to request_phrases.",
+      "Reduced context_score to 0.05 to minimize false positives from general academic talk without intent."
     ]
   },
 
   "high_confidence_boost_patterns": {
-    "_description": "Core help-request patterns and explicit student queries. Any word after the first group benefits from the boost; standalone patterns also trigger boost.",
+    "_description": "Core help-request patterns with explicit action verbs. Any word after these patterns benefits from the boost.",
     "_boost": 0.25,
     "patterns": [
       "احتاج احد يسوي",
@@ -62,14 +62,11 @@
       "ادور احد يسوي لي",
       "بدور احد يسوي",
       "بدور احد يسوي لي",
-      "اللي تعرف شخص",
-      "اللي عنده حد",
-      "اللي عندها حد",
-      "بنات تعرفون",
-      "الذي تعرف أحد",
-      "تعرفون شخص يسوي",
-      "أحتاج خصوصي",
-      "أحتاج مختص"
+      "احتاج احد يساعدني",
+      "ابي احد يساعدني",
+      "ابغى احد يساعدني",
+      "محتاج احد يساعدني",
+      "ممكن احد يساعدني"
     ]
   },
 
@@ -136,7 +133,14 @@
       "تعرفون احد يساعد", "تعرفون احد يسوي", "تعرفون احد يكتب", "تعرفون احد يحل", "تعرفون احد يشرح", "تعرفون احد متخصص", "تعرفون احد فاهم", "تعرفون احد عنده خبره",
       "احد يعرف شخص",
       "ياليت احد يفزع", "ياليت احد يساعدني", "الله يسعدكم احد يساعد", "تكفون احد يساعد", "تكفى ساعدني", "تكفون ساعدوني",
-      "ممكن احد يساعدني", "ممكن تساعدوني", "ممكن يساعدني"
+      "ممكن احد يساعدني", "ممكن تساعدوني", "ممكن يساعدني",
+      "اللي تعرف شخص",
+      "اللي عنده حد",
+      "اللي عندها حد",
+      "الذي تعرف أحد",
+      "تعرفون شخص يسوي",
+      "أحتاج خصوصي",
+      "أحتاج مختص"
     ],
     "indirect_distress": [
       "تعبت من الواجب", "تعبت من الماده", "تعبت من الدراسه", "ضايع في الدرس", "ضايع في الماده", "ضايعه في الماده",
@@ -234,7 +238,20 @@
 
   "distance_scoring_config": { "thresholds": { "0_to_3": { "score_multiplier": 1.0 }, "4_to_7": { "score_multiplier": 0.85 }, "8_to_10": { "score_multiplier": 0.65 }, "11_to_15": { "score_multiplier": 0.4 }, "16_plus": { "score_multiplier": 0.15 } } },
   "length_modifier": { "1_3_tokens": 0.75, "4_10_tokens": 0.9, "11_30_tokens": 1.0, "30_plus_tokens": 0.9 },
-  "scoring_weights": { "positive_modules": { "intent_score": 0.3, "academic_score": 0.25, "grammar_score": 0.15, "distance_score": 0.15, "urgency_score": 0.05, "context_score": 0.1 }, "suppression_modules": { "negation_score": { "effect": "multiplies base confidence by (1 - negation_score)" }, "advert_score": { "effect": "multiplies base confidence by (1 - advert_score * 0.9)" } } },
+  "scoring_weights": {
+    "positive_modules": {
+      "intent_score": 0.3,
+      "academic_score": 0.25,
+      "grammar_score": 0.15,
+      "distance_score": 0.15,
+      "urgency_score": 0.05,
+      "context_score": 0.05
+    },
+    "suppression_modules": {
+      "negation_score": { "effect": "multiplies base confidence by (1 - negation_score)" },
+      "advert_score": { "effect": "multiplies base confidence by (1 - advert_score * 0.9)" }
+    }
+  },
   "explainability": { "required_fields": ["decision", "confidence", "reasons"], "example": { "decision": "accept", "confidence": 0.91, "reasons": ["intent_phrase_detected: ابي احد يسوي", "academic_object: مشروع", "distance: 2 tokens", "advert_score: 0.0"] } },
   "conversation_history_config": { "open_request_ttl_hours": 24, "resolution_closes_request": true, "max_history_per_user": 5, "conversation_states": ["OPEN_REQUEST", "NEGOTIATION", "RESOLVED", "CLOSED"] },
   "test_cases": {
