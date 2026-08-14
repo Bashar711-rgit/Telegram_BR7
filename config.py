@@ -1,8 +1,35 @@
 #!/usr/bin/env python3
 """
-config.py – Configuration Manager v13.0 (IntentEngine-NLP Edition)
+config.py – Configuration Manager v13.1 (IntentEngine-NLP Edition, HARDENED)
 Supports: SQLite, PostgreSQL (via DATABASE_URL)
-Compatible with: keywords.json v13.0.2, filter_engine.py v13.0
+Compatible with: keywords.json v14.0.x, filter_engine.py, monitors.py v9.7 (hardened)
+
+v13.1 (this pass) — targeted fix, config.py ONLY:
+  * _KW_CATEGORIES was missing "templates" and "template_patterns" — the two
+    top-level keys that keywords.json v14.0.x actually stores its
+    Template-Driven Pattern Generation data under. Because load_keywords()
+    builds the exported KEYWORDS dict *exclusively* from the keys listed in
+    _KW_CATEGORIES, any key not listed there was silently dropped, no
+    matter how much data existed for it in keywords.json. This meant
+    filter_engine.py's _generate_template_patterns() always saw
+    KEYWORDS.get("templates", {}) == {} and returned an empty pattern set —
+    the entire Template-Boost mechanism (the core of "IntentEngine v14.0")
+    was dead on arrival, with no error or warning anywhere.
+    Both keys are now included, so keywords.json's template data actually
+    reaches the filter engine.
+  * load_keywords() now logs a dedicated line reporting how many template
+    entries were loaded, specifically so this class of "silently empty
+    category" bug is visible at boot instead of requiring a code read to
+    catch (mirrors how config.py already logs total keyword counts).
+  * No other behavioral changes in this file. Everything monitors.py v9.7
+    already relies on from this module (CFG.DEAD_LETTER_MAX_RETRIES,
+    CFG.CONNECTION_TIMEOUT, CFG.SESSION_REFRESH_INTERVAL, CFG.*_THRESHOLD,
+    CFG.SCORE_WEIGHT_*, etc.) was already present and is unchanged.
+  * Note: FLOOD_WAIT_MULTIPLIER is kept for backward compatibility (e.g. if
+    other modules still read it), but as of monitors.py v9.7 the
+    CircuitBreaker no longer uses it to *guess* a FloodWait duration — it
+    honors the exact FloodWaitError.seconds value from Telegram instead.
+    This var is effectively legacy/unused by the hardened monitors.py.
 """
 
 from __future__ import annotations
@@ -228,7 +255,7 @@ class SecretManager:
 load_dotenv("accounts.env")
 
 # =============================================================================
-# Core Config Dataclass v13.0 – جميع المتغيرات الجديدة
+# Core Config Dataclass v13.1 – جميع المتغيرات
 # =============================================================================
 @dataclass(frozen=True, slots=True)
 class _ConfigData:
@@ -347,37 +374,37 @@ class _ConfigData:
     SENTRY_DSN: Optional[str]
 
     # ═══════════════════════════════════════════════════════════════════
-    # ── NEW v13.0: Confidence Thresholds ──
+    # ── Confidence Thresholds ──
     CONFIDENCE_ACCEPT_THRESHOLD: float
     CONFIDENCE_REVIEW_THRESHOLD: float
 
-    # ── NEW v13.0: Feature Toggles ──
+    # ── Feature Toggles ──
     NEGATION_ENABLED: bool
     FUZZY_MATCHING_ENABLED: bool
     DISTANCE_SCORING_ENABLED: bool
     AD_DETECTION_ENABLED: bool
 
-    # ── NEW v13.0: Fuzzy Matching ──
+    # ── Fuzzy Matching ──
     FUZZY_MAX_EDIT_DISTANCE: int
     FUZZY_MIN_TOKEN_LENGTH: int
     FUZZY_SIMILARITY_THRESHOLD: float
 
-    # ── NEW v13.0: Negation ──
+    # ── Negation ──
     NEGATION_CLAUSE_BOUNDARIES_ENABLED: bool
 
-    # ── NEW v13.0: Distance Thresholds ──
+    # ── Distance Thresholds ──
     DISTANCE_CLOSE_THRESHOLD: int
     DISTANCE_MEDIUM_THRESHOLD: int
     DISTANCE_FAR_THRESHOLD: int
     DISTANCE_VERY_FAR_THRESHOLD: int
 
-    # ── NEW v13.0: Length Modifiers ──
+    # ── Length Modifiers ──
     LENGTH_MODIFIER_SHORT: float
     LENGTH_MODIFIER_MEDIUM: float
     LENGTH_MODIFIER_LONG: float
     LENGTH_MODIFIER_VERY_LONG: float
 
-    # ── NEW v13.0: Scoring Weights ──
+    # ── Scoring Weights ──
     SCORE_WEIGHT_INTENT: float
     SCORE_WEIGHT_ACADEMIC: float
     SCORE_WEIGHT_GRAMMAR: float
@@ -385,16 +412,16 @@ class _ConfigData:
     SCORE_WEIGHT_URGENCY: float
     SCORE_WEIGHT_CONTEXT: float
 
-    # ── NEW v13.0: Ad Detection ──
+    # ── Ad Detection ──
     AD_WEAK_PROVIDER_THRESHOLD: int
     AD_EMOJI_THRESHOLD: int
 
-    # ── NEW v13.0: Cache ──
+    # ── Cache ──
     TEXT_CACHE_SIZE: int
     TEXT_CACHE_TTL: int
 
 # =============================================================================
-# Config Builder v13.0
+# Config Builder v13.1
 # =============================================================================
 class Config:
     _instance: Optional[_ConfigData] = None
@@ -568,48 +595,48 @@ class Config:
             PROMETHEUS_PORT=SecretManager.get_int("PROMETHEUS_PORT", 9090, required=False),
             SENTRY_DSN=SecretManager.get("SENTRY_DSN", None, required=False),
             # ═══════════════════════════════════════════════════════════════════
-            # ========== NEW v13.0: عتبات الثقة ==========
+            # ========== عتبات الثقة ==========
             CONFIDENCE_ACCEPT_THRESHOLD=SecretManager.get_float("CONFIDENCE_ACCEPT_THRESHOLD", 0.65, required=False),
             CONFIDENCE_REVIEW_THRESHOLD=SecretManager.get_float("CONFIDENCE_REVIEW_THRESHOLD", 0.40, required=False),
-            # ========== NEW v13.0: تشغيل/إيقاف الميزات ==========
+            # ========== تشغيل/إيقاف الميزات ==========
             NEGATION_ENABLED=SecretManager.get_bool("NEGATION_ENABLED", True),
             FUZZY_MATCHING_ENABLED=SecretManager.get_bool("FUZZY_MATCHING_ENABLED", True),
             DISTANCE_SCORING_ENABLED=SecretManager.get_bool("DISTANCE_SCORING_ENABLED", True),
             AD_DETECTION_ENABLED=SecretManager.get_bool("AD_DETECTION_ENABLED", True),
-            # ========== NEW v13.0: المطابقة الضبابية ==========
+            # ========== المطابقة الضبابية ==========
             FUZZY_MAX_EDIT_DISTANCE=SecretManager.get_int("FUZZY_MAX_EDIT_DISTANCE", 1, required=False),
             FUZZY_MIN_TOKEN_LENGTH=SecretManager.get_int("FUZZY_MIN_TOKEN_LENGTH", 5, required=False),
             FUZZY_SIMILARITY_THRESHOLD=SecretManager.get_float("FUZZY_SIMILARITY_THRESHOLD", 0.92, required=False),
-            # ========== NEW v13.0: النفي ==========
+            # ========== النفي ==========
             NEGATION_CLAUSE_BOUNDARIES_ENABLED=SecretManager.get_bool("NEGATION_CLAUSE_BOUNDARIES_ENABLED", True),
-            # ========== NEW v13.0: المسافة ==========
+            # ========== المسافة ==========
             DISTANCE_CLOSE_THRESHOLD=SecretManager.get_int("DISTANCE_CLOSE_THRESHOLD", 3, required=False),
             DISTANCE_MEDIUM_THRESHOLD=SecretManager.get_int("DISTANCE_MEDIUM_THRESHOLD", 7, required=False),
             DISTANCE_FAR_THRESHOLD=SecretManager.get_int("DISTANCE_FAR_THRESHOLD", 10, required=False),
             DISTANCE_VERY_FAR_THRESHOLD=SecretManager.get_int("DISTANCE_VERY_FAR_THRESHOLD", 15, required=False),
-            # ========== NEW v13.0: معامل الطول ==========
+            # ========== معامل الطول ==========
             LENGTH_MODIFIER_SHORT=SecretManager.get_float("LENGTH_MODIFIER_SHORT", 0.75, required=False),
             LENGTH_MODIFIER_MEDIUM=SecretManager.get_float("LENGTH_MODIFIER_MEDIUM", 0.9, required=False),
             LENGTH_MODIFIER_LONG=SecretManager.get_float("LENGTH_MODIFIER_LONG", 1.0, required=False),
             LENGTH_MODIFIER_VERY_LONG=SecretManager.get_float("LENGTH_MODIFIER_VERY_LONG", 0.9, required=False),
-            # ========== NEW v13.0: أوزان التسجيل ==========
+            # ========== أوزان التسجيل ==========
             SCORE_WEIGHT_INTENT=SecretManager.get_float("SCORE_WEIGHT_INTENT", 0.30, required=False),
             SCORE_WEIGHT_ACADEMIC=SecretManager.get_float("SCORE_WEIGHT_ACADEMIC", 0.25, required=False),
             SCORE_WEIGHT_GRAMMAR=SecretManager.get_float("SCORE_WEIGHT_GRAMMAR", 0.15, required=False),
             SCORE_WEIGHT_DISTANCE=SecretManager.get_float("SCORE_WEIGHT_DISTANCE", 0.15, required=False),
             SCORE_WEIGHT_URGENCY=SecretManager.get_float("SCORE_WEIGHT_URGENCY", 0.05, required=False),
             SCORE_WEIGHT_CONTEXT=SecretManager.get_float("SCORE_WEIGHT_CONTEXT", 0.10, required=False),
-            # ========== NEW v13.0: كشف الإعلانات ==========
+            # ========== كشف الإعلانات ==========
             AD_WEAK_PROVIDER_THRESHOLD=SecretManager.get_int("AD_WEAK_PROVIDER_THRESHOLD", 2, required=False),
             AD_EMOJI_THRESHOLD=SecretManager.get_int("AD_EMOJI_THRESHOLD", 3, required=False),
-            # ========== NEW v13.0: الكاش ==========
+            # ========== الكاش ==========
             TEXT_CACHE_SIZE=SecretManager.get_int("TEXT_CACHE_SIZE", 5000, required=False),
             TEXT_CACHE_TTL=SecretManager.get_int("TEXT_CACHE_TTL", 300, required=False),
         )
 
         cls._instance = cfg
         logger.info(
-            f"Config v13.0 built: DB={db_type} | "
+            f"Config v13.1 built: DB={db_type} | "
             f"PROCESSING_WORKERS={workers} | "
             f"DASHBOARD={'ON' if cfg.DASHBOARD_ENABLED else 'OFF'} | "
             f"FUZZY={'ON' if cfg.FUZZY_MATCHING_ENABLED else 'OFF'} | "
@@ -691,14 +718,21 @@ class InputSanitizer:
         return bool(dangerous.search(text))
 
 # =============================================================================
-# Keyword Loader v13.0 – متوافق مع الهيكل الجديد
+# Keyword Loader v13.1 – متوافق مع keywords.json v14.0.x
+#
+# FIX (critical, see module docstring): "templates" and "template_patterns"
+# are now included. These are the two keys keywords.json v14.0.x actually
+# uses for its Template-Driven Pattern Generation data. Previously they
+# were absent from this list, so load_keywords() silently discarded them
+# and filter_engine.py's Template-Boost mechanism always ran on an empty
+# dataset — no exception, no log warning, just quietly-degraded filtering.
 # =============================================================================
 _KW_CATEGORIES: Final[List[str]] = [
     # الفئات القديمة (للتوافق)
     "request", "advertisement", "ignore", "emoji_advertisement",
     "education_providers", "ad_blockers", "request_context",
     "indirect_request", "urgency", "spam_patterns",
-    # الفئات الجديدة v13.0
+    # الفئات v13.0
     "intent_verbs", "academic_objects", "request_phrases",
     "urgency_markers", "negation", "advertisement_signals",
     "spam_categories", "emoji_signals", "ignore_signals",
@@ -707,6 +741,8 @@ _KW_CATEGORIES: Final[List[str]] = [
     "conversation_history_config", "test_cases", "learning_feedback",
     "high_confidence_boost_patterns", "action_verbs", "subject_markers",
     "implicit_request_patterns", "solve_actions", "help_expressions",
+    # ── v14.0.x: Template-Driven Pattern Generation (previously missing) ──
+    "templates", "template_patterns",
 ]
 
 def load_keywords(path: str = "keywords.json") -> Dict[str, Any]:
@@ -731,6 +767,26 @@ def load_keywords(path: str = "keywords.json") -> Dict[str, Any]:
                 result[key] = {}
         total = sum(len(v) if isinstance(v, (list, dict)) else 0 for v in result.values())
         logger.info(f"Keywords loaded: {total} total across {len(_KW_CATEGORIES)} categories")
+
+        # Dedicated visibility for the template engine specifically, so a
+        # future regression (e.g. someone renaming a key in keywords.json)
+        # shows up immediately in boot logs instead of as a silent
+        # accuracy regression discovered weeks later.
+        templates_data = result.get("templates", {})
+        template_patterns_data = result.get("template_patterns", {})
+        templates_count = len(templates_data) if isinstance(templates_data, (list, dict)) else 0
+        template_patterns_count = len(template_patterns_data) if isinstance(template_patterns_data, (list, dict)) else 0
+        if templates_count == 0 and template_patterns_count == 0:
+            logger.warning(
+                "Template-Boost engine: 'templates'/'template_patterns' are EMPTY in "
+                f"{path} - template_boost pattern generation will produce zero patterns. "
+                "If keywords.json is expected to define templates, check the key names."
+            )
+        else:
+            logger.info(
+                f"Template-Boost engine: templates={templates_count} entries, "
+                f"template_patterns={template_patterns_count} entries loaded from {path}"
+            )
         return result
     except Exception as e:
         logger.error(f"Error loading keywords: {e}")
@@ -867,8 +923,8 @@ def get_memory_info() -> Dict[str, Any]:
     return {"rss_mb": 0, "vms_mb": 0, "percent": 0.0}
 
 logger.info(
-    f"config.py v13.0 loaded | Accounts: {len(ACCOUNTS)} | Workers: {CFG.PROCESSING_WORKERS} | "
+    f"config.py v13.1 loaded | Accounts: {len(ACCOUNTS)} | Workers: {CFG.PROCESSING_WORKERS} | "
     f"DB_URL: {'YES' if os.getenv('DATABASE_URL') else 'NO'} | "
     f"DASHBOARD: {'ON' if CFG.DASHBOARD_ENABLED else 'OFF'} | "
-    f"INTENT_ENGINE: v13.0"
+    f"INTENT_ENGINE: v13.1 (template-boost fix applied)"
 )
