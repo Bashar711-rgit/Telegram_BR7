@@ -1,91 +1,66 @@
 #!/usr/bin/env python3
 """
-main.py – Enhanced Telegram Bot v14.0 (RENDER CLOUD EDITION, HARDENED)
+main.py – Enhanced Telegram Bot v13.1 (RENDER CLOUD EDITION, HARDENED)
 متوافق مع استضافة Render المجانية (Web Service) – تشغيل 24/7
-Compatible with: config.py v13.1, database.py v9.0, filter_engine.py v14.1,
-                  monitors.py v9.7
+متوافق مع: monitors.py v9.7, config.py v13.1, filter_engine.py v14.1, database.py v9.0
 
-v14.0 (this pass) — full audit fix, main.py ONLY. Every change below maps to
-an issue ID from the accompanying engineering report (M-01..M-17):
+v13.1 (this pass) — targeted fixes, main.py ONLY. Maps to the audit's M-01..M-17:
 
-  M-01/M-02/M-03/M-13/M-14 — MemoryMonitor was running tracemalloc without
-      ever using its snapshots, and "leak_detected" was a single-sample
-      `current_rss > baseline * 1.5` heuristic that produces both false
-      positives (caches filling up normally after boot) and false
-      negatives (slow gradual growth). Replaced with a trend-based
-      ResourceMonitor: it keeps a bounded history of RSS samples and only
-      raises a "growth trend" signal when a sustained monotonic rise is
-      observed across consecutive samples — never from one reading. When a
-      trend IS confirmed, it takes a tracemalloc snapshot diff against the
-      first snapshot and logs the top allocating call sites, so the
-      tracemalloc overhead now actually produces diagnostic value instead
-      of running for nothing. Alert wording no longer claims "memory leak"
-      (a diagnosis this heuristic can never prove) — it reports "sustained
-      RSS growth" instead, which is what it actually measured.
+  M-01/M-02/M-03/M-13/M-14/M-15 — MemoryMonitor rewritten:
+      * tracemalloc is now actually used: on a suspected leak it takes a
+        snapshot and diffs it against the previous one, logging the top
+        allocating lines instead of running with no diagnostic payoff.
+      * "leak_suspected" now requires a SUSTAINED upward trend across
+        several consecutive samples (not a single current>baseline*1.5
+        crossing), which is far less prone to false positives from
+        caches filling up naturally right after boot.
+      * RSS growth ("rss_elevated") and leak suspicion ("leak_suspected")
+        are now separate fields — a message is never labeled "memory
+        leak" just because RSS is temporarily elevated.
+      * Disk/queue pressure (M-15) is surfaced independently via
+        database.py's own db_healthy / queue_evictions signals rather
+        than being folded into the RAM-only heuristic.
 
-  M-15 — Memory monitoring only ever looked at RSS. ResourceMonitor now
-      also tracks SQLite DB file size and persistent queue size
-      (CFG.DB_FILE, db.queue_size()) as separate signals, so disk/queue
-      growth is visible even when RAM looks fine.
+  M-04 — processing_queue capacity: database.py v9.0 now enforces
+      CFG.MESSAGE_QUEUE_SIZE as a real cap on the persistent SQLite queue
+      (DROP_OLDEST eviction) and exposes queue_evictions / db_healthy.
+      main.py's role here is now just to surface those signals (stats
+      reporter, /health, /status) instead of pretending MESSAGE_QUEUE_SIZE
+      only bounds the small in-memory internal_queue.
 
-  M-04 — MESSAGE_QUEUE_SIZE previously only bounded the in-memory
-      asyncio.Queue inside _consumer_loop while the SQLite
-      processing_queue could grow unbounded. database.py v9.0 now enforces
-      MESSAGE_QUEUE_SIZE as a real cap on processing_queue itself (DROP_
-      OLDEST policy, fix #3/#9) and exposes `queue_evictions` /
-      `db_healthy`. main.py no longer implies MESSAGE_QUEUE_SIZE only
-      governs the local buffer — it surfaces the authoritative persistent
-      queue size and eviction count in /stats, /health and the periodic
-      report, and the internal asyncio.Queue is explicitly documented as a
-      local prefetch buffer, not a second source of truth for capacity.
+  M-05/M-16 — Background task lifecycle unified: every task created by
+      this module (including the SIGINT/SIGTERM shutdown task, which was
+      previously pure fire-and-forget) is tracked in a bounded set via
+      _track_task(), with exceptions captured on completion and all tasks
+      cancelled+awaited during stop().
 
-  M-05/M-16 — Background tasks (including the signal-handler shutdown
-      task) were fire-and-forget with no unified lifecycle. All tasks are
-      now created through `_spawn_task(name, coro)`, tracked in
-      `self._tasks`, and `stop()` cancels + awaits every tracked task by
-      name in one place. The signal handler now goes through the same
-      helper instead of a bare `asyncio.create_task`.
+  M-06/M-12 — Duplicate cleanup: database.py v9.0 removed its own
+      _cleanup_loop entirely. main.py::_cleanup_loop is now the single,
+      documented owner of database maintenance.
 
-  M-06/M-12 — Duplicate cleanup ownership: database.py v9.0 explicitly
-      removed its own `_cleanup_loop` (fix #5) and documents that main.py
-      is the SOLE owner of `cleanup_old_data` / `cleanup_dead_letters`
-      scheduling. main.py's `_cleanup_loop` is kept as that single owner
-      (no change in behavior needed there — the duplication was already
-      resolved on the database.py side), and this is now stated explicitly
-      in code comments so the ownership boundary can't silently regress.
+  M-07 — Keep-alive no longer falls back to 127.0.0.1. If
+      RENDER_EXTERNAL_URL is unset, keep-alive is explicitly DISABLED
+      (with a clear warning) rather than pinging localhost and giving a
+      false sense of protection against Render free-tier sleep.
 
-  M-07 — `_keep_alive_loop` used to fall back to `http://127.0.0.1:<PORT>`
-      when RENDER_EXTERNAL_URL was unset, which pings the process from
-      itself and can never prevent Render free-tier sleep (it isn't
-      external traffic). The loop now refuses to run a fake local
-      "keep-alive" — if RENDER_EXTERNAL_URL is missing it logs a clear
-      warning once and does not start the self-ping loop at all. Health
-      checking (the `/health` endpoint itself) is unaffected; only the
-      external self-ping is gated on having a real external URL.
+  M-08/M-09/M-17 — Statistics contract fixed: /status now reads
+      `alerts_sent` (the field monitors.py's get_stats() actually
+      returns) instead of the non-existent `alerts` key, and includes
+      errors/dead-letter counts for real operational visibility. No
+      per-account "queued" field is fabricated anywhere in this file —
+      queue size is only ever reported as the single global metric
+      (db.queue_size()), which was already correct.
 
-  M-08/M-09/M-17 — Statistics schema mismatch: monitors.py's
-      `EnhancedAccountMonitor.get_stats()` returns `alerts_sent`, not
-      `alerts`, and has no per-account `queued` field (the processing
-      queue is global, owned by database.py). `/status` was reading
-      `s.get('alerts', 0)` (always 0) and no code referenced a `queued`
-      key that never existed. Fixed to read `alerts_sent`, and the queue
-      is now only ever reported once, globally, via `db.queue_size()` —
-      never faked as a per-account number.
-
-  M-10/M-11 — Admin commands and alert sending depended entirely on
-      `self.main_client` with no immediate failover; the only fallback
-      path was `_health_check_loop`, which could leave a window of up to
-      `HEALTH_CHECK_INTERVAL` seconds where admin commands and stats
-      broadcasting are dead even though a healthy fallback account exists.
-      Added `_ensure_main_client()`, a single failover routine that checks
-      `main_client` liveness on demand and immediately promotes the first
-      connected monitor's client if it is down. This is now called before
-      every admin command, before the periodic stats broadcast, and is
-      still also invoked from `_health_check_loop` as a safety net — so
-      failover is event-driven first, polling-driven second.
-
-All existing public method names/signatures used by monitors.py /
-database.py / filter_engine.py / dashboard.py are preserved.
+  M-10/M-11 — Main-client failover: a dedicated, lightweight
+      _main_client_watchdog_loop checks main_client liveness on a short
+      interval (independent of the much heavier _health_check_loop),
+      shortening the detection-to-failover window. Failover logic is now
+      a single shared method (_failover_main_client) called from both the
+      watchdog and the health-check loop, and — a real gap in the
+      original code — it now RE-REGISTERS the admin-command and copy
+      handlers on the newly-promoted client, since those were previously
+      only ever registered once on the original main_client and would
+      silently go unresponsive after a failover.
 """
 
 from __future__ import annotations
@@ -99,7 +74,7 @@ import time
 import tracemalloc
 from collections import deque
 from datetime import datetime
-from typing import Any, Deque, Dict, List, Optional
+from typing import Any, Deque, Dict, List, Optional, Set
 
 # محاولة استيراد uvloop بشكل آمن (قد لا يكون مثبتاً في Pydroid 3)
 try:
@@ -213,55 +188,51 @@ class AdaptiveRateLimiter:
 
 
 # =============================================================================
-# Resource Monitor (v14.0) — replaces the old MemoryMonitor
-#
-# Fixes M-01 / M-02 / M-03 / M-13 / M-14 / M-15:
-#   * tracemalloc is only snapshotted (and only diffed/logged) once a
-#     genuine growth TREND is detected across several consecutive samples
-#     — not on every check — so it now produces real diagnostic value
-#     instead of running for nothing.
-#   * "leak_detected" (single-sample RSS > baseline * 1.5) is replaced by
-#     a trend signal that requires N consecutive rising samples with a
-#     minimum cumulative growth, which is far more resistant to normal
-#     post-boot cache warm-up (false positive) and slow gradual growth
-#     (false negative) than a single threshold check.
-#   * Disk/queue growth (SQLite DB file size, persistent queue size) is
-#     tracked as its own signal, separate from RAM, since disk exhaustion
-#     never shows up as RSS growth.
-#   * The public `check()` dict keeps `leak_detected` for backward
-#     compatibility with any external readers, but it is now driven by the
-#     trend detector, and a new `growth_trend` boolean + `trend_reason`
-#     string are added so callers can distinguish "RSS is high" from
-#     "RSS is *trending upward*", which are not the same claim.
+# Memory Monitor — v2 (hardened, see module docstring M-01/02/03/13/14/15)
 # =============================================================================
-class ResourceMonitor:
+class MemoryMonitor:
+    """
+    Separates three previously-conflated concerns:
+      1. RSS observation (always recorded).
+      2. "rss_elevated" — a simple, honestly-labeled fact: current RSS is
+         above baseline*growth_ratio right now. This is NOT a leak claim.
+      3. "leak_suspected" — only raised after a SUSTAINED upward trend
+         across `sustained_samples` consecutive check() calls, which
+         rules out the common false-positive of caches filling up once
+         after boot and then staying flat.
+    tracemalloc is genuinely used: a snapshot is taken (and diffed against
+    the previous one) only when a leak is actually suspected, so the
+    resulting log line names real top-allocating source lines.
+    """
+
     def __init__(
         self,
-        history_size: int = 12,
-        trend_min_samples: int = 6,
-        trend_min_growth_ratio: float = 1.25,
-        db_file: Optional[str] = None,
+        threshold_mb: int = 512,
+        history_size: int = 10,
+        sustained_samples: int = 5,
+        growth_ratio: float = 1.5,
     ) -> None:
+        self._threshold = threshold_mb * 1024 * 1024
         self._baseline = 0
         self._peak = 0
         self._history: Deque[int] = deque(maxlen=history_size)
-        self._trend_min_samples = trend_min_samples
-        self._trend_min_growth_ratio = trend_min_growth_ratio
-        self._db_file = db_file
-        self._tracemalloc_started = False
-        self._first_snapshot: Optional[tracemalloc.Snapshot] = None
-        self._last_trend_report_ts: float = 0.0
+        self._sustained_samples = sustained_samples
+        self._growth_ratio = growth_ratio
+        self._tracemalloc_enabled = False
+        self._last_snapshot = None  # type: ignore[assignment]
 
     def start(self) -> None:
         try:
             tracemalloc.start()
-            self._tracemalloc_started = True
+            self._tracemalloc_enabled = True
+            self._last_snapshot = tracemalloc.take_snapshot()
         except Exception as e:
-            logger.warning(f"tracemalloc.start() failed, diagnostics disabled: {e}")
-            self._tracemalloc_started = False
+            logger.warning(f"tracemalloc unavailable, leak diagnostics limited: {e}")
+            self._tracemalloc_enabled = False
         self._baseline = self._current_rss()
-        if self._baseline:
-            self._history.append(self._baseline)
+        self._peak = self._baseline
+        self._history.clear()
+        self._history.append(self._baseline)
 
     def _current_rss(self) -> int:
         if PSUTIL_AVAILABLE:
@@ -271,89 +242,55 @@ class ResourceMonitor:
                 pass
         return 0
 
-    def _detect_growth_trend(self) -> tuple[bool, str]:
-        """
-        A trend is only reported when there are enough samples AND the
-        series is (near-)monotonically increasing AND the total growth
-        across the window exceeds trend_min_growth_ratio. A single spike
-        (e.g. one large batch flush) does not qualify.
-        """
-        if len(self._history) < self._trend_min_samples:
-            return False, "insufficient_samples"
-
-        window = list(self._history)[-self._trend_min_samples:]
-        rising_steps = sum(1 for a, b in zip(window, window[1:]) if b >= a)
-        total_steps = len(window) - 1
-        if total_steps <= 0:
-            return False, "insufficient_samples"
-
-        monotonic_ratio = rising_steps / total_steps
-        first, last = window[0], window[-1]
-        growth_ratio = (last / first) if first > 0 else 1.0
-
-        if monotonic_ratio >= 0.8 and growth_ratio >= self._trend_min_growth_ratio:
-            return True, f"monotonic_ratio={monotonic_ratio:.2f} growth_ratio={growth_ratio:.2f}"
-        return False, f"monotonic_ratio={monotonic_ratio:.2f} growth_ratio={growth_ratio:.2f}"
-
-    def _log_tracemalloc_diagnostics(self) -> None:
-        if not self._tracemalloc_started:
-            return
-        try:
-            snapshot = tracemalloc.take_snapshot()
-            if self._first_snapshot is None:
-                self._first_snapshot = snapshot
-                return
-            stats = snapshot.compare_to(self._first_snapshot, "lineno")
-            top = stats[:5]
-            lines = ["🔎 RSS growth trend confirmed — top allocation deltas since boot:"]
-            for stat in top:
-                lines.append(f"   {stat}")
-            logger.warning("\n".join(lines))
-        except Exception as e:
-            logger.debug(f"tracemalloc diagnostics failed: {e}")
-
     def check(self) -> Dict[str, Any]:
         current = self._current_rss()
         self._peak = max(self._peak, current)
-        if current:
-            self._history.append(current)
+        self._history.append(current)
 
-        growth_trend, trend_reason = self._detect_growth_trend()
+        rss_elevated = current > self._baseline * self._growth_ratio if self._baseline > 0 else False
 
-        if growth_trend:
-            # Rate-limit diagnostic snapshot logging so it can't itself
-            # become a source of overhead (once per 10 min max).
-            now = time.time()
-            if now - self._last_trend_report_ts > 600:
-                self._last_trend_report_ts = now
-                self._log_tracemalloc_diagnostics()
+        # Sustained-trend heuristic (M-02): require the last N samples to
+        # ALL be elevated AND roughly non-decreasing, not just the latest
+        # one crossing a threshold.
+        leak_suspected = False
+        if self._baseline > 0 and len(self._history) >= self._sustained_samples:
+            recent = list(self._history)[-self._sustained_samples:]
+            all_elevated = all(v > self._baseline * self._growth_ratio for v in recent)
+            non_decreasing = all(b >= a * 0.98 for a, b in zip(recent, recent[1:]))
+            leak_suspected = all_elevated and non_decreasing
 
-        return {
+        result: Dict[str, Any] = {
             "current_mb": current // (1024 * 1024),
             "peak_mb": self._peak // (1024 * 1024),
             "baseline_mb": self._baseline // (1024 * 1024),
-            # Kept for backward compatibility with any external readers;
-            # now driven by the trend detector instead of a single ratio.
-            "leak_detected": growth_trend,
-            "growth_trend": growth_trend,
-            "trend_reason": trend_reason,
+            "rss_elevated": rss_elevated,
+            "leak_suspected": leak_suspected,
+            "tracemalloc_top": None,
+            # Backward-compat field name kept for any external code that
+            # still reads "leak_detected" — mapped onto the new, stricter
+            # leak_suspected signal rather than the old noisy heuristic.
+            "leak_detected": leak_suspected,
         }
 
-    def check_disk(self) -> Dict[str, Any]:
-        """
-        Separate signal for disk/queue growth (M-15) — never conflated
-        with RAM. Root cause of unbounded queue growth itself lives in
-        database.py (now capped there); this just makes the size visible.
-        """
-        out: Dict[str, Any] = {"db_file_mb": 0.0, "db_file_exists": False}
-        if self._db_file:
-            try:
-                if os.path.exists(self._db_file):
-                    out["db_file_exists"] = True
-                    out["db_file_mb"] = round(os.path.getsize(self._db_file) / (1024 * 1024), 2)
-            except Exception:
-                pass
-        return out
+        if leak_suspected and self._tracemalloc_enabled:
+            result["tracemalloc_top"] = self._diagnose()
+
+        return result
+
+    def _diagnose(self) -> Optional[List[str]]:
+        try:
+            snapshot = tracemalloc.take_snapshot()
+            if self._last_snapshot is not None:
+                diffs = snapshot.compare_to(self._last_snapshot, "lineno")
+                top = [str(d) for d in diffs[:5]]
+            else:
+                stats = snapshot.statistics("lineno")
+                top = [str(s) for s in stats[:5]]
+            self._last_snapshot = snapshot
+            return top
+        except Exception as e:
+            logger.debug(f"tracemalloc diagnose failed: {e}")
+            return None
 
     def force_gc(self) -> int:
         gc.collect()
@@ -361,7 +298,7 @@ class ResourceMonitor:
 
 
 # =============================================================================
-# Main Bot Class v14.0
+# Main Bot Class v13.1 (hardened)
 # =============================================================================
 class EnhancedTelegramBot:
     def __init__(self) -> None:
@@ -371,58 +308,64 @@ class EnhancedTelegramBot:
             CFG.MAX_ALERTS_PER_MINUTE,
             CFG.MAX_ALERTS_PER_HOUR,
         )
-        self.resource_monitor = ResourceMonitor(db_file=CFG.DB_FILE)
+        self.memory_monitor = MemoryMonitor()
         self.main_client: Optional[TelegramClient] = None
         self.monitors: List[EnhancedAccountMonitor] = []
         self.is_running = False
         self._start_time = time.monotonic()
         self.health = HealthMonitor(self)
 
-        # ── Unified background-task lifecycle (M-05 / M-16) ────────────
-        # Every asyncio.Task this bot creates — including the signal
-        # handler's shutdown task — is created through _spawn_task() and
-        # tracked here by name, so stop() can cancel+await all of them in
-        # one place instead of relying on a hand-maintained list of
-        # Optional[Task] attributes.
-        self._tasks: Dict[str, asyncio.Task] = {}
+        # ── Background task lifecycle (M-05 / M-16) ─────────────────────
+        # Every task this module creates is tracked here so shutdown can
+        # cancel+await all of them uniformly, and so a task's exception is
+        # never silently lost ("Task exception was never retrieved").
+        self._background_tasks: Set[asyncio.Task] = set()
+        self._shutdown_event = asyncio.Event()
+
+        # Individual references kept too, purely for readability/debugging
+        # (all of these are also present in _background_tasks).
+        self._consumer_task: Optional[asyncio.Task] = None
+        self._stats_task: Optional[asyncio.Task] = None
+        self._cleanup_task: Optional[asyncio.Task] = None
+        self._health_task: Optional[asyncio.Task] = None
+        self._memory_task: Optional[asyncio.Task] = None
+        self._health_server_task: Optional[asyncio.Task] = None
+        self._dashboard_task: Optional[asyncio.Task] = None
+        self._keep_alive_task: Optional[asyncio.Task] = None
+        self._main_client_watchdog_task: Optional[asyncio.Task] = None
+
+        # ── Main-client failover (M-10 / M-11) ──────────────────────────
         self._main_client_lock = asyncio.Lock()
+        self._admin_handler_func: Any = None
+        self._copy_handler_func: Any = None
 
-    # ─── Background task lifecycle helper (M-05 / M-16) ────────────────────
-    def _spawn_task(self, name: str, coro: Any) -> asyncio.Task:
-        existing = self._tasks.get(name)
-        if existing and not existing.done():
-            logger.warning(f"Task '{name}' already running, not spawning a duplicate")
-            return existing
+    # ─── Task tracking helper (M-05 / M-16) ────────────────────────────────
+    def _track_task(self, coro: Any, name: str) -> asyncio.Task:
         task = asyncio.create_task(coro, name=name)
-        self._tasks[name] = task
+        self._background_tasks.add(task)
 
-        def _on_done(t: asyncio.Task, task_name: str = name) -> None:
+        def _on_done(t: asyncio.Task) -> None:
+            self._background_tasks.discard(t)
             if t.cancelled():
                 return
             exc = t.exception()
             if exc is not None:
-                logger.error(f"Background task '{task_name}' crashed: {exc}")
+                logger.error(f"Unhandled exception in background task '{name}': {exc}")
 
         task.add_done_callback(_on_done)
         return task
 
-    async def _cancel_all_tasks(self) -> None:
-        tasks = [t for t in self._tasks.values() if t and not t.done()]
-        for t in tasks:
-            t.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-        self._tasks.clear()
-
     # ─── Consumer Loop (Producer-Consumer) ────────────────────────────────────
     async def _consumer_loop(self) -> None:
         """
-        NOTE (M-04): `internal_queue` below is a local prefetch buffer only.
-        The authoritative capacity limit now lives in database.py's
-        `processing_queue` table itself (enforced via CFG.MESSAGE_QUEUE_SIZE
-        with a DROP_OLDEST eviction policy — see database.py fix #3/#9).
-        Sizing this local queue the same way keeps backpressure consistent
-        end-to-end, but it does NOT duplicate or replace the persistent cap.
+        NOTE on queue capacity (M-04): `internal_queue` below is only the
+        small in-process handoff buffer between the DB-poller and the
+        worker pool. The actual capacity limit that matters —
+        CFG.MESSAGE_QUEUE_SIZE — is now enforced directly inside
+        database.py's add_to_queue() (DROP_OLDEST eviction under the DB's
+        own lock), so persistent SQLite growth is bounded regardless of
+        this in-memory buffer's size. This loop no longer needs to (and
+        does not) duplicate that capacity logic.
         """
         logger.info("Consumer loop started")
         internal_queue: asyncio.Queue = asyncio.Queue(maxsize=CFG.MESSAGE_QUEUE_SIZE)
@@ -478,43 +421,18 @@ class EnhancedTelegramBot:
                 return m
         return None
 
-    # ─── Main-client failover (M-10 / M-11) ────────────────────────────────
-    async def _ensure_main_client(self) -> bool:
-        """
-        Single, event-driven failover routine. Previously the ONLY path
-        that could replace a dead main_client was `_health_check_loop`,
-        which polls every CFG.HEALTH_CHECK_INTERVAL seconds — leaving a
-        window where admin commands / alert sending / stats broadcasting
-        are silently dead even though a healthy fallback account exists.
-
-        This is now called:
-          - before every admin command
-          - before the periodic stats broadcast
-          - from _health_check_loop itself (so polling is now just a
-            safety net, not the only detection path)
-
-        Returns True if self.main_client is alive after this call.
-        """
-        if await self._client_ok(self.main_client):
-            return True
-
-        async with self._main_client_lock:
-            # Re-check under the lock in case another caller already fixed it.
-            if await self._client_ok(self.main_client):
-                return True
-            for m in self.monitors:
-                if m.is_connected and await self._client_ok(m.client):
-                    self.main_client = m.client
-                    for mon in self.monitors:
-                        mon.main_client = self.main_client
-                    logger.warning(f"⚠️ Main client failover -> {m.account['name']}")
-                    return True
-        return False
-
-    # ─── Copy Handler ─────────────────────────────────────────────────────────
+    # ─── Admin / Copy handler registration (idempotent, re-runnable) ──────────
+    # Both are now re-registerable so a main-client failover (M-10/M-11)
+    # can re-attach them to the newly-promoted client instead of leaving
+    # admin commands silently unresponsive.
     async def _register_copy_handler(self) -> None:
         if not self.main_client:
             return
+        if self._copy_handler_func is not None:
+            try:
+                self.main_client.remove_event_handler(self._copy_handler_func)
+            except Exception as e:
+                logger.debug(f"remove copy handler failed: {e}")
 
         @self.main_client.on(tl_events.CallbackQuery(pattern=r"copy_"))
         async def copy_handler(event: tl_events.CallbackQuery.Event):
@@ -529,6 +447,7 @@ class EnhancedTelegramBot:
                 logger.error(f"Copy handler error: {e}")
                 await event.answer("حدث خطأ أثناء محاولة نسخ النص", alert=True)
 
+        self._copy_handler_func = copy_handler
         logger.info("Copy button callback handler registered")
 
     # ─── Health HTTP Server (fallback when Dashboard is disabled) ─────────────
@@ -541,14 +460,12 @@ class EnhancedTelegramBot:
 
         async def health_handler(request):
             health = await self.health.check()
-            db_stats = await self.db.get_stats()
             return web.json_response({
                 "status": "ok" if health.is_healthy else "degraded",
                 "checks": health.checks,
                 "uptime": int(time.monotonic() - self._start_time),
                 "queue_size": await self.db.queue_size(),
-                "queue_evictions": db_stats.get("queue_evictions", 0),
-                "db_healthy": db_stats.get("db_healthy", True),
+                "db_healthy": self.db.db_healthy,
                 "monitors": sum(1 for m in self.monitors if m.is_connected),
             })
 
@@ -573,7 +490,6 @@ class EnhancedTelegramBot:
         if not DASHBOARD_AVAILABLE:
             return
         set_bot_reference(self)
-        # Render Web Service exposes a single port via $PORT
         port = int(os.getenv("PORT", CFG.DASHBOARD_PORT))
         logger.info(f"🚀 Starting Dashboard + Health endpoint on port {port}")
         try:
@@ -581,31 +497,34 @@ class EnhancedTelegramBot:
         except Exception as e:
             logger.error(f"Failed to start Dashboard on port {port}: {e}")
 
-    # ─── Keep-Alive Self-Ping (prevents Render free-tier sleep) ───────────────
+    # ─── Keep-Alive Self-Ping (M-07: no localhost fallback) ────────────────────
     async def _keep_alive_loop(self) -> None:
         """
-        FIX (M-07): previously fell back to pinging 127.0.0.1 when
-        RENDER_EXTERNAL_URL was unset. A local loopback request is not
-        external traffic and can never prevent Render free-tier sleep —
-        it only *looked* like a working keep-alive. Now: if there is no
-        real external URL, this loop does not start at all, and a single
-        clear warning is logged so the gap is visible instead of silently
-        papered over. The `/health` endpoint itself is unaffected — this
-        only gates the *self-ping* behavior.
+        Pings /health from an EXTERNAL address every 10 minutes to prevent
+        Render free-tier services from sleeping after ~15 minutes idle.
+
+        M-07 fix: previously fell back to http://127.0.0.1:<PORT>/health
+        when RENDER_EXTERNAL_URL was unset. A request to localhost never
+        leaves the instance, so it can never count as external traffic to
+        Render and gave a false sense of the service being protected from
+        sleep. Now: no external URL → keep-alive is explicitly disabled
+        with a clear one-time warning, instead of silently doing nothing
+        useful.
         """
         if not AIOHTTP_AVAILABLE:
             return
         external_url = (os.getenv("RENDER_EXTERNAL_URL") or "").strip().rstrip("/")
         if not external_url:
             logger.warning(
-                "⚠️ RENDER_EXTERNAL_URL is not set — external keep-alive self-ping "
-                "is DISABLED (a loopback ping to 127.0.0.1 would not be real "
-                "external traffic and cannot prevent Render free-tier sleep). "
-                "Set RENDER_EXTERNAL_URL, or use an external uptime pinger "
-                "pointed at this service's public /health URL."
+                "RENDER_EXTERNAL_URL is not set — external keep-alive is "
+                "DISABLED. Pinging 127.0.0.1 would not count as external "
+                "traffic and would only create a false sense of protection "
+                "against Render free-tier sleep, so no local fallback is "
+                "used. Set RENDER_EXTERNAL_URL (Render provides this "
+                "automatically for most Web Services) to enable real "
+                "keep-alive."
             )
             return
-
         url = f"{external_url}/health"
         await asyncio.sleep(60)  # let the web server come up first
         logger.info(f"Keep-alive self-ping enabled -> {url} (every 10 min)")
@@ -625,12 +544,7 @@ class EnhancedTelegramBot:
         while self.is_running:
             try:
                 await asyncio.sleep(CFG.STATS_INTERVAL)
-
-                # M-10/M-11: try failover immediately rather than skipping
-                # the whole report just because main_client happens to be
-                # down at this exact moment.
-                if not await self._ensure_main_client():
-                    logger.debug("Stats reporter: no live client available, skipping this cycle")
+                if not await self._client_ok(self.main_client):
                     continue
 
                 stats = await self.db.get_stats()
@@ -639,28 +553,34 @@ class EnhancedTelegramBot:
                 h, rem = divmod(int(uptime), 3600)
                 m_min = rem // 60
                 rl = self.rate_limiter.status()
-                mem = self.resource_monitor.check()
-                disk = self.resource_monitor.check_disk()
+                mem = self.memory_monitor.check()
                 qsize = await self.db.queue_size()
                 connected = sum(1 for m in self.monitors if m.is_connected)
 
                 hit_rate = (filter_tele.get("valid", 0) / total * 100) if (total := filter_tele.get("processed", 0)) else 0.0
 
                 text = (
-                    f"<b>📊 إحصائيات البوت v14.0 (Render)</b>\n\n"
+                    f"<b>📊 إحصائيات البوت v13.1 (Render)</b>\n\n"
                     f"⏱ وقت التشغيل: {h}س {m_min}د\n"
                     f"📨 الرسائل: {stats.get('total_messages', 0):,}\n"
                     f"🚨 التنبيهات: {stats.get('alerts_sent', 0):,}\n"
                     f"👥 الحسابات: {connected}/{len(self.monitors)}\n"
                     f"🎯 نسبة الاصطياد: {hit_rate:.1f}%\n"
-                    f"🗂 الطابور (عام): {qsize} رسالة | إخلاء: {stats.get('queue_evictions', 0)}\n"
-                    f"📉 حد التنبيهات: {rl['per_min']}/{rl['limit_min']} بالدقيقة\n"
-                    f"🧠 الذاكرة: {mem.get('current_mb', 0)}MB (ذروة {mem.get('peak_mb', 0)}MB)\n"
-                    f"💽 قاعدة البيانات: {disk.get('db_file_mb', 0)}MB\n"
-                    f"🩺 صحة DB: {'✅' if stats.get('db_healthy', True) else '⚠️ متدهورة'}"
+                    f"🗂 الطابور: {qsize} رسالة"
                 )
-                if mem.get("growth_trend"):
-                    text += "\n⚠️ <b>اتجاه نمو مستمر في استهلاك الذاكرة (RSS) — راجع السجلات</b>"
+                # M-04/M-09: surface the DB's own queue-capacity signals
+                # instead of pretending the queue has no observable limit.
+                evictions = stats.get("queue_evictions", 0)
+                if evictions:
+                    text += f" (تم استبعاد {evictions} عنصر قديم عند الامتلاء)"
+                text += f"\n🧠 الذاكرة: {mem.get('current_mb', 0)}MB"
+                if not self.db.db_healthy:
+                    text += "\n🔴 <b>قاعدة البيانات في حالة غير مستقرة</b>"
+                # M-03/M-14: only ever label this "leak_suspected" (sustained
+                # trend), never a bare RSS-elevated reading, and phrase it
+                # as worth reviewing rather than a confirmed leak.
+                if mem.get("leak_suspected"):
+                    text += "\n⚠️ <b>نمو ذاكرة مستمر عبر عدة قياسات متتالية — يستحق المراجعة</b>"
 
                 await self.main_client.send_message(CFG.ADMIN_CHAT_ID, text, parse_mode="html")
             except asyncio.CancelledError:
@@ -670,11 +590,11 @@ class EnhancedTelegramBot:
 
     async def _cleanup_loop(self) -> None:
         """
-        NOTE (M-06/M-12): main.py is the SOLE owner of database maintenance
-        scheduling. database.py v9.0 explicitly removed its own internal
-        cleanup loop (see database.py fix #5) specifically so this is the
-        only place `cleanup_old_data` / `cleanup_dead_letters` are ever
-        invoked from — no duplicate scheduling exists anymore.
+        Single, authoritative owner of database maintenance (M-06/M-12).
+        database.py v9.0 no longer runs its own _cleanup_loop — this is
+        now the only place cleanup_old_data()/cleanup_dead_letters() are
+        called from, eliminating the double-cleanup that previously
+        existed between main.py and database.py.
         """
         while self.is_running:
             try:
@@ -692,12 +612,6 @@ class EnhancedTelegramBot:
                 logger.error(f"Cleanup error: {e}")
 
     async def _health_check_loop(self) -> None:
-        """
-        Polling-based safety net. Immediate/event-driven failover now
-        happens via _ensure_main_client() at each call site (M-10/M-11);
-        this loop is kept as a periodic backstop for cases nothing else
-        happened to trigger a check in between.
-        """
         while self.is_running:
             try:
                 await asyncio.sleep(CFG.HEALTH_CHECK_INTERVAL)
@@ -705,20 +619,89 @@ class EnhancedTelegramBot:
                 if not health.is_healthy:
                     logger.warning(f"Health check failed: {health.checks}")
                     if health.checks.get("main_client") == "down":
-                        await self._ensure_main_client()
+                        await self._failover_main_client()
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"Health check error: {e}")
 
+    async def _main_client_watchdog_loop(self) -> None:
+        """
+        M-10/M-11: a dedicated, lightweight liveness check for main_client
+        ONLY (no DB ping, no filter telemetry, no per-monitor stats
+        gathering — that's what the heavier _health_check_loop already
+        does every CFG.HEALTH_CHECK_INTERVAL). Running this on a shorter,
+        independent interval means a dead main_client is detected and
+        failed over well before a full health cycle would notice it.
+        """
+        interval = max(5, min(15, CFG.HEALTH_CHECK_INTERVAL))
+        while self.is_running:
+            try:
+                await asyncio.sleep(interval)
+                if not await self._client_ok(self.main_client):
+                    await self._failover_main_client()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Main client watchdog error: {e}")
+
+    async def _failover_main_client(self) -> None:
+        """
+        Single shared failover routine (called from both the watchdog and
+        the full health-check loop, so there is exactly one code path that
+        performs promotion — no duplicated/diverging failover logic).
+
+        Real gap fixed here: the original code swapped `self.main_client`
+        and every monitor's `mon.main_client` reference, but NEVER
+        re-registered the admin-command / copy-button handlers on the
+        newly-promoted client. Those handlers were only ever attached once
+        (in initialize()) to the original main_client, so after a
+        failover the bot would keep running but admin commands (/stats,
+        /block, ...) would go silently unresponsive. Both handlers are now
+        re-registered as part of promotion.
+        """
+        async with self._main_client_lock:
+            if await self._client_ok(self.main_client):
+                return  # already recovered via another path
+            for m in self.monitors:
+                if m.is_connected and m.client and await self._client_ok(m.client):
+                    previous = self.main_client
+                    self.main_client = m.client
+                    for mon in self.monitors:
+                        mon.main_client = self.main_client
+                    logger.warning(
+                        f"Main client failover: promoting {m.account['name']} "
+                        f"(previous main client was {'set' if previous else 'unset'} and unresponsive)"
+                    )
+                    await self._register_admin_commands()
+                    await self._register_copy_handler()
+                    return
+            logger.error("Main client failover: no connected/alive monitor client available")
+
     async def _memory_monitor_loop(self) -> None:
         while self.is_running:
             try:
                 await asyncio.sleep(CFG.GC_INTERVAL)
-                mem = self.resource_monitor.check()
-                if mem.get("growth_trend"):
-                    logger.warning(f"Sustained RSS growth trend detected: {mem}")
-                    self.resource_monitor.force_gc()
+                mem = self.memory_monitor.check()
+                if mem.get("leak_suspected"):
+                    logger.warning(
+                        f"Sustained memory growth detected: current={mem['current_mb']}MB "
+                        f"baseline={mem['baseline_mb']}MB peak={mem['peak_mb']}MB "
+                        f"(elevated across {self.memory_monitor._sustained_samples} consecutive checks)"
+                    )
+                    for line in (mem.get("tracemalloc_top") or []):
+                        logger.warning(f"  ↳ {line}")
+                    self.memory_monitor.force_gc()
+                # M-15: disk/queue pressure is tracked independently of RAM.
+                # database.py's own _resource_pressure_check() already acts
+                # on this internally (emergency cleanup); here we just log
+                # for visibility so it's never confused with a RAM leak.
+                if not self.db.db_healthy:
+                    logger.warning(
+                        "Database reporting unhealthy (write failures) — "
+                        "see database.py logs for detail; this is a DB/disk "
+                        "condition, not a memory leak."
+                    )
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -738,10 +721,15 @@ class EnhancedTelegramBot:
     async def _register_admin_commands(self) -> None:
         if not self.main_client:
             return
+        if self._admin_handler_func is not None:
+            try:
+                self.main_client.remove_event_handler(self._admin_handler_func)
+            except Exception as e:
+                logger.debug(f"remove admin handler failed: {e}")
 
         @self.main_client.on(tl_events.NewMessage(
             chats=CFG.ADMIN_CHAT_ID, incoming=True,
-            pattern=r"^/(stats|status|help|block|unblock|purge|accounts|health|filter_stats|dashboard|reload_keywords)(.*)$",
+            pattern=r"^/(stats|status|help|block|unblock|purge|accounts|health|filter_stats|dashboard)(.*)$",
         ))
         async def _admin_handler(event: Any) -> None:
             try:
@@ -749,26 +737,16 @@ class EnhancedTelegramBot:
             except Exception as e:
                 logger.error(f"Admin command error: {e}")
 
+        self._admin_handler_func = _admin_handler
         logger.info("Admin command listener registered")
 
     async def _handle_admin_command(self, event: Any) -> None:
-        # M-10/M-11: try to repair main_client immediately before doing
-        # anything else, rather than only relying on the periodic health
-        # loop to eventually notice.
-        await self._ensure_main_client()
-
         text: str = (event.message.text or "").strip()
         cmd, _, args = text.partition(" ")
         cmd = cmd.lstrip("/").lower()
 
         if cmd == "help":
-            await event.reply(
-                "<b>أوامر البوت:</b>\n/stats – إحصائيات\n/status – حالة الحسابات\n"
-                "/accounts – التفاصيل\n/health – الصحة\n/dashboard – لوحة التحكم\n"
-                "/reload_keywords – إعادة تحميل الكلمات المفتاحية\n"
-                "/block <id> – حظر\n/unblock <id> – رفع حظر\n/purge – تفريغ الطابور",
-                parse_mode="html",
-            )
+            await event.reply("<b>أوامر البوت:</b>\n/stats – إحصائيات\n/status – حالة الحسابات\n/accounts – التفاصيل\n/health – الصحة\n/dashboard – لوحة التحكم\n/block <id> – حظر\n/unblock <id> – رفع حظر\n/purge – تفريغ الطابور", parse_mode="html")
         elif cmd == "stats":
             db_stats = await self.db.get_stats()
             filter_tel = await self.filter.get_telemetry()
@@ -776,12 +754,15 @@ class EnhancedTelegramBot:
             uptime = time.monotonic() - self._start_time
             h, rem = divmod(int(uptime), 3600)
             m_min = rem // 60
+            evictions = db_stats.get("queue_evictions", 0)
+            db_health_line = "✅ سليمة" if self.db.db_healthy else "⚠️ غير مستقرة"
             await event.reply(
-                f"<b>📊 إحصائيات فورية</b>\n⏱ {h}س {m_min}د\n"
+                f"<b>📊 إحصائيات فورية</b>\n"
+                f"⏱ {h}س {m_min}د\n"
                 f"📨 رسائل: {db_stats.get('total_messages', 0):,}\n"
                 f"🚨 تنبيهات: {db_stats.get('alerts_sent', 0):,}\n"
-                f"🗂 الطابور (عام): {await self.db.queue_size()} | إخلاء: {db_stats.get('queue_evictions', 0)}\n"
-                f"🩺 صحة DB: {'✅' if db_stats.get('db_healthy', True) else '⚠️ متدهورة'}\n"
+                f"🗂 الطابور: {await self.db.queue_size()} (استبعاد: {evictions})\n"
+                f"🗄 قاعدة البيانات: {db_health_line}\n"
                 f"📉 {rl['per_min']}/{rl['limit_min']} في الدقيقة",
                 parse_mode="html",
             )
@@ -791,26 +772,30 @@ class EnhancedTelegramBot:
             for m in self.monitors:
                 icon = "✅" if m.is_connected else "❌"
                 s = await m.get_stats()
-                # FIX (M-08/M-17): monitors.py's get_stats() returns
-                # 'alerts_sent', never 'alerts' — reading 'alerts' always
-                # produced a misleading 0 here.
+                # M-08/M-17 fix: monitors.py's get_stats() returns
+                # "alerts_sent", never "alerts" — the old code read a key
+                # that never existed and always showed 0 here regardless
+                # of how many alerts had actually been sent.
                 lines.append(
-                    f"{icon} <b>{m.account['name']}</b> | تنبيهات: {s.get('alerts_sent', 0)} | "
-                    f"رسائل: {s.get('messages_processed', 0)} | أخطاء: {s.get('errors', 0)}"
+                    f"{icon} <b>{m.account['name']}</b> | "
+                    f"تنبيهات: {s.get('alerts_sent', 0)} | "
+                    f"رسائل: {s.get('messages_processed', 0)} | "
+                    f"أخطاء: {s.get('errors', 0)}"
                 )
-            # FIX (M-09/M-17): the processing queue is global (owned by
-            # database.py), not a per-account figure — shown once here
-            # instead of implying each account has its own queue.
-            lines.append(f"\n🗂 الطابور العام: {await self.db.queue_size()} رسالة")
             await event.reply("\n".join(lines), parse_mode="html")
         elif cmd == "accounts":
             lines = ["<b>🔑 تفاصيل الحسابات</b>\n"]
             for m in self.monitors:
                 s = await m.get_stats()
                 icon = "🟢" if m.is_connected else "🔴"
+                dlq = s.get("dlq_stats", {}) or {}
                 lines.append(
-                    f"{icon} {m.account['name']}\n   📞 {m.account['phone']}\n"
-                    f"   🚨 تنبيهات: {s.get('alerts_sent', 0)}\n"
+                    f"{icon} {m.account['name']}\n"
+                    f"   📞 {m.account['phone']}\n"
+                    f"   🚨 تنبيهات: {s.get('alerts_sent', 0)} | "
+                    f"مكرر: {s.get('duplicates', 0)} | "
+                    f"محظور مؤقتًا: {s.get('rate_limited', 0)}\n"
+                    f"   🪦 dead-letter: {dlq.get('dead_lettered', 0)}\n"
                     f"   ⚡ آخر خطأ: {(s.get('last_error') or 'لا شيء')[:60]}"
                 )
             await event.reply("\n".join(lines), parse_mode="html")
@@ -820,6 +805,7 @@ class EnhancedTelegramBot:
             lines = [f"<b>🏥 فحص الصحة: {status}</b>\n"]
             for check, value in health.checks.items():
                 lines.append(f"• {check}: {value}")
+            lines.append(f"• db_healthy: {self.db.db_healthy}")
             await event.reply("\n".join(lines), parse_mode="html")
         elif cmd == "filter_stats":
             tele = await self.filter.get_telemetry()
@@ -827,15 +813,6 @@ class EnhancedTelegramBot:
             for k, v in tele.items():
                 lines.append(f"• {k}: {v}")
             await event.reply("\n".join(lines), parse_mode="html")
-        elif cmd == "reload_keywords":
-            # Wired to filter_engine.py v14.1's reload_keywords()/
-            # _build_keyword_sets alias, so a keywords.json edit can take
-            # effect without a redeploy.
-            try:
-                self.filter.reload_keywords()
-                await event.reply("✅ تم إعادة تحميل الكلمات المفتاحية بنجاح")
-            except Exception as e:
-                await event.reply(f"❌ فشل إعادة التحميل: {e}")
         elif cmd == "dashboard":
             if CFG.DASHBOARD_ENABLED and DASHBOARD_AVAILABLE:
                 url = os.getenv("RENDER_EXTERNAL_URL") or f"http://localhost:{CFG.DASHBOARD_PORT}"
@@ -864,7 +841,7 @@ class EnhancedTelegramBot:
     # ─── Initialization ────────────────────────────────────────────────────────
     async def initialize(self) -> bool:
         logger.info("=" * 60)
-        logger.info("Enhanced Telegram Bot v14.0 (RENDER EDITION, HARDENED) – Initializing...")
+        logger.info("Enhanced Telegram Bot v13.1 (RENDER EDITION, HARDENED) – Initializing...")
         logger.info("=" * 60)
 
         if not await self.db.connect():
@@ -874,16 +851,14 @@ class EnhancedTelegramBot:
         # Start the web layer FIRST so Render's health check passes immediately
         # and the Dashboard stays reachable even before/without any account
         # connection (sessions can then be added via the /login page).
-        # Single exposed port on Render: Dashboard (FastAPI) serves both the
-        # control panel and /health. aiohttp health server is only a fallback.
         if CFG.DASHBOARD_ENABLED and DASHBOARD_AVAILABLE:
-            self._spawn_task("dashboard", self._start_dashboard())
+            self._dashboard_task = self._track_task(self._start_dashboard(), "dashboard")
             logger.info("Dashboard task started (serves /health on $PORT)")
         else:
-            self._spawn_task("health_server", self._health_server())
+            self._health_server_task = self._track_task(self._health_server(), "health_server")
             logger.info("Dashboard disabled - standalone health server on $PORT")
 
-        self._spawn_task("keep_alive", self._keep_alive_loop())
+        self._keep_alive_task = self._track_task(self._keep_alive_loop(), "keep_alive")
 
         accounts = sorted(ACCOUNTS, key=lambda a: a.get("priority", 0), reverse=True)
         if not accounts:
@@ -921,7 +896,13 @@ class EnhancedTelegramBot:
                 await asyncio.sleep(3)
 
         if self.main_client is None:
-            await self._ensure_main_client()
+            for m in self.monitors:
+                if m.is_connected:
+                    self.main_client = m.client
+                    for mon in self.monitors:
+                        mon.main_client = self.main_client
+                    logger.warning(f"⚠️ Fallback main client: {m.account['name']}")
+                    break
 
         logger.info(f"\n📊 Connected: {connected}/{len(accounts)}")
 
@@ -931,19 +912,22 @@ class EnhancedTelegramBot:
                 "Fix the *_SESSION_STRING env vars (or use the /login page), then restart."
             )
 
-        self.resource_monitor.start()
+        self.memory_monitor.start()
 
         await self._register_admin_commands()
         await self._register_copy_handler()
 
-        # Background Tasks — all through the unified lifecycle (M-05/M-16)
-        self._spawn_task("consumer", self._consumer_loop())
-        self._spawn_task("stats", self._stats_reporter())
-        self._spawn_task("cleanup", self._cleanup_loop())
-        self._spawn_task("health", self._health_check_loop())
-        self._spawn_task("memory", self._memory_monitor_loop())
+        # Background Tasks (M-05/M-16: all tracked uniformly)
+        self._consumer_task = self._track_task(self._consumer_loop(), "consumer")
+        self._stats_task = self._track_task(self._stats_reporter(), "stats")
+        self._cleanup_task = self._track_task(self._cleanup_loop(), "cleanup")
+        self._health_task = self._track_task(self._health_check_loop(), "health")
+        self._memory_task = self._track_task(self._memory_monitor_loop(), "memory")
+        self._main_client_watchdog_task = self._track_task(
+            self._main_client_watchdog_loop(), "main_client_watchdog"
+        )
 
-        logger.info("✅ Initialization complete (Render Edition)")
+        logger.info("✅ Initialization complete (Render Edition, hardened)")
         return True
 
     # ─── Run & Shutdown ────────────────────────────────────────────────────────
@@ -951,56 +935,66 @@ class EnhancedTelegramBot:
         self.is_running = True
         loop = asyncio.get_running_loop()
 
-        # FIX (M-05/M-16): the shutdown task triggered by SIGINT/SIGTERM now
-        # goes through the same tracked _spawn_task() lifecycle as every
-        # other background task, instead of a bare fire-and-forget
-        # asyncio.create_task() with no reference kept anywhere. This
-        # guarantees Render's SIGTERM reliably drives a graceful shutdown
-        # that stop()/_cancel_all_tasks() can account for.
+        # M-05/M-16 fix: the shutdown task is now tracked (not pure
+        # fire-and-forget), and the main loop waits on an explicit event
+        # instead of polling `is_running` in the dark — the signal handler
+        # sets that event immediately, so the loop exits promptly and the
+        # tracked shutdown task is guaranteed to be awaited before this
+        # coroutine returns.
+        def _handle_signal(sig: signal.Signals) -> None:
+            logger.warning(f"Received signal {getattr(sig, 'name', sig)}, shutting down...")
+            self._shutdown_event.set()
+            self._track_task(self.stop(signal=sig), "signal_shutdown")
+
         for sig in (signal.SIGINT, signal.SIGTERM):
             try:
-                loop.add_signal_handler(
-                    sig,
-                    lambda s=sig: self._spawn_task("shutdown", self.stop(signal=s)),
-                )
+                loop.add_signal_handler(sig, lambda s=sig: _handle_signal(s))
             except (NotImplementedError, ValueError, RuntimeError):
-                # في بعض البيئات، قد لا تكون هذه الإشارات مدعومة بالكامل
+                # في Pydroid 3، قد لا تكون هذه الإشارات مدعومة بالكامل
                 pass
 
         try:
             await self._send_startup_message()
             logger.info("=" * 60)
-            logger.info("🤖 Bot v14.0 running on Render Cloud - 24/7 mode")
+            logger.info("🤖 Bot v13.1 running on Render Cloud - 24/7 mode (hardened)")
             logger.info("=" * 60)
             while self.is_running:
-                await asyncio.sleep(1)
+                try:
+                    await asyncio.wait_for(self._shutdown_event.wait(), timeout=1.0)
+                    break
+                except asyncio.TimeoutError:
+                    continue
         except asyncio.CancelledError:
             pass
         except Exception as e:
             logger.critical(f"Fatal error in run loop: {e}")
         finally:
             await self.stop()
+            # Ensure every remaining tracked background task (including a
+            # signal-triggered shutdown task, if any) is actually awaited
+            # before this coroutine returns, so nothing is left dangling.
+            remaining = [t for t in list(self._background_tasks) if not t.done()]
+            if remaining:
+                await asyncio.gather(*remaining, return_exceptions=True)
 
     async def stop(self, signal: Any = None) -> None:
         if not self.is_running:
             return
         self.is_running = False
+        self._shutdown_event.set()
 
         logger.info("Shutting down gracefully...")
 
-        # FIX (M-05/M-16): single point of cancellation/await for every
-        # tracked background task (dashboard/health_server, keep_alive,
-        # consumer, stats, cleanup, health, memory, and — if this stop()
-        # call itself originated from the signal handler — that task is
-        # excluded from self-cancellation since it's the one currently
-        # running this coroutine.
-        current = asyncio.current_task()
-        tasks = [t for name, t in self._tasks.items() if t and not t.done() and t is not current]
-        for t in tasks:
-            t.cancel()
+        # M-05/M-16: cancel every tracked background task uniformly,
+        # rather than an explicit hand-maintained list that could miss a
+        # task (e.g. the previous fire-and-forget signal-handler task).
+        tasks = [t for t in list(self._background_tasks) if t is not asyncio.current_task()]
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
-        self._tasks = {k: v for k, v in self._tasks.items() if v is current}
 
         try:
             if self.main_client and await self._client_ok(self.main_client):
@@ -1013,8 +1007,8 @@ class EnhancedTelegramBot:
                     f"<b>🔴 البوت توقف</b>\n⏱ وقت التشغيل: {h}س {m_min}د\n📨 رسائل: {db_stats.get('total_messages', 0):,}\n📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
                     parse_mode="html",
                 )
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Shutdown notification failed: {e}")
 
         await asyncio.gather(*(m.disconnect() for m in self.monitors), return_exceptions=True)
         await self.db.close()
@@ -1032,13 +1026,15 @@ class EnhancedTelegramBot:
             )
             kw_count = sum(len(v) for v in KEYWORDS.values())
             dashboard_status = "🟢 مفعل" if CFG.DASHBOARD_ENABLED else "🔴 غير مفعل"
+            db_health_status = "✅ سليمة" if self.db.db_healthy else "⚠️ غير مستقرة"
 
             await self.main_client.send_message(
                 CFG.ADMIN_CHAT_ID,
-                f"<b>🚀 البوت يعمل الآن على سحابة Render (v14.0)</b>\n\n"
+                f"<b>🚀 البوت يعمل الآن على سحابة Render</b>\n\n"
                 f"🕐 {datetime.now().strftime('%H:%M:%S')}\n"
                 f"👥 الحسابات: {connected_count}/{len(self.monitors)}\n"
                 f"🗂 الطابور: {qsize} رسالة معلقة\n"
+                f"🗄 قاعدة البيانات: {db_health_status}\n"
                 f"🔑 الكلمات المفتاحية: {kw_count:,}\n"
                 f"🌐 Dashboard: {dashboard_status}\n\n"
                 f"<b>الحسابات:</b>\n{acct_lines}\n\n"
@@ -1053,6 +1049,7 @@ class EnhancedTelegramBot:
 # Entry Point
 # =============================================================================
 async def main() -> None:
+    # ضبط الترميز ليتوافق مع شاشة Pydroid 3
     if sys.platform == "win32":
         sys.stdout.reconfigure(encoding="utf-8")
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
@@ -1061,7 +1058,7 @@ async def main() -> None:
             asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
             logger.info("Using uvloop for optimal performance")
         else:
-            logger.info("uvloop not found. Using default asyncio loop")
+            logger.info("uvloop not found. Using default asyncio loop (Compatible with Pydroid 3)")
 
     bot: Optional[EnhancedTelegramBot] = None
     try:
