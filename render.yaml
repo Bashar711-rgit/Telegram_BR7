@@ -1,162 +1,571 @@
 # ================================================================
-# render.yaml – Telegram Bot v13.0 (Render Free Web Service)
-# ================================================================
+# render.yaml – Telegram Bot v2.0 (HARDENED EDITION)
+# Compatible with:
+#   main.py v13.1 | config.py v13.1 | database.py v9.0
+#   monitors.py v9.7 | filter_engine.py v14.1 | dashboard.py v3.0
+#   keywords.json v15.1
+#
 # ملاحظة أمنية: هذا الملف لا يحتوي أي أسرار.
-# جميع القيم السرية (API_HASH, الهواتف, SESSION_STRING) تُضاف من
+# جميع القيم السرية (API_HASH, SESSION_STRING, ...) تُضاف من
 # لوحة تحكم Render > Environment (sync: false)
+#
+# ────────────────────────────────────────────────────────────────
+# استراتيجية التخزين (إصلاح P0 — المشكلات #1/#2/#4/#6):
+#
+#   الخيار المُوصى به (PostgreSQL دائم):
+#     1. أنشئ قاعدة بيانات Render PostgreSQL (خطة Starter مدفوعة
+#        أو Free مع حدودها) من Dashboard > New > PostgreSQL.
+#     2. في لوحة تحكم الخدمة، أضف متغير DATABASE_URL (sync:false)
+#        بالـ Internal Database URL الذي توفره Render تلقائياً.
+#     3. اضبط DB_TYPE=postgresql تلقائياً عند وجود DATABASE_URL
+#        (database.py v9.0 يكتشف ذلك تلقائياً).
+#     4. لا تحتاج DB_FILE ولا BACKUP_UPLOAD_URL في هذه الحالة.
+#
+#   الخيار البديل (SQLite + Persistent Disk مدفوع):
+#     1. أضف disk في هذا الملف (انظر قسم disks أدناه) أو من
+#        لوحة تحكم Render.
+#     2. اضبط DB_FILE ليشير لمسار القرص الدائم (مثل /data/bot.db).
+#     3. اضبط BACKUP_UPLOAD_URL لرفع النسخ الاحتياطية لتخزين
+#        خارجي (S3 / R2 / Backblaze) — database.py v9.0 يدعم
+#        الرفع التلقائي عبر HTTP PUT.
+#
+#   الخيار المجاني المحدود (SQLite ephemeral — بيانات مؤقتة):
+#     استخدام SQLite الافتراضي مقبول فقط لأغراض الاختبار.
+#     database.py v9.0 يطبع تحذيراً صريحاً عند كل بدء تشغيل
+#     وعند كل دورة نسخ احتياطي إذا لم يُضبط DATABASE_URL أو
+#     BACKUP_UPLOAD_URL — التحذير غير قابل للكتم عمداً لضمان
+#     أن المشغّل لا يتجاهل هذا الخطر بصمت.
+#
+# ────────────────────────────────────────────────────────────────
+# ملاحظة بشأن Keep-Alive (إصلاح M-07 في main.py v13.1):
+#   main.py v13.1 لا يقبل fallback إلى 127.0.0.1 كعنوان keep-alive.
+#   إذا لم يُضبط RENDER_EXTERNAL_URL، يُعطّل keep-alive تماماً مع
+#   تحذير واضح. Render توفر هذا المتغير تلقائياً للخدمات المدفوعة
+#   وللخدمات المجانية التي لديها custom domain. إذا لم يظهر
+#   تلقائياً، أضفه يدوياً من Dashboard > Environment.
 # ================================================================
 
 services:
   - type: web
     name: telegram-bot
     runtime: python
-    plan: free
+    plan: free            # غيّر إلى starter أو standard لضمان 24/7 الحقيقي
     region: frankfurt
-    buildCommand: pip install -r requirements.txt
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
     startCommand: python main.py
     healthCheckPath: /health
     autoDeploy: true
+
+    # ──────────────────────────────────────────────────────────────
+    # Persistent Disk (SQLite فقط — احذف هذا القسم إذا استخدمت
+    # PostgreSQL عبر DATABASE_URL)
+    #
+    # ملاحظة: Persistent Disk غير متاح على خطة Free.
+    # فعّله عند الترقية إلى Starter أو أعلى.
+    # ──────────────────────────────────────────────────────────────
+    # disk:
+    #   name: bot-data
+    #   mountPath: /data
+    #   sizeGB: 1
+
     envVars:
-      # ========== Runtime ==========
+
+      # ════════════════════════════════════════════════════════════
+      # Runtime
+      # ════════════════════════════════════════════════════════════
       - key: PYTHON_VERSION
-        value: 3.11.9
+        value: "3.11.9"
+
       - key: LOG_LEVEL
         value: INFO
 
-      # ========== Core (secret) ==========
+      # ════════════════════════════════════════════════════════════
+      # Core identifiers — سرية، تُضاف من Dashboard
+      # ════════════════════════════════════════════════════════════
       - key: TARGET_GROUP_ID
         sync: false
+
       - key: ADMIN_CHAT_ID
         sync: false
 
-      # ========== Database (SQLite ephemeral on free tier) ==========
+      # ════════════════════════════════════════════════════════════
+      # Database — استراتيجية التخزين (اختر واحداً)
+      # ════════════════════════════════════════════════════════════
+
+      # ── الخيار 1: PostgreSQL دائم (مُوصى به) ────────────────────
+      # أضف DATABASE_URL من Dashboard بعد إنشاء Render PostgreSQL.
+      # عند وجود DATABASE_URL، يتجاهل البوت DB_TYPE/DB_FILE تلقائياً.
+      - key: DATABASE_URL
+        sync: false       # Internal DB URL من Render PostgreSQL
+
+      # ── الخيار 2: SQLite على Persistent Disk ────────────────────
+      # فعّل قسم disk أعلاه أولاً، ثم فعّل السطرين أدناه:
+      # - key: DB_TYPE
+      #   value: sqlite
+      # - key: DB_FILE
+      #   value: /data/telegram_bot.db   # على Persistent Disk
+
+      # ── الإعداد الافتراضي (ephemeral — للاختبار فقط) ────────────
+      # إذا لم تُضبط DATABASE_URL ولم تُفعّل Persistent Disk،
+      # يعمل البوت بـ SQLite مؤقتة مع تحذير واضح عند كل بدء تشغيل.
       - key: DB_TYPE
         value: sqlite
       - key: DB_FILE
         value: telegram_bot.db
-      # DATABASE_URL: أضفه يدوياً إذا أنشأت PostgreSQL
 
-      # ========== Security (auto-generated on blueprint deploy) ==========
+      # DB Pool (PostgreSQL فقط — يُتجاهل مع SQLite)
+      - key: DB_POOL_MIN
+        value: "2"
+      - key: DB_POOL_MAX
+        value: "5"
+
+      # ════════════════════════════════════════════════════════════
+      # Backup خارجي — database.py v9.0 (إصلاح #2/#7)
+      # أضف BACKUP_UPLOAD_URL إذا استخدمت SQLite لرفع النسخ
+      # الاحتياطية إلى تخزين خارجي (S3 / R2 / أي endpoint يقبل PUT).
+      # ════════════════════════════════════════════════════════════
+      - key: BACKUP_UPLOAD_URL
+        sync: false       # مثال: https://s3.amazonaws.com/bucket/bot-backup.gz
+
+      - key: BACKUP_UPLOAD_TOKEN
+        sync: false       # Bearer token للـ endpoint (إن وُجد)
+
+      # ════════════════════════════════════════════════════════════
+      # Security — يُولّد تلقائياً عند النشر عبر Blueprint
+      # ════════════════════════════════════════════════════════════
       - key: SECRET_KEY_OVERRIDE
         generateValue: true
+
       - key: DASHBOARD_AUTH_TOKEN
         generateValue: true
 
-      # ========== Dashboard ==========
+      # ════════════════════════════════════════════════════════════
+      # Dashboard (dashboard.py v3.0)
+      # ════════════════════════════════════════════════════════════
       - key: DASHBOARD_ENABLED
         value: "true"
 
-      # ========== Performance (Render free: 512MB RAM) ==========
-      - key: PROCESSING_WORKERS
-        value: "2"
-      - key: MEMORY_THRESHOLD_MB
-        value: "400"
-      - key: GC_INTERVAL
-        value: "120"
-      - key: ENTITY_CACHE_MAX_SIZE
-        value: "1500"
-      - key: PROCESSED_HASHES_MAX_SIZE
-        value: "8000"
-      - key: TEXT_CACHE_SIZE
-        value: "3000"
-      - key: TEXT_CACHE_TTL
-        value: "180"
-      - key: PREFILTER_ENABLED
-        value: "true"
-      - key: MAX_ALERTS_PER_MINUTE
-        value: "10"
-      - key: MAX_ALERTS_PER_HOUR
-        value: "100"
-      - key: STATS_INTERVAL
-        value: "3600"
-      - key: HEALTH_CHECK_INTERVAL
-        value: "60"
+      - key: DASHBOARD_PORT
+        value: "10000"    # Render يحدد المنفذ عبر $PORT تلقائياً
 
-      # ========== IntentEngine ==========
-      - key: CONFIDENCE_ACCEPT_THRESHOLD
-        value: "0.65"
-      - key: CONFIDENCE_REVIEW_THRESHOLD
-        value: "0.40"
-      - key: NEGATION_ENABLED
-        value: "true"
-      - key: FUZZY_MATCHING_ENABLED
-        value: "true"
-      - key: DISTANCE_SCORING_ENABLED
-        value: "true"
-      - key: AD_DETECTION_ENABLED
-        value: "true"
+      # CORS: أضف نطاقاتك المسموحة مفصولة بفاصلة إذا كان لديك
+      # frontend منفصل يحتاج cross-origin access.
+      # تركه فارغاً يُعطّل CORS (آمن بشكل افتراضي — dashboard.py v3.0).
+      - key: DASHBOARD_CORS_ORIGINS
+        value: ""
 
-      # ========== Render API self-management (for /login page) ==========
+      # ════════════════════════════════════════════════════════════
+      # Keep-Alive (main.py v13.1 — إصلاح M-07)
+      # Render توفر RENDER_EXTERNAL_URL تلقائياً للخدمات المدفوعة.
+      # إذا لم يظهر تلقائياً، أضفه يدوياً:
+      #   مثال: https://telegram-bot.onrender.com
+      # main.py v13.1 يرفض الـ fallback إلى 127.0.0.1 — إذا لم
+      # يُضبط هذا المتغير، يُعطّل keep-alive مع تحذير واضح.
+      # ════════════════════════════════════════════════════════════
+      - key: RENDER_EXTERNAL_URL
+        sync: false       # يُضاف يدوياً أو تلقائياً من Render
+
+      # ════════════════════════════════════════════════════════════
+      # Render API — لصفحة /login في dashboard.py v3.0
+      # تُتيح حفظ SESSION_STRING تلقائياً في env vars الخدمة
+      # ════════════════════════════════════════════════════════════
       - key: RENDER_API_KEY
         sync: false
+
       - key: RENDER_SERVICE_ID
         sync: false
 
-      # ========== Telegram Accounts (secret - fill via dashboard) ==========
-      # لكل حساب: {PREFIX}_API_ID / {PREFIX}_API_HASH / {PREFIX}_PHONE /
-      #           {PREFIX}_SESSION_NAME / {PREFIX}_SESSION_STRING
+      # ════════════════════════════════════════════════════════════
+      # Performance — معايرة لـ Render Free (512MB RAM)
+      # ════════════════════════════════════════════════════════════
+      - key: PROCESSING_WORKERS
+        value: "2"
+
+      - key: MEMORY_THRESHOLD_MB
+        value: "400"
+
+      - key: GC_INTERVAL
+        value: "120"
+
+      - key: ENTITY_CACHE_MAX_SIZE
+        value: "1500"
+
+      - key: PROCESSED_HASHES_MAX_SIZE
+        value: "8000"
+
+      - key: TEXT_CACHE_SIZE
+        value: "3000"
+
+      - key: TEXT_CACHE_TTL
+        value: "180"
+
+      - key: PREFILTER_ENABLED
+        value: "true"
+
+      - key: PREFILTER_MIN_WORDS
+        value: "2"
+
+      - key: PREFILTER_MAX_EMOJIS
+        value: "5"
+
+      - key: MAX_ALERTS_PER_MINUTE
+        value: "10"
+
+      - key: MAX_ALERTS_PER_HOUR
+        value: "100"
+
+      - key: ALERT_COOLDOWN
+        value: "300"
+
+      - key: STATS_INTERVAL
+        value: "3600"
+
+      - key: HEALTH_CHECK_INTERVAL
+        value: "60"
+
+      - key: CLEANUP_INTERVAL
+        value: "86400"
+
+      - key: SESSION_BACKUP_INTERVAL
+        value: "3600"
+
+      # ════════════════════════════════════════════════════════════
+      # Queue capacity — database.py v9.0 (إصلاح #3/#9)
+      # MESSAGE_QUEUE_SIZE يُطبَّق الآن على مستوى SQLite فعلياً
+      # (DROP_OLDEST eviction) بالإضافة إلى الـ in-memory queue.
+      # ════════════════════════════════════════════════════════════
+      - key: MESSAGE_QUEUE_SIZE
+        value: "500"
+
+      # Batch writer — database.py v9.0
+      - key: DB_BATCH_SIZE
+        value: "50"
+      - key: DB_BATCH_INTERVAL
+        value: "5"
+      - key: DB_BATCH_MAX_SIZE
+        value: "500"      # الحد الأقصى لـ _batch في الذاكرة
+
+      # Dead-letter queue — database.py v9.0 (إصلاح #11)
+      - key: DEAD_LETTER_MAX_RETRIES
+        value: "5"
+      - key: DEAD_LETTER_CLEANUP_DAYS
+        value: "7"
+      - key: DEAD_LETTER_MAX_ROWS
+        value: "5000"     # الحد الأقصى لصفوف dead_letters
+
+      # Resource pressure check — database.py v9.0 (إصلاح #12)
+      - key: DB_PRESSURE_CHECK_EVERY
+        value: "12"
+
+      # Disk monitoring thresholds — main.py v13.1 (إصلاح M-15)
+      - key: DISK_WARN_MB
+        value: "200"
+      - key: DISK_CRITICAL_MB
+        value: "400"
+      - key: QUEUE_WARN_ROWS
+        value: "400"
+      - key: QUEUE_CRITICAL_ROWS
+        value: "480"
+
+      # ════════════════════════════════════════════════════════════
+      # Memory Monitor — main.py v13.1 (إصلاح M-01/02/03)
+      # tracemalloc يُفعّل فقط إذا كانت DEBUG_TRACEMALLOC=true.
+      # ════════════════════════════════════════════════════════════
+      - key: DEBUG_TRACEMALLOC
+        value: "false"    # غيّر إلى true مؤقتاً لتشخيص تسربات الذاكرة
+
+      - key: MEMORY_WINDOW_SIZE
+        value: "20"       # عدد العينات للنافذة المتحركة
+
+      - key: MEMORY_GROWTH_THRESHOLD_MB
+        value: "50"       # الحد الأدنى للنمو المستمر قبل الإنذار
+
+      - key: CONSECUTIVE_LEAK_THRESHOLD
+        value: "2"        # عدد الدورات المتتالية قبل تفعيل GC
+
+      # Task cancellation timeout — main.py v13.1 (إصلاح M-05/16)
+      - key: TASK_CANCEL_TIMEOUT
+        value: "15"
+
+      # ════════════════════════════════════════════════════════════
+      # Connection & sessions
+      # ════════════════════════════════════════════════════════════
+      - key: CONNECTION_TIMEOUT
+        value: "30"
+
+      - key: SESSION_REFRESH_INTERVAL
+        value: "43200"    # 12 ساعة
+
+      - key: MAX_RECONNECT_BACKOFF
+        value: "300"
+
+      - key: RECONNECT_CHECK_INTERVAL
+        value: "15"
+
+      - key: SECURE_SESSIONS
+        value: "false"
+
+      - key: SESSIONS_DIR
+        value: sessions
+
+      # ════════════════════════════════════════════════════════════
+      # IntentEngine — filter_engine.py v14.1 / keywords.json v15.1
+      # ════════════════════════════════════════════════════════════
+      - key: CONFIDENCE_ACCEPT_THRESHOLD
+        value: "0.65"     # راجع keywords.json._meta للتوافق مع tuning
+
+      - key: CONFIDENCE_REVIEW_THRESHOLD
+        value: "0.40"
+
+      - key: NEGATION_ENABLED
+        value: "true"
+
+      - key: NEGATION_CLAUSE_BOUNDARIES_ENABLED
+        value: "true"
+
+      - key: FUZZY_MATCHING_ENABLED
+        value: "true"
+
+      - key: FUZZY_MAX_EDIT_DISTANCE
+        value: "1"
+
+      - key: FUZZY_MIN_TOKEN_LENGTH
+        value: "5"
+
+      - key: FUZZY_SIMILARITY_THRESHOLD
+        value: "0.92"
+
+      - key: DISTANCE_SCORING_ENABLED
+        value: "true"
+
+      - key: DISTANCE_CLOSE_THRESHOLD
+        value: "3"
+
+      - key: DISTANCE_MEDIUM_THRESHOLD
+        value: "7"
+
+      - key: DISTANCE_FAR_THRESHOLD
+        value: "10"
+
+      - key: DISTANCE_VERY_FAR_THRESHOLD
+        value: "15"
+
+      - key: AD_DETECTION_ENABLED
+        value: "true"
+
+      - key: AD_WEAK_PROVIDER_THRESHOLD
+        value: "2"
+
+      - key: AD_EMOJI_THRESHOLD
+        value: "3"
+
+      # Scoring weights — يجب أن تتطابق مع keywords.json v15.1
+      - key: SCORE_WEIGHT_INTENT
+        value: "0.30"
+
+      - key: SCORE_WEIGHT_ACADEMIC
+        value: "0.25"
+
+      - key: SCORE_WEIGHT_GRAMMAR
+        value: "0.15"
+
+      - key: SCORE_WEIGHT_DISTANCE
+        value: "0.15"
+
+      - key: SCORE_WEIGHT_URGENCY
+        value: "0.05"
+
+      - key: SCORE_WEIGHT_CONTEXT
+        value: "0.10"
+
+      # Legacy scoring (للتوافق مع الحسابات القديمة)
+      - key: SCORE_DIRECT_MATCH
+        value: "60"
+
+      - key: SCORE_CONTEXT_MAX
+        value: "20"
+
+      - key: SCORE_INDIRECT
+        value: "25"
+
+      - key: SCORE_URGENCY
+        value: "15"
+
+      - key: SCORE_MIN_VALID
+        value: "50"
+
+      # Filter & language
+      - key: LANGUAGE_FILTER
+        value: "true"
+
+      - key: MIN_ARABIC_CONFIDENCE
+        value: "0.7"
+
+      - key: SPAM_SCORE_THRESHOLD
+        value: "0.7"
+
+      - key: BLOOM_FILTER_SIZE
+        value: "50000"
+
+      - key: BLOOM_FILTER_FP
+        value: "0.001"
+
+      - key: MAX_MESSAGE_LENGTH
+        value: "5000"
+
+      - key: MIN_MESSAGE_LENGTH
+        value: "10"
+
+      # ════════════════════════════════════════════════════════════
+      # Resilience
+      # ════════════════════════════════════════════════════════════
+      - key: MAX_RETRIES
+        value: "3"
+
+      - key: RETRY_DELAY
+        value: "5"
+
+      - key: RETRY_BACKOFF
+        value: "2.0"
+
+      - key: MAX_WORKER_RESTARTS
+        value: "10"
+
+      # FLOOD_WAIT_MULTIPLIER محتفظ به للتوافق الخلفي فقط —
+      # monitors.py v9.7 يستخدم FloodWaitError.seconds الفعلي
+      # ولا يستخدم هذا المعامل بعد الآن.
+      - key: FLOOD_WAIT_MULTIPLIER
+        value: "1.5"
+
+      # ════════════════════════════════════════════════════════════
+      # Alerts
+      # ════════════════════════════════════════════════════════════
+      - key: ALERT_WITH_BUTTONS
+        value: "true"
+
+      - key: ALERT_SHOW_SCORE
+        value: "true"
+
+      - key: ALERT_MAX_TEXT_LEN
+        value: "350"
+
+      - key: ALERT_WITH_COPY_BUTTON
+        value: "true"
+
+      # ════════════════════════════════════════════════════════════
+      # Health
+      # ════════════════════════════════════════════════════════════
+      - key: HEALTH_MIN_MONITORS_RATIO
+        value: "0.5"
+
+      # ════════════════════════════════════════════════════════════
+      # Monitoring (اختياري)
+      # ════════════════════════════════════════════════════════════
+      - key: PROMETHEUS_ENABLED
+        value: "false"
+
+      - key: SENTRY_DSN
+        sync: false       # أضفه إذا كنت تستخدم Sentry
+
+      # ════════════════════════════════════════════════════════════
+      # حسابات تيليجرام — سرية، تُضاف من Dashboard أو عبر /login
+      # لكل حساب: {PREFIX}_API_ID / {PREFIX}_API_HASH / {PREFIX}_PHONE
+      #            {PREFIX}_SESSION_NAME / {PREFIX}_SESSION_STRING
+      # SESSION_STRING يمكن حفظه تلقائياً من صفحة /login
+      # ════════════════════════════════════════════════════════════
+
+      # ── الحساب الرئيسي (MAIN) ────────────────────────────────────
       - key: MAIN_API_ID
         sync: false
+
       - key: MAIN_API_HASH
         sync: false
+
       - key: MAIN_PHONE
         sync: false
+
       - key: MAIN_SESSION_NAME
         value: main_account
+
       - key: MAIN_SESSION_STRING
         sync: false
 
+      # ── الحساب 1 ─────────────────────────────────────────────────
       - key: ACCOUNT_1_API_ID
         sync: false
+
       - key: ACCOUNT_1_API_HASH
         sync: false
+
       - key: ACCOUNT_1_PHONE
         sync: false
+
       - key: ACCOUNT_1_SESSION_NAME
         value: account1
+
       - key: ACCOUNT_1_SESSION_STRING
         sync: false
 
+      # ── الحساب 2 ─────────────────────────────────────────────────
       - key: ACCOUNT_2_API_ID
         sync: false
+
       - key: ACCOUNT_2_API_HASH
         sync: false
+
       - key: ACCOUNT_2_PHONE
         sync: false
+
       - key: ACCOUNT_2_SESSION_NAME
         value: account2
+
       - key: ACCOUNT_2_SESSION_STRING
         sync: false
 
+      # ── الحساب 3 ─────────────────────────────────────────────────
       - key: ACCOUNT_3_API_ID
         sync: false
+
       - key: ACCOUNT_3_API_HASH
         sync: false
+
       - key: ACCOUNT_3_PHONE
         sync: false
+
       - key: ACCOUNT_3_SESSION_NAME
         value: account3
+
       - key: ACCOUNT_3_SESSION_STRING
         sync: false
 
+      # ── الحساب 4 ─────────────────────────────────────────────────
       - key: ACCOUNT_4_API_ID
         sync: false
+
       - key: ACCOUNT_4_API_HASH
         sync: false
+
       - key: ACCOUNT_4_PHONE
         sync: false
+
       - key: ACCOUNT_4_SESSION_NAME
         value: account4
+
       - key: ACCOUNT_4_SESSION_STRING
         sync: false
 
+      # ── الحساب 5 ─────────────────────────────────────────────────
       - key: ACCOUNT_5_API_ID
         sync: false
+
       - key: ACCOUNT_5_API_HASH
         sync: false
+
       - key: ACCOUNT_5_PHONE
         sync: false
+
       - key: ACCOUNT_5_SESSION_NAME
         value: account5
+
       - key: ACCOUNT_5_SESSION_STRING
         sync: false
