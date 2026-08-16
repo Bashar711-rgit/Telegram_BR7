@@ -1,17 +1,10 @@
 #!/usr/bin/env python3
 """
-database.py – Unified Async Database Layer v9.1 (HARDENED EDITION)
+database.py – Unified Async Database Layer v9.0 (HARDENED EDITION)
 Supports: SQLite (aiosqlite) and PostgreSQL (asyncpg)
-Compatible with: config.py v13.2, monitors.py v9.8, filter_engine.py v14.1
+Compatible with: config.py v13.1, monitors.py v9.7, filter_engine.py v14.1
 
-v9.1 (this pass) — Instant Capture support, database.py ONLY:
-  * Added capture_records table and save_capture_record() method for
-    the new InstantCaptureManager in monitors.py v9.8.
-  * No existing methods or signatures changed.
-  * capture_records table is created in _create_tables() alongside
-    the existing schema.
-
-v9.0 (prior pass) — full audit fix, database.py ONLY:
+v9.0 (this pass) — full audit fix, database.py ONLY:
 
   FIXED #1  — Blocking I/O in _backup_loop: all Path.read_bytes(),
               zlib.compress(), and write_bytes() calls are now offloaded
@@ -246,7 +239,7 @@ def _warn_ephemeral_storage() -> None:
     if CFG.DB_TYPE != "sqlite":
         return
     if os.getenv("DATABASE_URL"):
-        return
+        return  # PostgreSQL via DATABASE_URL — persistent
     if _BACKUP_UPLOAD_URL:
         logger.info(
             "SQLite mode: external backup upload configured → "
@@ -311,20 +304,19 @@ def _verify_gz(path: str, expected_digest: str) -> bool:
         actual = hashlib.sha256(data).hexdigest()
         if actual != expected_digest:
             return False
-        zlib.decompress(data)
+        zlib.decompress(data)  # Ensure it decompresses without error
         return True
     except Exception:
         return False
 
 
 # =============================================================================
-# Unified Database Class v9.1
+# Unified Database Class v9.0
 # =============================================================================
 class EnhancedDatabase:
     """
     Production-grade async database with IntentEngine support.
     All 12 audit issues from the v8.2 report are addressed in this version.
-    v9.1 adds capture_records table for Instant Capture support.
     """
 
     def __init__(self) -> None:
@@ -349,13 +341,14 @@ class EnhancedDatabase:
         self._batch: List[Tuple[Any, ...]] = []
         self._batch_lock = asyncio.Lock()
         self._flush_failure_count: int = 0
-        self._flush_backoff: float = 1.0
+        self._flush_backoff: float = 1.0        # seconds, doubles on each failure
         self._flush_backoff_max: float = 60.0
-        self._db_healthy: bool = True
+        self._db_healthy: bool = True           # exposed as property (fix #10)
 
         # Background tasks (fix #5: _cleanup_loop REMOVED from this class)
         self._writer_task: Optional[asyncio.Task] = None
         self._backup_task: Optional[asyncio.Task] = None
+        # Note: _cleanup_task intentionally absent — cleanup is owned by main.py
 
         # Dashboard query cache
         self._query_cache: TTLCache = TTLCache(maxsize=100, ttl=30)
@@ -377,7 +370,7 @@ class EnhancedDatabase:
     # ─── Connection ──────────────────────────────────────────────────────────
     async def connect(self) -> bool:
         try:
-            _warn_ephemeral_storage()
+            _warn_ephemeral_storage()  # fix #6: always warn at startup
             if self.db_type == "sqlite":
                 await self._connect_sqlite()
             else:
@@ -386,7 +379,8 @@ class EnhancedDatabase:
             await self._create_indexes()
             self.is_connected = True
             await self.start_writer()
-            logger.info(f"Database connected: {self.db_type.upper()} v9.1")
+            # Note: start_cleanup() intentionally NOT called here (fix #5)
+            logger.info(f"Database connected: {self.db_type.upper()} v9.0")
             return True
         except Exception as e:
             logger.error(f"Database connection failed: {e}")
@@ -489,7 +483,7 @@ class EnhancedDatabase:
         if self.db_type == "sqlite":
             await self._sqlite_conn.commit()
 
-    # ─── Schema v9.1 ─────────────────────────────────────────────────────────
+    # ─── Schema v9.0 ─────────────────────────────────────────────────────────
     async def _create_tables(self) -> None:
         stmts = """
             CREATE TABLE IF NOT EXISTS messages (
@@ -579,17 +573,6 @@ class EnhancedDatabase:
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
             );
-            CREATE TABLE IF NOT EXISTS capture_records (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                message_id INTEGER,
-                chat_id INTEGER,
-                sender_id INTEGER DEFAULT 0,
-                capture_status TEXT DEFAULT 'CAPTURE_PENDING',
-                capture_latency_ms INTEGER DEFAULT 0,
-                forward_attempts INTEGER DEFAULT 0,
-                captured_at REAL NOT NULL,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            );
         """
         for stmt in stmts.split(";"):
             s = stmt.strip()
@@ -603,8 +586,6 @@ class EnhancedDatabase:
                         .replace("REAL NOT NULL", "DOUBLE PRECISION NOT NULL")
                         .replace("REAL DEFAULT", "DOUBLE PRECISION DEFAULT")
                         .replace("REAL,", "DOUBLE PRECISION,")
-                        .replace("INTEGER DEFAULT", "BIGINT DEFAULT")
-                        .replace("INTEGER,", "BIGINT,")
                     )
                 await self._execute(s)
         await self._commit()
@@ -628,107 +609,10 @@ class EnhancedDatabase:
             "CREATE INDEX IF NOT EXISTS idx_alr_time_sender ON alerts(timestamp DESC, sender_id)",
             "CREATE INDEX IF NOT EXISTS idx_alr_decision  ON alerts(decision)",
             "CREATE INDEX IF NOT EXISTS idx_alr_confidence ON alerts(confidence)",
-            # NEW v9.1: Index for capture_records
-            "CREATE INDEX IF NOT EXISTS idx_capture_time   ON capture_records(captured_at)",
-            "CREATE INDEX IF NOT EXISTS idx_capture_status ON capture_records(capture_status)",
         ]
         for idx in indexes:
             await self._execute(idx)
         await self._commit()
-
-    # ─── NEW v9.1: Capture Records ──────────────────────────────────────────
-    async def save_capture_record(self, record: Dict[str, Any]) -> bool:
-        """
-        Save an Instant Capture result record.
-        Used by InstantCaptureManager in monitors.py v9.8.
-
-        record: {
-            message_id: int,
-            chat_id: int,
-            sender_id: int,
-            capture_status: str,
-            capture_latency_ms: int,
-            forward_attempts: int,
-            captured_at: float,
-        }
-        """
-        try:
-            if self.db_type == "sqlite":
-                await self._execute(
-                    "INSERT INTO capture_records "
-                    "(message_id, chat_id, sender_id, capture_status, "
-                    " capture_latency_ms, forward_attempts, captured_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        record.get("message_id"),
-                        record.get("chat_id"),
-                        record.get("sender_id", 0),
-                        record.get("capture_status", "CAPTURE_PENDING"),
-                        record.get("capture_latency_ms", 0),
-                        record.get("forward_attempts", 0),
-                        record.get("captured_at", time.time()),
-                    ),
-                )
-                await self._commit()
-            else:
-                await self._pool.execute(
-                    "INSERT INTO capture_records "
-                    "(message_id, chat_id, sender_id, capture_status, "
-                    " capture_latency_ms, forward_attempts, captured_at) "
-                    "VALUES ($1, $2, $3, $4, $5, $6, $7)",
-                    record.get("message_id"),
-                    record.get("chat_id"),
-                    record.get("sender_id", 0),
-                    record.get("capture_status", "CAPTURE_PENDING"),
-                    record.get("capture_latency_ms", 0),
-                    record.get("forward_attempts", 0),
-                    record.get("captured_at", time.time()),
-                )
-            return True
-        except Exception as e:
-            logger.debug(f"save_capture_record error: {e}")
-            return False
-
-    async def get_capture_stats(self, hours: int = 24) -> Dict[str, Any]:
-        """Get aggregate capture statistics for the last N hours."""
-        cutoff = time.time() - (hours * 3600)
-        stats: Dict[str, Any] = {
-            "total_captured": 0,
-            "total_failed": 0,
-            "total_candidates": 0,
-            "avg_latency_ms": 0,
-        }
-        try:
-            row = await self._fetchone(
-                "SELECT COUNT(*) as cnt FROM capture_records WHERE captured_at >= ?",
-                (cutoff,),
-            )
-            stats["total_candidates"] = int(row["cnt"]) if row else 0
-
-            row = await self._fetchone(
-                "SELECT COUNT(*) as cnt FROM capture_records "
-                "WHERE capture_status = 'CAPTURED' AND captured_at >= ?",
-                (cutoff,),
-            )
-            stats["total_captured"] = int(row["cnt"]) if row else 0
-
-            row = await self._fetchone(
-                "SELECT COUNT(*) as cnt FROM capture_records "
-                "WHERE capture_status = 'CAPTURE_FAILED' AND captured_at >= ?",
-                (cutoff,),
-            )
-            stats["total_failed"] = int(row["cnt"]) if row else 0
-
-            row = await self._fetchone(
-                "SELECT AVG(capture_latency_ms) as avg_ms FROM capture_records "
-                "WHERE capture_status = 'CAPTURED' AND captured_at >= ?",
-                (cutoff,),
-            )
-            stats["avg_latency_ms"] = round(float(row["avg_ms"]), 1) if row and row["avg_ms"] else 0
-
-        except Exception as e:
-            logger.debug(f"get_capture_stats error: {e}")
-        return stats
 
     # ─── Persistent Queue (fix #3 / #9) ──────────────────────────────────────
     async def add_to_queue(self, event_data: dict, priority: int = 5) -> int:
@@ -745,11 +629,13 @@ class EnhancedDatabase:
         cap is enforced atomically under _queue_lock (fix #3 / #9).
         """
         if not self._db_healthy:
+            # Backpressure: tell the caller the DB is unhealthy (fix #10)
             logger.debug("add_to_queue: DB unhealthy, returning -2 (backpressure)")
             return -2
 
         try:
-            async with self._queue_lock:
+            async with self._queue_lock:  # serialise cap check + insert (fix #9)
+                # ── Enforce capacity cap (fix #3) ─────────────────────────
                 if self.db_type == "sqlite":
                     row = await self._fetchone(
                         "SELECT COUNT(*) AS cnt FROM processing_queue"
@@ -757,6 +643,7 @@ class EnhancedDatabase:
                     current_size = int(row["cnt"]) if row else 0
 
                     if current_size >= CFG.MESSAGE_QUEUE_SIZE:
+                        # DROP_OLDEST: remove the single oldest lowest-priority row
                         await self._execute(
                             "DELETE FROM processing_queue WHERE id = ("
                             "  SELECT id FROM processing_queue"
@@ -779,6 +666,7 @@ class EnhancedDatabase:
                     return cursor.lastrowid
 
                 else:
+                    # PostgreSQL: capacity check + insert in one transaction
                     async with self._pool.acquire() as conn:
                         async with conn.transaction():
                             row = await conn.fetchrow(
@@ -961,9 +849,16 @@ class EnhancedDatabase:
             return None
 
     async def cleanup_dead_letters(self, days: int = 7) -> int:
+        """
+        Remove resolved and old dead letters.
+        Also enforces _DEAD_LETTER_MAX_ROWS hard cap (fix #11):
+        if the table exceeds the cap, oldest resolved rows are purged first,
+        then oldest unresolved rows are purged until under the cap.
+        """
         cutoff = time.time() - days * 86400
         total = 0
         try:
+            # Normal time-based cleanup
             await self._execute("DELETE FROM dead_letters WHERE resolved = 1")
             if self.db_type == "sqlite":
                 total += self._sqlite_conn.total_changes
@@ -974,6 +869,7 @@ class EnhancedDatabase:
             if self.db_type == "sqlite":
                 total += self._sqlite_conn.total_changes
 
+            # Hard row cap (fix #11)
             row = await self._fetchone(
                 "SELECT COUNT(*) AS cnt FROM dead_letters"
             )
@@ -1222,6 +1118,7 @@ class EnhancedDatabase:
             self.stats["alerts_sent"] += 1
 
         async with self._batch_lock:
+            # Enforce batch cap (fix #4): evict oldest when full
             if len(self._batch) >= _DB_BATCH_MAX_SIZE:
                 evict_count = max(1, _DB_BATCH_MAX_SIZE // 10)
                 del self._batch[:evict_count]
@@ -1321,6 +1218,10 @@ class EnhancedDatabase:
         return out
 
     async def cleanup_old_data(self, days: int = 7) -> int:
+        """
+        Remove old messages and alerts.
+        Called exclusively from main.py (fix #5: single cleanup owner).
+        """
         cutoff = time.time() - days * 86400
         total = 0
         try:
@@ -1339,6 +1240,10 @@ class EnhancedDatabase:
 
     # ─── Resource pressure check (fix #12) ────────────────────────────────────
     async def _resource_pressure_check(self) -> None:
+        """
+        Inspect SQLite file size. If it exceeds CFG.MEMORY_THRESHOLD_MB,
+        trigger an emergency cleanup to relieve storage pressure (fix #12).
+        """
         if self.db_type != "sqlite":
             return
         try:
@@ -1364,7 +1269,16 @@ class EnhancedDatabase:
             self._backup_task = asyncio.create_task(self._backup_loop(), name="db_backup")
             logger.info("Database background tasks started (writer + backup)")
 
+    # Note: start_cleanup() intentionally removed (fix #5). Cleanup is owned
+    # by main.py::EnhancedTelegramBot._cleanup_loop exclusively.
+
     async def _writer_loop(self) -> None:
+        """
+        Batch-flush writer with:
+          - exponential backoff on consecutive failures (fix #4 / #10)
+          - periodic ping + reconnect
+          - periodic resource-pressure check (fix #12)
+        """
         ping_counter = 0
         while self.is_connected:
             try:
@@ -1373,6 +1287,7 @@ class EnhancedDatabase:
 
                 self._writer_cycle += 1
 
+                # Periodic resource-pressure check (fix #12)
                 if self._writer_cycle % _PRESSURE_CHECK_EVERY == 0:
                     await self._resource_pressure_check()
 
@@ -1384,6 +1299,7 @@ class EnhancedDatabase:
                         self._db_healthy = False
                         await self._reconnect()
                     else:
+                        # Reset health/backoff on successful ping
                         if not self._db_healthy:
                             logger.info("Database ping recovered — marking DB healthy")
                         self._db_healthy = True
@@ -1398,6 +1314,15 @@ class EnhancedDatabase:
                 await asyncio.sleep(1)
 
     async def _flush(self) -> None:
+        """
+        Batch-write queued alerts.
+        Fixes applied:
+          - Bounded _batch with hard cap (fix #4)
+          - Exponential backoff on failure (fix #4 / #10)
+          - _db_healthy flag update (fix #10)
+          - Does NOT re-add items to _batch after consecutive failures
+            beyond backoff_max (evicts instead with CRITICAL log)
+        """
         async with self._batch_lock:
             if not self._batch:
                 return
@@ -1450,6 +1375,7 @@ class EnhancedDatabase:
                     )
                 await self._commit()
 
+            # Success — reset failure tracking (fix #10)
             self._flush_failure_count = 0
             self._flush_backoff = 1.0
             self._db_healthy = True
@@ -1464,6 +1390,7 @@ class EnhancedDatabase:
                 f"backoff {backoff:.1f}s): {e}"
             )
 
+            # Re-queue the failed batch only if under the hard cap (fix #4)
             async with self._batch_lock:
                 available = _DB_BATCH_MAX_SIZE - len(self._batch)
                 re_add = alerts_data[:available]
@@ -1476,12 +1403,24 @@ class EnhancedDatabase:
                         "(DB failure, cannot buffer further). Check DB connectivity."
                     )
 
+            # Exponential backoff sleep (fix #4 / #10)
             self._flush_backoff = min(self._flush_backoff * 2, self._flush_backoff_max)
             await asyncio.sleep(backoff)
 
     # ─── Backup Loop (fixes #1 / #2 / #7 / #8) ───────────────────────────────
     async def _backup_loop(self) -> None:
+        """
+        Periodic database backup with:
+          - Non-blocking I/O via run_in_executor (fix #1 / #8)
+          - SQLite online backup API to avoid full RAM read (fix #8)
+          - Post-write integrity verification (fix #7)
+          - Optional upload to external HTTP endpoint (fix #2 / #7)
+          - Ephemeral-storage warning on every cycle when no external
+            target is configured (fix #2)
+          - Consecutive-failure counter with CRITICAL alert (fix #7)
+        """
         if self.db_type != "sqlite":
+            # PostgreSQL has its own backup/replication infrastructure
             return
 
         loop = asyncio.get_event_loop()
@@ -1494,6 +1433,7 @@ class EnhancedDatabase:
                     continue
 
                 if not _BACKUP_UPLOAD_URL:
+                    # Repeat the ephemeral-storage warning on every cycle (fix #2)
                     logger.warning(
                         "⚠️  Backup cycle: no BACKUP_UPLOAD_URL set. "
                         "Local .gz written but data remains ephemeral."
@@ -1503,14 +1443,17 @@ class EnhancedDatabase:
                 tmp_path = Path(f"{CFG.DB_FILE}.bak.tmp")
 
                 try:
+                    # Step 1: hot copy via SQLite backup API (fix #8 — no full RAM read)
                     db_size = await loop.run_in_executor(
                         None, _sqlite_hot_backup, str(CFG.DB_FILE), str(tmp_path)
                     )
 
+                    # Step 2: compress in executor (fix #1 — non-blocking)
                     compressed_size, digest = await loop.run_in_executor(
                         None, _compress_file_to_gz, str(tmp_path), str(backup_path)
                     )
 
+                    # Step 3: verify integrity (fix #7)
                     is_valid = await loop.run_in_executor(
                         None, _verify_gz, str(backup_path), digest
                     )
@@ -1525,12 +1468,15 @@ class EnhancedDatabase:
                         f"sha256={digest[:16]}…, verified=OK)"
                     )
 
+                    # Step 4: upload to external storage (fix #2 / #7)
                     if _BACKUP_UPLOAD_URL:
                         await self._upload_backup(backup_path, digest)
 
+                    # Reset failure counter on success
                     self._backup_failure_count = 0
 
                 finally:
+                    # Always clean up the temp hot-copy
                     if tmp_path.exists():
                         try:
                             tmp_path.unlink()
@@ -1551,6 +1497,11 @@ class EnhancedDatabase:
                 await asyncio.sleep(60)
 
     async def _upload_backup(self, backup_path: Path, digest: str) -> None:
+        """
+        Stream the backup .gz to an external HTTP PUT endpoint (fix #2 / #7).
+        Logs success/failure — never raises so a failed upload cannot crash
+        the backup loop.
+        """
         if not AIOHTTP_AVAILABLE:
             logger.warning(
                 "BACKUP_UPLOAD_URL is set but aiohttp is not installed. "
@@ -1814,4 +1765,4 @@ class EnhancedDatabase:
             await self._sqlite_conn.close()
         elif self.db_type == "postgresql" and self._pool:
             await self._pool.close()
-        logger.info("Database v9.1 closed")
+        logger.info("Database v9.0 closed")
