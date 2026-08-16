@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """
-main.py – Enhanced Telegram Bot v13.1 (RENDER CLOUD EDITION, HARDENED)
+main.py – Enhanced Telegram Bot v13.2 (RENDER CLOUD EDITION, HARDENED)
 متوافق مع استضافة Render المجانية (Web Service) – تشغيل 24/7
-متوافق مع: monitors.py v9.7, config.py v13.1, filter_engine.py v14.1, database.py v9.0
+متوافق مع: monitors.py v9.8, config.py v13.2, filter_engine.py v14.1, database.py v9.1
 
-v13.1 (this pass) — targeted fixes, main.py ONLY. Maps to the audit's M-01..M-17:
+v13.2 (this pass) — Instant Capture integration, main.py ONLY:
+  * /status and /accounts commands now include instant_capture stats.
+  * Startup message includes Instant Capture status.
+  * No existing functionality changed.
+
+v13.1 (prior pass) — targeted fixes, main.py ONLY. Maps to the audit's M-01..M-17:
 
   M-01/M-02/M-03/M-13/M-14/M-15 — MemoryMonitor rewritten:
       * tracemalloc is now actually used: on a suspected leak it takes a
@@ -92,7 +97,7 @@ except ImportError:
 
 from telethon import TelegramClient, events as tl_events
 
-from config import CFG, ACCOUNTS, KEYWORDS, InputSanitizer, logger
+from config import CFG, ACCOUNTS, KEYWORDS, InputSanitizer, logger, FAST_INTENT_SIGNALS, FAST_ACADEMIC_SIGNALS
 from database import EnhancedDatabase
 from filter_engine import EnhancedFilter
 from monitors import EnhancedAccountMonitor, HealthMonitor
@@ -249,9 +254,6 @@ class MemoryMonitor:
 
         rss_elevated = current > self._baseline * self._growth_ratio if self._baseline > 0 else False
 
-        # Sustained-trend heuristic (M-02): require the last N samples to
-        # ALL be elevated AND roughly non-decreasing, not just the latest
-        # one crossing a threshold.
         leak_suspected = False
         if self._baseline > 0 and len(self._history) >= self._sustained_samples:
             recent = list(self._history)[-self._sustained_samples:]
@@ -266,9 +268,6 @@ class MemoryMonitor:
             "rss_elevated": rss_elevated,
             "leak_suspected": leak_suspected,
             "tracemalloc_top": None,
-            # Backward-compat field name kept for any external code that
-            # still reads "leak_detected" — mapped onto the new, stricter
-            # leak_suspected signal rather than the old noisy heuristic.
             "leak_detected": leak_suspected,
         }
 
@@ -298,7 +297,7 @@ class MemoryMonitor:
 
 
 # =============================================================================
-# Main Bot Class v13.1 (hardened)
+# Main Bot Class v13.2 (hardened + instant capture)
 # =============================================================================
 class EnhancedTelegramBot:
     def __init__(self) -> None:
@@ -316,14 +315,10 @@ class EnhancedTelegramBot:
         self.health = HealthMonitor(self)
 
         # ── Background task lifecycle (M-05 / M-16) ─────────────────────
-        # Every task this module creates is tracked here so shutdown can
-        # cancel+await all of them uniformly, and so a task's exception is
-        # never silently lost ("Task exception was never retrieved").
         self._background_tasks: Set[asyncio.Task] = set()
         self._shutdown_event = asyncio.Event()
 
         # Individual references kept too, purely for readability/debugging
-        # (all of these are also present in _background_tasks).
         self._consumer_task: Optional[asyncio.Task] = None
         self._stats_task: Optional[asyncio.Task] = None
         self._cleanup_task: Optional[asyncio.Task] = None
@@ -357,16 +352,6 @@ class EnhancedTelegramBot:
 
     # ─── Consumer Loop (Producer-Consumer) ────────────────────────────────────
     async def _consumer_loop(self) -> None:
-        """
-        NOTE on queue capacity (M-04): `internal_queue` below is only the
-        small in-process handoff buffer between the DB-poller and the
-        worker pool. The actual capacity limit that matters —
-        CFG.MESSAGE_QUEUE_SIZE — is now enforced directly inside
-        database.py's add_to_queue() (DROP_OLDEST eviction under the DB's
-        own lock), so persistent SQLite growth is bounded regardless of
-        this in-memory buffer's size. This loop no longer needs to (and
-        does not) duplicate that capacity logic.
-        """
         logger.info("Consumer loop started")
         internal_queue: asyncio.Queue = asyncio.Queue(maxsize=CFG.MESSAGE_QUEUE_SIZE)
 
@@ -422,9 +407,6 @@ class EnhancedTelegramBot:
         return None
 
     # ─── Admin / Copy handler registration (idempotent, re-runnable) ──────────
-    # Both are now re-registerable so a main-client failover (M-10/M-11)
-    # can re-attach them to the newly-promoted client instead of leaving
-    # admin commands silently unresponsive.
     async def _register_copy_handler(self) -> None:
         if not self.main_client:
             return
@@ -471,7 +453,6 @@ class EnhancedTelegramBot:
 
         app.router.add_get('/health', health_handler)
 
-        # Render Web Service: MUST bind to $PORT (default 10000)
         port = int(os.getenv("PORT", 10000))
         runner = web.AppRunner(app)
         await runner.setup()
@@ -499,18 +480,6 @@ class EnhancedTelegramBot:
 
     # ─── Keep-Alive Self-Ping (M-07: no localhost fallback) ────────────────────
     async def _keep_alive_loop(self) -> None:
-        """
-        Pings /health from an EXTERNAL address every 10 minutes to prevent
-        Render free-tier services from sleeping after ~15 minutes idle.
-
-        M-07 fix: previously fell back to http://127.0.0.1:<PORT>/health
-        when RENDER_EXTERNAL_URL was unset. A request to localhost never
-        leaves the instance, so it can never count as external traffic to
-        Render and gave a false sense of the service being protected from
-        sleep. Now: no external URL → keep-alive is explicitly disabled
-        with a clear one-time warning, instead of silently doing nothing
-        useful.
-        """
         if not AIOHTTP_AVAILABLE:
             return
         external_url = (os.getenv("RENDER_EXTERNAL_URL") or "").strip().rstrip("/")
@@ -526,7 +495,7 @@ class EnhancedTelegramBot:
             )
             return
         url = f"{external_url}/health"
-        await asyncio.sleep(60)  # let the web server come up first
+        await asyncio.sleep(60)
         logger.info(f"Keep-alive self-ping enabled -> {url} (every 10 min)")
         while self.is_running:
             try:
@@ -536,7 +505,6 @@ class EnhancedTelegramBot:
                         logger.debug(f"Keep-alive ping {url} -> HTTP {resp.status}")
             except Exception as e:
                 logger.warning(f"Keep-alive ping failed: {e}")
-            # Render free tier sleeps after ~15 min of no inbound traffic
             await asyncio.sleep(600)
 
     # ─── Background Tasks ─────────────────────────────────────────────────────
@@ -559,8 +527,18 @@ class EnhancedTelegramBot:
 
                 hit_rate = (filter_tele.get("valid", 0) / total * 100) if (total := filter_tele.get("processed", 0)) else 0.0
 
+                # NEW v13.2: Aggregate instant capture stats
+                total_ic_captured = 0
+                total_ic_failed = 0
+                total_ic_queued = 0
+                for m in self.monitors:
+                    ic = (await m.get_stats()).get("instant_capture", {})
+                    total_ic_captured += ic.get("captured", 0)
+                    total_ic_failed += ic.get("failed", 0)
+                    total_ic_queued += ic.get("total_candidates", 0)
+
                 text = (
-                    f"<b>📊 إحصائيات البوت v13.1 (Render)</b>\n\n"
+                    f"<b>📊 إحصائيات البوت v13.2 (Render)</b>\n\n"
                     f"⏱ وقت التشغيل: {h}س {m_min}د\n"
                     f"📨 الرسائل: {stats.get('total_messages', 0):,}\n"
                     f"🚨 التنبيهات: {stats.get('alerts_sent', 0):,}\n"
@@ -568,17 +546,16 @@ class EnhancedTelegramBot:
                     f"🎯 نسبة الاصطياد: {hit_rate:.1f}%\n"
                     f"🗂 الطابور: {qsize} رسالة"
                 )
-                # M-04/M-09: surface the DB's own queue-capacity signals
-                # instead of pretending the queue has no observable limit.
                 evictions = stats.get("queue_evictions", 0)
                 if evictions:
                     text += f" (تم استبعاد {evictions} عنصر قديم عند الامتلاء)"
+                text += (
+                    f"\n⚡ الالتقاط الفوري: {total_ic_captured} ناجح / "
+                    f"{total_ic_failed} فشل / {total_ic_queued} مرشح"
+                )
                 text += f"\n🧠 الذاكرة: {mem.get('current_mb', 0)}MB"
                 if not self.db.db_healthy:
                     text += "\n🔴 <b>قاعدة البيانات في حالة غير مستقرة</b>"
-                # M-03/M-14: only ever label this "leak_suspected" (sustained
-                # trend), never a bare RSS-elevated reading, and phrase it
-                # as worth reviewing rather than a confirmed leak.
                 if mem.get("leak_suspected"):
                     text += "\n⚠️ <b>نمو ذاكرة مستمر عبر عدة قياسات متتالية — يستحق المراجعة</b>"
 
@@ -589,13 +566,6 @@ class EnhancedTelegramBot:
                 logger.error(f"Stats reporter error: {e}")
 
     async def _cleanup_loop(self) -> None:
-        """
-        Single, authoritative owner of database maintenance (M-06/M-12).
-        database.py v9.0 no longer runs its own _cleanup_loop — this is
-        now the only place cleanup_old_data()/cleanup_dead_letters() are
-        called from, eliminating the double-cleanup that previously
-        existed between main.py and database.py.
-        """
         while self.is_running:
             try:
                 await asyncio.sleep(CFG.CLEANUP_INTERVAL)
@@ -626,14 +596,6 @@ class EnhancedTelegramBot:
                 logger.error(f"Health check error: {e}")
 
     async def _main_client_watchdog_loop(self) -> None:
-        """
-        M-10/M-11: a dedicated, lightweight liveness check for main_client
-        ONLY (no DB ping, no filter telemetry, no per-monitor stats
-        gathering — that's what the heavier _health_check_loop already
-        does every CFG.HEALTH_CHECK_INTERVAL). Running this on a shorter,
-        independent interval means a dead main_client is detected and
-        failed over well before a full health cycle would notice it.
-        """
         interval = max(5, min(15, CFG.HEALTH_CHECK_INTERVAL))
         while self.is_running:
             try:
@@ -646,23 +608,9 @@ class EnhancedTelegramBot:
                 logger.error(f"Main client watchdog error: {e}")
 
     async def _failover_main_client(self) -> None:
-        """
-        Single shared failover routine (called from both the watchdog and
-        the full health-check loop, so there is exactly one code path that
-        performs promotion — no duplicated/diverging failover logic).
-
-        Real gap fixed here: the original code swapped `self.main_client`
-        and every monitor's `mon.main_client` reference, but NEVER
-        re-registered the admin-command / copy-button handlers on the
-        newly-promoted client. Those handlers were only ever attached once
-        (in initialize()) to the original main_client, so after a
-        failover the bot would keep running but admin commands (/stats,
-        /block, ...) would go silently unresponsive. Both handlers are now
-        re-registered as part of promotion.
-        """
         async with self._main_client_lock:
             if await self._client_ok(self.main_client):
-                return  # already recovered via another path
+                return
             for m in self.monitors:
                 if m.is_connected and m.client and await self._client_ok(m.client):
                     previous = self.main_client
@@ -692,10 +640,6 @@ class EnhancedTelegramBot:
                     for line in (mem.get("tracemalloc_top") or []):
                         logger.warning(f"  ↳ {line}")
                     self.memory_monitor.force_gc()
-                # M-15: disk/queue pressure is tracked independently of RAM.
-                # database.py's own _resource_pressure_check() already acts
-                # on this internally (emergency cleanup); here we just log
-                # for visibility so it's never confused with a RAM leak.
                 if not self.db.db_healthy:
                     logger.warning(
                         "Database reporting unhealthy (write failures) — "
@@ -729,7 +673,7 @@ class EnhancedTelegramBot:
 
         @self.main_client.on(tl_events.NewMessage(
             chats=CFG.ADMIN_CHAT_ID, incoming=True,
-            pattern=r"^/(stats|status|help|block|unblock|purge|accounts|health|filter_stats|dashboard)(.*)$",
+            pattern=r"^/(stats|status|help|block|unblock|purge|accounts|health|filter_stats|dashboard|capture)(.*)$",
         ))
         async def _admin_handler(event: Any) -> None:
             try:
@@ -746,7 +690,7 @@ class EnhancedTelegramBot:
         cmd = cmd.lstrip("/").lower()
 
         if cmd == "help":
-            await event.reply("<b>أوامر البوت:</b>\n/stats – إحصائيات\n/status – حالة الحسابات\n/accounts – التفاصيل\n/health – الصحة\n/dashboard – لوحة التحكم\n/block <id> – حظر\n/unblock <id> – رفع حظر\n/purge – تفريغ الطابور", parse_mode="html")
+            await event.reply("<b>أوامر البوت:</b>\n/stats – إحصائيات\n/status – حالة الحسابات\n/accounts – التفاصيل\n/capture – إحصائيات الالتقاط الفوري\n/health – الصحة\n/dashboard – لوحة التحكم\n/block <id> – حظر\n/unblock <id> – رفع حظر\n/purge – تفريغ الطابور", parse_mode="html")
         elif cmd == "stats":
             db_stats = await self.db.get_stats()
             filter_tel = await self.filter.get_telemetry()
@@ -772,15 +716,13 @@ class EnhancedTelegramBot:
             for m in self.monitors:
                 icon = "✅" if m.is_connected else "❌"
                 s = await m.get_stats()
-                # M-08/M-17 fix: monitors.py's get_stats() returns
-                # "alerts_sent", never "alerts" — the old code read a key
-                # that never existed and always showed 0 here regardless
-                # of how many alerts had actually been sent.
+                ic = s.get("instant_capture", {})
                 lines.append(
                     f"{icon} <b>{m.account['name']}</b> | "
                     f"تنبيهات: {s.get('alerts_sent', 0)} | "
                     f"رسائل: {s.get('messages_processed', 0)} | "
-                    f"أخطاء: {s.get('errors', 0)}"
+                    f"أخطاء: {s.get('errors', 0)} | "
+                    f"⚡التقاط: {ic.get('captured', 0)}/{ic.get('total_candidates', 0)}"
                 )
             await event.reply("\n".join(lines), parse_mode="html")
         elif cmd == "accounts":
@@ -789,15 +731,48 @@ class EnhancedTelegramBot:
                 s = await m.get_stats()
                 icon = "🟢" if m.is_connected else "🔴"
                 dlq = s.get("dlq_stats", {}) or {}
+                ic = s.get("instant_capture", {})
                 lines.append(
                     f"{icon} {m.account['name']}\n"
                     f"   📞 {m.account['phone']}\n"
                     f"   🚨 تنبيهات: {s.get('alerts_sent', 0)} | "
                     f"مكرر: {s.get('duplicates', 0)} | "
                     f"محظور مؤقتًا: {s.get('rate_limited', 0)}\n"
+                    f"   ⚡ التقاط فوري: {ic.get('captured', 0)} ناجح / "
+                    f"{ic.get('failed', 0)} فشل / {ic.get('total_candidates', 0)} مرشح\n"
                     f"   🪦 dead-letter: {dlq.get('dead_lettered', 0)}\n"
                     f"   ⚡ آخر خطأ: {(s.get('last_error') or 'لا شيء')[:60]}"
                 )
+            await event.reply("\n".join(lines), parse_mode="html")
+        elif cmd == "capture":
+            # NEW v13.2: Dedicated command for instant capture stats
+            lines = ["<b>⚡ إحصائيات الالتقاط الفوري</b>\n"]
+            total_captured = 0
+            total_failed = 0
+            total_candidates = 0
+            total_fallback = 0
+            for m in self.monitors:
+                s = await m.get_stats()
+                ic = s.get("instant_capture", {})
+                icon = "🟢" if m.is_connected else "🔴"
+                lines.append(
+                    f"{icon} <b>{m.account['name']}</b>\n"
+                    f"   مرشح: {ic.get('total_candidates', 0)}\n"
+                    f"   ✅ ناجح: {ic.get('captured', 0)}\n"
+                    f"   ❌ فشل: {ic.get('failed', 0)}\n"
+                    f"   🔄 Fallback: {ic.get('fallback_recreates', 0)}\n"
+                    f"   📦 في الطابور: {ic.get('queue_size', 0)}\n"
+                    f"   ⏱ متوسط: {ic.get('avg_capture_latency_ms', 0):.0f}ms"
+                )
+                total_captured += ic.get("captured", 0)
+                total_failed += ic.get("failed", 0)
+                total_candidates += ic.get("total_candidates", 0)
+                total_fallback += ic.get("fallback_recreates", 0)
+            lines.append(
+                f"\n<b>الإجمالي:</b> {total_captured} ناجح / "
+                f"{total_failed} فشل / {total_candidates} مرشح / "
+                f"{total_fallback} fallback"
+            )
             await event.reply("\n".join(lines), parse_mode="html")
         elif cmd == "health":
             health = await self.health.check()
@@ -841,16 +816,13 @@ class EnhancedTelegramBot:
     # ─── Initialization ────────────────────────────────────────────────────────
     async def initialize(self) -> bool:
         logger.info("=" * 60)
-        logger.info("Enhanced Telegram Bot v13.1 (RENDER EDITION, HARDENED) – Initializing...")
+        logger.info("Enhanced Telegram Bot v13.2 (RENDER EDITION, HARDENED + INSTANT CAPTURE) – Initializing...")
         logger.info("=" * 60)
 
         if not await self.db.connect():
             logger.error("Database connection failed - aborting")
             return False
 
-        # Start the web layer FIRST so Render's health check passes immediately
-        # and the Dashboard stays reachable even before/without any account
-        # connection (sessions can then be added via the /login page).
         if CFG.DASHBOARD_ENABLED and DASHBOARD_AVAILABLE:
             self._dashboard_task = self._track_task(self._start_dashboard(), "dashboard")
             logger.info("Dashboard task started (serves /health on $PORT)")
@@ -917,7 +889,6 @@ class EnhancedTelegramBot:
         await self._register_admin_commands()
         await self._register_copy_handler()
 
-        # Background Tasks (M-05/M-16: all tracked uniformly)
         self._consumer_task = self._track_task(self._consumer_loop(), "consumer")
         self._stats_task = self._track_task(self._stats_reporter(), "stats")
         self._cleanup_task = self._track_task(self._cleanup_loop(), "cleanup")
@@ -927,7 +898,7 @@ class EnhancedTelegramBot:
             self._main_client_watchdog_loop(), "main_client_watchdog"
         )
 
-        logger.info("✅ Initialization complete (Render Edition, hardened)")
+        logger.info("✅ Initialization complete (Render Edition, hardened + instant capture)")
         return True
 
     # ─── Run & Shutdown ────────────────────────────────────────────────────────
@@ -935,12 +906,6 @@ class EnhancedTelegramBot:
         self.is_running = True
         loop = asyncio.get_running_loop()
 
-        # M-05/M-16 fix: the shutdown task is now tracked (not pure
-        # fire-and-forget), and the main loop waits on an explicit event
-        # instead of polling `is_running` in the dark — the signal handler
-        # sets that event immediately, so the loop exits promptly and the
-        # tracked shutdown task is guaranteed to be awaited before this
-        # coroutine returns.
         def _handle_signal(sig: signal.Signals) -> None:
             logger.warning(f"Received signal {getattr(sig, 'name', sig)}, shutting down...")
             self._shutdown_event.set()
@@ -950,13 +915,12 @@ class EnhancedTelegramBot:
             try:
                 loop.add_signal_handler(sig, lambda s=sig: _handle_signal(s))
             except (NotImplementedError, ValueError, RuntimeError):
-                # في Pydroid 3، قد لا تكون هذه الإشارات مدعومة بالكامل
                 pass
 
         try:
             await self._send_startup_message()
             logger.info("=" * 60)
-            logger.info("🤖 Bot v13.1 running on Render Cloud - 24/7 mode (hardened)")
+            logger.info("🤖 Bot v13.2 running on Render Cloud - 24/7 mode (hardened + instant capture)")
             logger.info("=" * 60)
             while self.is_running:
                 try:
@@ -970,9 +934,6 @@ class EnhancedTelegramBot:
             logger.critical(f"Fatal error in run loop: {e}")
         finally:
             await self.stop()
-            # Ensure every remaining tracked background task (including a
-            # signal-triggered shutdown task, if any) is actually awaited
-            # before this coroutine returns, so nothing is left dangling.
             remaining = [t for t in list(self._background_tasks) if not t.done()]
             if remaining:
                 await asyncio.gather(*remaining, return_exceptions=True)
@@ -985,9 +946,6 @@ class EnhancedTelegramBot:
 
         logger.info("Shutting down gracefully...")
 
-        # M-05/M-16: cancel every tracked background task uniformly,
-        # rather than an explicit hand-maintained list that could miss a
-        # task (e.g. the previous fire-and-forget signal-handler task).
         tasks = [t for t in list(self._background_tasks) if t is not asyncio.current_task()]
         for task in tasks:
             if not task.done():
@@ -1027,6 +985,8 @@ class EnhancedTelegramBot:
             kw_count = sum(len(v) for v in KEYWORDS.values())
             dashboard_status = "🟢 مفعل" if CFG.DASHBOARD_ENABLED else "🔴 غير مفعل"
             db_health_status = "✅ سليمة" if self.db.db_healthy else "⚠️ غير مستقرة"
+            ic_status = "🟢 مفعل" if CFG.INSTANT_CAPTURE_ENABLED else "🔴 غير مفعل"
+            ic_channel = CFG.TARGET_CHANNEL_ID or CFG.ADMIN_CHAT_ID
 
             await self.main_client.send_message(
                 CFG.ADMIN_CHAT_ID,
@@ -1036,7 +996,8 @@ class EnhancedTelegramBot:
                 f"🗂 الطابور: {qsize} رسالة معلقة\n"
                 f"🗄 قاعدة البيانات: {db_health_status}\n"
                 f"🔑 الكلمات المفتاحية: {kw_count:,}\n"
-                f"🌐 Dashboard: {dashboard_status}\n\n"
+                f"🌐 Dashboard: {dashboard_status}\n"
+                f"⚡ الالتقاط الفوري: {ic_status} (القناة: {ic_channel})\n\n"
                 f"<b>الحسابات:</b>\n{acct_lines}\n\n"
                 f"💡 اكتب /help للأوامر المتاحة",
                 parse_mode="html",
@@ -1049,7 +1010,6 @@ class EnhancedTelegramBot:
 # Entry Point
 # =============================================================================
 async def main() -> None:
-    # ضبط الترميز ليتوافق مع شاشة Pydroid 3
     if sys.platform == "win32":
         sys.stdout.reconfigure(encoding="utf-8")
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
