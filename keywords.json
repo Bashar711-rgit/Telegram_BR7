@@ -1,11 +1,11 @@
 {
   "_meta": {
-    "version": "15.1.0",
-    "codename": "IntentEngine-NLP-Templates-HighPrecision-SchemaFixed",
+    "version": "15.2.0",
+    "codename": "IntentEngine-NLP-Templates-Hardened-AuditPass1",
     "target": "telegram_group_filter",
     "dialect": "saudi_arabic_multilingual",
     "intent": "student_help_requests",
-    "updated": "2026-08-14",
+    "updated": "2026-08-16",
     "engine_compatibility": "filter_engine.py v14.1 / config.py v13.1 / database.py v9.0 / monitors.py v9.7 / main.py v13.1",
     "architecture": "NLP Pipeline — Tokenization → Entity Extraction → Negation Analysis → Dependency Analysis → Distance Scoring → Ad Detection → Confidence Engine → Explainability",
     "pipeline_stages": [
@@ -29,44 +29,66 @@
       "Token distance modifies score; message length modifies confidence",
       "English academic terms receive lower weight unless accompanied by Arabic intent verb",
       "Auto-learning disabled; human approval required for feedback integration",
-      "CRITICAL: every keyword string used for trie matching MUST already be in normalized form (no أ/إ/آ/ة/ى/ئ/ؤ). filter_engine.py normalizes INPUT text via _normalize_arabic() before searching the tries, but keyword entries loaded from this file are used AS-IS, with no normalization applied on the keywords side. An entry containing 'ة' or 'أ' etc. will never match normalized input and is silently dead weight — this is the same failure class as the original templates/config.py bug, just at the data layer instead of the loader layer.",
+      "CRITICAL: every keyword string used for trie matching MUST already be in normalized form (no أ/إ/آ/ة/ى/ئ/ؤ). filter_engine.py normalizes INPUT text via _normalize_arabic() before searching the tries, but keyword entries loaded from this file are used AS-IS, with no normalization applied on the keywords side.",
+      "CRITICAL (v15.2, new finding): the same AS-IS rule applies to English tokens. _clean() lower-cases the INPUT text before every trie search, but keyword entries are matched as-is with no case-folding on the keywords side. Any keyword entry containing an uppercase Latin character (e.g. the previous 'PowerPoint', 'Excel', 'Mind Map') can never match lower-cased input and is silently dead weight — identical failure class to the Arabic-normalization bug, just for Latin script. Every English keyword in this file is now lower-case only (see fixes_changelog v15.2 item 1).",
+      "CRITICAL (v15.2, new finding): a message-sharing link is not inherently commercial. ad_blockers previously hard-blocked generic 'http://'/'https://'/'www.' prefixes and academic file-sharing domains (Google Drive/Docs, YouTube, Dropbox, OneDrive) that students routinely paste when sharing lecture files or assignment briefs. Because ad_blocker_trie is an early short-circuit in analyze() (any match -> immediate 'ignore'), this was silently rejecting legitimate academic messages that happened to include a file link. ad_blockers is now scoped to redirect/shortener/social/messaging-app domains only (see fixes_changelog v15.2 item 2).",
+      "IMPORTANT (v15.2): this file's design-target confidence thresholds are now kept in sync with config.py's actual runtime defaults (CONFIDENCE_ACCEPT_THRESHOLD=0.65 / CONFIDENCE_REVIEW_THRESHOLD=0.40) instead of documenting an aspirational 0.78/0.55 pair the runtime never applied. If accounts.env is ever changed to override those two env vars, confidence_thresholds_design_target below must be updated in the same change (see fixes_changelog v15.2 item 3).",
+      "KNOWN LIMITATION (documented, not fixable from this file alone): resolution_trie.search_first() returns a match anywhere in the message and, at score>=0.7, short-circuits the whole message to 'ignore' — there is no clause-level scoping in filter_engine.py v14.1. A message that both resolves an old request and raises a new one in the same text (e.g. 'لقيت حل للواجب لكن عندي تقرير ثاني محتاج مساعدة فيه') will currently be mis-classified as ignore. Mitigated here by keeping resolution_phrases as long, low-ambiguity exact phrases rather than short generic ones, but a real fix requires clause-level resolution detection in filter_engine.py (tracked for a future engine version, not a data-only fix).",
+      "KNOWN LIMITATION (documented): template_boost is a fixed +0.25 confidence add-on hard-coded in filter_engine.py's analyze() and is NOT gated on academic_object/university_context presence at the engine level. Generic template combinations (e.g. '<availability> <person>' -> 'مين يساعد') can therefore earn the same +0.25 boost whether or not the message is academic. Mitigated here by keeping the template word banks (person/availability/action/expert) oriented toward help-seeking phrasing rather than fully generic terms, but true context-gating requires an engine change (recommended follow-up, not implemented in this data file).",
       "test_cases.*.text are deliberately left in natural/raw Arabic spelling (with ة, hamzas, etc.) because they represent simulated RAW user input that itself passes through the normalization pipeline during a test run — normalizing them here would test something other than production behavior."
     ],
     "arabic_normalization": { "char_map": { "أ": "ا", "إ": "ا", "آ": "ا", "ة": "ه", "ى": "ي", "ئ": "ي", "ؤ": "و" }, "remove": ["tashkeel", "tatweel"] },
     "obfuscation_normalization": { "remove_spaces_inside_words": true, "remove_zero_width_chars": true, "normalize_repeated_letters": true },
-    "fuzzy_matching": { "enabled": true, "max_edit_distance": 2, "minimum_token_length": 4, "only_for": [] },
+    "fuzzy_matching": {
+      "_note": "v15.2: previously only_for=[] meant fuzzy matching (edit distance <= 2) was effectively unscoped across the entire vocabulary — high risk of false positives in Arabic, where many unrelated short roots differ by 1-2 characters (e.g. واجب/واجه, بحث/بحه, مقرر/مقر). Scoped to a short, high-value list and tightened edit distance to match CFG.FUZZY_MAX_EDIT_DISTANCE's own default (1, not 2) and a longer minimum token length so short/common words are never fuzzy-matched.",
+      "enabled": true,
+      "max_edit_distance": 1,
+      "minimum_token_length": 5,
+      "only_for": ["intent_verbs", "request_phrases", "high_confidence_boost_patterns"]
+    },
     "signal_priority": { "phrase_match": 3, "entity_match": 2, "single_token_match": 1 },
     "confidence_thresholds_design_target": {
-      "_note": "These are the DESIGN target thresholds this keyword set was tuned against. The ACTUAL runtime thresholds come from CFG.CONFIDENCE_ACCEPT_THRESHOLD / CFG.CONFIDENCE_REVIEW_THRESHOLD in config.py (env-overridable), whose current defaults are 0.65 / 0.40, not 0.78 / 0.55. Set CONFIDENCE_ACCEPT_THRESHOLD=0.78 and CONFIDENCE_REVIEW_THRESHOLD=0.55 in accounts.env to match this file's tuning, or re-tune this file's boost/weight values against the 0.65/0.40 defaults. This mismatch is exactly the kind of 'JSON documents one thing, runtime does another' gap the engineering audit warned about (see fixes_changelog, item 9).",
-      "ignore": { "min": 0.0, "max": 0.55, "action": "ignore" },
-      "review": { "min": 0.55, "max": 0.78, "action": "review" },
-      "accept": { "min": 0.78, "max": 1.0, "action": "accept" }
+      "_note": "v15.2: aligned to the ACTUAL runtime defaults from config.py (CFG.CONFIDENCE_ACCEPT_THRESHOLD=0.65, CFG.CONFIDENCE_REVIEW_THRESHOLD=0.40) instead of the previous aspirational 0.78/0.55 pair, which the runtime never enforced (env-var default mismatch — see fixes_changelog v15.2 item 3). If these env vars are changed in accounts.env, update this block in the same change so the file never again documents a target the runtime doesn't apply.",
+      "ignore": { "min": 0.0, "max": 0.40, "action": "ignore" },
+      "review": { "min": 0.40, "max": 0.65, "action": "review" },
+      "accept": { "min": 0.65, "max": 1.0, "action": "accept" }
     },
     "total_unique_entries": "dynamic",
     "fixes_changelog": [
-      "1) [confirmed already fixed upstream] templates/template_patterns reach KEYWORDS: config.py v13.1's _KW_CATEGORIES now includes 'templates' and 'template_patterns' — verified this file's data is structurally compatible with that loader (dict-of-lists under 'templates', list-of-strings under 'template_patterns').",
-      "2) [confirmed already fixed upstream] filter_engine.py v14.1's _generate_template_patterns() receives real data end-to-end (config.py -> KEYWORDS -> EnhancedFilter._load_keyword_sets -> WeightedTrie).",
-      "3) [new bug found + fixed] template_patterns previously listed 12 combinations, but filter_engine.py v14.1's _generate_template_patterns() only implements 7 exact tag combinations (2-part: <need><person>, <need><expert>, <availability><person>, <availability><action>, <availability><expert>; 3-part: <need><person><action>, <availability><person><action>). The other 5 patterns (anything referencing <academic_object> or <urgency>, and any 4-part pattern) were silently ignored by the generator — same failure class as the original P0 bug, just reintroduced at the content layer. template_patterns has been trimmed to exactly the 7 supported combinations. Do not add <academic_object>/<urgency> combinations or patterns with more than 3 tags back into template_patterns unless filter_engine.py's _generate_template_patterns() is extended to parse them first.",
-      "4) [new bug found + fixed] length_modifier keys used the format '1_3_tokens' etc., but filter_engine.py's parser only recognizes the '_to_' delimiter ('X_to_Y'). Every length_modifier entry was silently dropped at load time (get_length_modifier() always fell back to the 0.9 default). Keys renamed to '1_to_3', '4_to_10', '11_to_30', '31_to_9999'.",
-      "5) [new bug found + fixed] filter_engine.py's _detect_advertisement() reads a TOP-LEVEL 'ad_blockers' array (self._ad_blockers = set(kw.get('ad_blockers', []))), used both for the early ad_blocker_trie short-circuit in analyze() and for a +0.2 ad-score contribution. This top-level key did not exist in v15 (only the never-loaded 'url_and_contact_signals' section existed, which is not in config.py's _KW_CATEGORIES and was therefore silently dropped at load — see item 7). The ad_blocker mechanism was effectively disabled. Added a real top-level 'ad_blockers' array; removed the dead 'url_and_contact_signals' section.",
-      "6) [new bug found + fixed, file-wide] Arabic hamza/ta-marbuta normalization mismatch: many keyword entries used unnormalized forms (أ/إ/آ/ة/ى/ئ/ؤ) which can never match normalized runtime input (see design_principles note above). Performed a normalization pass across every matchable field (templates, intent_verbs, request_phrases, academic_objects, advertisement_signals, ignore_signals, spam_categories, university_context, dialect_mapping, subject_markers, negation, etc.). Removed a handful of entries that were exact duplicates of an already-correct normalized sibling entry (e.g. 'رسالة ماجستير' duplicating 'رساله ماجستير'). test_cases.*.text intentionally left un-normalized (see design_principles).",
-      "7) [decision documented] high_confidence_boost_patterns: the original engineering report flagged this as an undecided design question (static list vs template engine). Decision made explicit here: BOTH are used. high_confidence_boost_patterns.patterns now holds curated, high-precision multi-word phrases (including everything merged in from the external keyword list) that are not expressible as template combinations; template_patterns continues to generate the large combinatorial set. filter_engine.py already unions both into self._boost_patterns, so no code change was required.",
-      "8) [documented, not silently dropped] Legacy/pre-v13 flat keys still listed in config.py's _KW_CATEGORIES ('request', 'advertisement', 'ignore', 'emoji_advertisement', 'education_providers', 'request_context', 'indirect_request', 'urgency', 'spam_patterns') are intentionally present as empty arrays rather than simply absent. Their functionality is fully superseded by the v13+/v15 structured sections (intent_verbs+request_phrases, advertisement_signals, ignore_signals, emoji_signals.ad_style_emoji, advertisement_signals.institution_terms, request_phrases, implicit_request_patterns, urgency_markers, spam_categories respectively). Keeping them present-but-empty, with this note, makes the schema contract discoverable instead of silently absent — directly resolving the audit's Problem #4/#8/#9 (schema mismatch / gaps that should be visible, not silent).",
-      "9) academic_object_weight and url_and_contact_signals sections were removed from the top level: neither key is in config.py's _KW_CATEGORIES, so both were being silently dropped by load_keywords() before ever reaching filter_engine.py — dead JSON that looked functional but never executed. url_and_contact_signals' actual data is now live under the top-level 'ad_blockers' key (see item 5). academic_object_weight (exact_phrase_multiplier / single_word_multiplier) is not implemented anywhere in filter_engine.py v14.1's scoring path; noted here as a documented future-feature idea rather than left as misleading dead configuration.",
-      "10) Merged the externally-provided general/subject-specific keyword list into the file: general request phrasings were added to request_phrases.direct_requests; 'عندي <thing>' statements were added to implicit_request_patterns.problem_state; subject-specific combined phrases (بحث/تقرير/واجب/مشروع/عرض/إكسل/خريطة مفاهيم/اختبار) were added to high_confidence_boost_patterns.patterns for maximum precision as exact phrase matches. All merged in normalized form, de-duplicated against existing entries (e.g. 'عندي واجب' / 'عندي مشروع' / 'عندي بحث' already existed and were not re-added).",
-      "11) explainability.example.reasons updated to match the ACTUAL reason-string formats produced by filter_engine.py's analyze() (e.g. 'intent_verb: X', 'academic_object: X', 'template_boost: X') instead of an illustrative-but-inaccurate example.",
-      "12) Nothing was deleted from request/advertisement/ignore/action_verbs/subject_markers/implicit_request_patterns/solve_actions/help_expressions content itself (per the audit's explicit 'do not touch' list) beyond the character-level normalization fixes and duplicate removal described above."
+      "== v15.2 (this pass) — engineering-audit hardening ==",
+      "1) [P0-fixable-in-data] English case-folding bug: filter_engine.py's _clean() lower-cases INPUT text but keyword entries are matched AS-IS with no case-folding applied on the keyword side (same failure class as the Arabic-normalization issue, documented in v15.1's item 6, just for Latin script). 'PowerPoint' -> 'powerpoint', 'Excel' -> 'excel' (all occurrences), 'Mind Map' -> 'mind map', 'Concept Map' -> 'concept map' in high_confidence_boost_patterns.patterns, which were previously dead weight and could never match lower-cased input.",
+      "2) [P0] ad_blockers over-reach: removed the generic protocol prefixes 'http://', 'https://', 'www.' (these matched almost any link at all, not specifically commercial ones) and removed academic file-sharing domains 'drive.google.com/', 'docs.google.com/', 'youtube.com/', 'dropbox.com/', 'onedrive.com/' — students routinely paste these when sharing lecture slides, assignment files, or reference videos, and because ad_blocker_trie is an early hard short-circuit to 'ignore' in analyze(), these entries were silently rejecting legitimate academic messages. ad_blockers now contains only messaging-app / social-discovery / URL-shortener domains, which are much stronger commercial-intent signals on their own.",
+      "3) [P0] Threshold mismatch: confidence_thresholds_design_target changed from the aspirational 0.78/0.55 pair (never enforced by runtime) to match config.py's actual CONFIDENCE_ACCEPT_THRESHOLD/CONFIDENCE_REVIEW_THRESHOLD defaults (0.65/0.40), so this file's documented tuning target matches what the engine genuinely applies. See the new design_principles note for the maintenance rule going forward.",
+      "4) [P1] Negation vs. implicit-distress conflict: 'ما عرفت احل', 'ما عرفت اسوي', 'ما فهمت شي', 'ما قدرت اخلص', 'ما لحقت اسوي' (and their base forms 'ما عرفت' / 'ما فهمت' / 'ما قدرت' / 'ما لحقت') were flagged as genuine student-help requests in request_phrases.indirect_distress, yet the pre_verb_negator 'ما' would trigger negation on the exact same text via _detect_negation(), suppressing the request's confidence. Added these phrases to negation.negation_exceptions so _detect_negation() correctly backs off when one of these failure-state phrases is present alongside the negator.",
+      "5) [P1] spam_categories / academic-context overlap: removed ambiguous standalone terms that can legitimately appear in academic requests and were previously hard-blocked via spam_trie's immediate 'ignore' short-circuit: 'تداول', 'اسهم', 'فوركس' from financial_spam (a finance/business student may legitimately ask for help with a report about these topics); 'ادويه' from irrelevant_commercial (overlaps with medical_documents/clinical_nursing academic terms); 'وظيفه', 'وظايف', 'عمل عن بعد', 'عمل من المنزل' from irrelevant_commercial (can appear in legitimate business/HR coursework requests). Kept the unambiguous job-ad phrase 'مطلوب موظفين', which has no plausible academic-request reading.",
+      "6) [P1] ignore_signals.health_general / medical academic overlap: 'مرض', 'علاج', 'دواء', 'مستشفي', 'طبيب', 'عنايه', 'صحه' removed from ignore_signals.health_general — these single tokens overlap heavily with academic_objects.medical_documents and academic_objects.clinical_nursing (nursing/medical students legitimately ask for help with 'بحث عن علاج مرض السكري', 'حاله دراسيه عن مريض', etc.) and, since ignore_signals is an early hard short-circuit in analyze(), were causing false rejections of legitimate academic health requests. Narrowed health_general to a small set of casual, clearly non-academic wellbeing chit-chat that is very unlikely to co-occur with a real academic object.",
+      "7) [P2] Lowered academic_objects.general_academic._weight_hint from 0.7 to 0.6 — this subsection (ماده/محاضره/جامعه/كليه/تخصص, etc.) is the most generic academic_objects category and the one most likely to appear in non-request chit-chat ('جامعة الملك سعود حلوة'), so it should contribute the least per-match weight of any academic_objects tier.",
+      "8) [P2] De-duplication: removed a duplicate 'يسلم' entry in templates.action (was listed twice) and a duplicate 'شخص' entry in templates.person (was listed twice). No semantic content removed — both canonical forms are still present exactly once.",
+      "9) [P2] Test suite expansion (audit item 33/34): grew test_cases from 21 total (10 positive / 9 negative / 2 borderline) to a much larger, scenario-driven set explicitly covering: negation-vs-distress, resolution+new-request-in-one-message, academic file-link messages, commercial-link messages, ambiguous finance/health academic topics, non-academic uses of intent verbs and template words, the 'احتاج دكتور' expert-ambiguity case, very short messages, and a long multi-clause message. See test_cases below.",
+      "== v15.1 (prior pass) — see following items, unchanged from the previous release ==",
+      "10) [confirmed already fixed upstream] templates/template_patterns reach KEYWORDS: config.py v13.1's _KW_CATEGORIES now includes 'templates' and 'template_patterns' — verified this file's data is structurally compatible with that loader (dict-of-lists under 'templates', list-of-strings under 'template_patterns').",
+      "11) [confirmed already fixed upstream] filter_engine.py v14.1's _generate_template_patterns() receives real data end-to-end (config.py -> KEYWORDS -> EnhancedFilter._load_keyword_sets -> WeightedTrie).",
+      "12) [bug found + fixed] template_patterns previously listed 12 combinations, but filter_engine.py v14.1's _generate_template_patterns() only implements 7 exact tag combinations. template_patterns has been trimmed to exactly the 7 supported combinations.",
+      "13) [bug found + fixed] length_modifier keys renamed from '1_3_tokens' style to the 'X_to_Y' format filter_engine.py's parser actually recognizes.",
+      "14) [bug found + fixed] Added a real top-level 'ad_blockers' array (filter_engine.py reads this directly); removed the dead 'url_and_contact_signals' section which was never loaded by config.py's _KW_CATEGORIES.",
+      "15) [file-wide fix] Arabic hamza/ta-marbuta normalization pass across every matchable field so keyword entries match normalized runtime input.",
+      "16) [decision documented] high_confidence_boost_patterns and template_patterns are BOTH used (curated precision list + combinatorial generation) — filter_engine.py already unions both into self._boost_patterns.",
+      "17) [documented, not silently dropped] Legacy pre-v13 flat keys kept as empty arrays (not absent) so the schema contract stays discoverable.",
+      "18) academic_object_weight and url_and_contact_signals sections removed from the top level (dead JSON, never reached by config.py's _KW_CATEGORIES).",
+      "19) Merged an externally-provided keyword list into request_phrases / implicit_request_patterns / high_confidence_boost_patterns.",
+      "20) explainability.example.reasons updated to match the ACTUAL reason-string formats produced by filter_engine.py's analyze().",
+      "21) Nothing was deleted from request/advertisement/ignore/action_verbs/subject_markers/implicit_request_patterns/solve_actions/help_expressions content itself beyond character-level normalization fixes and duplicate removal."
     ]
   },
 
   "templates": {
-    "_description": "Word sets for template-based pattern generation. Engine combines them according to template_patterns at load time. Only 'need','person','action','expert','availability' are read by filter_engine.py v14.1's _generate_template_patterns(); 'urgency' is kept as a reserved/documented word bank for a future engine version that adds <urgency> tag support (see fixes_changelog item 3) — it is NOT currently consumed by the generator.",
+    "_description": "Word sets for template-based pattern generation. Engine combines them according to template_patterns at load time. Only 'need','person','action','expert','availability' are read by filter_engine.py v14.1's _generate_template_patterns(); 'urgency' is kept as a reserved/documented word bank for a future engine version that adds <urgency> tag support — it is NOT currently consumed by the generator. See design_principles for the known limitation that template_boost is not academic-context-gated at the engine level.",
     "need": [
       "احتاج", "ابي", "ابغى", "محتاج", "ادور", "بدور", "اريد", "ودي", "نفسي",
       "نبغى", "نبي", "نحتاج", "ابا", "ابى", "محتاجه", "محتاجين", "نبغيه"
     ],
     "person": [
-      "احد", "شخص", "واحد", "حد", "بنات", "شباب", "اللي", "شخص",
+      "احد", "شخص", "واحد", "حد", "بنات", "شباب", "اللي",
       "شخص واحد", "اي احد", "اي شخص", "فرد", "طالب", "طالبه"
     ],
     "action": [
@@ -74,7 +96,7 @@
       "يخلص", "يراجع", "يصمم", "يبرمج", "يترجم", "يعدل", "يضبط", "يدرس",
       "يفهمني", "يفهم", "يعمل", "يقدم", "ينفذ", "يعد", "يتابع", "يسلم",
       "ينسق", "يرتب", "يحضر", "يوجد", "يلخص", "يحلل", "يقدر", "يعرف",
-      "يفزع", "يساعدكم", "يساعدنا", "يرفع", "يسلم", "يناقش", "يشرحلي"
+      "يفزع", "يساعدكم", "يساعدنا", "يرفع", "يناقش", "يشرحلي"
     ],
     "expert": [
       "مختص", "متخصص", "خبير", "فاهم", "خصوصي", "متمكن", "محترف",
@@ -107,7 +129,7 @@
   ],
 
   "intent_verbs": {
-    "_description": "Canonical first-person verb stems. Weighted for high precision.",
+    "_description": "Canonical first-person verb stems. Weighted for high precision. Intent alone (without an academic_object) is intentionally kept below the accept threshold via the scoring pipeline — see design_principles note on non-academic uses of these verbs (e.g. 'ادور على سكن').",
     "tier_1_high": {
       "_weight_hint": 1.5,
       "terms": ["ابي", "ابغى", "احتاج", "محتاج", "محتاجه", "اريد", "ادور", "بدور", "نحتاج", "نبغى", "نبي", "ابا", "ابى", "محتاجين"]
@@ -153,7 +175,7 @@
     "clinical_nursing": { "_weight_hint": 0.95, "terms": ["خطه رعايه", "خطه علاجيه", "حاله دراسيه", "دراسه حاله", "تحليل حاله", "حل حاله", "تقرير حاله", "care plan", "nursing care plan", "ncp", "soap note", "clinical worksheet", "case study", "clinical case", "case report", "case presentation", "osce", "worksheet", "تمريض", "اسعاف"] },
     "programming_tech": { "_weight_hint": 0.85, "terms": ["كود", "برمجه", "برنامج", "تطبيق", "موقع", "تطوير", "تطوير ويب", "تطوير تطبيق", "قاعده بيانات", "api", "database", "python", "java", "javascript", "php", "c++", "c#", "react", "flutter", "django", "laravel", "sql", "mysql", "oracle", "excel", "matlab", "spss", "power bi", "figma", "autocad", "revit", "solidworks", "lumion", "packet tracer", "wireshark", "اكسس", "access", "html", "css", "nodejs", "mongodb"] },
     "design_visual": { "_weight_hint": 0.8, "terms": ["تصميم", "رسم هندسي", "مخطط", "مخططات", "ui", "ux", "portfolio", "cv", "سيره ذاتيه", "resume", "جرافيكس", "لوقو", "انيميشن", "after effects", "blender", "فوتوشوب", "الستريتور"] },
-    "general_academic": { "_weight_hint": 0.7, "terms": ["ماده", "محاضره", "مختبر", "درس", "منهج", "فصل دراسي", "مقرر", "مقررات", "كورس", "كورسات", "شعبه", "سكشن", "لاب", "ساعات مكتبيه", "مناقشه", "مناقشه مشروع", "مناقشه تخرج", "دكتور الماده", "دكتوره الماده", "بلاك بورد", "blackboard", "course", "lab", "discussion", "discussion board", "حضور محاضرات", "ورقه عمل", "ورقه علميه", "سيره ذاتيه", "cv", "تخصص", "كليه", "جامعه"] }
+    "general_academic": { "_weight_hint": 0.6, "terms": ["ماده", "محاضره", "مختبر", "درس", "منهج", "فصل دراسي", "مقرر", "مقررات", "كورس", "كورسات", "شعبه", "سكشن", "لاب", "ساعات مكتبيه", "مناقشه", "مناقشه مشروع", "مناقشه تخرج", "دكتور الماده", "دكتوره الماده", "بلاك بورد", "blackboard", "course", "lab", "discussion", "discussion board", "حضور محاضرات", "ورقه عمل", "ورقه علميه", "سيره ذاتيه", "cv", "تخصص", "كليه", "جامعه"] }
   },
 
   "request_phrases": {
@@ -220,7 +242,13 @@
     "clause_boundaries": ["لكن", "بس", "الا", "مع ذلك", "غير ان", "على الرغم"],
     "pre_verb_negators": { "_scope": "clause", "terms": ["ما", "مو", "مش", "لا", "ليس", "لم", "لن", "بدون", "غير", "مب"] },
     "post_clause_negators": ["ما عاد", "ما بقى", "ما في داعي", "ما احتاج", "ما ابي", "ما ابغى", "ما اريد", "ما احتاج مساعده", "ما احتاج شرح", "ما احتاج احد", "ما ابي شي", "ما ابغى شي", "ما اريد شي", "ما عاد ابي", "ما عاد اريد", "ما صار لي داعي"],
-    "negation_exceptions": ["ما احتاج حاليا لكن", "ما احتاج الان عندي", "ما ابي احد حاليا", "ما احتاج توضيح لكن", "مو مشكله الان"],
+    "negation_exceptions": [
+      "ما احتاج حاليا لكن", "ما احتاج الان عندي", "ما ابي احد حاليا", "ما احتاج توضيح لكن", "مو مشكله الان",
+      "ما عرفت", "ما فهمت", "ما قدرت", "ما لحقت",
+      "ما عرفت احل", "ما عرفت اسوي", "ما فهمت شي", "ما فهمت الدرس", "ما فهمت الماده",
+      "ما قدرت اخلص", "ما لحقت اسوي", "ما عندي وقت"
+    ],
+    "_negation_exceptions_note": "v15.2 fix: 'ما عرفت احل', 'ما فهمت شي', etc. are genuine failure-state help requests (also listed in request_phrases.indirect_distress) that happen to start with the pre_verb_negator 'ما'. Without these exceptions, _detect_negation() would treat them as a negated (i.e. suppressed) request. These entries make _detect_negation() correctly back off for that phrasing.",
     "resolution_phrases": [
       "تم الحل", "انحل", "انحلت", "حليت", "حليت الواجب", "حليت المشروع", "حليت البحث",
       "خلصت", "خلصت البحث", "خلصت من الواجب", "خلصت من المشروع", "خلصت من البحث",
@@ -239,7 +267,7 @@
   },
 
   "subject_markers": {
-    "_description": "Comprehensive set of markers that identify the speaker as a student seeking help.",
+    "_description": "Comprehensive set of markers that identify the speaker as a student seeking help. IMPORTANT: these are CONTEXT signals only (feed the low-weight 'grammar_score' component, CFG.SCORE_WEIGHT_GRAMMAR=0.15 by default) — they are not, and must not be treated as, standalone intent signals. 'عندي سياره للبيع' contains 'عندي' but is not a help request.",
     "student_pronouns": [
       "انا", "عندي", "لي", "مني", "فيني", "علي",
       "لنا", "عندنا", "احنا", "نحن", "بيدي", "من جهتي",
@@ -268,7 +296,8 @@
       "strong_provider": ["نسوي لكم", "نستقبل الطلبات", "نقدم لكم", "نوفر لكم", "لدينا فريق", "نحن نقدم", "نحن نوفر", "خدماتنا", "فريقنا", "نختص ب", "متخصصون في", "مكتبنا", "مركزنا"],
       "weak_provider": ["نسوي", "نساعد", "نقدم", "نكتب", "نصمم", "نبرمج", "نحل", "نشرح", "نجهز", "نخلص", "نراجع", "نترجم"],
       "individual_provider": ["اكتب لكم", "اسوي لكم", "احل لكم", "اصمم لكم", "اساعدكم", "انجز لكم"],
-      "_rule": "strong_provider/individual_provider + any commercial signal = immediate reject. weak_provider requires 3+ commercial signals."
+      "_rule": "strong_provider/individual_provider + any commercial signal = immediate reject. weak_provider requires 3+ commercial signals.",
+      "_false_positive_note": "weak_provider verbs (نسوي/نساعد/نقدم...) are first-person-plural and can be used by a student describing a group project ('نسوي مشروع جماعي'), which is why weak_provider alone requires 3+ additional commercial signals rather than triggering on its own — do not lower that bar without re-testing against the group-project test cases below."
     },
     "hard_signals": [
       "نسوي لكم", "نقدم لكم", "نوفر لكم", "نستقبل الطلبات", "تابعونا على", "انضم لقناتنا",
@@ -299,21 +328,20 @@
   },
 
   "ad_blockers": [
-    "http://", "https://", "www.", "t.me/", "telegram.me/", "wa.me/",
+    "t.me/", "telegram.me/", "wa.me/",
     "chat.whatsapp.com/", "discord.gg/", "instagram.com/", "x.com/", "twitter.com/",
     "snapchat.com/", "tiktok.com/", "bit.ly/", "tinyurl.com/", "linktr.ee/",
-    "cutt.ly/", "rebrand.ly/", "short.link/", "rb.gy/", "s.id/", "is.gd/",
-    "tiny.cc/", "youtube.com/", "drive.google.com/", "docs.google.com/",
-    "dropbox.com/", "onedrive.com/"
+    "cutt.ly/", "rebrand.ly/", "short.link/", "rb.gy/", "s.id/", "is.gd/", "tiny.cc/"
   ],
-  "_ad_blockers_note": "Read directly by filter_engine.py (self._ad_blockers = set(kw.get('ad_blockers', []))) — used both for the early ad_blocker_trie short-circuit in analyze() and as a +0.2 ad-score contribution in _detect_advertisement(). This key did not exist as a top-level array in the previous version (only the never-loaded 'url_and_contact_signals' section existed), so the ad-blocker mechanism was silently inert — see fixes_changelog item 5.",
+  "_ad_blockers_note": "v15.2: scoped down from the previous list (see fixes_changelog v15.2 item 2). Read directly by filter_engine.py (self._ad_blockers = set(kw.get('ad_blockers', []))) — used both for the early ad_blocker_trie short-circuit in analyze() and as a +0.2 ad-score contribution in _detect_advertisement(). Removed: generic 'http://'/'https://'/'www.' prefixes (matched almost any link, not specifically commercial ones) and academic file-sharing domains 'drive.google.com/', 'docs.google.com/', 'youtube.com/', 'dropbox.com/', 'onedrive.com/' (students legitimately paste these when sharing lecture files / assignment briefs / reference videos). What remains are messaging-app / social-discovery / URL-shortener domains, which carry much stronger standalone commercial-intent signal.",
 
   "spam_categories": {
-    "financial_spam": ["تسويق بالعموله", "تسويق شبكي", "اربح من", "اربح المال", "دخل اضافي", "ربح سريع", "ربح مضمون", "استثمار مربح", "عملات رقميه", "تداول", "اسهم", "فوركس"],
+    "financial_spam": ["تسويق بالعموله", "تسويق شبكي", "اربح من", "اربح المال", "دخل اضافي", "ربح سريع", "ربح مضمون", "استثمار مربح", "عملات رقميه"],
     "gaming_spam": ["شحن العاب", "جواهر", "فري فاير", "free fire", "ببجي", "pubg", "روبلوكس", "roblox", "فورت نايت", "حسابات مجانيه", "حسابات للبيع", "شدات", "عملات اللعبه"],
     "tech_piracy": ["واتساب gb", "apk", "تطبيق مهكر", "برنامج مهكر", "برامج مكركه", "كراك", "سيريال", "تفعيل مجاني", "هاكر", "تهكير", "اختراق", "فيروس", "كسر الحمايه"],
     "social_farming": ["follow", "followers", "متابعين", "لايكات", "likes", "تفاعلوا", "تعليقات", "مشاهدات", "views"],
-    "irrelevant_commercial": ["للبيع", "للايجار", "ازاله الكرش", "تخسيس", "ريجيم", "مكملات غذائيه", "بروتين", "كرياتين", "دايت", "ادويه", "روشته", "وظيفه", "وظايف", "مطلوب موظفين", "عمل عن بعد", "عمل من المنزل", "للشراء", "اجهزه", "الكترونيات"]
+    "irrelevant_commercial": ["للبيع", "للايجار", "ازاله الكرش", "تخسيس", "ريجيم", "مكملات غذائيه", "بروتين", "كرياتين", "دايت", "روشته", "مطلوب موظفين", "للشراء", "اجهزه", "الكترونيات"],
+    "_v15_2_trim_note": "Removed 'تداول'/'اسهم'/'فوركس' (financial_spam) — a business/finance student may legitimately request help with a report on these exact topics. Removed 'ادويه' (overlaps with medical_documents/clinical_nursing). Removed standalone 'وظيفه'/'وظائف'/'عمل عن بعد'/'عمل من المنزل' (can appear in legitimate HR/business coursework); kept 'مطلوب موظفين', which has no plausible academic-request reading. spam_trie is an early hard short-circuit to 'ignore' in analyze(), so ambiguous standalone terms here directly cause false negatives on legitimate academic requests — see fixes_changelog v15.2 item 5."
   },
 
   "emoji_signals": {
@@ -335,8 +363,9 @@
       "ذهب", "فضه", "مجوهرات", "عطور", "مكياج"
     ],
     "politics": ["سياسه", "حكومه", "وزير", "ملك", "امير", "انتخابات", "برلمان", "دستور", "قانون", "قضاء"],
-    "health_general": ["مرض", "علاج", "دواء", "مستشفي", "طبيب", "عنايه", "صحه", "حميه"],
-    "entertainment": ["فيلم", "مسلسل", "اغنيه", "موسيقي", "فنان", "مطرب", "حفله", "سينما", "تلفزيون"]
+    "health_general": ["حميه", "رجيم", "نظام غذائي", "تمارين رياضيه", "نوم مبكر"],
+    "entertainment": ["فيلم", "مسلسل", "اغنيه", "موسيقي", "فنان", "مطرب", "حفله", "سينما", "تلفزيون"],
+    "_health_general_v15_2_note": "Trimmed from a broader list that previously included 'مرض'/'علاج'/'دواء'/'مستشفي'/'طبيب'/'عنايه'/'صحه' — those single tokens overlap heavily with academic_objects.medical_documents / academic_objects.clinical_nursing and were causing false 'ignore' rejections of legitimate nursing/medical-student academic requests (e.g. 'بحث عن علاج مرض السكري'). Kept only casual wellbeing chit-chat terms with essentially no academic-request reading. See fixes_changelog v15.2 item 6."
   },
 
   "dialect_mapping": {
@@ -361,15 +390,15 @@
   "distance_scoring_config": { "thresholds": { "0_to_3": { "score_multiplier": 1.0 }, "4_to_7": { "score_multiplier": 0.85 }, "8_to_10": { "score_multiplier": 0.65 }, "11_to_15": { "score_multiplier": 0.4 }, "16_plus": { "score_multiplier": 0.15 } } },
 
   "length_modifier": {
-    "_note": "FIXED (fixes_changelog item 4): keys renamed from '1_3_tokens' style to the 'X_to_Y' format filter_engine.py's _load_keyword_sets() actually parses (it splits on '_to_'). The old key format matched isinstance(key,str) and 'in key' checks that always evaluated false, so every entry was silently dropped and get_length_modifier() always fell back to its 0.9 default regardless of message length.",
+    "_note": "Keys use the 'X_to_Y' format filter_engine.py's _load_keyword_sets() parses (splits on '_to_'). Values intentionally do not penalize long academic messages: 11_to_30 stays at the neutral 1.0 ceiling, and even 31_to_9999 stays fairly close to neutral (0.9) rather than being treated as a quality signal in itself — length should only meaningfully discount very short (1-3 token) messages that lack enough context to disambiguate intent.",
     "1_to_3": 0.7,
     "4_to_10": 0.85,
     "11_to_30": 1.0,
-    "31_to_9999": 0.85
+    "31_to_9999": 0.9
   },
 
   "scoring_weights": {
-    "_note": "Documentation of the DESIGN target weights. filter_engine.py v14.1 actually blends confidence using CFG.SCORE_WEIGHT_INTENT/ACADEMIC/GRAMMAR/DISTANCE/URGENCY/CONTEXT from config.py (env-overridable). Keep these two in sync manually when re-tuning: current config.py defaults are intent=0.30, academic=0.25, grammar=0.15, distance=0.15, urgency=0.05, context=0.10.",
+    "_note": "Documentation of the DESIGN target weights. filter_engine.py v14.1 actually blends confidence using CFG.SCORE_WEIGHT_INTENT/ACADEMIC/GRAMMAR/DISTANCE/URGENCY/CONTEXT from config.py (env-overridable) as the single runtime source of truth. Keep these two in sync manually when re-tuning: current config.py defaults are intent=0.30, academic=0.25, grammar=0.15, distance=0.15, urgency=0.05, context=0.10.",
     "positive_modules": {
       "intent_score": 0.30,
       "academic_score": 0.25,
@@ -402,7 +431,7 @@
   "conversation_history_config": { "open_request_ttl_hours": 24, "resolution_closes_request": true, "max_history_per_user": 5, "conversation_states": ["OPEN_REQUEST", "NEGOTIATION", "RESOLVED", "CLOSED"] },
 
   "test_cases": {
-    "_note": "text values are intentionally natural/raw Arabic (ة, hamzas, etc. as a real user would type) — they are run through the SAME normalization pipeline as production input, so pre-normalizing them here would test something other than real behavior. See _meta.design_principles.",
+    "_note": "text values are intentionally natural/raw Arabic (ة, hamzas, etc. as a real user would type) — they are run through the SAME normalization pipeline as production input, so pre-normalizing them here would test something other than real behavior. See _meta.design_principles. v15.2 significantly expands this suite (audit items 33/34) to explicitly cover negation-vs-distress, resolution+new-request, academic vs. commercial links, ambiguous finance/health topics, non-academic intent-verb/template uses, expert-word ambiguity, very short messages, and long messages.",
     "positive": [
       { "text": "ابي احد يسوي مشروع تخرج هندسة", "expected": "accept" },
       { "text": "فيه احد فاهم مادة الشبكات؟", "expected": "accept" },
@@ -413,7 +442,17 @@
       { "text": "ضروري محتاج حل للواجب اليوم", "expected": "accept" },
       { "text": "محتاج احد يساعدني في مشروع التخرج", "expected": "accept" },
       { "text": "فيه احد متخصص في الاكسل يقدر يساعدني؟", "expected": "accept" },
-      { "text": "احد عنده خبره يسوي لي خريطة مفاهيم للمادة", "expected": "accept" }
+      { "text": "احد عنده خبره يسوي لي خريطة مفاهيم للمادة", "expected": "accept" },
+      { "text": "ما عرفت احل الواجب ابد محتاج مساعدة", "expected": "accept", "_covers": "negation-vs-distress exception (fixes_changelog v15.2 item 4)" },
+      { "text": "ما فهمت شي من المحاضرة ومحتاج شرح للبحث", "expected": "accept", "_covers": "negation-vs-distress exception" },
+      { "text": "السلام عليكم، عندي مشروع تخرج ومحتاج أحد يساعدني فيه، شكراً", "expected": "accept", "_covers": "greeting+request+thanks in one message should not fall through to ignore" },
+      { "text": "هذا رابط ملف المشروع https://drive.google.com/file/xyz مين يساعدني اكمله", "expected": "accept", "_covers": "academic file link must not be hard-blocked (fixes_changelog v15.2 item 2)" },
+      { "text": "عندي بحث تخرج عن علاج مرض السكري ومحتاج مساعدة في التحليل", "expected": "accept", "_covers": "medical academic topic must not be suppressed by ignore_signals.health_general (fixes_changelog v15.2 item 6)" },
+      { "text": "عندي مشروع في مادة التمويل عن تداول الاسهم ومحتاج احد يراجعه", "expected": "accept", "_covers": "finance academic topic must not be suppressed by spam_categories (fixes_changelog v15.2 item 5)" },
+      { "text": "احتاج دكتور يشرح لي مادة التشريح قبل الاختبار", "expected": "accept", "_covers": "expert word 'دكتور' disambiguated by academic context" },
+      { "text": "ابي احد يحل لي واجب اكسل ضروري اليوم", "expected": "accept" },
+      { "text": "مين يعرف احد متخصص يسوي بوربوينت لمادة التسويق", "expected": "accept" },
+      { "text": "بنات مين تعرف احد يساعدني في تقرير التدريب الميداني", "expected": "accept" }
     ],
     "negative": [
       { "text": "نسوي لكم مشاريع تخرج باسعار ممتازة", "expected": "ignore" },
@@ -424,18 +463,29 @@
       { "text": "شروحات لكل المواد وفي كل التخصصات (يوجد حصة مجانية)", "expected": "ignore" },
       { "text": "للبيع ايفون 14 بحالة ممتازة", "expected": "ignore" },
       { "text": "مطلوب موظفين للعمل عن بعد", "expected": "ignore" },
-      { "text": "تواصل معنا واتساب لخدمات طلابية مضمونة النتيجة", "expected": "ignore" }
+      { "text": "تواصل معنا واتساب لخدمات طلابية مضمونة النتيجة", "expected": "ignore" },
+      { "text": "للتواصل واتساب نسوي مشاريع تخرج وبحوث جاهزة للتسليم باسعار مميزة", "expected": "ignore", "_covers": "commercial link/CTA combined with hard_signals" },
+      { "text": "مين يساعد في نقل العفش اليوم", "expected": "ignore", "_covers": "template match on a non-academic task (person+action combo trap)" },
+      { "text": "يا بنات ❤️", "expected": "ignore" },
+      { "text": "تمام", "expected": "ignore" },
+      { "text": "ادور على سكن قريب من الجامعة", "expected": "ignore", "_covers": "intent verb used for a non-academic need" },
+      { "text": "ودي اسافر هالصيف", "expected": "ignore", "_covers": "intent verb 'ودي' with no academic object" }
     ],
     "borderline": [
       { "text": "ابي حل للمشكلة", "expected": "review" },
-      { "text": "عندي مشكلة في المادة", "expected": "review" }
+      { "text": "عندي مشكلة في المادة", "expected": "review" },
+      { "text": "احتاج دكتور", "expected": "review", "_covers": "expert word with no academic_object/context to disambiguate it" },
+      { "text": "مين يساعد", "expected": "review", "_covers": "bare template match with no academic context — should not reach accept on template_boost alone" },
+      { "text": "محتاج", "expected": "review", "_covers": "very short message, intent-only with no object" },
+      { "text": "لقيت شخص يحل الواجب لكن عندي تقرير ثاني محتاج مساعدة فيه", "expected": "review", "_covers": "resolution phrase + new request in one message — known engine limitation (see design_principles); documented here as a target for future clause-level resolution scoring rather than a currently-guaranteed accept" },
+      { "text": "السلام عليكم، انا طالبة هندسة صناعية في السنة الرابعة، اشتغل حاليا على مشروع التخرج وهو عبارة عن تحسين خط انتاج في مصنع محلي، وعندي جزء من التحليل الاحصائي للبيانات ما زلت متعثرة فيه، جربت اكثر من طريقة بس النتائج ما طلعت متسقة، وياليت احد عنده خبرة في spss او minitab يقدر يوجهني او يراجع معي الجزء هذا قبل يوم المناقشة اللي باقي عليه اسبوع تقريبا، وجزاكم الله خير مقدما", "expected": "accept", "_covers": "long, multi-clause academic message should not be penalized by length_modifier" }
     ]
   },
 
-  "learning_feedback": { "false_positives": [], "false_negatives": [], "unknown_terms": [], "borderline_cases": [], "last_reviewed": "2026-08-14", "auto_learn_enabled": false, "human_approval_required": true, "recalibration_trigger": "50 new labeled examples OR weekly" },
+  "learning_feedback": { "false_positives": [], "false_negatives": [], "unknown_terms": [], "borderline_cases": [], "last_reviewed": "2026-08-16", "auto_learn_enabled": false, "human_approval_required": true, "recalibration_trigger": "50 new labeled examples OR weekly" },
 
   "high_confidence_boost_patterns": {
-    "_note": "Curated static high-precision phrases, complementary to (not a replacement for) template_patterns' combinatorial generation — see fixes_changelog item 7. filter_engine.py's _load_keyword_sets() reads boost_data.get('patterns', []) from this section and unions it with the template-generated set into self._boost_patterns; a match adds +0.25 confidence and 'template_boost: X' to reasons. Includes the subject-specific phrasing merged in from the external keyword list (bahth/taqrir/wajib/mashroo'/'ard/Excel/khareeta mafaheem/ikhtibar).",
+    "_note": "Curated static high-precision phrases, complementary to (not a replacement for) template_patterns' combinatorial generation. filter_engine.py's _load_keyword_sets() reads boost_data.get('patterns', []) from this section and unions it with the template-generated set into self._boost_patterns; a match adds +0.25 confidence and 'template_boost: X' to reasons. v15.2: all English tokens lower-cased ('PowerPoint'->'powerpoint', 'Excel'->'excel', 'Mind Map'->'mind map', 'Concept Map'->'concept map') — these were previously dead weight because filter_engine.py lower-cases input text but never lower-cases keyword entries (fixes_changelog v15.2 item 1).",
     "patterns": [
       "من يسوي لي بحث", "ابي احد يسوي بحث", "احد يسوي بحث", "من يعرف يسوي بحث", "تعرفون احد يسوي بحث",
       "ابي احد يكتب بحث", "من يسوي تقرير", "ابي احد يسوي تقرير", "احد يسوي تقرير ميداني", "من يعرف يسوي تقرير ميداني",
@@ -452,16 +502,16 @@
 
       "احد يسوي لي عرض", "من يسوي لي عرض تقديمي", "من يعرف يسوي برزنتيشن", "احد يسوي برزنتيشن",
       "ابي احد يسوي بوربوينت", "من يسوي بوربوينت", "احد يجهز عرض بوربوينت", "من يصمم عرض تقديمي",
-      "احد يصمم برزنتيشن", "ابي عرض جامعي", "من يجهز برزنتيشن جامعي", "احد يسوي PowerPoint",
-      "من يعرف يسوي PowerPoint", "ابي احد يصمم لي عرض",
+      "احد يصمم برزنتيشن", "ابي عرض جامعي", "من يجهز برزنتيشن جامعي", "احد يسوي powerpoint",
+      "من يعرف يسوي powerpoint", "ابي احد يصمم لي عرض",
 
-      "احد يحل اكسل", "من يحل Excel", "احد يسوي لي اكسل", "من يعرف Excel", "حل واجب Excel",
-      "احد يحل واجب اكسل", "من يسوي جداول اكسل", "احد يساعدني في Excel", "من يعرف يحل مسائل Excel",
-      "احد يسوي مشروع Excel", "من يجهز ملف Excel", "حل واجبات برامج", "احد يساعدني في البرامج",
+      "احد يحل اكسل", "من يحل excel", "احد يسوي لي اكسل", "من يعرف excel", "حل واجب excel",
+      "احد يحل واجب اكسل", "من يسوي جداول اكسل", "احد يساعدني في excel", "من يعرف يحل مسائل excel",
+      "احد يسوي مشروع excel", "من يجهز ملف excel", "حل واجبات برامج", "احد يساعدني في البرامج",
 
       "من يسوي خريطه مفاهيم", "احد يسوي خريطه مفاهيم", "من يسوي خريطه ذهنيه", "احد يسوي خريطه ذهنيه",
-      "ابي خريطه مفاهيم", "ابي خريطه ذهنيه", "من يعرف يسوي Mind Map", "احد يصمم Mind Map",
-      "من يسوي Concept Map", "احد يجهز خريطه للماده", "من يسوي مخطط للمقرر",
+      "ابي خريطه مفاهيم", "ابي خريطه ذهنيه", "من يعرف يسوي mind map", "احد يصمم mind map",
+      "من يسوي concept map", "احد يجهز خريطه للماده", "من يسوي مخطط للمقرر",
 
       "احد يحل لي ميد", "من يحل الميد", "حل ميد", "احد يساعدني في الميد", "من يحل كويز", "احد يحل كويز",
       "حل اختبار شهري", "من يحل اختبار", "احد يساعدني في الاختبار", "حل ميدترم",
@@ -478,5 +528,5 @@
   "indirect_request": [],
   "urgency": [],
   "spam_patterns": [],
-  "_legacy_keys_note": "The 9 keys directly above (request, advertisement, ignore, emoji_advertisement, education_providers, request_context, indirect_request, urgency, spam_patterns) are pre-v13 flat-list keys still present in config.py's _KW_CATEGORIES for backward compatibility. They are intentionally kept as EMPTY arrays rather than removed or left absent, so the schema contract stays fully visible (see fixes_changelog item 8) instead of silently missing. Their function is fully covered by the structured v13+/v15 sections above (intent_verbs+request_phrases, advertisement_signals, ignore_signals, emoji_signals.ad_style_emoji, advertisement_signals.institution_terms, request_phrases/implicit_request_patterns, urgency_markers, spam_categories, respectively). Do not populate these unless a genuine need for the flat legacy format is identified — populating them would create a second, harder-to-maintain source of truth for data that already exists in the structured sections."
+  "_legacy_keys_note": "The 9 keys directly above (request, advertisement, ignore, emoji_advertisement, education_providers, request_context, indirect_request, urgency, spam_patterns) are pre-v13 flat-list keys still present in config.py's _KW_CATEGORIES for backward compatibility. They are intentionally kept as EMPTY arrays rather than removed or left absent, so the schema contract stays fully visible instead of silently missing. Their function is fully covered by the structured v13+/v15 sections above (intent_verbs+request_phrases, advertisement_signals, ignore_signals, emoji_signals.ad_style_emoji, advertisement_signals.institution_terms, request_phrases/implicit_request_patterns, urgency_markers, spam_categories, respectively). Do not populate these unless a genuine need for the flat legacy format is identified — populating them would create a second, harder-to-maintain source of truth for data that already exists in the structured sections."
 }
