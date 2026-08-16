@@ -1,28 +1,33 @@
 #!/usr/bin/env python3
 """
-monitors.py – Account Monitor v9.8.1 (STABLE 24/7 EDITION, HARDENED)
+monitors.py – Account Monitor v9.7 (STABLE 24/7 EDITION, HARDENED)
 - إصلاح تدوير الجلسة (إعادة تسجيل المعالج)
 - تحسين إعادة الاتصال واكتشاف العميل الميت
 - دعم كامل لـ IntentEngine
-- NEW v9.8: Instant Capture Lane — Message Deletion Race Condition Fix
-- NEW v9.8.1: SharedCaptureDedup — prevents 6 accounts capturing same message
 
-v9.8.1 (this pass) — deduplication fix, monitors.py ONLY:
-  * Added SharedCaptureDedup class: process-wide set that ensures only
-    the FIRST account to see a message captures it; the other 5 accounts
-    see the dedup hit and skip immediately.
-  * submit_candidate() now calls SharedCaptureDedup.try_claim() before
-    enqueueing — atomic check-and-claim.
-  * _capture_worker() releases the claim on failure so another account
-    can retry the capture.
+v9.7 (this pass) — targeted reliability fixes, monitors.py ONLY:
+  * DeadLetterQueue._retry now genuinely re-submits failed events through the
+    existing processing pipeline instead of sleeping and discarding them.
+  * FloodWaitError is now honored using the exact Telegram-provided wait
+    duration, gated per-account via the existing CircuitBreaker (no global
+    lock, no guessed durations, no stacking).
+  * Media events no longer run their full pipeline synchronously inside the
+    Telethon event handler; they are offloaded to a tracked background task
+    bounded by the existing pipeline semaphore, so the handler stays light
+    and subsequent events for the same account are not blocked.
+  * _rotate_session now reuses the exact same TelegramClient configuration
+    as connect() (timeout / retries / auto_reconnect / device metadata),
+    connects+authorizes the new client before tearing down the old one, and
+    is guarded by the existing connection lock to avoid overlapping clients.
+  * All background tasks created by this module (DLQ retries, media
+    offloading) are tracked in bounded sets, have their exceptions captured
+    via done-callbacks, and are cancelled/awaited cleanly on disconnect().
+  * Previously silent `except Exception: pass` blocks now log at DEBUG/
+    WARNING without ever logging session strings, API hashes, or tokens.
 
-v9.8 (prior pass) — Instant Capture Lane added:
-  * Added InstantCaptureManager class for immediate message capture
-    before full NLP analysis, solving the Message Deletion Race Condition.
-  * EnhancedAccountMonitor now creates and manages an InstantCaptureManager.
-  * The event handler now submits candidates to the capture queue
-    BEFORE the normal processing pipeline (DB queue / media task).
-  * All existing functionality preserved unchanged.
+See the accompanying engineering report for the full list of changes,
+the retry_count propagation fix (process_event_from_queue / _send_alert),
+and documented FOLLOW-UP items for other files.
 """
 from __future__ import annotations
 import asyncio
@@ -45,551 +50,9 @@ from telethon.tl.types import (
     MessageMediaWebPage,
     InputPeerChannel,
 )
-from config import CFG, InputSanitizer, fast_hash, FAST_INTENT_SIGNALS, FAST_ACADEMIC_SIGNALS
+from config import CFG, InputSanitizer, fast_hash
 from database import EnhancedDatabase, MessageRecord, AlertRecord, DeadLetterRecord
 from filter_engine import EnhancedFilter
-
-
-# =============================================================================
-# NEW v9.8.1: SharedCaptureDedup — prevents duplicate captures across accounts
-# =============================================================================
-class SharedCaptureDedup:
-    """
-    Process-wide deduplication set shared by ALL InstantCaptureManager
-    instances. When multiple accounts monitor the same group, only the
-    FIRST account to see a message will capture it; the other accounts
-    will see the dedup hit and skip.
-
-    Thread-safety: uses asyncio.Lock for atomic check-and-claim.
-    Bounded: keeps max 5000 keys; when full, clears oldest half.
-    """
-
-    _seen_keys: Set[str] = set()
-    _lock = asyncio.Lock()
-    _MAX_KEYS = 5000
-
-    @classmethod
-    async def try_claim(cls, chat_id: int, message_id: int) -> bool:
-        """
-        Atomically check-and-claim a message.
-        Returns True if this caller should capture (first to claim),
-        False if another account already claimed it.
-        """
-        key = f"{chat_id}:{message_id}"
-        async with cls._lock:
-            if key in cls._seen_keys:
-                return False
-            # Keep the set bounded
-            if len(cls._seen_keys) >= cls._MAX_KEYS:
-                # Clear oldest half (approximate — sets are unordered)
-                half_size = cls._MAX_KEYS // 2
-                for i, k in enumerate(list(cls._seen_keys)):
-                    if i >= half_size:
-                        break
-                    cls._seen_keys.discard(k)
-            cls._seen_keys.add(key)
-            return True
-
-    @classmethod
-    async def release(cls, chat_id: int, message_id: int) -> None:
-        """Release a claim if capture failed (allows retry by same or other account)."""
-        key = f"{chat_id}:{message_id}"
-        async with cls._lock:
-            cls._seen_keys.discard(key)
-
-    @classmethod
-    def size(cls) -> int:
-        """Return current size of the dedup set."""
-        return len(cls._seen_keys)
-
-
-# =============================================================================
-# NEW v9.8: InstantCaptureManager — Message Deletion Race Condition Fix
-# =============================================================================
-class InstantCaptureManager:
-    """
-    Manages the Instant Capture Lane: captures candidate messages and
-    forwards them to the target channel IMMEDIATELY, before the full NLP
-    analysis pipeline runs. This solves the Message Deletion Race Condition
-    where a message is deleted (by the user or another bot) before the
-    slow analysis pipeline completes.
-
-    v9.8.1: Uses SharedCaptureDedup so only ONE account captures a
-    message even when 6 accounts monitor the same group.
-
-    Architecture:
-        Telegram Update
-              │
-              ▼
-        Snapshot (immediate)
-              │
-              ▼
-        Fast Candidate Check (intent + academic signals)
-              │
-              ▼
-        Shared Dedup Claim (first account wins)
-              │
-              ▼
-        Capture Queue (bounded, backpressure)
-              │
-              ▼
-        Forward Worker (ASAP, with retry + fallback)
-              │
-              ▼
-        Full NLP Analysis (runs in parallel, NOT blocking capture)
-    """
-
-    # Capture status constants
-    CAPTURE_PENDING = "CAPTURE_PENDING"
-    CAPTURED = "CAPTURED"
-    CAPTURE_FAILED = "CAPTURE_FAILED"
-    CAPTURE_RETRYING = "CAPTURE_RETRYING"
-
-    def __init__(
-        self,
-        account_name: str,
-        client: Optional[TelegramClient] = None,
-        target_channel_id: Optional[int] = None,
-        db: Optional[EnhancedDatabase] = None,
-    ):
-        self._account_name = account_name
-        self._client = client
-        self._db = db
-        self._target_channel_id = target_channel_id or CFG.TARGET_CHANNEL_ID or CFG.ADMIN_CHAT_ID
-
-        # Bounded queue with backpressure
-        self._queue: asyncio.Queue = asyncio.Queue(maxsize=CFG.INSTANT_CAPTURE_QUEUE_SIZE)
-
-        # Worker state
-        self._workers: List[asyncio.Task] = []
-        self._worker_started = False
-        self._stopping = False
-
-        # Statistics
-        self._stats: Dict[str, Any] = {
-            "total_candidates": 0,
-            "queued": 0,
-            "captured": 0,
-            "failed": 0,
-            "retried": 0,
-            "queue_full_drops": 0,
-            "fallback_recreates": 0,
-            "dedup_skipped": 0,
-            "avg_capture_latency_ms": 0.0,
-            "total_latency_ms": 0.0,
-        }
-        self._stats_lock = asyncio.Lock()
-
-    def set_client(self, client: Optional[TelegramClient]) -> None:
-        """Update the client reference (e.g. after session rotation)."""
-        self._client = client
-
-    async def start(self) -> None:
-        """Start the capture workers."""
-        if self._worker_started:
-            return
-
-        self._stopping = False
-        num_workers = max(1, CFG.INSTANT_CAPTURE_WORKERS)
-
-        for i in range(num_workers):
-            task = asyncio.create_task(
-                self._capture_worker(i),
-                name=f"instant_capture_{self._account_name}_{i}",
-            )
-            self._workers.append(task)
-
-        self._worker_started = True
-        logger.info(
-            f"InstantCaptureManager[{self._account_name}]: started {num_workers} worker(s), "
-            f"target_channel={self._target_channel_id}, queue_size={CFG.INSTANT_CAPTURE_QUEUE_SIZE}"
-        )
-
-    async def stop(self) -> None:
-        """Stop all capture workers."""
-        if not self._worker_started:
-            return
-
-        self._stopping = True
-
-        # Cancel all workers
-        for task in self._workers:
-            if not task.done():
-                task.cancel()
-
-        # Await all workers
-        for task in self._workers:
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-            except Exception as e:
-                logger.error(
-                    f"InstantCaptureManager[{self._account_name}]: "
-                    f"error awaiting worker during shutdown: {e}"
-                )
-
-        self._workers.clear()
-        self._worker_started = False
-        logger.info(f"InstantCaptureManager[{self._account_name}]: stopped")
-
-    def create_snapshot(self, event_data: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Create a snapshot from event data. The snapshot contains all
-        information needed to forward/recreate the message even if the
-        original is deleted from the source group.
-        """
-        snapshot = {
-            "chat_id": event_data.get("chat_id"),
-            "message_id": event_data.get("message_id"),
-            "sender_id": event_data.get("sender_id", 0),
-            "sender_username": event_data.get("sender_username"),
-            "sender_first_name": event_data.get("sender_first_name"),
-            "sender_last_name": event_data.get("sender_last_name"),
-            "sender_access_hash": event_data.get("sender_access_hash"),
-            "chat_access_hash": event_data.get("chat_access_hash"),
-            "chat_username": event_data.get("chat_username"),
-            "text": event_data.get("text", ""),
-            "has_text": event_data.get("has_text", False),
-            "has_media": event_data.get("has_media", False),
-            "media_type": event_data.get("media_type"),
-            "media_object": event_data.get("media_object"),
-            "account_name": self._account_name,
-            "timestamp": time.time(),
-            "capture_status": self.CAPTURE_PENDING,
-            "forward_attempts": 0,
-        }
-        return snapshot
-
-    def fast_candidate_check(self, text: str) -> bool:
-        """
-        Ultra-fast check: Intent Signal + Academic Signal.
-        Returns True only if BOTH are present.
-        This is intentionally simple — no fuzzy matching, no negation,
-        no distance scoring. Just substring checks.
-        """
-        if not text or not CFG.INSTANT_CAPTURE_ENABLED:
-            return False
-
-        text_lower = text.lower()
-
-        # 1. Check Intent Signals
-        has_intent = False
-        for category, signals in FAST_INTENT_SIGNALS.items():
-            for signal in signals:
-                if signal in text_lower:
-                    has_intent = True
-                    break
-            if has_intent:
-                break
-
-        if not has_intent:
-            return False
-
-        # 2. Check Academic Signals
-        has_academic = False
-        for category, signals in FAST_ACADEMIC_SIGNALS.items():
-            for signal in signals:
-                if signal in text_lower:
-                    has_academic = True
-                    break
-            if has_academic:
-                break
-
-        return has_intent and has_academic
-
-    async def submit_candidate(self, snapshot: Dict[str, Any]) -> bool:
-        """
-        Submit a candidate snapshot to the capture queue.
-        Uses put_nowait() to never block the event handler.
-
-        v9.8.1: First checks SharedCaptureDedup.try_claim() — only the
-        FIRST account to see this message will capture it. The other
-        5 accounts will skip immediately.
-        """
-        if self._stopping or not CFG.INSTANT_CAPTURE_ENABLED:
-            return False
-
-        # ── v9.8.1: Shared Deduplication ──────────────────────────────
-        chat_id = snapshot.get("chat_id", 0)
-        message_id = snapshot.get("message_id", 0)
-
-        if not await SharedCaptureDedup.try_claim(chat_id, message_id):
-            async with self._stats_lock:
-                self._stats["dedup_skipped"] += 1
-            logger.debug(
-                f"InstantCaptureManager[{self._account_name}]: "
-                f"message {chat_id}:{message_id} already claimed by another account, skipping"
-            )
-            return False
-        # ───────────────────────────────────────────────────────────────
-
-        async with self._stats_lock:
-            self._stats["total_candidates"] += 1
-
-        try:
-            self._queue.put_nowait(snapshot)
-            async with self._stats_lock:
-                self._stats["queued"] += 1
-            return True
-        except asyncio.QueueFull:
-            async with self._stats_lock:
-                self._stats["queue_full_drops"] += 1
-            logger.warning(
-                f"InstantCaptureManager[{self._account_name}]: "
-                f"queue full, dropping candidate msg_id={snapshot.get('message_id')}"
-            )
-            # Release claim on queue-full so another account can try
-            await SharedCaptureDedup.release(chat_id, message_id)
-            return False
-
-    async def _capture_worker(self, worker_id: int) -> None:
-        """Background worker that processes the capture queue."""
-        logger.debug(f"InstantCaptureManager[{self._account_name}]: worker {worker_id} started")
-
-        while not self._stopping:
-            try:
-                snapshot = await self._queue.get()
-            except asyncio.CancelledError:
-                logger.debug(
-                    f"InstantCaptureManager[{self._account_name}]: "
-                    f"worker {worker_id} cancelled"
-                )
-                break
-
-            start_time = time.perf_counter()
-
-            try:
-                snapshot["capture_status"] = self.CAPTURE_RETRYING
-                success = await self._forward_with_retry(snapshot)
-
-                latency_ms = int((time.perf_counter() - start_time) * 1000)
-
-                async with self._stats_lock:
-                    self._stats["total_latency_ms"] += latency_ms
-                    total_ops = self._stats["captured"] + self._stats["failed"]
-                    if total_ops > 0:
-                        self._stats["avg_capture_latency_ms"] = (
-                            self._stats["total_latency_ms"] / total_ops
-                        )
-
-                if success:
-                    snapshot["capture_status"] = self.CAPTURED
-                    snapshot["capture_latency_ms"] = latency_ms
-                    async with self._stats_lock:
-                        self._stats["captured"] += 1
-                    await self._record_capture(snapshot, success=True)
-                    logger.info(
-                        f"InstantCaptureManager[{self._account_name}]: "
-                        f"captured msg_id={snapshot.get('message_id')} in {latency_ms}ms"
-                    )
-                else:
-                    snapshot["capture_status"] = self.CAPTURE_FAILED
-                    snapshot["capture_latency_ms"] = latency_ms
-                    async with self._stats_lock:
-                        self._stats["failed"] += 1
-                    await self._record_capture(snapshot, success=False)
-                    # v9.8.1: Release claim on failure so another account can retry
-                    await SharedCaptureDedup.release(
-                        snapshot.get("chat_id", 0),
-                        snapshot.get("message_id", 0),
-                    )
-                    logger.error(
-                        f"InstantCaptureManager[{self._account_name}]: "
-                        f"FAILED to capture msg_id={snapshot.get('message_id')} "
-                        f"after {snapshot.get('forward_attempts', 0)} attempts"
-                    )
-
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                async with self._stats_lock:
-                    self._stats["failed"] += 1
-                # v9.8.1: Release claim on unexpected error
-                await SharedCaptureDedup.release(
-                    snapshot.get("chat_id", 0),
-                    snapshot.get("message_id", 0),
-                )
-                logger.exception(
-                    f"InstantCaptureManager[{self._account_name}]: "
-                    f"worker {worker_id} error: {e}"
-                )
-            finally:
-                self._queue.task_done()
-
-        logger.debug(f"InstantCaptureManager[{self._account_name}]: worker {worker_id} stopped")
-
-    async def _forward_with_retry(self, snapshot: Dict[str, Any]) -> bool:
-        """Forward with retry. Returns True on first success."""
-        max_retries = CFG.INSTANT_CAPTURE_RETRIES
-        retry_delay = CFG.INSTANT_CAPTURE_RETRY_DELAY_MS / 1000
-
-        for attempt in range(max_retries + 1):
-            snapshot["forward_attempts"] = attempt + 1
-
-            try:
-                success = await self._forward_single(snapshot)
-                if success:
-                    if attempt > 0:
-                        async with self._stats_lock:
-                            self._stats["retried"] += 1
-                    return True
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                logger.debug(
-                    f"InstantCaptureManager[{self._account_name}]: "
-                    f"forward attempt {attempt + 1}/{max_retries + 1} failed "
-                    f"for msg_id={snapshot.get('message_id')}: {type(e).__name__}: {e}"
-                )
-
-            if attempt < max_retries:
-                await asyncio.sleep(retry_delay)
-
-        return False
-
-    async def _forward_single(self, snapshot: Dict[str, Any]) -> bool:
-        """Single forward attempt with fallback to recreate."""
-        client = self._client
-        if not client or not self._is_client_alive(client):
-            logger.warning(
-                f"InstantCaptureManager[{self._account_name}]: "
-                f"no available client for forward"
-            )
-            return False
-
-        msg_id = snapshot.get("message_id")
-        chat_id = snapshot.get("chat_id")
-        target = self._target_channel_id
-
-        if not msg_id or not chat_id or not target:
-            return False
-
-        try:
-            # Primary: forward_messages
-            await client.forward_messages(
-                entity=target,
-                from_peer=chat_id,
-                messages=[msg_id],
-                drop_author=False,
-                drop_media_captions=False,
-            )
-            return True
-
-        except asyncio.CancelledError:
-            raise
-        except Exception as forward_error:
-            logger.debug(
-                f"InstantCaptureManager[{self._account_name}]: "
-                f"forward failed for msg_id={msg_id}, trying fallback: "
-                f"{type(forward_error).__name__}"
-            )
-            return await self._fallback_recreate(snapshot, client, target)
-
-    async def _fallback_recreate(
-        self,
-        snapshot: Dict[str, Any],
-        client: TelegramClient,
-        target: int,
-    ) -> bool:
-        """
-        Fallback: recreate the message manually if forward fails.
-        Handles text-only messages and media messages.
-        """
-        try:
-            text = snapshot.get("text", "")
-            has_media = snapshot.get("has_media", False)
-            media_object = snapshot.get("media_object")
-
-            if has_media and media_object is not None:
-                try:
-                    await client.send_file(
-                        target,
-                        file=media_object,
-                        caption=text or None,
-                        parse_mode="html",
-                    )
-                    async with self._stats_lock:
-                        self._stats["fallback_recreates"] += 1
-                    return True
-                except Exception as e:
-                    logger.debug(
-                        f"InstantCaptureManager[{self._account_name}]: "
-                        f"media fallback failed: {e}"
-                    )
-                    return False
-
-            elif text:
-                await client.send_message(
-                    target,
-                    text,
-                    parse_mode=None,
-                    link_preview=False,
-                )
-                async with self._stats_lock:
-                    self._stats["fallback_recreates"] += 1
-                return True
-
-            return False
-
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            logger.debug(
-                f"InstantCaptureManager[{self._account_name}]: "
-                f"fallback recreate failed: {e}"
-            )
-            return False
-
-    @staticmethod
-    def _is_client_alive(client: TelegramClient) -> bool:
-        """Check if a TelegramClient is connected."""
-        try:
-            attr = getattr(client, "is_connected", None)
-            return bool(attr() if callable(attr) else attr)
-        except Exception:
-            return False
-
-    async def _record_capture(self, snapshot: Dict[str, Any], success: bool) -> None:
-        """Record capture status to database if available."""
-        if not self._db:
-            return
-
-        try:
-            record = {
-                "message_id": snapshot.get("message_id"),
-                "chat_id": snapshot.get("chat_id"),
-                "sender_id": snapshot.get("sender_id", 0),
-                "capture_status": snapshot.get("capture_status", ""),
-                "capture_latency_ms": snapshot.get("capture_latency_ms", 0),
-                "forward_attempts": snapshot.get("forward_attempts", 0),
-                "captured_at": time.time(),
-            }
-            try:
-                await self._db.save_capture_record(record)
-            except AttributeError:
-                pass
-            except Exception as e:
-                logger.debug(
-                    f"InstantCaptureManager[{self._account_name}]: "
-                    f"failed to record capture: {e}"
-                )
-        except Exception as e:
-            logger.debug(
-                f"InstantCaptureManager[{self._account_name}]: "
-                f"error in _record_capture: {e}"
-            )
-
-    async def get_stats(self) -> Dict[str, Any]:
-        """Return capture statistics."""
-        async with self._stats_lock:
-            stats = dict(self._stats)
-        stats["queue_size"] = self._queue.qsize()
-        stats["workers"] = len(self._workers)
-        stats["enabled"] = CFG.INSTANT_CAPTURE_ENABLED
-        stats["target_channel_id"] = self._target_channel_id
-        stats["dedup_pool_size"] = SharedCaptureDedup.size()
-        return stats
 
 
 # (نفس الدوال المساعدة من النسخة الأصلية: resolve_chat_entity, build_telegram_links)
@@ -658,6 +121,7 @@ class CircuitBreaker:
         self.name = name; self._threshold = failure_threshold; self._recovery = recovery_timeout
         self._failures = 0; self._successes = 0; self._last_fail: Optional[float] = None
         self._state = CircuitState.CLOSED; self._half_open_reqs = 0; self._lock = asyncio.Lock()
+        # FloodWait gate: only ever set from a real FloodWaitError.seconds value.
         self._flood_wait_until: Optional[float] = None
         self._flood_seconds_last: float = 0.0
 
@@ -710,6 +174,13 @@ class CircuitBreaker:
                 self._state = CircuitState.OPEN; logger.warning(f"Circuit '{self.name}' OPEN ({self._failures} failures)")
 
     async def _flood_failure(self, seconds: float):
+        """
+        Records the *exact* Telegram-provided wait duration. Never guesses,
+        never reuses the generic `_recovery` backoff. If another concurrent
+        caller already recorded a flood window, only extend it (never
+        shorten / never stack additively) so repeated FloodWait hits for the
+        same account don't compound into an ever-growing sleep.
+        """
         async with self._lock:
             self._failures += 1
             self._last_fail = time.monotonic()
@@ -742,7 +213,9 @@ class DeadLetterQueue:
     Persists permanently-failed events and retries recoverable ones by
     re-submitting them through the existing processing pipeline via a
     caller-supplied reprocess callback (EnhancedAccountMonitor wires this to
-    its own process_event_from_queue / alert re-send logic).
+    its own process_event_from_queue / alert re-send logic). This
+    deliberately reuses the existing pipeline instead of duplicating
+    filter/database/alert logic here.
     """
 
     def __init__(
@@ -761,6 +234,8 @@ class DeadLetterQueue:
         self._task_lock = asyncio.Lock()
         self._stats: Dict[str, int] = defaultdict(int)
         self._stopping = False
+        # Prevents scheduling a second concurrent retry for the same
+        # chat/message while one is already pending (dup-scheduling guard).
         self._scheduled_keys: Set[str] = set()
 
     @staticmethod
@@ -771,6 +246,8 @@ class DeadLetterQueue:
 
     async def push(self, event_data: Dict[str, Any], error: Exception, retry_count: int = 0) -> None:
         if self._stopping:
+            # Never schedule new background work during shutdown — persist
+            # directly so the event is not silently lost.
             await self._persist_dead_letter(event_data, error, retry_count)
             return
 
@@ -808,6 +285,7 @@ class DeadLetterQueue:
             return
         exc = task.exception()
         if exc is not None:
+            # Guarantees no "Task exception was never retrieved" warnings.
             logger.error(f"DLQ[{self._account_name}]: unhandled exception in retry task: {exc}")
 
     async def _retry(self, event_data: Dict[str, Any], retry_count: int, delay: float, key: str) -> None:
@@ -835,6 +313,10 @@ class DeadLetterQueue:
             return
 
         try:
+            # The reprocess callback (process_event_from_queue / alert
+            # re-send) is responsible for calling push() again on failure
+            # with the *current* retry_count — we deliberately do not call
+            # push() again here to avoid double-scheduling the same event.
             await self._reprocess(event_data, retry_count)
             self._stats["retry_succeeded"] += 1
             logger.info(f"DLQ[{self._account_name}]: retry succeeded for event {key}")
@@ -846,6 +328,9 @@ class DeadLetterQueue:
                 f"DLQ[{self._account_name}]: retry {retry_count}/{self.max_retries} "
                 f"failed for event {key}: {type(e).__name__}: {str(e)[:150]}"
             )
+            # Safety net: if the reprocess callback raised without itself
+            # calling push() (unexpected path), ensure we never lose the
+            # event once max_retries is reached.
             if retry_count >= self.max_retries:
                 await self._persist_dead_letter(event_data, e, retry_count)
 
@@ -866,6 +351,8 @@ class DeadLetterQueue:
                 f"moved to dead-letter storage after {retry_count} attempt(s)"
             )
         except Exception as e:
+            # Last line of defense: even if DB persistence fails, log the
+            # event key at CRITICAL so it is never silently unaccounted for.
             logger.critical(
                 f"DLQ[{self._account_name}]: FAILED to persist dead letter "
                 f"(event may be lost): {e} | event_key={self._event_key(event_data)}"
@@ -917,6 +404,8 @@ class ReconnectionManager:
             try:
                 await asyncio.sleep(CFG.RECONNECT_CHECK_INTERVAL)
                 if not self._mon.is_connected:
+                    # Respect an active connect-time FloodWait before doing
+                    # anything else — never hammer reconnects during it.
                     now_ts = time.time()
                     if self._mon._connect_flood_until and now_ts < self._mon._connect_flood_until:
                         remaining = self._mon._connect_flood_until - now_ts
@@ -949,6 +438,7 @@ class ReconnectionManager:
                         try:
                             await asyncio.wait_for(self._mon.client.get_me(), timeout=15)
                             self._consecutive_failures = 0
+                            # التحقق من وجود المعالج (إصلاح تدوير الجلسة)
                             if self._mon._handler_func is None:
                                 logger.warning(f"Handler missing for {self._mon.account['name']}, re-registering...")
                                 await self._mon._register_handler()
@@ -975,7 +465,6 @@ class EnhancedAccountMonitor:
             "total_processing_time_ms": 0.0, "last_error": None, "last_alert_time": 0.0,
             "connect_attempts": 0, "reconnect_attempts": 0,
             "accepted": 0, "reviewed": 0, "ignored": 0, "avg_confidence": 0.0, "total_confidence": 0.0, "decisions_count": 0,
-            "instant_captured": 0, "instant_failed": 0, "instant_queued": 0,
         }
         self._stats_lock = asyncio.Lock()
         self._entity_cache: TTLCache = TTLCache(maxsize=CFG.ENTITY_CACHE_MAX_SIZE, ttl=600)
@@ -983,6 +472,8 @@ class EnhancedAccountMonitor:
         self._processed_hashes: LRUCache = LRUCache(maxsize=CFG.PROCESSED_HASHES_MAX_SIZE)
         self._processed_lock = asyncio.Lock()
         self._get_entity_sem = asyncio.Semaphore(5); self._pipeline_sem = asyncio.Semaphore(20)
+        # DLQ now wired to genuinely reprocess events through this monitor's
+        # own pipeline (process_event_from_queue) or alert re-send path.
         self._dlq = DeadLetterQueue(
             db,
             max_retries=CFG.DEAD_LETTER_MAX_RETRIES,
@@ -990,18 +481,15 @@ class EnhancedAccountMonitor:
             account_name=account["name"],
         )
         self._connect_attempts = 0; self._last_connect_error: Optional[str] = None
+        # Account-scoped connect-time FloodWait gate (0.0 = not active).
         self._connect_flood_until: float = 0.0
         self._processing_times: List[float] = []; self._max_processing_times = 100
         self._session_rotate_task: Optional[asyncio.Task] = None; self._last_rotation = 0.0
+        # Tracked background tasks for media events offloaded out of the
+        # Telethon event handler (see _register_handler / _spawn_media_task).
         self._media_tasks: Set[asyncio.Task] = set()
         self._media_task_lock = asyncio.Lock()
 
-        self._instant_capture = InstantCaptureManager(
-            account_name=account["name"],
-            client=None,
-            target_channel_id=CFG.TARGET_CHANNEL_ID,
-            db=db,
-        )
 
     def set_bot(self, bot: Any) -> None: self._bot_ref = bot
 
@@ -1028,6 +516,13 @@ class EnhancedAccountMonitor:
 
 
     def _client_kwargs(self) -> Dict[str, Any]:
+        """
+        Single source of truth for TelegramClient construction settings.
+        Used by BOTH connect() and _rotate_session() so a session refresh
+        can never silently drop timeout/retry/auto_reconnect/device
+        settings (previously _rotate_session built a bare client with only
+        api_id/api_hash, diverging from connect()).
+        """
         return dict(
             api_id=self.account["api_id"],
             api_hash=self.account["api_hash"],
@@ -1041,6 +536,9 @@ class EnhancedAccountMonitor:
         cache_key = chat_id; entity = None
         async with self._cache_lock: entity = self._entity_cache.get(cache_key)
         if entity is None:
+            # Route entity resolution through the (previously unused)
+            # entity circuit breaker so a FloodWait here is gated per
+            # account instead of hammering Telegram repeatedly.
             try:
                 entity = await self._entity_cb.call(
                     lambda: resolve_chat_entity(
@@ -1112,6 +610,7 @@ class EnhancedAccountMonitor:
                         from config import SecretManager; SecretManager.decrypt_session(secure_path, plain_path)
                     client_kwargs = self._client_kwargs()
                     if session_string:
+                        # Render/Cloud: non-interactive StringSession from env var
                         client = TelegramClient(StringSession(session_string), **client_kwargs)
                     elif os.path.exists(plain_path) or os.path.exists(f"{session_name}.session"):
                         session_ref = plain_path if os.path.exists(plain_path) else session_name
@@ -1139,13 +638,9 @@ class EnhancedAccountMonitor:
                     logger.info(f"Connected {account['name']} as @{me.username or me.id}")
                     self.client = client; self.is_connected = True; self.started_at = time.time()
                     self._last_connect_error = None; self._stats["last_error"] = None
-                    await self._register_handler()
+                    await self._register_handler()  # تسجيل المعالج
                     await self._reconnect.start()
                     self._start_session_rotation()
-
-                    self._instant_capture.set_client(client)
-                    await self._instant_capture.start()
-
                     return True
                 except SessionPasswordNeededError:
                     logger.error(f"2FA required for {account['name']} - skipping")
@@ -1159,6 +654,10 @@ class EnhancedAccountMonitor:
                         except FileNotFoundError: pass
                     self._last_connect_error = "AuthKeyDuplicated"; self._stats["last_error"] = "AuthKeyDuplicated"; return False
                 except FloodWaitError as e:
+                    # Honor Telegram's exact wait duration; do not burn the
+                    # remaining local attempts (2/3, 3/3) against a window
+                    # we already know will fail. Record it account-scoped so
+                    # ReconnectionManager also respects it.
                     wait = max(0, int(getattr(e, "seconds", 0) or 0))
                     self._connect_flood_until = time.time() + wait
                     self._last_connect_error = f"FloodWait {wait}s"
@@ -1194,6 +693,7 @@ class EnhancedAccountMonitor:
 
 
     async def _register_handler(self):
+        # إزالة أي معالج سابق لتجنب التكرار
         if self._handler_func is not None and self.client:
             try: self.client.remove_event_handler(self._handler_func)
             except Exception as e: logger.debug(f"remove_event_handler (pre-register) failed [{self.account['name']}]: {e}")
@@ -1208,15 +708,13 @@ class EnhancedAccountMonitor:
                 if msg_date and self.started_at > 0:
                     if msg_date.timestamp() < self.started_at - 5: return
                 event_data = await self._event_to_dict(event)
-
-                if CFG.INSTANT_CAPTURE_ENABLED and event_data.get("has_text"):
-                    snapshot = self._instant_capture.create_snapshot(event_data)
-                    if self._instant_capture.fast_candidate_check(event_data.get("text", "")):
-                        queued = await self._instant_capture.submit_candidate(snapshot)
-                        if queued:
-                            await self._inc_stat("instant_queued")
-
                 if event_data.get("has_media"):
+                    # Media is offloaded to a tracked background task instead
+                    # of being processed inline here, so this handler stays
+                    # light and does not block subsequent events for this
+                    # account while a (potentially slow) media pipeline run
+                    # is in progress. Text events keep going through the
+                    # existing persistent DB queue below, unaffected.
                     media = event.message.media
                     event_data["media_object"] = media if event_data["media_type"] in ("photo", "document") else None
                     await self._spawn_media_task(event_data)
@@ -1237,6 +735,13 @@ class EnhancedAccountMonitor:
 
 
     async def _spawn_media_task(self, event_data: Dict[str, Any]) -> None:
+        """
+        Runs the full pipeline for a media event in a tracked background
+        task, bounded by the same _pipeline_sem used by text processing, so
+        it never blocks the Telethon event handler. On failure the event is
+        pushed to the (now functional) DeadLetterQueue instead of being
+        silently dropped, matching the guarantee text events already had.
+        """
         async def _run():
             async with self._pipeline_sem:
                 try:
@@ -1310,6 +815,24 @@ class EnhancedAccountMonitor:
 
 
     async def _rotate_session(self) -> bool:
+        """
+        Controlled client/session refresh (NOT cryptographic key rotation).
+
+        Fixed in this pass:
+          * Uses the exact same client configuration as connect() via
+            _client_kwargs() (timeout, retries, auto_reconnect, device
+            metadata) instead of a bare TelegramClient(session, id, hash).
+          * Connects + authorizes the NEW client BEFORE tearing down the
+            OLD one, and only registers the event handler on the new client
+            after the old handler/connection are torn down — this avoids a
+            window where both clients would be actively receiving/
+            processing the same events.
+          * Wrapped in the existing _connect_lock so this can never overlap
+            with a concurrent connect() call from ReconnectionManager.
+          * On any failure, self.client is explicitly cleared (rather than
+            left pointing at an already-disconnected client) so the normal
+            reconnect path via connect() takes over cleanly.
+        """
         async with self._connect_lock:
             if not self.client or not self.is_connected:
                 return False
@@ -1330,6 +853,9 @@ class EnhancedAccountMonitor:
                     except Exception: pass
                     return False
 
+                # Only now tear down the old client/handler — the new
+                # client has no handler registered yet, so there is no
+                # window where both clients process events simultaneously.
                 if old_handler:
                     try: old_client.remove_event_handler(old_handler)
                     except Exception as e: logger.debug(f"remove_event_handler during rotation failed [{account_name}]: {e}")
@@ -1341,9 +867,6 @@ class EnhancedAccountMonitor:
                 self.is_connected = True
                 self._last_rotation = time.time()
                 await self._register_handler()
-
-                self._instant_capture.set_client(new_client)
-
                 logger.info(f"Session rotated successfully for {account_name}")
                 return True
             except Exception as e:
@@ -1354,6 +877,17 @@ class EnhancedAccountMonitor:
 
 
     async def _dlq_reprocess(self, event_data: Dict[str, Any], retry_count: int) -> None:
+        """
+        Single entry point used by DeadLetterQueue to retry an event.
+        Dispatches to the correct existing pipeline based on what kind of
+        failure originally produced this event: a message-processing
+        failure goes back through process_event_from_queue (which will
+        naturally no-op via the existing message_hash dedup if the message
+        was already stored); an alert-send failure re-invokes _send_alert
+        directly, since routing it back through the full pipeline would be
+        deduped away by the already-stored message and never actually
+        resend the alert.
+        """
         if event_data.get("_dlq_kind") == "alert_resend":
             await self._retry_send_alert(event_data, retry_count)
         else:
@@ -1374,6 +908,17 @@ class EnhancedAccountMonitor:
 
 
     async def process_event_from_queue(self, event_data: Dict[str, Any], retry_count: int = 0) -> None:
+        """
+        retry_count is optional and defaults to 0 to preserve the existing
+        call signature used by main.py's consumer worker
+        (monitor.process_event_from_queue(event_data)). It is only ever
+        passed explicitly by this module's own DLQ retry path, so that a
+        failure occurring on a retry correctly increments retry_count
+        instead of resetting to 0 on every subsequent push() (the original
+        bug: DeadLetterQueue.push() was always called with the default
+        retry_count=0 here, which meant events effectively retried forever
+        and never reached max_retries / dead-letter storage).
+        """
         start_time = time.perf_counter()
         async with self._pipeline_sem:
             try:
@@ -1490,6 +1035,14 @@ class EnhancedAccountMonitor:
         analysis: Dict[str, Any],
         retry_count: int = 0,
     ):
+        """
+        retry_count defaults to 0 to preserve the original call signature
+        used from _analyze_and_alert. When this is invoked as part of a DLQ
+        retry (_retry_send_alert), retry_count is forwarded so that a
+        repeated send failure correctly advances toward max_retries instead
+        of resetting (mirrors the same fix applied to
+        process_event_from_queue).
+        """
         if not self._bot_ref: return
         account_name = data.get("account_name", self.account["name"])
         if not await self._bot_ref.rate_limiter.can_proceed(account_name):
@@ -1562,13 +1115,13 @@ class EnhancedAccountMonitor:
         async with self._connect_lock:
             self.is_connected = False
             await self._reconnect.stop(); await self._dlq.stop()
-
-            await self._instant_capture.stop()
-
             if self._session_rotate_task:
                 self._session_rotate_task.cancel()
                 try: await self._session_rotate_task
                 except asyncio.CancelledError: pass
+            # Cancel and await any in-flight media background tasks so
+            # shutdown never leaves "Task was destroyed but it is pending"
+            # noise and never silently drops a media event mid-flight.
             async with self._media_task_lock:
                 media_tasks = list(self._media_tasks)
             for t in media_tasks:
@@ -1603,7 +1156,6 @@ class EnhancedAccountMonitor:
     async def get_stats(self) -> Dict[str, Any]:
         async with self._stats_lock:
             stats = dict(self._stats)
-        instant_stats = await self._instant_capture.get_stats()
         return {
             "name": self.account["name"], "phone": self.account["phone"], "connected": self.is_connected,
             "priority": self.account.get("priority", 0), "send_cb_state": self._send_cb.state,
@@ -1618,11 +1170,10 @@ class EnhancedAccountMonitor:
             "cache_size": len(self._entity_cache), "processed_hashes_size": len(self._processed_hashes),
             "accepted": stats.get("accepted", 0), "reviewed": stats.get("reviewed", 0), "ignored": stats.get("ignored", 0),
             "avg_confidence": round(stats.get("avg_confidence", 0.0), 2), "decisions_count": stats.get("decisions_count", 0),
-            "instant_capture": instant_stats,
-            "instant_queued": stats.get("instant_queued", 0),
         }
 
 
+# (HealthMonitor كما هو في النسخة الأصلية - تم الحفاظ عليه)
 class HealthStatus:
     def __init__(self, is_healthy: bool, checks: Dict[str, Any], details: Optional[Dict[str, Any]] = None):
         self.is_healthy = is_healthy; self.checks = checks; self.details = details or {}; self.timestamp = time.monotonic()
@@ -1651,9 +1202,7 @@ class HealthMonitor:
                     s = await m.get_stats(); monitors_stats.append({"name": s.get("name"), "connected": s.get("connected"),
                         "messages_processed": s.get("messages_processed", 0), "alerts_sent": s.get("alerts_sent", 0),
                         "errors": s.get("errors", 0), "avg_time": s.get("avg_processing_time_ms", 0), "last_error": s.get("last_error"),
-                        "accepted": s.get("accepted", 0), "reviewed": s.get("reviewed", 0), "ignored": s.get("ignored", 0), "avg_confidence": s.get("avg_confidence", 0),
-                        "instant_captured": (s.get("instant_capture") or {}).get("captured", 0),
-                        "instant_failed": (s.get("instant_capture") or {}).get("failed", 0)})
+                        "accepted": s.get("accepted", 0), "reviewed": s.get("reviewed", 0), "ignored": s.get("ignored", 0), "avg_confidence": s.get("avg_confidence", 0)})
                 details["monitors"] = monitors_stats
                 checks["monitors_ok"] = up >= max(1, total * CFG.HEALTH_MIN_MONITORS_RATIO)
                 main_ok = await self.client_ok(self._bot.main_client); checks["main_client"] = "up" if main_ok else "down"
