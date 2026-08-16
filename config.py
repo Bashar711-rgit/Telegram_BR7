@@ -1,10 +1,18 @@
 #!/usr/bin/env python3
 """
-config.py – Configuration Manager v13.1 (IntentEngine-NLP Edition, HARDENED)
+config.py – Configuration Manager v13.2 (IntentEngine-NLP Edition, HARDENED)
 Supports: SQLite, PostgreSQL (via DATABASE_URL)
-Compatible with: keywords.json v14.0.x, filter_engine.py, monitors.py v9.7 (hardened)
+Compatible with: keywords.json v14.0.x, filter_engine.py, monitors.py v9.8
 
-v13.1 (this pass) — targeted fix, config.py ONLY:
+v13.2 (this pass) — Instant Capture Lane config, config.py ONLY:
+  * Added INSTANT_CAPTURE_* settings and FAST_INTENT_SIGNALS /
+    FAST_ACADEMIC_SIGNALS to support the new Message Deletion Race
+    Condition fix in monitors.py v9.8.
+  * No existing config keys were changed, removed, or reordered.
+  * All new keys have safe defaults that keep the bot fully backwards
+    compatible if monitors.py is not yet updated.
+
+v13.1 (prior pass) — targeted fix:
   * _KW_CATEGORIES was missing "templates" and "template_patterns" — the two
     top-level keys that keywords.json v14.0.x actually stores its
     Template-Driven Pattern Generation data under. Because load_keywords()
@@ -40,7 +48,7 @@ import json
 import os
 import re
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Final, List, Optional, Tuple
 
@@ -128,9 +136,6 @@ def setup_logging(
             enqueue=True,
         )
     except ValueError:
-        # Some Python 3.11 builds fail to parse loguru color markup
-        # ("Single '}' encountered in format string") - fall back to a
-        # plain format so logging setup can never crash the app.
         logger.add(
             sys.stdout,
             level=level,
@@ -255,7 +260,7 @@ class SecretManager:
 load_dotenv("accounts.env")
 
 # =============================================================================
-# Core Config Dataclass v13.1 – جميع المتغيرات
+# Core Config Dataclass v13.2 – جميع المتغيرات
 # =============================================================================
 @dataclass(frozen=True, slots=True)
 class _ConfigData:
@@ -420,8 +425,19 @@ class _ConfigData:
     TEXT_CACHE_SIZE: int
     TEXT_CACHE_TTL: int
 
+    # ═══════════════════════════════════════════════════════════════════
+    # NEW v13.2: Instant Capture Lane — Message Deletion Race Condition Fix
+    # ═══════════════════════════════════════════════════════════════════
+    INSTANT_CAPTURE_ENABLED: bool
+    INSTANT_CAPTURE_QUEUE_SIZE: int
+    INSTANT_CAPTURE_RETRIES: int
+    INSTANT_CAPTURE_RETRY_DELAY_MS: int
+    INSTANT_CAPTURE_MIN_SIGNALS: int
+    TARGET_CHANNEL_ID: Optional[int]
+    INSTANT_CAPTURE_WORKERS: int
+
 # =============================================================================
-# Config Builder v13.1
+# Config Builder v13.2
 # =============================================================================
 class Config:
     _instance: Optional[_ConfigData] = None
@@ -431,7 +447,6 @@ class Config:
         if cls._instance is not None:
             return cls._instance
 
-        # تحذير أمني لـ DASHBOARD_AUTH_TOKEN
         dash_token = SecretManager.get("DASHBOARD_AUTH_TOKEN", "change-me", required=False)
         if dash_token == "change-me":
             logger.warning(
@@ -497,6 +512,26 @@ class Config:
             db_name = SecretManager.get("DB_NAME", None, required=False)
             db_user = SecretManager.get("DB_USER", None, required=False)
             db_password = SecretManager.get("DB_PASSWORD", None, required=False)
+
+        # NEW v13.2: Instant Capture settings
+        instant_capture_enabled = SecretManager.get_bool("INSTANT_CAPTURE_ENABLED", True)
+        instant_capture_queue_size = SecretManager.get_int("INSTANT_CAPTURE_QUEUE_SIZE", 100, required=False)
+        instant_capture_retries = SecretManager.get_int("INSTANT_CAPTURE_RETRIES", 3, required=False)
+        instant_capture_retry_delay_ms = SecretManager.get_int("INSTANT_CAPTURE_RETRY_DELAY_MS", 50, required=False)
+        instant_capture_min_signals = SecretManager.get_int("INSTANT_CAPTURE_MIN_SIGNALS", 2, required=False)
+        instant_capture_workers = SecretManager.get_int("INSTANT_CAPTURE_WORKERS", 2, required=False)
+
+        target_channel_id_raw = SecretManager.get("TARGET_CHANNEL_ID", None, required=False)
+        target_channel_id: Optional[int] = None
+        if target_channel_id_raw:
+            try:
+                target_channel_id = int(target_channel_id_raw)
+            except ValueError:
+                logger.warning(
+                    f"TARGET_CHANNEL_ID is not a valid integer: {target_channel_id_raw!r}. "
+                    "Instant Capture will forward to ADMIN_CHAT_ID as fallback."
+                )
+                target_channel_id = None
 
         # ── بناء الكائن مع جميع المتغيرات ──
         cfg = _ConfigData(
@@ -632,16 +667,27 @@ class Config:
             # ========== الكاش ==========
             TEXT_CACHE_SIZE=SecretManager.get_int("TEXT_CACHE_SIZE", 5000, required=False),
             TEXT_CACHE_TTL=SecretManager.get_int("TEXT_CACHE_TTL", 300, required=False),
+            # ═══════════════════════════════════════════════════════════════════
+            # NEW v13.2: Instant Capture Lane
+            # ═══════════════════════════════════════════════════════════════════
+            INSTANT_CAPTURE_ENABLED=instant_capture_enabled,
+            INSTANT_CAPTURE_QUEUE_SIZE=instant_capture_queue_size,
+            INSTANT_CAPTURE_RETRIES=instant_capture_retries,
+            INSTANT_CAPTURE_RETRY_DELAY_MS=instant_capture_retry_delay_ms,
+            INSTANT_CAPTURE_MIN_SIGNALS=instant_capture_min_signals,
+            TARGET_CHANNEL_ID=target_channel_id,
+            INSTANT_CAPTURE_WORKERS=instant_capture_workers,
         )
 
         cls._instance = cfg
         logger.info(
-            f"Config v13.1 built: DB={db_type} | "
+            f"Config v13.2 built: DB={db_type} | "
             f"PROCESSING_WORKERS={workers} | "
             f"DASHBOARD={'ON' if cfg.DASHBOARD_ENABLED else 'OFF'} | "
             f"FUZZY={'ON' if cfg.FUZZY_MATCHING_ENABLED else 'OFF'} | "
             f"NEGATION={'ON' if cfg.NEGATION_ENABLED else 'OFF'} | "
-            f"AD_DETECTION={'ON' if cfg.AD_DETECTION_ENABLED else 'OFF'}"
+            f"AD_DETECTION={'ON' if cfg.AD_DETECTION_ENABLED else 'OFF'} | "
+            f"INSTANT_CAPTURE={'ON' if cfg.INSTANT_CAPTURE_ENABLED else 'OFF'}"
         )
         return cfg
 
@@ -684,6 +730,41 @@ WS_PATTERN: Final = re.compile(r"\s+")
 ARABIC_CHARS_PATTERN: Final = re.compile(r"[\u0600-\u06FF]")
 
 # =============================================================================
+# NEW v13.2: Fast Intent/Academic Signals for Instant Capture
+# =============================================================================
+FAST_INTENT_SIGNALS: Final[Dict[str, List[str]]] = {
+    "direct_request": [
+        "ابي احد", "ابغى احد", "احتاج احد", "محتاج احد",
+        "مين يسوي", "مين يحل", "مين يشرح", "مين يقدر",
+        "احد يساعدني", "احد يحل لي", "احد يسوي لي",
+        "من يسوي لي", "من يحل لي", "من يشرح لي",
+        "فيه احد متخصص", "فيه احد فاهم", "احد عنده خبره",
+        "من يعرف يسوي", "تعرفون احد", "من عنده شخص"
+    ],
+    "help_seeking": [
+        "احتاج مساعده", "محتاج مساعده", "ابي مساعده",
+        "احتاج مختص", "احتاج خبير", "ابي مختص",
+        "ابي خبير", "محتاج مختص", "محتاج خبير"
+    ],
+    "distress": [
+        "ما عرفت احل", "ما فهمت شي", "ما قدرت اخلص",
+        "ما لحقت اسوي", "عجزت افهم", "عجزت احل"
+    ]
+}
+
+FAST_ACADEMIC_SIGNALS: Final[Dict[str, List[str]]] = {
+    "assignments": ["واجب", "واجبات", "تكليف", "تكاليف", "تمارين", "assignment", "homework"],
+    "projects": ["مشروع", "مشاريع", "بروجكت", "برجكت", "capstone", "project"],
+    "reports": ["تقرير", "تقارير", "ريبورت", "report"],
+    "research": ["بحث", "بحوث", "رساله", "اطروحه", "research"],
+    "exams": ["اختبار", "امتحان", "كويز", "ميد", "فاينل", "exam", "quiz"],
+    "presentations": ["بوربوينت", "عرض تقديمي", "برزنتيشن", "presentation", "powerpoint"],
+    "technical": ["اكسل", "excel", "برمجه", "كود", "python", "java", "sql", "matlab", "spss"],
+    "medical": ["سكليف", "sick leave", "عذر طبي", "عذر مرضي", "medical report"],
+    "academic_terms": ["ماده", "مقرر", "محاضره", "جامعه", "كليه", "تخصص", "دكتور", "استاذ"]
+}
+
+# =============================================================================
 # Input Sanitizer
 # =============================================================================
 class InputSanitizer:
@@ -718,14 +799,7 @@ class InputSanitizer:
         return bool(dangerous.search(text))
 
 # =============================================================================
-# Keyword Loader v13.1 – متوافق مع keywords.json v14.0.x
-#
-# FIX (critical, see module docstring): "templates" and "template_patterns"
-# are now included. These are the two keys keywords.json v14.0.x actually
-# uses for its Template-Driven Pattern Generation data. Previously they
-# were absent from this list, so load_keywords() silently discarded them
-# and filter_engine.py's Template-Boost mechanism always ran on an empty
-# dataset — no exception, no log warning, just quietly-degraded filtering.
+# Keyword Loader v13.2 – متوافق مع keywords.json v14.0.x
 # =============================================================================
 _KW_CATEGORIES: Final[List[str]] = [
     # الفئات القديمة (للتوافق)
@@ -741,8 +815,10 @@ _KW_CATEGORIES: Final[List[str]] = [
     "conversation_history_config", "test_cases", "learning_feedback",
     "high_confidence_boost_patterns", "action_verbs", "subject_markers",
     "implicit_request_patterns", "solve_actions", "help_expressions",
-    # ── v14.0.x: Template-Driven Pattern Generation (previously missing) ──
+    # ── v14.0.x: Template-Driven Pattern Generation ──
     "templates", "template_patterns",
+    # ── v15.3: Abuse signals (منفصلة عن ignore_signals) ──
+    "abuse_signals",
 ]
 
 def load_keywords(path: str = "keywords.json") -> Dict[str, Any]:
@@ -768,10 +844,6 @@ def load_keywords(path: str = "keywords.json") -> Dict[str, Any]:
         total = sum(len(v) if isinstance(v, (list, dict)) else 0 for v in result.values())
         logger.info(f"Keywords loaded: {total} total across {len(_KW_CATEGORIES)} categories")
 
-        # Dedicated visibility for the template engine specifically, so a
-        # future regression (e.g. someone renaming a key in keywords.json)
-        # shows up immediately in boot logs instead of as a silent
-        # accuracy regression discovered weeks later.
         templates_data = result.get("templates", {})
         template_patterns_data = result.get("template_patterns", {})
         templates_count = len(templates_data) if isinstance(templates_data, (list, dict)) else 0
@@ -818,7 +890,6 @@ def load_accounts() -> List[Dict[str, Any]]:
                 "api_hash": SecretManager.get(f"{prefix}_API_HASH", required=True),
                 "phone": SecretManager.get(f"{prefix}_PHONE", required=True),
                 "session": SecretManager.get(f"{prefix}_SESSION_NAME", required=True),
-                # Render/Cloud: Telethon StringSession read from env (no interactive login)
                 "session_string": SecretManager.get(f"{prefix}_SESSION_STRING", None, required=False),
                 "priority": SecretManager.get_int(f"{prefix}_PRIORITY", default_priority, required=False),
                 "is_main": is_main,
@@ -834,10 +905,8 @@ def load_accounts() -> List[Dict[str, Any]]:
         except (EnvironmentError, ValueError) as e:
             logger.error(f"Skipping account {prefix}: {e}")
 
-    # MAIN account
     _try_load("MAIN", is_main=True, default_priority=10)
 
-    # ACCOUNT_1 .. ACCOUNT_20
     for i in range(1, 21):
         prefix = f"ACCOUNT_{i}"
         api_id = SecretManager.get(f"{prefix}_API_ID", None, required=False)
@@ -923,8 +992,9 @@ def get_memory_info() -> Dict[str, Any]:
     return {"rss_mb": 0, "vms_mb": 0, "percent": 0.0}
 
 logger.info(
-    f"config.py v13.1 loaded | Accounts: {len(ACCOUNTS)} | Workers: {CFG.PROCESSING_WORKERS} | "
+    f"config.py v13.2 loaded | Accounts: {len(ACCOUNTS)} | Workers: {CFG.PROCESSING_WORKERS} | "
     f"DB_URL: {'YES' if os.getenv('DATABASE_URL') else 'NO'} | "
     f"DASHBOARD: {'ON' if CFG.DASHBOARD_ENABLED else 'OFF'} | "
-    f"INTENT_ENGINE: v13.1 (template-boost fix applied)"
+    f"INSTANT_CAPTURE: {'ON' if CFG.INSTANT_CAPTURE_ENABLED else 'OFF'} | "
+    f"INTENT_ENGINE: v13.2 (instant-capture added)"
 )
