@@ -1,52 +1,4 @@
 #!/usr/bin/env python3
-"""
-filter_engine.py – Smart Filter Engine v14.1 (Template-Driven IntentEngine-NLP, HARDENED)
-Architecture: Prefilter + Fast Path + Fuzzy Path + Bloom Filter + Sharded Cache + Trie + TTLCache
-Supports: keywords.json v14.0.x, config.py v13.1 (template-boost fix), monitors.py v9.7
-
-v14.1 (this pass) — targeted reliability/accuracy fixes, filter_engine.py ONLY:
-  * Template-Boost is now actually fed real data: config.py v13.1 fixed
-    _KW_CATEGORIES to include "templates"/"template_patterns", so
-    _generate_template_patterns() (unchanged here, already correct) now
-    receives real word lists instead of always seeing {} / [].
-  * The documented weighted-scoring pipeline (SCORE_WEIGHT_INTENT,
-    SCORE_WEIGHT_ACADEMIC, SCORE_WEIGHT_GRAMMAR, SCORE_WEIGHT_DISTANCE,
-    SCORE_WEIGHT_URGENCY, SCORE_WEIGHT_CONTEXT, distance_scoring_config)
-    was computed in the old code (intent_weight, academic_weight,
-    _calculate_distance_score) and then silently discarded — the actual
-    decision ran entirely on the legacy point system. It is now genuinely
-    blended into result.confidence, gated by the existing
-    CFG.DISTANCE_SCORING_ENABLED toggle so it can be switched off to fall
-    back to pure legacy scoring if it ever needs retuning against
-    test_cases. The two previously-unused keyword sets subject_markers /
-    action_verbs now feed the "grammar" weight instead of sitting unused.
-  * result.score_details is now actually populated (legacy score, weighted
-    score, and each weighted component) instead of always being `{}` —
-    this is what keywords.json's "explainability" section was documented
-    for.
-  * Removed genuinely redundant trie scans of the *same* trie for the
-    *same* text within one analyze() call: request_trie, indirect_trie,
-    urgency_trie, and context_trie were each being searched twice (once
-    in an early block whose result was partly discarded, once again in
-    the "Fast Path" block). Each trie is now searched exactly once per
-    message and the result is reused. WeightedTrie.search_first now also
-    returns the match's start position (word, weight, position) — needed
-    for distance scoring — instead of just (word, weight); all existing
-    call sites only used index [0] (the word) or a truthiness check, so
-    this is a safe, non-breaking extension of the return shape.
-  * _is_blocked() no longer re-checks ignore_trie / the ad_blockers set —
-    both are already screened earlier in analyze() before _is_blocked()
-    can ever be reached, so those two checks inside _is_blocked() were
-    dead code that could never fire.
-  * Added reload_keywords() (aliased as _build_keyword_sets for backward
-    compatibility with older dashboard.py callers — see the accompanying
-    engineering report, item #3): re-reads keywords.json from disk and
-    rebuilds every set/trie in place. This also fixes a deeper issue: even
-    calling the *correctly*-named _load_keyword_sets() would not have
-    picked up dashboard-side keyword edits, because it always read from
-    the module-level `KEYWORDS` constant in config.py, which is frozen at
-    process start. reload_keywords() re-reads the file instead.
-"""
 
 from __future__ import annotations
 
@@ -73,7 +25,6 @@ from config import (
     WS_PATTERN,
 )
 
-# ── Optional libraries ────────────────────────────────────────────────────────
 try:
     from rapidfuzz import fuzz, process as rf_process
     RAPIDFUZZ_AVAILABLE = True
@@ -94,9 +45,6 @@ except ImportError:
     PYARABIC_AVAILABLE = False
 
 
-# =============================================================================
-# FilterResult (lightweight slots) – v14.1
-# =============================================================================
 @dataclass(slots=True)
 class FilterResult:
     valid: bool = False
@@ -154,12 +102,7 @@ class FilterResult:
         }
 
 
-# =============================================================================
-# Prefilter – فحص أولي سريع
-# =============================================================================
 class Prefilter:
-    """Ultra-fast initial check to reject obviously invalid messages."""
-
     @staticmethod
     def check(text: str, min_words: int = 3, max_emojis: int = 5) -> Tuple[bool, str, Dict[str, Any]]:
         metadata = {
@@ -200,9 +143,6 @@ class Prefilter:
         return True, "ok", metadata
 
 
-# =============================================================================
-# Optimized Bloom Filter (Thread-Safe)
-# =============================================================================
 class OptimizedBloomFilter:
     __slots__ = ("_size", "_hash_count", "_bit_array", "_lock", "_hash_cache", "_max_cache",
                  "_added_count", "_reset_threshold")
@@ -259,9 +199,6 @@ class OptimizedBloomFilter:
             self._added_count = 0
 
 
-# =============================================================================
-# Sharded LRU Cache (16 shards)
-# =============================================================================
 class ShardedLRUCache:
     def __init__(self, max_size: int = 10_000, ttl: int = 300, shards: int = 16) -> None:
         self._shards: List[OrderedDict] = [OrderedDict() for _ in range(shards)]
@@ -296,9 +233,6 @@ class ShardedLRUCache:
             cache[key] = (value, time.time())
 
 
-# =============================================================================
-# Trie Index (مع دعم الأوزان والموقع) – v14.1
-# =============================================================================
 class TrieNode:
     __slots__ = ("children", "is_end", "word", "weight")
 
@@ -332,15 +266,6 @@ class WeightedTrie:
             self._max_word_len = max(self._max_word_len, len(word))
 
     def search_first(self, text: str) -> Optional[Tuple[str, float, int]]:
-        """
-        Returns (matched_word, weight, start_position) for the first match
-        found scanning left-to-right, or None. The start_position element
-        was added in v14.1 (previously (word, weight) only) so callers that
-        need distance-between-matches (e.g. intent verb vs academic object)
-        don't have to re-scan the trie a second time via search_all() just
-        to recover a position. Existing callers that only used [0] or did a
-        truthiness check are unaffected by this extension.
-        """
         limit = min(len(text), 1000)
         max_depth = min(self._max_word_len + 1, 60)
         for start in range(limit):
@@ -351,7 +276,7 @@ class WeightedTrie:
                     break
                 node = node.children[ch]
                 if node.is_end:
-                    return (node.word, node.weight, start)  # type: ignore
+                    return (node.word, node.weight, start)
         return None
 
     def search_all(self, text: str) -> List[Tuple[str, float, int]]:
@@ -366,13 +291,10 @@ class WeightedTrie:
                     break
                 node = node.children[ch]
                 if node.is_end:
-                    results.append((node.word, node.weight, start))  # type: ignore
+                    results.append((node.word, node.weight, start))
         return results
 
 
-# =============================================================================
-# Main Filter Engine v14.1 – Template-Driven IntentEngine-NLP (hardened)
-# =============================================================================
 class EnhancedFilter:
     ARABIC_CHARS: Final[Set[str]] = set("ابتثجحخدذرزسشصضطظعغفقكلمنهويأإؤئآة")
     ARABIC_NORMALIZE: Final[Dict[int, int]] = str.maketrans(
@@ -387,7 +309,6 @@ class EnhancedFilter:
     }
 
     def __init__(self) -> None:
-        # تهيئة الإحصائيات مبكراً (قبل أي تحميل)
         self._stats: Dict[str, int] = {
             "processed": 0,
             "valid": 0,
@@ -415,7 +336,6 @@ class EnhancedFilter:
         self._load_keyword_sets()
         self._build_tries()
 
-        # Bloom Filter & Caches
         self._bloom = OptimizedBloomFilter(CFG.BLOOM_FILTER_SIZE, CFG.BLOOM_FILTER_FP)
         self._cache = ShardedLRUCache(CFG.MAX_CACHE_SIZE, CFG.CACHE_TTL)
         self._text_cache = TTLCache(maxsize=CFG.TEXT_CACHE_SIZE, ttl=CFG.TEXT_CACHE_TTL)
@@ -431,18 +351,7 @@ class EnhancedFilter:
             "ON" if CFG.DISTANCE_SCORING_ENABLED else "OFF",
         )
 
-    # ─── Load & Build ──────────────────────────────────────────────────────────
-
     def _generate_template_patterns(self, kw: Dict[str, Any]) -> Set[str]:
-        """
-        v14.0: Generate boost patterns from templates defined in keywords.json.
-        This replaces the static high_confidence_boost_patterns list with
-        dynamically generated combinations from word sets.
-
-        v14.1: now takes `kw` explicitly (instead of reading the module-level
-        KEYWORDS constant directly) so reload_keywords() can regenerate
-        patterns from freshly-read data without restarting the process.
-        """
         generated: Set[str] = set()
         templates_data = kw.get("templates", {})
         if not templates_data or not isinstance(templates_data, dict):
@@ -452,7 +361,6 @@ class EnhancedFilter:
         if not template_patterns_list or not isinstance(template_patterns_list, list):
             return generated
 
-        # Extract word sets
         need: List[str] = templates_data.get("need", [])
         person: List[str] = templates_data.get("person", [])
         action: List[str] = templates_data.get("action", [])
@@ -470,13 +378,11 @@ class EnhancedFilter:
         if not isinstance(availability, list):
             availability = []
 
-        # Generate combinations for each pattern template
         for pattern in template_patterns_list:
             if not isinstance(pattern, str):
                 continue
             parts = pattern.strip().split()
 
-            # ── 2-part templates ──────────────────────────────────────────
             if len(parts) == 2:
                 tag1, tag2 = parts[0], parts[1]
 
@@ -505,7 +411,6 @@ class EnhancedFilter:
                         for e in expert:
                             generated.add(f"{a} {e}")
 
-            # ── 3-part templates ──────────────────────────────────────────
             elif len(parts) == 3:
                 tag1, tag2, tag3 = parts[0], parts[1], parts[2]
 
@@ -536,19 +441,8 @@ class EnhancedFilter:
         return generated
 
     def _load_keyword_sets(self, keywords_data: Optional[Dict[str, Any]] = None) -> None:
-        """
-        تحميل جميع القوائم من مصدر بيانات الكلمات المفتاحية (متوافق مع v14.0.x).
-
-        v14.1: accepts an optional `keywords_data` override. When omitted,
-        falls back to the module-level KEYWORDS constant from config.py (the
-        snapshot taken at process start) — this preserves the exact original
-        behavior for the initial load done in __init__. reload_keywords()
-        passes a freshly re-read dict here so a dashboard-triggered keyword
-        edit can actually take effect without a process restart.
-        """
         kw = keywords_data if keywords_data is not None else KEYWORDS
 
-        # 1. Intent Verbs (موزون)
         self._intent_verbs: Dict[str, Dict[str, Any]] = kw.get("intent_verbs", {})
         self._intent_verbs_all: Set[str] = set()
         self._intent_weights: Dict[str, float] = {}
@@ -559,7 +453,6 @@ class EnhancedFilter:
                     self._intent_verbs_all.add(term)
                     self._intent_weights[term] = weight
 
-        # 2. Academic Objects (موزون)
         self._academic_objects: Dict[str, Dict[str, Any]] = kw.get("academic_objects", {})
         self._academic_objects_all: Set[str] = set()
         self._academic_weights: Dict[str, float] = {}
@@ -570,7 +463,6 @@ class EnhancedFilter:
                     self._academic_objects_all.add(term)
                     self._academic_weights[term] = weight
 
-        # 3. Request Phrases (مباشرة وغير مباشرة)
         request_phrases_data = kw.get("request_phrases", {})
         self._request_phrases_all: Set[str] = set()
         for category, phrases in request_phrases_data.items():
@@ -580,14 +472,12 @@ class EnhancedFilter:
         self._indirect_request: List[str] = kw.get("indirect_request", [])
         self._indirect_request_all: Set[str] = set(self._indirect_request)
 
-        # 4. Urgency Markers
         urgency_data = kw.get("urgency_markers", {})
         self._urgency_all: Set[str] = set()
         for category, markers in urgency_data.items():
             if isinstance(markers, list):
                 self._urgency_all.update(markers)
 
-        # 5. Negation
         self._negation: Dict[str, Any] = kw.get("negation", {})
         self._negation_all: Set[str] = set()
         self._negation_exceptions: Set[str] = set()
@@ -609,7 +499,6 @@ class EnhancedFilter:
         if isinstance(resolution, list):
             self._resolution_phrases.update(resolution)
 
-        # 6. High Confidence Boost Patterns (static + template-generated)
         boost_data = kw.get("high_confidence_boost_patterns", {})
         self._boost_patterns: Set[str] = set()
         if isinstance(boost_data, dict):
@@ -617,62 +506,50 @@ class EnhancedFilter:
             if isinstance(patterns, list):
                 self._boost_patterns.update(patterns)
 
-        # ── Generate patterns from templates (now actually populated as of
-        #    config.py v13.1 — see module docstring) ────────────────────────
         template_generated = self._generate_template_patterns(kw)
         self._boost_patterns.update(template_generated)
         self._stats["template_patterns_generated"] = len(template_generated)
 
-        # 7. Advertisement Signals
         self._ad_signals: Dict[str, Any] = kw.get("advertisement_signals", {})
 
-        # 8. Spam Categories
         self._spam_categories: Dict[str, List[str]] = kw.get("spam_categories", {})
         self._spam_all: Set[str] = set()
         for category, terms in self._spam_categories.items():
             if isinstance(terms, list):
                 self._spam_all.update(terms)
 
-        # 9. Emoji Signals
         emoji_data = kw.get("emoji_signals", {})
         self._ad_emoji: Set[str] = set(emoji_data.get("ad_style_emoji", []))
         self._neutral_emoji: Set[str] = set(emoji_data.get("neutral_emoji", []))
 
-        # 10. Ad Blockers
         self._ad_blockers: Set[str] = set(kw.get("ad_blockers", []))
 
-        # 11. Ignore Signals
         ignore_data = kw.get("ignore_signals", {})
         self._ignore_all: Set[str] = set()
         for category, terms in ignore_data.items():
             if isinstance(terms, list):
                 self._ignore_all.update(terms)
 
-        # 12. Help Expressions
         self._help_expressions: Set[str] = set(kw.get("help_expressions", []))
 
-        # 13. Action Verbs (now actually used — see grammar_score in analyze())
         action_verbs_data = kw.get("action_verbs", {})
         self._action_verbs: Set[str] = set()
         for key in ["core", "suffixed_forms", "imperative_forms"]:
             if isinstance(action_verbs_data.get(key), list):
                 self._action_verbs.update(action_verbs_data.get(key, []))
 
-        # 14. Subject Markers (now actually used — see grammar_score in analyze())
         subject_data = kw.get("subject_markers", {})
         self._subject_markers: Set[str] = set()
         for key in ["student_pronouns", "student_question_subject"]:
             if isinstance(subject_data.get(key), list):
                 self._subject_markers.update(subject_data.get(key, []))
 
-        # 15. Implicit Request Patterns
         implicit_data = kw.get("implicit_request_patterns", {})
         self._implicit_request_all: Set[str] = set()
         for key in ["availability_question", "problem_state"]:
             if isinstance(implicit_data.get(key), list):
                 self._implicit_request_all.update(implicit_data.get(key, []))
 
-        # 16. Solve Actions
         solve_data = kw.get("solve_actions", {})
         self._solve_academic: Set[str] = set()
         self._technical_problem_terms: Set[str] = set()
@@ -681,24 +558,20 @@ class EnhancedFilter:
         if isinstance(solve_data.get("technical_problem_terms"), list):
             self._technical_problem_terms.update(solve_data.get("technical_problem_terms", []))
 
-        # 17. Dialect Mapping
         self._dialect_map: Dict[str, str] = {}
         dialect_data = kw.get("dialect_mapping", {})
         for category, mapping in dialect_data.items():
             if isinstance(mapping, dict):
                 self._dialect_map.update(mapping)
 
-        # 18. University Context
         self._university_context: Set[str] = set()
         university_data = kw.get("university_context", {})
         for key, value in university_data.items():
             if isinstance(value, list):
                 self._university_context.update(value)
 
-        # 19. Distance Scoring Config
         self._distance_config: Dict[str, Any] = kw.get("distance_scoring_config", {})
 
-        # 20. Length Modifier
         self._length_modifier: Dict[Tuple[int, int], float] = {}
         length_data = kw.get("length_modifier", {})
         for key, value in length_data.items():
@@ -711,9 +584,6 @@ class EnhancedFilter:
                 except Exception:
                     pass
 
-        # 21. Scoring Weights (documented keywords.json-side weights; the
-        #     config.py-side CFG.SCORE_WEIGHT_* are what actually drives the
-        #     weighted-confidence blend in analyze() — see module docstring)
         self._scoring_weights: Dict[str, float] = {}
         weights_data = kw.get("scoring_weights", {})
         positive_modules = weights_data.get("positive_modules", {})
@@ -721,13 +591,10 @@ class EnhancedFilter:
             for key, value in positive_modules.items():
                 self._scoring_weights[key] = float(value)
 
-        # 22. Clause boundaries (for negation)
         self._clause_boundaries: Set[str] = set()
         boundaries = self._negation.get("clause_boundaries", [])
         if isinstance(boundaries, list):
             self._clause_boundaries.update(boundaries)
-
-        # ── تحويل البيانات الجديدة إلى القوائم القديمة (للتوافق) ──
 
         self.request_words: Set[str] = set(self._intent_verbs_all).union(self._request_phrases_all)
         self.context_words: Set[str] = set(self._academic_objects_all).union(self._university_context)
@@ -746,7 +613,6 @@ class EnhancedFilter:
         self.ad_blockers: Set[str] = self._ad_blockers
         self.spam_patterns: Set[str] = self._spam_all
 
-        # ── Backward compatibility: old-format keywords ────────────────────
         old_request = set(kw.get("request", []))
         old_context = set(kw.get("request_context", []))
         old_indirect = set(kw.get("indirect_request", []))
@@ -769,7 +635,6 @@ class EnhancedFilter:
         self.ad_blockers.update(old_blockers)
         self.spam_patterns.update(old_spam)
 
-        # Ensure all sets are actual sets
         self.request_words = set(self.request_words)
         self.context_words = set(self.context_words)
         self.indirect_words = set(self.indirect_words)
@@ -782,7 +647,6 @@ class EnhancedFilter:
         self.spam_patterns = set(self.spam_patterns)
         self._boost_patterns = set(self._boost_patterns)
 
-        # Build all tries
         self._request_trie = WeightedTrie(self.request_words)
         self._context_trie = WeightedTrie(self.context_words)
         self._indirect_trie = WeightedTrie(self.indirect_words)
@@ -798,34 +662,15 @@ class EnhancedFilter:
         self._spam_trie = WeightedTrie(self._spam_all)
         self._ad_blocker_trie = WeightedTrie(self._ad_blockers)
 
-        # v14.1: subject_markers / action_verbs now feed the "grammar"
-        # weighted-scoring component in analyze() instead of being loaded
-        # and never referenced again.
         self._subject_markers_trie = WeightedTrie(self._subject_markers)
         self._action_verbs_trie = WeightedTrie(self._action_verbs)
 
         self._raw_keywords = kw
 
     def _build_tries(self) -> None:
-        """
-        Tries are built as part of _load_keyword_sets() itself. Kept as a
-        separate no-op call point (rather than removed outright) purely so
-        any external caller expecting a `_build_tries()` method to exist
-        does not hit an AttributeError; all real work happens above.
-        """
         pass
 
     def reload_keywords(self, path: str = "keywords.json") -> None:
-        """
-        Re-reads keywords.json from disk and rebuilds every keyword
-        set/trie in place, including regenerating template-boost patterns.
-
-        This is what dashboard.py's add_keyword/delete_keyword handlers
-        should call after writing to keywords.json, so an edit made through
-        the dashboard actually changes the running filter's behavior — not
-        just the file on disk / the frozen KEYWORDS constant from process
-        start.
-        """
         from config import load_keywords
         fresh = load_keywords(path)
         self._load_keyword_sets(fresh)
@@ -840,13 +685,7 @@ class EnhancedFilter:
             len(self._boost_patterns),
         )
 
-    # Backward/forward-compatible alias: some dashboard.py versions call
-    # `bot.filter._build_keyword_sets()` (see engineering report item #3 —
-    # that name never existed and raised AttributeError at runtime). Both
-    # names now work and both do a real reload.
     _build_keyword_sets = reload_keywords
-
-    # ─── Normalization ─────────────────────────────────────────────────────────
 
     def _normalize_arabic(self, text: str) -> str:
         text = text.translate(self.ARABIC_NORMALIZE)
@@ -871,8 +710,6 @@ class EnhancedFilter:
         text = self._apply_dialect_mapping(text)
         return text
 
-    # ─── Language Detection ────────────────────────────────────────────────────
-
     def _is_arabic(self, text: str) -> Tuple[bool, float]:
         if not text:
             return False, 0.0
@@ -896,8 +733,6 @@ class EnhancedFilter:
                 pass
         return ratio > 0.25, ratio
 
-    # ─── Spam Score ────────────────────────────────────────────────────────────
-
     def _spam_score(self, text: str) -> float:
         score = 0.0
         if PHONE_PATTERN.search(text):
@@ -909,8 +744,6 @@ class EnhancedFilter:
         if re.search(r"(.)\1{4,}", text):
             score += 0.15
         return min(score, 1.0)
-
-    # ─── Ad Detection ──────────────────────────────────────────────────────────
 
     def _detect_advertisement(self, text: str) -> Tuple[float, List[str]]:
         ad_score = 0.0
@@ -983,8 +816,6 @@ class EnhancedFilter:
 
         return min(ad_score, 1.0), reasons
 
-    # ─── Negation Detection ────────────────────────────────────────────────────
-
     def _detect_negation(self, text: str) -> Tuple[bool, float, List[str]]:
         negation_score = 0.0
         reasons = []
@@ -1027,16 +858,7 @@ class EnhancedFilter:
 
         return False, 0.0, reasons
 
-    # ─── Distance Scoring ─────────────────────────────────────────────────────
-
     def _calculate_distance_score(self, intent_pos: int, academic_pos: int, text_len: int) -> float:
-        """
-        Returns a 0..1 multiplier based on how far apart the intent verb and
-        academic object are in the text — closer usually means a more
-        coherent single request; far apart more often means two unrelated
-        mentions. Wired into result.confidence in analyze() as of v14.1
-        (previously computed nowhere and this method was never called).
-        """
         distance = abs(intent_pos - academic_pos)
         thresholds = self._distance_config.get("thresholds", {})
 
@@ -1068,15 +890,11 @@ class EnhancedFilter:
             else:
                 return 0.5
 
-    # ─── Length Modifier ──────────────────────────────────────────────────────
-
     def _get_length_modifier(self, token_count: int) -> float:
         for (start, end), value in self._length_modifier.items():
             if start <= token_count <= end:
                 return value
         return 0.9
-
-    # ─── Main Analysis ─────────────────────────────────────────────────────────
 
     async def analyze(self, text: str) -> Dict[str, Any]:
         start = time.perf_counter()
@@ -1092,7 +910,6 @@ class EnhancedFilter:
             cleaned = self._clean(validated)
             cache_key = hashlib.blake2b(cleaned.encode(), digest_size=16).hexdigest()[:32]
 
-            # Prefilter
             if CFG.PREFILTER_ENABLED:
                 ok, reason, metadata = Prefilter.check(
                     cleaned, CFG.PREFILTER_MIN_WORDS, CFG.PREFILTER_MAX_EMOJIS
@@ -1102,13 +919,11 @@ class EnhancedFilter:
                         self._stats["prefilter_rejected"] += 1
                     return self._result("ignore", 0.0, [reason])
 
-            # Bloom Filter (duplicate)
             if await self._bloom.contains(cache_key):
                 async with self._stats_lock:
                     self._stats["bloom_hits"] += 1
                 return self._result("ignore", 0.0, ["duplicate"])
 
-            # Text Cache
             async with self._cache_lock:
                 if cache_key in self._text_cache:
                     async with self._stats_lock:
@@ -1122,41 +937,31 @@ class EnhancedFilter:
             async with self._stats_lock:
                 self._stats["processed"] += 1
 
-            # Language
             is_arabic, arabic_ratio = self._is_arabic(cleaned)
             if CFG.LANGUAGE_FILTER and not is_arabic:
                 return self._result("ignore", 0.0, ["non_arabic"])
 
-            # Spam check
             spam_score = self._spam_score(cleaned)
             if spam_score > CFG.SPAM_SCORE_THRESHOLD:
                 async with self._stats_lock:
                     self._stats["spam"] += 1
                 return self._result("ignore", 0.0, ["spam_detected"])
 
-            # Spam trie check
             if self._spam_trie.search_first(cleaned):
                 async with self._stats_lock:
                     self._stats["spam"] += 1
                 return self._result("ignore", 0.0, ["spam_pattern"])
 
-            # Ignore
             if self._ignore_trie.search_first(cleaned):
                 return self._result("ignore", 0.0, ["ignore_pattern"])
 
-            # Ad blocker
             if self._ad_blocker_trie.search_first(cleaned):
                 return self._result("ignore", 0.0, ["ad_blocker"])
 
-            # Negation
             is_negated, neg_score, neg_reasons = self._detect_negation(cleaned)
             if is_negated and neg_score > 0.7:
                 return self._result("ignore", 1.0 - neg_score, neg_reasons)
 
-            # ── Single-pass trie lookups ────────────────────────────────────
-            # v14.1: each trie is now searched exactly once per message.
-            # Previously request_trie / indirect_trie / urgency_trie /
-            # context_trie were each scanned twice (see module docstring).
             intent_match = self._request_trie.search_first(cleaned)
             indirect_match = self._indirect_trie.search_first(cleaned)
             urgency_match = self._urgency_trie.search_first(cleaned)
@@ -1178,13 +983,11 @@ class EnhancedFilter:
             is_implicit = implicit_match is not None
             boost = 0.25 if boost_match else 0.0
 
-            # Ad detection
             ad_score, ad_reasons = self._detect_advertisement(cleaned)
 
             if ad_score > 0.6:
                 return self._result("ignore", 1.0 - ad_score, ad_reasons)
 
-            # ─── Fast Path ───────────────────────────────────────────────
             result = FilterResult()
 
             if self._is_blocked(cleaned, result):
@@ -1226,11 +1029,6 @@ class EnhancedFilter:
 
             legacy_confidence = score / 100.0
 
-            # ── Weighted / distance-aware confidence ────────────────────
-            # Previously computed (intent_weight, academic_weight,
-            # _calculate_distance_score) and then discarded entirely — the
-            # decision ran purely on the legacy point system above. Now
-            # actually blended in, gated by CFG.DISTANCE_SCORING_ENABLED.
             weighted_confidence: Optional[float] = None
             distance_score = 0.0
             grammar_score = 0.0
@@ -1244,8 +1042,6 @@ class EnhancedFilter:
                 if intent_pos is not None and academic_pos is not None:
                     distance_score = self._calculate_distance_score(intent_pos, academic_pos, len(cleaned))
                 elif intent_word:
-                    # No academic anchor to measure distance against —
-                    # neutral score rather than penalizing.
                     distance_score = 0.5
 
                 context_component = min(len(context_matches) / 3.0, 1.0)
@@ -1305,7 +1101,6 @@ class EnhancedFilter:
 
             result.confidence = max(0.0, min(1.0, result.confidence))
 
-            # v14.1: score_details now actually populated (explainability).
             result.score_details = {
                 "legacy_score": round(legacy_confidence, 4),
                 "weighted_score": round(weighted_confidence, 4) if weighted_confidence is not None else 0.0,
@@ -1353,17 +1148,7 @@ class EnhancedFilter:
             logger.error(f"Filter.analyze error: {e}")
             return self._result("ignore", 0.0, [f"internal_error: {str(e)[:50]}"])
 
-    # ─── Helpers ──────────────────────────────────────────────────────────────
-
     def _is_blocked(self, text: str, result: FilterResult) -> bool:
-        """
-        v14.1: no longer re-checks ignore_trie or the ad_blockers set here —
-        both are already screened earlier in analyze() (ignore_trie /
-        ad_blocker_trie checks with early return) *before* this method can
-        ever be reached, so those two checks were unreachable dead code.
-        Only ad_trie / education_trie / ad-style emoji are genuinely new
-        checks at this point in the pipeline.
-        """
         if self._ad_trie.search_first(text):
             result.reason = "advertisement"
             return True
@@ -1411,8 +1196,6 @@ class EnhancedFilter:
             "negation_detected": False,
             "advert_score": 0.0,
         }
-
-    # ─── Telemetry ─────────────────────────────────────────────────────────────
 
     async def get_telemetry(self) -> Dict[str, Any]:
         async with self._stats_lock:
