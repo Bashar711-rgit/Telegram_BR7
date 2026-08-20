@@ -465,6 +465,8 @@ class EnhancedAccountMonitor:
             "total_processing_time_ms": 0.0, "last_error": None, "last_alert_time": 0.0,
             "connect_attempts": 0, "reconnect_attempts": 0,
             "accepted": 0, "reviewed": 0, "ignored": 0, "avg_confidence": 0.0, "total_confidence": 0.0, "decisions_count": 0,
+            # NEW — track add_to_queue() failures instead of losing them silently
+            "queue_insert_failed": 0, "queue_backpressure": 0,
         }
         self._stats_lock = asyncio.Lock()
         self._entity_cache: TTLCache = TTLCache(maxsize=CFG.ENTITY_CACHE_MAX_SIZE, ttl=600)
@@ -723,10 +725,40 @@ class EnhancedAccountMonitor:
                     await self._inc_stat("media_processed"); await self._inc_stat("messages_processed")
                     return
                 priority = 7 if event_data.get("has_text") else 3
-                await self.db.add_to_queue(event_data, priority=priority)
+                queue_result = await self.db.add_to_queue(event_data, priority=priority)
+                if queue_result > 0:
+                    # نجح الإدراج فعلياً
+                    await self._inc_stat("queue_processed")
+                elif queue_result == -2:
+                    # DB غير سليمة (backpressure) — لا تُفقد الرسالة؛ تُحال لـ DLQ
+                    # لإعادة المحاولة بدل تجاهلها، بنفس نمط _spawn_media_task
+                    logger.warning(
+                        f"add_to_queue backpressure [{self.account['name']}] "
+                        f"chat={event_data.get('chat_id')} msg={event_data.get('message_id')} "
+                        f"— DB unhealthy, routing to DLQ"
+                    )
+                    await self._inc_stat("queue_backpressure")
+                    await self._dlq.push(
+                        event_data,
+                        RuntimeError("add_to_queue: db_unhealthy (backpressure)"),
+                        retry_count=0,
+                    )
+                else:
+                    # queue_result == -1 (أو أي قيمة غير متوقعة) — خطأ إدراج فعلي
+                    logger.error(
+                        f"add_to_queue failed [{self.account['name']}] "
+                        f"chat={event_data.get('chat_id')} msg={event_data.get('message_id')} "
+                        f"result={queue_result} — routing to DLQ"
+                    )
+                    await self._inc_stat("queue_insert_failed")
+                    await self._dlq.push(
+                        event_data,
+                        RuntimeError(f"add_to_queue: insert failed (result={queue_result})"),
+                        retry_count=0,
+                    )
                 processing_time = (time.perf_counter() - start_time) * 1000
                 await self._update_avg_time(processing_time)
-                await self._inc_stat("messages_processed"); await self._inc_stat("queue_processed")
+                await self._inc_stat("messages_processed")
             except Exception as e:
                 logger.error(f"Handler error [{self.account['name']}]: {e}")
                 await self._inc_stat("errors"); self._stats["last_error"] = str(e)
@@ -1214,3 +1246,12 @@ class HealthMonitor:
         self._consecutive_fail = 0 if is_healthy else self._consecutive_fail + 1
         details["consecutive_unhealthy"] = self._consecutive_fail
         return HealthStatus(is_healthy=is_healthy, checks=checks, details=details)
+
+
+
+
+
+
+
+
+
