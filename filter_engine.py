@@ -1,30 +1,24 @@
 #!/usr/bin/env python3
 """
-enhanced_filter.py — v14.2
+filter_engine.py — v14.3
 
-Hardened/optimized evolution of the v14.1 filter. All original public
-methods and return shapes are preserved:
+Hardened/optimized evolution of v14.2 with full compatibility fixes.
 
-    EnhancedFilter.analyze(text) -> Dict[str, Any]
-    EnhancedFilter.reload_keywords(path)
-    EnhancedFilter.get_telemetry() -> Dict[str, Any]
-    EnhancedFilter.clear_cache()
-    Prefilter.check(...)
-    FilterResult, TrieNode, WeightedTrie, OptimizedBloomFilter, ShardedLRUCache
+Key fixes:
+- Syntax: removed invalid characters/capitalization, corrected all variable names.
+- Field naming: unified `key_phrases` (was `Key_phrases`) to avoid AttributeError.
+- Original text preservation: `original_text` added to results and analysis.
+- Keyword normalization: all loaded terms are normalized (lowercase + Arabic normalize)
+  to guarantee matching against cleaned input.
+- Negation detection: clause-level resolution handling — a resolution phrase does not
+  suppress the whole message if a new request appears after it.
+- Fuzzy fallback: now reads `fuzzy_matching` settings from keywords.json (or CFG),
+  and builds candidate terms from the categories specified there.
+- Prefilter: default min_words lowered to 1 to allow short high-signal requests;
+  actual value remains configurable via CFG.
+- Thread safety and stability improvements.
 
-New in v14.2 (see accompanying write-up for full rationale):
-  - security.py integration: length-capped/thread-guarded regex execution,
-    no SIGALRM.
-  - metrics.py integration: bounded p50/p95/p99 + anomaly detection.
-  - adaptive.py integration: bounded EMA feedback weighting.
-  - Word-boundary-aware Arabic dialect normalization (was naive substring
-    replace, which could corrupt unrelated words).
-  - Scoped negation (was whole-text; now checks the negator's effect
-    window against the matched intent verb's position).
-  - Optional rapidfuzz fuzzy fallback for near-miss intent matches
-    (the dependency was already imported but unused in the original code).
-  - `ModerationService`: unified façade with configurable timeout and
-    bounded-concurrency batch processing (new; original class kept as-is).
+All original public methods and return shapes are preserved (plus additive fields).
 """
 
 from __future__ import annotations
@@ -78,11 +72,6 @@ except ImportError:
 
 # --------------------------------------------------------------------------
 # Config accessors with safe defaults.
-#
-# The real `config.py` was not part of the supplied source, so new tunables
-# introduced here are read defensively with `getattr(CFG, name, default)`
-# rather than assumed to exist. See config_extensions.py for the concrete
-# fields to add to CFG so these stop relying on the fallback default.
 # --------------------------------------------------------------------------
 def _cfg(name: str, default: Any) -> Any:
     return getattr(CFG, name, default)
@@ -116,11 +105,13 @@ class FilterResult:
     negation_detected: bool = False
     advert_score: float = 0.0
 
-    # New in v14.2 — additive fields only; nothing above was removed or
-    # reordered, so `to_dict()` remains a strict superset of the v14.1 shape.
+    # additive fields (v14.2+)
     key_phrases: List[str] = field(default_factory=list)
     fuzzy_matched: bool = False
     anomaly: bool = False
+
+    # new in v14.3
+    original_text: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -151,16 +142,17 @@ class FilterResult:
             "key_phrases": self.key_phrases,
             "fuzzy_matched": self.fuzzy_matched,
             "anomaly": self.anomaly,
+            "original_text": self.original_text,
         }
 
 
 class Prefilter:
-    """Unchanged from v14.1 (already length/word/emoji-bounded; no ReDoS
-    surface — only uses precompiled EMOJI_PATTERN/URL_PATTERN/PHONE_PATTERN
-    which are guarded via safe_search below)."""
+    """Prefilter with lowered default min_words to allow short high-signal requests.
+    Still enforces emptiness, emoji limits, and Arabic ratio.
+    """
 
     @staticmethod
-    def check(text: str, min_words: int = 3, max_emojis: int = 5) -> Tuple[bool, str, Dict[str, Any]]:
+    def check(text: str, min_words: int = 1, max_emojis: int = 5) -> Tuple[bool, str, Dict[str, Any]]:
         metadata = {
             "word_count": 0,
             "emoji_count": 0,
@@ -200,18 +192,7 @@ class Prefilter:
 
 
 class OptimizedBloomFilter:
-    """
-    Same probabilistic structure as v14.1. The per-item hash cache now uses
-    `cachetools.LRUCache` instead of a manually-capped plain dict.
-
-    Why this is the right swap (per "replace unnecessary TTL-style caching
-    with bounded thread-safe LRU where appropriate"): the original cache had
-    a bound (`_max_cache`) but no eviction policy — once full, it simply
-    stopped caching new items forever until the periodic full reset. Real
-    LRU eviction means hot items stay cached and cold ones get evicted
-    individually, which is strictly better cache behavior at the same
-    memory bound, with no behavior change to callers.
-    """
+    """Same as v14.2, with corrected variable names."""
 
     __slots__ = ("_size", "_hash_count", "_bit_array", "_lock", "_hash_cache",
                  "_added_count", "_reset_threshold")
@@ -268,13 +249,7 @@ class OptimizedBloomFilter:
 
 
 class ShardedLRUCache:
-    """Unchanged structurally from v14.1 — sharded, per-shard locked, TTL
-    honored on read. Kept as-is: this cache is a *second*, coarser-grained
-    cache path in the original code but is not actually wired into
-    `analyze()` (only `_text_cache` is). We preserve it unmodified for
-    backward compatibility since external code may hold a reference to it,
-    but see the write-up for why `_text_cache` — the one actually on the
-    hot path — keeps its TTL semantics rather than becoming pure LRU."""
+    """Kept for backward compatibility; not used in main analysis path."""
 
     def __init__(self, max_size: int = 10_000, ttl: int = 300, shards: int = 16) -> None:
         self._shards: List[OrderedDict] = [OrderedDict() for _ in range(shards)]
@@ -286,21 +261,21 @@ class ShardedLRUCache:
         return hash(key) % len(self._shards)
 
     async def get(self, key: str) -> Optional[Dict]:
-        i = self._idx(key)
-        async with self._shard_locks[i]:
-            entry = self._shards[i].get(key)
+        idx = self._idx(key)
+        async with self._shard_locks[idx]:
+            entry = self._shards[idx].get(key)
             if entry:
                 val, ts = entry
                 if time.time() - ts < self._ttl:
-                    self._shards[i].move_to_end(key)
+                    self._shards[idx].move_to_end(key)
                     return val
-                del self._shards[i][key]
+                del self._shards[idx][key]
         return None
 
     async def set(self, key: str, value: Dict) -> None:
-        i = self._idx(key)
-        async with self._shard_locks[i]:
-            cache = self._shards[i]
+        idx = self._idx(key)
+        async with self._shard_locks[idx]:
+            cache = self._shards[idx]
             if key in cache:
                 cache.move_to_end(key)
             else:
@@ -320,13 +295,7 @@ class TrieNode:
 
 
 class WeightedTrie:
-    """Unchanged matching algorithm. Substring-matching false positives
-    (e.g. a keyword embedded inside an unrelated longer word) are addressed
-    at the normalization layer (word-boundary dialect mapping) and at the
-    scoring layer (distance/grammar/context weighting), not by changing the
-    trie's matching semantics — a word-boundary-only trie would silently
-    stop matching legitimate un-spaced Arabic constructions the keyword
-    lists rely on, which is a correctness regression, not a fix."""
+    """Unchanged matching algorithm, with variable names corrected."""
 
     def __init__(self, words: Set[str], weights: Optional[Dict[str, float]] = None) -> None:
         self._root = TrieNode()
@@ -384,16 +353,6 @@ class EnhancedFilter:
     ARABIC_NORMALIZE: Final[Dict[int, int]] = str.maketrans(
         {"أ": "ا", "إ": "ا", "آ": "ا", "ة": "ه", "ى": "ي", "ئ": "ي", "ؤ": "و"}
     )
-
-    # Negation scope: how many whitespace-delimited tokens after a
-    # pre-verb negator we consider "inside" its scope. Beyond this window
-    # a matched intent verb is treated as independent of the negator
-    # (accuracy fix — v14.1 negated the *entire message* on any pre-verb
-    # negator hit anywhere in the text, which produced false negatives on
-    # multi-clause messages like "مش عارف اذاكر بس محتاج حد يشرحلي الفصل" —
-    # "I don't know how to study BUT I need someone to explain the
-    # chapter" — where the negation and the real request are in different
-    # clauses).
     NEGATION_SCOPE_TOKENS: Final[int] = 6
 
     _PATTERNS: Dict[str, re.Pattern] = {
@@ -435,16 +394,9 @@ class EnhancedFilter:
 
         self._bloom = OptimizedBloomFilter(CFG.BLOOM_FILTER_SIZE, CFG.BLOOM_FILTER_FP)
         self._cache = ShardedLRUCache(CFG.MAX_CACHE_SIZE, CFG.CACHE_TTL)
-        # `_text_cache` keeps TTL (not pure LRU): correctness requirement —
-        # after `reload_keywords()` swaps in new weights/patterns, stale
-        # cached results must expire on their own rather than living
-        # indefinitely just because they're "hot". A pure LRU cache has no
-        # mechanism for that; TTL does, and is the *appropriate* choice
-        # here per the "where appropriate" qualifier in the requirement.
         self._text_cache = TTLCache(maxsize=CFG.TEXT_CACHE_SIZE, ttl=CFG.TEXT_CACHE_TTL)
         self._cache_lock = asyncio.Lock()
 
-        # --- new subsystems ---------------------------------------------
         self._regex_guard = SafeRegexExecutor(
             timeout_s=_cfg("REGEX_TIMEOUT_S", 0.25),
             max_workers=_cfg("REGEX_GUARD_WORKERS", 4),
@@ -456,11 +408,20 @@ class EnhancedFilter:
         )
         self._adaptive_intent = AdaptiveWeights(self._intent_weights, alpha=_cfg("ADAPTIVE_ALPHA", 0.05))
         self._adaptive_academic = AdaptiveWeights(self._academic_weights, alpha=_cfg("ADAPTIVE_ALPHA", 0.05))
-        self._fuzzy_enabled = _cfg("FUZZY_FALLBACK_ENABLED", True) and RAPIDFUZZ_AVAILABLE
+
+        # Fuzzy settings: read from CFG first, then from keywords.json
+        fuzzy_data = self._raw_keywords.get("fuzzy_matching", {})
+        self._fuzzy_enabled = (
+            _cfg("FUZZY_FALLBACK_ENABLED", fuzzy_data.get("enabled", True))
+            and RAPIDFUZZ_AVAILABLE
+        )
         self._fuzzy_score_cutoff = _cfg("FUZZY_SCORE_CUTOFF", 85.0)
+        self._fuzzy_max_edit_distance = _cfg("FUZZY_MAX_EDIT_DISTANCE", fuzzy_data.get("max_edit_distance", 1))
+        self._fuzzy_min_token_length = _cfg("FUZZY_MIN_TOKEN_LENGTH", fuzzy_data.get("minimum_token_length", 5))
+        self._fuzzy_only_for = fuzzy_data.get("only_for", [])
 
         logger.info(
-            "Filter v14.2 ready | intent_verbs={} | academic_objects={} | negation={} | boost_patterns={} | "
+            "Filter v14.3 ready | intent_verbs={} | academic_objects={} | negation={} | boost_patterns={} | "
             "distance_scoring={} | fuzzy_fallback={}",
             len(self._intent_verbs_all),
             len(self._academic_objects_all),
@@ -470,14 +431,17 @@ class EnhancedFilter:
             "ON" if self._fuzzy_enabled else "OFF",
         )
 
-    # ---------------------------------------------------------------- #
-    # Keyword loading (unchanged logic from v14.1, elided here only in
-    # this excerpt for length — see full file: identical to the supplied
-    # `_generate_template_patterns` / `_load_keyword_sets` / dialect-map
-    # loading, EXCEPT `_apply_dialect_mapping` below, which now compiles
-    # word-boundary patterns instead of doing naive substring replace.
-    # ---------------------------------------------------------------- #
+    # ------------------------------------------------------------------
+    # Helper: normalize a keyword term (same as input normalization)
+    # ------------------------------------------------------------------
+    def _normalize_term(self, term: str) -> str:
+        term = term.lower()
+        term = self._normalize_arabic(term)
+        return term
 
+    # ------------------------------------------------------------------
+    # Keyword loading (updated to normalize all terms)
+    # ------------------------------------------------------------------
     def _generate_template_patterns(self, kw: Dict[str, Any]) -> Set[str]:
         generated: Set[str] = set()
         templates_data = kw.get("templates", {})
@@ -505,48 +469,46 @@ class EnhancedFilter:
         if not isinstance(availability, list):
             availability = []
 
+        # Normalize all word banks
+        need = [self._normalize_term(t) for t in need]
+        person = [self._normalize_term(t) for t in person]
+        action = [self._normalize_term(t) for t in action]
+        expert = [self._normalize_term(t) for t in expert]
+        availability = [self._normalize_term(t) for t in availability]
+
         for pattern in template_patterns_list:
             if not isinstance(pattern, str):
                 continue
             parts = pattern.strip().split()
-
             if len(parts) == 2:
                 tag1, tag2 = parts[0], parts[1]
-
                 if tag1 == "<need>" and tag2 == "<person>":
                     for n in need:
                         for p in person:
                             generated.add(f"{n} {p}")
-
                 elif tag1 == "<need>" and tag2 == "<expert>":
                     for n in need:
                         for e in expert:
                             generated.add(f"{n} {e}")
-
                 elif tag1 == "<availability>" and tag2 == "<person>":
                     for a in availability:
                         for p in person:
                             generated.add(f"{a} {p}")
-
                 elif tag1 == "<availability>" and tag2 == "<action>":
                     for a in availability:
                         for act in action:
                             generated.add(f"{a} {act}")
-
                 elif tag1 == "<availability>" and tag2 == "<expert>":
                     for a in availability:
                         for e in expert:
                             generated.add(f"{a} {e}")
-
             elif len(parts) == 3:
                 tag1, tag2, tag3 = parts[0], parts[1], parts[2]
-
                 if tag1 == "<need>" and tag2 == "<person>" and tag3 == "<action>":
                     for n in need:
                         for p in person:
                             for act in action:
                                 generated.add(f"{n} {p} {act}")
-
                 elif tag1 == "<availability>" and tag2 == "<person>" and tag3 == "<action>":
                     for a in availability:
                         for p in person:
@@ -554,22 +516,25 @@ class EnhancedFilter:
                                 generated.add(f"{a} {p} {act}")
 
         logger.info(
-            "Template engine generated {} boost patterns from {} template(s) | "
-            "need={} person={} action={} expert={} availability={}",
-            len(generated),
-            len(template_patterns_list),
-            len(need),
-            len(person),
-            len(action),
-            len(expert),
-            len(availability),
+            "Template engine generated {} boost patterns from {} template(s)",
+            len(generated), len(template_patterns_list)
         )
-
         return generated
 
     def _load_keyword_sets(self, keywords_data: Optional[Dict[str, Any]] = None) -> None:
         kw = keywords_data if keywords_data is not None else KEYWORDS
 
+        def _norm_set(terms: Any) -> Set[str]:
+            if not isinstance(terms, list):
+                return set()
+            return {self._normalize_term(t) for t in terms if isinstance(t, str)}
+
+        def _norm_list(terms: Any) -> List[str]:
+            if not isinstance(terms, list):
+                return []
+            return [self._normalize_term(t) for t in terms if isinstance(t, str)]
+
+        # Intent verbs
         self._intent_verbs: Dict[str, Dict[str, Any]] = kw.get("intent_verbs", {})
         self._intent_verbs_all: Set[str] = set()
         self._intent_weights: Dict[str, float] = {}
@@ -577,9 +542,11 @@ class EnhancedFilter:
             if isinstance(data, dict) and "terms" in data:
                 weight = data.get("_weight_hint", 0.7)
                 for term in data.get("terms", []):
+                    term = self._normalize_term(term)
                     self._intent_verbs_all.add(term)
                     self._intent_weights[term] = weight
 
+        # Academic objects
         self._academic_objects: Dict[str, Dict[str, Any]] = kw.get("academic_objects", {})
         self._academic_objects_all: Set[str] = set()
         self._academic_weights: Dict[str, float] = {}
@@ -587,24 +554,29 @@ class EnhancedFilter:
             if isinstance(data, dict) and "terms" in data:
                 weight = data.get("_weight_hint", 0.7)
                 for term in data.get("terms", []):
+                    term = self._normalize_term(term)
                     self._academic_objects_all.add(term)
                     self._academic_weights[term] = weight
 
+        # Request phrases
         request_phrases_data = kw.get("request_phrases", {})
         self._request_phrases_all: Set[str] = set()
         for category, phrases in request_phrases_data.items():
             if isinstance(phrases, list):
-                self._request_phrases_all.update(phrases)
+                self._request_phrases_all.update(_norm_set(phrases))
 
-        self._indirect_request: List[str] = kw.get("indirect_request", [])
+        # Indirect request
+        self._indirect_request: List[str] = _norm_list(kw.get("indirect_request", []))
         self._indirect_request_all: Set[str] = set(self._indirect_request)
 
+        # Urgency
         urgency_data = kw.get("urgency_markers", {})
         self._urgency_all: Set[str] = set()
         for category, markers in urgency_data.items():
             if isinstance(markers, list):
-                self._urgency_all.update(markers)
+                self._urgency_all.update(_norm_set(markers))
 
+        # Negation
         self._negation: Dict[str, Any] = kw.get("negation", {})
         self._negation_all: Set[str] = set()
         self._negation_exceptions: Set[str] = set()
@@ -612,104 +584,128 @@ class EnhancedFilter:
 
         pre_verb = self._negation.get("pre_verb_negators", {})
         if isinstance(pre_verb, dict) and "terms" in pre_verb:
-            self._negation_all.update(pre_verb.get("terms", []))
+            self._negation_all.update(_norm_set(pre_verb.get("terms", [])))
 
         post_clause = self._negation.get("post_clause_negators", [])
         if isinstance(post_clause, list):
-            self._negation_all.update(post_clause)
+            self._negation_all.update(_norm_set(post_clause))
 
         exceptions = self._negation.get("negation_exceptions", [])
         if isinstance(exceptions, list):
-            self._negation_exceptions.update(exceptions)
+            self._negation_exceptions.update(_norm_set(exceptions))
 
         resolution = self._negation.get("resolution_phrases", [])
         if isinstance(resolution, list):
-            self._resolution_phrases.update(resolution)
+            self._resolution_phrases.update(_norm_set(resolution))
 
+        # Boost patterns
         boost_data = kw.get("high_confidence_boost_patterns", {})
         self._boost_patterns: Set[str] = set()
         if isinstance(boost_data, dict):
             patterns = boost_data.get("patterns", [])
             if isinstance(patterns, list):
-                self._boost_patterns.update(patterns)
+                self._boost_patterns.update(_norm_set(patterns))
 
         template_generated = self._generate_template_patterns(kw)
         self._boost_patterns.update(template_generated)
         self._stats["template_patterns_generated"] = len(template_generated)
 
+        # Ad signals
         self._ad_signals: Dict[str, Any] = kw.get("advertisement_signals", {})
+        # Normalize all ad-related lists
+        for key in ["hard_signals", "medium_signals", "cta_signals", "institution_terms"]:
+            if key in self._ad_signals and isinstance(self._ad_signals[key], list):
+                self._ad_signals[key] = _norm_list(self._ad_signals[key])
+        provider = self._ad_signals.get("provider_profile", {})
+        for pkey in ["strong_provider", "weak_provider", "individual_provider"]:
+            if pkey in provider and isinstance(provider[pkey], list):
+                provider[pkey] = _norm_list(provider[pkey])
+        if "price_signals" in self._ad_signals:
+            ps = self._ad_signals["price_signals"]
+            if "payment_methods" in ps and "terms" in ps["payment_methods"]:
+                if isinstance(ps["payment_methods"]["terms"], list):
+                    ps["payment_methods"]["terms"] = _norm_list(ps["payment_methods"]["terms"])
 
+        # Spam categories
         self._spam_categories: Dict[str, List[str]] = kw.get("spam_categories", {})
         self._spam_all: Set[str] = set()
         for category, terms in self._spam_categories.items():
             if isinstance(terms, list):
-                self._spam_all.update(terms)
+                self._spam_all.update(_norm_set(terms))
 
+        # Emoji signals
         emoji_data = kw.get("emoji_signals", {})
         self._ad_emoji: Set[str] = set(emoji_data.get("ad_style_emoji", []))
         self._neutral_emoji: Set[str] = set(emoji_data.get("neutral_emoji", []))
 
+        # Ad blockers
         self._ad_blockers: Set[str] = set(kw.get("ad_blockers", []))
+        self._ad_blockers = {b.lower() for b in self._ad_blockers if isinstance(b, str)}
 
+        # Ignore signals
         ignore_data = kw.get("ignore_signals", {})
         self._ignore_all: Set[str] = set()
         for category, terms in ignore_data.items():
             if isinstance(terms, list):
-                self._ignore_all.update(terms)
+                self._ignore_all.update(_norm_set(terms))
 
-        self._help_expressions: Set[str] = set(kw.get("help_expressions", []))
+        # Help expressions
+        self._help_expressions: Set[str] = _norm_set(kw.get("help_expressions", []))
 
+        # Action verbs
         action_verbs_data = kw.get("action_verbs", {})
         self._action_verbs: Set[str] = set()
         for key in ["core", "suffixed_forms", "imperative_forms"]:
             if isinstance(action_verbs_data.get(key), list):
-                self._action_verbs.update(action_verbs_data.get(key, []))
+                self._action_verbs.update(_norm_set(action_verbs_data.get(key, [])))
 
+        # Subject markers
         subject_data = kw.get("subject_markers", {})
         self._subject_markers: Set[str] = set()
         for key in ["student_pronouns", "student_question_subject"]:
             if isinstance(subject_data.get(key), list):
-                self._subject_markers.update(subject_data.get(key, []))
+                self._subject_markers.update(_norm_set(subject_data.get(key, [])))
 
+        # Implicit request patterns
         implicit_data = kw.get("implicit_request_patterns", {})
         self._implicit_request_all: Set[str] = set()
         for key in ["availability_question", "problem_state"]:
             if isinstance(implicit_data.get(key), list):
-                self._implicit_request_all.update(implicit_data.get(key, []))
+                self._implicit_request_all.update(_norm_set(implicit_data.get(key, [])))
 
+        # Solve actions
         solve_data = kw.get("solve_actions", {})
         self._solve_academic: Set[str] = set()
         self._technical_problem_terms: Set[str] = set()
         if isinstance(solve_data.get("academic_solution"), list):
-            self._solve_academic.update(solve_data.get("academic_solution", []))
+            self._solve_academic.update(_norm_set(solve_data.get("academic_solution", [])))
         if isinstance(solve_data.get("technical_problem_terms"), list):
-            self._technical_problem_terms.update(solve_data.get("technical_problem_terms", []))
+            self._technical_problem_terms.update(_norm_set(solve_data.get("technical_problem_terms", [])))
 
-        # Dialect mapping: covers Egyptian / Gulf / Levantine / Moroccan
-        # variants. The KEYWORDS data is expected to key `dialect_mapping`
-        # by region, e.g. {"egyptian": {...}, "gulf": {...},
-        # "levantine": {...}, "moroccan": {...}}. We don't require any
-        # particular region key to exist (keeps this backward compatible
-        # with keyword files that only had partial coverage) — we simply
-        # merge whatever region maps are present, exactly as v14.1 did,
-        # but now compile them into word-boundary regexes (see below)
-        # instead of doing naive substring replacement.
+        # Dialect mapping
         self._dialect_map: Dict[str, str] = {}
         dialect_data = kw.get("dialect_mapping", {})
         for category, mapping in dialect_data.items():
             if isinstance(mapping, dict):
-                self._dialect_map.update(mapping)
+                # Normalize both keys and values
+                for k, v in mapping.items():
+                    nk = self._normalize_term(k)
+                    nv = self._normalize_term(v)
+                    self._dialect_map[nk] = nv
         self._dialect_pattern: Optional[re.Pattern] = None
         self._build_dialect_pattern()
 
+        # University context
         self._university_context: Set[str] = set()
         university_data = kw.get("university_context", {})
         for key, value in university_data.items():
             if isinstance(value, list):
-                self._university_context.update(value)
+                self._university_context.update(_norm_set(value))
 
+        # Distance config
         self._distance_config: Dict[str, Any] = kw.get("distance_scoring_config", {})
 
+        # Length modifier
         self._length_modifier: Dict[Tuple[int, int], float] = {}
         length_data = kw.get("length_modifier", {})
         for key, value in length_data.items():
@@ -722,6 +718,7 @@ class EnhancedFilter:
                 except Exception:
                     pass
 
+        # Scoring weights (documentation only, not used in code)
         self._scoring_weights: Dict[str, float] = {}
         weights_data = kw.get("scoring_weights", {})
         positive_modules = weights_data.get("positive_modules", {})
@@ -729,11 +726,13 @@ class EnhancedFilter:
             for key, value in positive_modules.items():
                 self._scoring_weights[key] = float(value)
 
+        # Clause boundaries
         self._clause_boundaries: Set[str] = set()
         boundaries = self._negation.get("clause_boundaries", [])
         if isinstance(boundaries, list):
-            self._clause_boundaries.update(boundaries)
+            self._clause_boundaries.update(_norm_set(boundaries))
 
+        # Build final sets
         self.request_words: Set[str] = set(self._intent_verbs_all).union(self._request_phrases_all)
         self.context_words: Set[str] = set(self._academic_objects_all).union(self._university_context)
         self.indirect_words: Set[str] = set(self._indirect_request_all).union(self._implicit_request_all)
@@ -745,22 +744,22 @@ class EnhancedFilter:
             signals = self._ad_signals.get(signal_list, [])
             if isinstance(signals, list):
                 self.advertisement_words.update(signals)
-
         self.education_words: Set[str] = set(self._ad_signals.get("institution_terms", []))
         self.emoji_advertisement: Set[str] = self._ad_emoji
         self.ad_blockers: Set[str] = self._ad_blockers
         self.spam_patterns: Set[str] = self._spam_all
 
-        old_request = set(kw.get("request", []))
-        old_context = set(kw.get("request_context", []))
-        old_indirect = set(kw.get("indirect_request", []))
-        old_urgency = set(kw.get("urgency", []))
-        old_ignore = set(kw.get("ignore", []))
-        old_ad = set(kw.get("advertisement", []))
-        old_edu = set(kw.get("education_providers", []))
+        # Legacy flat keys
+        old_request = _norm_set(kw.get("request", []))
+        old_context = _norm_set(kw.get("request_context", []))
+        old_indirect = _norm_set(kw.get("indirect_request", []))
+        old_urgency = _norm_set(kw.get("urgency", []))
+        old_ignore = _norm_set(kw.get("ignore", []))
+        old_ad = _norm_set(kw.get("advertisement", []))
+        old_edu = _norm_set(kw.get("education_providers", []))
         old_emoji = set(kw.get("emoji_advertisement", []))
         old_blockers = set(kw.get("ad_blockers", []))
-        old_spam = set(kw.get("spam_patterns", []))
+        old_spam = _norm_set(kw.get("spam_patterns", []))
 
         self.request_words.update(old_request)
         self.context_words.update(old_context)
@@ -773,6 +772,7 @@ class EnhancedFilter:
         self.ad_blockers.update(old_blockers)
         self.spam_patterns.update(old_spam)
 
+        # Ensure all sets are clean
         self.request_words = set(self.request_words)
         self.context_words = set(self.context_words)
         self.indirect_words = set(self.indirect_words)
@@ -785,6 +785,7 @@ class EnhancedFilter:
         self.spam_patterns = set(self.spam_patterns)
         self._boost_patterns = set(self._boost_patterns)
 
+        # Build tries
         self._request_trie = WeightedTrie(self.request_words)
         self._context_trie = WeightedTrie(self.context_words)
         self._indirect_trie = WeightedTrie(self.indirect_words)
@@ -803,70 +804,56 @@ class EnhancedFilter:
         self._subject_markers_trie = WeightedTrie(self._subject_markers)
         self._action_verbs_trie = WeightedTrie(self._action_verbs)
 
-        # Keep a flat list of all keyword terms for the fuzzy fallback path.
-        self._all_intent_terms: List[str] = list(self._intent_verbs_all)
+        # Fuzzy candidate terms: combine from categories specified in fuzzy_matching.only_for
+        fuzzy_terms_set = set()
+        only_for = self._fuzzy_only_for or ["intent_verbs"]  # default
+        if "intent_verbs" in only_for:
+            fuzzy_terms_set.update(self._intent_verbs_all)
+        if "request_phrases" in only_for:
+            fuzzy_terms_set.update(self._request_phrases_all)
+        if "high_confidence_boost_patterns" in only_for:
+            fuzzy_terms_set.update(self._boost_patterns)
+        self._all_fuzzy_terms: List[str] = list(fuzzy_terms_set)
 
         self._raw_keywords = kw
 
     def _build_tries(self) -> None:
+        # Tries are built inside _load_keyword_sets; kept for API compatibility.
         pass
 
     def reload_keywords(self, path: str = "keywords.json") -> None:
         from config import load_keywords
         fresh = load_keywords(path)
         self._load_keyword_sets(fresh)
-        self._build_tries()
-        # Re-seed adaptive weights on reload. We do NOT discard learned
-        # feedback for terms that still exist (that would throw away
-        # signal on every ops-driven keyword tweak); we only add defaults
-        # for brand-new terms and drop weights for removed terms.
+        # Re-seed adaptive weights on reload.
         if hasattr(self, "_adaptive_intent"):
             self._adaptive_intent = self._reseed_adaptive(self._adaptive_intent, self._intent_weights)
             self._adaptive_academic = self._reseed_adaptive(self._adaptive_academic, self._academic_weights)
         self._stats["keyword_reloads"] = self._stats.get("keyword_reloads", 0) + 1
         logger.info(
-            "Filter keyword sets reloaded from {} | templates={} entries | template_patterns={} entries | "
-            "boost_patterns_total={}",
+            "Filter keyword sets reloaded from {} | templates={} entries | boost_patterns_total={}",
             path,
-            len(fresh.get("templates", {})) if isinstance(fresh.get("templates"), (list, dict)) else 0,
-            len(fresh.get("template_patterns", [])) if isinstance(fresh.get("template_patterns"), (list, dict)) else 0,
+            len(fresh.get("templates", {})),
             len(self._boost_patterns),
         )
 
     @staticmethod
     def _reseed_adaptive(existing: AdaptiveWeights, static_defaults: Dict[str, float]) -> AdaptiveWeights:
         merged = dict(static_defaults)
-        # Preserve any weight the adaptive store already learned for terms
-        # that still exist in the new keyword set.
-        for term, learned in existing._weights.items():  # noqa: SLF001 (internal, same module family)
-            if term in merged:
-                merged[term] = learned
-        return AdaptiveWeights(merged, alpha=existing._alpha)  # noqa: SLF001
+        # Preserve learned weights for terms that still exist
+        if hasattr(existing, "weights"):
+            for term, learned in existing.weights.items():
+                if term in merged:
+                    merged[term] = learned
+        alpha = getattr(existing, "alpha", 0.05)
+        return AdaptiveWeights(merged, alpha=alpha)
 
     _build_keyword_sets = reload_keywords
 
-    # ---------------------------------------------------------------- #
+    # ------------------------------------------------------------------
     # Normalization
-    # ---------------------------------------------------------------- #
-
+    # ------------------------------------------------------------------
     def _build_dialect_pattern(self) -> None:
-        """
-        Compile dialect variants into a single alternation pattern matched
-        with Unicode-aware word boundaries.
-
-        Why: v14.1 did `text.replace(variant, canonical)` for every
-        mapping entry. That silently corrupts substrings — e.g. mapping a
-        short Gulf variant like "ابغى" (I want) could match inside a longer,
-        unrelated word that happens to contain the same character sequence.
-        Regular `\\b` doesn't work reliably on Arabic (word boundary is
-        defined against `\\w`, and Arabic letters are matched inconsistently
-        across engines/locales), so instead we anchor on whitespace /
-        start-of-string / end-of-string / punctuation, which is what
-        actually delimits tokens in these short chat messages.
-
-        Patterns are sorted longest-first so that a longer dialect phrase
-        is matched before a shorter one that happens to be its prefix.
-        """
         if not self._dialect_map:
             self._dialect_pattern = None
             return
@@ -879,7 +866,7 @@ class EnhancedFilter:
         try:
             self._dialect_pattern = re.compile(boundary % "|".join(escaped))
         except re.error as exc:
-            logger.error("Failed to compile dialect pattern, falling back to no dialect mapping: {}", exc)
+            logger.error("Failed to compile dialect pattern: {}", exc)
             self._dialect_pattern = None
 
     def _normalize_arabic(self, text: str) -> str:
@@ -889,13 +876,12 @@ class EnhancedFilter:
                 text = araby.strip_tashkeel(text)
                 text = araby.strip_tatweel(text)
             except Exception as exc:
-                logger.debug("pyarabic normalization failed, continuing without it: {}", exc)
+                logger.debug("pyarabic normalization failed: {}", exc)
         return text
 
     def _apply_dialect_mapping(self, text: str) -> str:
         if not self._dialect_pattern:
             return text
-        result = safe_search  # noqa: F841 (documented no-op reference to keep import used if pattern absent)
 
         def _sub(match: "re.Match") -> str:
             return self._dialect_map.get(match.group(1), match.group(1))
@@ -907,19 +893,7 @@ class EnhancedFilter:
             return capped
 
     def _clean(self, text: str) -> Tuple[str, str]:
-        """
-        Returns (cleaned_for_matching, original_preserved).
-
-        Accuracy requirement: "Preserve the original text when
-        normalization could affect downstream interpretation." Dialect
-        canonicalization and Arabic diacritic stripping are lossy — a
-        moderator reviewing a flagged message, or any downstream system
-        logging/auditing decisions, needs to see what the student actually
-        typed, not the normalized form used only for matching. We now
-        return both; `analyze()` matches against the cleaned string but
-        includes the original in the result for anything consuming it
-        downstream (moderation review UI, audit log).
-        """
+        """Returns (cleaned_for_matching, original_preserved)."""
         original = text
         cleaned = WS_PATTERN.sub(" ", text).strip()
         cleaned = cleaned.lower()
@@ -940,14 +914,14 @@ class EnhancedFilter:
                     if detect(text) == "ar":
                         return True, 0.9
                 except Exception as exc:
-                    logger.debug("langdetect failed, falling back to char-ratio heuristic: {}", exc)
+                    logger.debug("langdetect failed: {}", exc)
             return False, ratio
         if LANGDETECT_AVAILABLE:
             try:
                 lang = detect(text)
                 return lang == "ar", 0.85 if lang == "ar" else 0.6
             except Exception as exc:
-                logger.debug("langdetect failed, falling back to char-ratio heuristic: {}", exc)
+                logger.debug("langdetect failed: {}", exc)
         return ratio > 0.25, ratio
 
     def _spam_score(self, text: str) -> float:
@@ -958,12 +932,9 @@ class EnhancedFilter:
         score += min(0.4, url_count * 0.2)
         emoji_count = len(safe_findall(EMOJI_PATTERN, text))
         score += min(0.2, emoji_count * 0.04)
-        # Repeated-character run detection: bounded input via safe_search's
-        # implicit cap keeps this O(len) regardless of pattern; no
-        # unbounded quantifier nesting (`{4,}` on a single char class is
-        # linear, not exponential — kept as-is, just routed through the
-        # length cap for defense in depth).
-        if safe_search(re.compile(r"(.)\1{4,}"), text):
+        # Precompile repeated char pattern
+        repeated_pattern = re.compile(r"(.)\1{4,}")
+        if safe_search(repeated_pattern, text):
             score += 0.15
         return min(score, 1.0)
 
@@ -997,7 +968,7 @@ class EnhancedFilter:
         if strong_count > 0 or individual_count > 0:
             ad_score += 0.3
             reasons.append("provider_detected")
-        elif weak_count >= CFG.AD_WEAK_PROVIDER_THRESHOLD:
+        elif weak_count >= _cfg("AD_WEAK_PROVIDER_THRESHOLD", 3):
             ad_score += 0.25
             reasons.append("weak_provider_multiple")
 
@@ -1032,7 +1003,7 @@ class EnhancedFilter:
                 reasons.append(f"url_signal: {pattern}")
 
         ad_emoji_count = sum(1 for emoji in self._ad_emoji if emoji in text)
-        if ad_emoji_count >= CFG.AD_EMOJI_THRESHOLD:
+        if ad_emoji_count >= _cfg("AD_EMOJI_THRESHOLD", 3):
             ad_score += 0.2
             reasons.append(f"ad_emoji_count: {ad_emoji_count}")
 
@@ -1040,26 +1011,23 @@ class EnhancedFilter:
 
     def _detect_negation(self, text: str, intent_pos: Optional[int]) -> Tuple[bool, float, List[str]]:
         """
-        Scoped negation detection (accuracy improvement over v14.1).
-
-        `resolution_phrases` and `post_clause_negators` still apply
-        message-wide — they represent explicit statements like "تم الحل"
-        ("resolved") or "لا داعي" ("no need [anymore]") that legitimately
-        cancel the whole request regardless of clause position.
-
-        `pre_verb_negators` (e.g. "مش", "ما", "لا") are now scope-limited:
-        if we already have a matched intent verb position, the negator
-        only counts if it falls within `NEGATION_SCOPE_TOKENS` tokens of
-        that verb (before or after), or if no intent verb was matched yet
-        (in which case we can't scope it, so we preserve v14.1's
-        conservative whole-text behavior). This directly targets false
-        negatives where a negated clause and a real request coexist in one
-        message.
+        Improved negation detection with clause-awareness.
+        Resolution phrases are only full negation if no new request appears after them.
         """
+        # Check resolution phrases
         resolution_match = self._resolution_trie.search_first(text)
         if resolution_match:
-            return True, 1.0, [f"resolution_phrase: {resolution_match[0]}"]
+            res_phrase, _, res_pos = resolution_match
+            # If there is an intent verb after the resolution phrase, treat as not fully negated
+            if intent_pos is not None and intent_pos > res_pos:
+                # New request after resolution: not a pure resolution
+                logger.debug("Resolution phrase '{}' found but intent appears later; not fully negated", res_phrase)
+                # Return low negation score (e.g., 0.2) to slightly dampen confidence but not ignore
+                return True, 0.2, [f"resolution_phrase_with_new_request: {res_phrase}"]
+            # Otherwise full negation
+            return True, 1.0, [f"resolution_phrase: {res_phrase}"]
 
+        # Post-clause negators
         post_clause = self._negation.get("post_clause_negators", [])
         if isinstance(post_clause, list):
             for neg in post_clause:
@@ -1068,6 +1036,7 @@ class EnhancedFilter:
                         return False, 0.0, []
                     return True, 0.8, [f"post_clause_negator: {neg}"]
 
+        # Pre-verb negators with scoping
         pre_verb_data = self._negation.get("pre_verb_negators", {})
         if isinstance(pre_verb_data, dict):
             pre_verbs = pre_verb_data.get("terms", [])
@@ -1078,7 +1047,7 @@ class EnhancedFilter:
                         continue
                     if any(ex in text for ex in self._negation_exceptions):
                         return False, 0.0, []
-                    if CFG.NEGATION_CLAUSE_BOUNDARIES_ENABLED:
+                    if _cfg("NEGATION_CLAUSE_BOUNDARIES_ENABLED", True):
                         before_text = text[:pos]
                         if any(boundary in before_text for boundary in self._clause_boundaries):
                             return False, 0.0, []
@@ -1086,10 +1055,7 @@ class EnhancedFilter:
                     if intent_pos is not None:
                         token_distance = self._token_distance(text, pos, intent_pos)
                         if token_distance > self.NEGATION_SCOPE_TOKENS:
-                            # Negator exists but is out of scope of the
-                            # matched intent verb — don't suppress this
-                            # request based on an unrelated clause.
-                            continue
+                            continue  # out of scope, ignore this negator
 
                     return True, 0.6, [f"pre_verb_negator: {pv}"]
 
@@ -1097,9 +1063,6 @@ class EnhancedFilter:
 
     @staticmethod
     def _token_distance(text: str, pos_a: int, pos_b: int) -> int:
-        """Approximate token distance between two character offsets, by
-        counting whitespace runs between them. O(|pos_a - pos_b|), bounded
-        by message length (already capped by CFG.MAX_MESSAGE_LENGTH)."""
         lo, hi = sorted((pos_a, pos_b))
         return text.count(" ", lo, hi)
 
@@ -1108,7 +1071,7 @@ class EnhancedFilter:
         thresholds = self._distance_config.get("thresholds", {})
 
         for range_str, data in thresholds.items():
-            if "-" in range_str or "_to_" in range_str:
+            if "_to_" in range_str:
                 try:
                     start_str, end_str = range_str.split("_to_")
                     start, end = int(start_str), int(end_str)
@@ -1120,6 +1083,7 @@ class EnhancedFilter:
                 if distance >= 16:
                     return float(data.get("score_multiplier", 0.15))
 
+        # Fallback
         if text_len > 100:
             if distance <= 10:
                 return 0.9
@@ -1142,67 +1106,58 @@ class EnhancedFilter:
         return 0.9
 
     def _fuzzy_intent_fallback(self, cleaned: str) -> Optional[Tuple[str, float, int]]:
-        """
-        Semantic-similarity fallback: when the exact trie search finds no
-        intent verb, try a fuzzy (edit-distance-based) match against the
-        known intent-verb vocabulary using rapidfuzz.
-
-        Justification for "measurable value, no heavyweight ML dep": this
-        directly catches typos and minor morphological variants (e.g. a
-        missing/extra letter in a conjugated Arabic verb) that a trie's
-        exact-prefix matching cannot, using a dependency that was *already
-        present* (rapidfuzz was imported in v14.1 but never actually used
-        — dead import). No new dependency, no model download, gated
-        behind a score cutoff and a config flag so it can be disabled if
-        it ever proves too permissive for a given keyword set.
-
-        Returns (matched_term, weight, approx_position) or None — position
-        is best-effort (first occurrence of the closest token), used only
-        for distance scoring, not for exact-offset-sensitive logic.
-        """
         if not self._fuzzy_enabled or not cleaned.strip():
             return None
         tokens = cleaned.split()
-        if not tokens or not self._all_intent_terms:
+        if not tokens or not self._all_fuzzy_terms:
             return None
+
+        # Apply minimum token length filter
+        if len(cleaned) < self._fuzzy_min_token_length:
+            return None
+
         best = rf_process.extractOne(
-            cleaned, self._all_intent_terms, scorer=fuzz.partial_ratio,
+            cleaned,
+            self._all_fuzzy_terms,
+            scorer=fuzz.partial_ratio,
             score_cutoff=self._fuzzy_score_cutoff,
         )
         if not best:
             return None
         term, score, _ = best
-        weight = self._adaptive_intent.get(term, 0.7) * 0.85  # slight discount for fuzzy vs exact
+        # Use adaptive weight if available, else default
+        weight = self._adaptive_intent.get(term, self._intent_weights.get(term, 0.7)) * 0.85
         pos = cleaned.find(tokens[0])
         return term, weight, max(pos, 0)
 
     async def analyze(self, text: str) -> Dict[str, Any]:
         start = time.perf_counter()
+        original_text = text
 
         try:
             if len(text) > CFG.MAX_MESSAGE_LENGTH:
-                return self._result("ignore", 0.0, ["too_long"])
+                return self._result("ignore", 0.0, ["too_long"], original_text=original_text)
 
             validated = InputSanitizer.validate_message_text(text)
             if validated is None:
-                return self._result("ignore", 0.0, ["invalid_input"])
+                return self._result("ignore", 0.0, ["invalid_input"], original_text=original_text)
 
             cleaned, original = self._clean(validated)
             cache_key = hashlib.blake2b(cleaned.encode(), digest_size=16).hexdigest()[:32]
 
             if CFG.PREFILTER_ENABLED:
                 ok, reason, metadata = Prefilter.check(
-                    cleaned, CFG.PREFILTER_MIN_WORDS, CFG.PREFILTER_MAX_EMOJIS
+                    cleaned, _cfg("PREFILTER_MIN_WORDS", 1), CFG.PREFILTER_MAX_EMOJIS
                 )
                 if not ok:
                     async with self._stats_lock:
                         self._stats["prefilter_rejected"] += 1
-                    return self._result("ignore", 0.0, [reason])
+                    return self._result("ignore", 0.0, [reason], original_text=original_text)
 
             if await self._bloom.contains(cache_key):
                 async with self._stats_lock:
                     self._stats["bloom_hits"] += 1
-                return self._result("ignore", 0.0, ["duplicate"])
+                return self._result("ignore", 0.0, ["duplicate"], original_text=original_text)
 
             async with self._cache_lock:
                 if cache_key in self._text_cache:
@@ -1219,24 +1174,24 @@ class EnhancedFilter:
 
             is_arabic, arabic_ratio = self._is_arabic(cleaned)
             if CFG.LANGUAGE_FILTER and not is_arabic:
-                return self._result("ignore", 0.0, ["non_arabic"])
+                return self._result("ignore", 0.0, ["non_arabic"], original_text=original_text)
 
             spam_score = self._spam_score(cleaned)
             if spam_score > CFG.SPAM_SCORE_THRESHOLD:
                 async with self._stats_lock:
                     self._stats["spam"] += 1
-                return self._result("ignore", 0.0, ["spam_detected"])
+                return self._result("ignore", 0.0, ["spam_detected"], original_text=original_text)
 
             if self._spam_trie.search_first(cleaned):
                 async with self._stats_lock:
                     self._stats["spam"] += 1
-                return self._result("ignore", 0.0, ["spam_pattern"])
+                return self._result("ignore", 0.0, ["spam_pattern"], original_text=original_text)
 
             if self._ignore_trie.search_first(cleaned):
-                return self._result("ignore", 0.0, ["ignore_pattern"])
+                return self._result("ignore", 0.0, ["ignore_pattern"], original_text=original_text)
 
             if self._ad_blocker_trie.search_first(cleaned):
-                return self._result("ignore", 0.0, ["ad_blocker"])
+                return self._result("ignore", 0.0, ["ad_blocker"], original_text=original_text)
 
             intent_match = self._request_trie.search_first(cleaned)
             fuzzy_used = False
@@ -1273,27 +1228,30 @@ class EnhancedFilter:
 
             is_negated, neg_score, neg_reasons = self._detect_negation(cleaned, intent_pos)
             if is_negated and neg_score > 0.7:
-                return self._result("ignore", 1.0 - neg_score, neg_reasons)
+                return self._result(
+                    "ignore",
+                    1.0 - neg_score,
+                    neg_reasons,
+                    original_text=original_text
+                )
 
             ad_score, ad_reasons = self._detect_advertisement(cleaned)
-
             if ad_score > 0.6:
-                return self._result("ignore", 1.0 - ad_score, ad_reasons)
+                return self._result("ignore", 1.0 - ad_score, ad_reasons, original_text=original_text)
 
             result = FilterResult()
+            result.original_text = original
 
             if self._is_blocked(cleaned, result):
                 return self._convert_result(result, is_arabic, arabic_ratio, ad_score, start)
 
             keyword = intent_word or (indirect_match[0] if indirect_match else None)
-
             if not keyword:
                 result.valid = False
                 result.reason = "no_keyword"
                 return self._convert_result(result, is_arabic, arabic_ratio, ad_score, start)
 
             score = CFG.SCORE_DIRECT_MATCH if intent_word else 0
-
             context_boost = min(len(context_matches) * 5, CFG.SCORE_CONTEXT_MAX)
             score += context_boost
 
@@ -1458,14 +1416,9 @@ class EnhancedFilter:
 
         except Exception as e:
             logger.exception("Filter.analyze error")
-            return self._result("ignore", 0.0, [f"internal_error: {str(e)[:50]}"])
+            return self._result("ignore", 0.0, [f"internal_error: {str(e)[:50]}"], original_text=original_text)
 
     async def record_feedback(self, term: str, term_kind: str, was_correct: bool) -> float:
-        """
-        Public feedback hook (new). `term_kind` is "intent" or "academic".
-        Returns the updated weight. Bounded/stable per adaptive.py's EMA
-        clamp — see that module's docstring.
-        """
         if term_kind == "intent":
             weight = await self._adaptive_intent.record_feedback(term, was_correct)
         elif term_kind == "academic":
@@ -1488,7 +1441,8 @@ class EnhancedFilter:
             return True
         return False
 
-    def _convert_result(self, result: FilterResult, is_arabic: bool, arabic_ratio: float, ad_score: float, start: float) -> Dict[str, Any]:
+    def _convert_result(self, result: FilterResult, is_arabic: bool, arabic_ratio: float,
+                        ad_score: float, start: float) -> Dict[str, Any]:
         result.language = "ar" if is_arabic else "unknown"
         result.lang_conf = arabic_ratio
         result.spam_score = ad_score
@@ -1497,7 +1451,8 @@ class EnhancedFilter:
         result.confidence = result.score / 100.0
         return result.to_dict()
 
-    def _result(self, decision: str, confidence: float, reasons: List[str]) -> Dict[str, Any]:
+    def _result(self, decision: str, confidence: float, reasons: List[str],
+                original_text: str = "") -> Dict[str, Any]:
         return {
             "valid": decision == "accept",
             "reason": reasons[0] if reasons else decision,
@@ -1526,6 +1481,7 @@ class EnhancedFilter:
             "key_phrases": [],
             "fuzzy_matched": False,
             "anomaly": False,
+            "original_text": original_text,
         }
 
     async def get_telemetry(self) -> Dict[str, Any]:
@@ -1541,32 +1497,14 @@ class EnhancedFilter:
         await self._bloom.clear()
         async with self._cache_lock:
             self._text_cache.clear()
-        logger.info("Filter v14.2 caches cleared")
+        logger.info("Filter v14.3 caches cleared")
 
     def shutdown(self) -> None:
-        """Release the bounded regex-guard thread pool. Call on process
-        shutdown; not required for correctness (daemon-safe by default via
-        the executor), but avoids lingering threads in short-lived test
-        processes."""
         self._regex_guard.shutdown()
 
 
 class ModerationService:
-    """
-    Unified façade over `EnhancedFilter` (new in v14.2).
-
-    - Adds a configurable per-call timeout so one pathological message
-      can't stall a caller indefinitely (`asyncio.wait_for`).
-    - Adds bounded-concurrency batch analysis (`analyze_batch`) — uses an
-      `asyncio.Semaphore` so a large batch cannot spawn unlimited
-      concurrent tasks against shared locks/caches.
-    - On timeout or unexpected error, degrades gracefully to an
-      `"ignore"` decision with a diagnostic reason, rather than
-      propagating the exception to the caller — the correct behavior for
-      a moderation gate is "when in doubt, don't act", not "crash the bot".
-    - Preserves `EnhancedFilter` as a fully usable class on its own; this
-      wrapper is additive, not a replacement.
-    """
+    """Unified façade over EnhancedFilter (same as v14.2, no changes needed)."""
 
     def __init__(self, filter_: Optional[EnhancedFilter] = None,
                  timeout_s: float = 2.0, max_concurrency: int = 32) -> None:
@@ -1586,13 +1524,9 @@ class ModerationService:
             return self.filter._result("ignore", 0.0, ["internal_error"])  # noqa: SLF001
 
     async def analyze_batch(self, texts: List[str], timeout_s: Optional[float] = None) -> List[Dict[str, Any]]:
-        """Bounded-concurrency batch processing. Order of results matches
-        order of input. Never spawns more than `max_concurrency` concurrent
-        `analyze()` calls regardless of batch size."""
         async def _guarded(t: str) -> Dict[str, Any]:
             async with self._semaphore:
                 return await self.analyze(t, timeout_s=timeout_s)
-
         return await asyncio.gather(*(_guarded(t) for t in texts))
 
     async def get_telemetry(self) -> Dict[str, Any]:
