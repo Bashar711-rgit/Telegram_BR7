@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-monitors.py – Account Monitor v9.7 (STABLE 24/7 EDITION, HARDENED)
+monitors.py – Account Monitor v9.7.1 (STABLE 24/7 EDITION, HARDENED)
 - إصلاح تدوير الجلسة (إعادة تسجيل المعالج)
 - تحسين إعادة الاتصال واكتشاف العميل الميت
 - دعم كامل لـ IntentEngine
@@ -24,6 +24,13 @@ v9.7 (this pass) — targeted reliability fixes, monitors.py ONLY:
     via done-callbacks, and are cancelled/awaited cleanly on disconnect().
   * Previously silent `except Exception: pass` blocks now log at DEBUG/
     WARNING without ever logging session strings, API hashes, or tokens.
+
+v9.7.1 (this fix) — alert gating fix:
+  * Alerts are now sent ONLY when the filter's final decision is "accept".
+    Previously `_analyze_and_alert` used `analysis.get("valid")`, which could
+    be True even for "review" decisions, causing false alerts for generic
+    short messages like "ابي" or "بنات". Now we explicitly check
+    `decision == "accept"` in addition to `valid`.
 
 See the accompanying engineering report for the full list of changes,
 the retry_count propagation fix (process_event_from_queue / _send_alert),
@@ -1019,7 +1026,10 @@ class EnhancedAccountMonitor:
             elif has_media: analysis = {"valid": False, "reason": "media_only_no_text", "keyword": None, "decision": "ignore"}
         else:
             analysis = {"valid": False, "reason": "no_content", "keyword": None, "decision": "ignore"}
-        is_valid = analysis.get("valid", False)
+        # ====== الإصلاح الجوهري: التأكد من أن القرار النهائي هو "accept" فقط ======
+        decision = analysis.get("decision", "ignore")
+        is_valid = analysis.get("valid", False) and decision == "accept"
+        # =========================================================================
         try: await self.db.update_sender_reputation(sender_id, is_valid)
         except Exception as e: logger.warning(f"update_sender_reputation failed [{self.account['name']}]: {e}")
         if is_valid and await self.db.can_send_alert(sender_id):
