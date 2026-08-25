@@ -1,16 +1,25 @@
 #!/usr/bin/env python3
 """
-filter_engine.py — v14.3.1
+filter_engine.py — v14.3.2
 
-Hardened/optimized evolution of v14.3 with critical fix:
-- Fixed AttributeError: '_fuzzy_only_for' was referenced inside _load_keyword_sets
-  before being assigned in __init__. Now fuzzy settings are read BEFORE calling
-  _load_keyword_sets, and _load_keyword_sets uses safe getattr fallback.
-- All previous fixes retained (syntax, key_phrases, original_text, normalization,
-  clause-level negation, fuzzy settings from JSON, prefilter min_words=1).
+Hardened/optimized evolution of v14.3.1 with critical fix:
+- Ensured result.valid is always synchronized with the final decision.
+  Previously, a "review" decision could leave result.valid = True,
+  causing monitors.py to send alerts for borderline messages (e.g. "ابي").
+  Now valid is only True when decision == "accept".
 
-Compatibility: FilterResult, TrieNode, WeightedTrie, OptimizedBloomFilter, ShardedLRUCache,
-Prefilter, EnhancedFilter, ModerationService.
+Retained all previous fixes:
+  * Syntax errors corrected.
+  * Field naming unified (key_phrases).
+  * Original text preserved (original_text field).
+  * Keywords normalized on load.
+  * Clause-level negation (resolution phrases do not suppress new requests).
+  * Fuzzy settings read from keywords.json/CFG.
+  * Prefilter min_words lowered to 1 (configurable).
+  * Thread-safe and stable.
+
+Compatibility: FilterResult, TrieNode, WeightedTrie, OptimizedBloomFilter,
+ShardedLRUCache, Prefilter, EnhancedFilter, ModerationService.
 """
 
 from __future__ import annotations
@@ -413,7 +422,7 @@ class EnhancedFilter:
         self._adaptive_academic = AdaptiveWeights(self._academic_weights, alpha=_cfg("ADAPTIVE_ALPHA", 0.05))
 
         logger.info(
-            "Filter v14.3.1 ready | intent_verbs={} | academic_objects={} | negation={} | boost_patterns={} | "
+            "Filter v14.3.2 ready | intent_verbs={} | academic_objects={} | negation={} | boost_patterns={} | "
             "distance_scoring={} | fuzzy_fallback={}",
             len(self._intent_verbs_all),
             len(self._academic_objects_all),
@@ -1365,7 +1374,10 @@ class EnhancedFilter:
                 result.decision = "review"
             else:
                 result.decision = "ignore"
-                result.valid = False
+
+            # ===== الإصلاح الحاسم: مزامنة valid مع القرار النهائي =====
+            result.valid = (result.decision == "accept")
+            # =====================================================
 
             elapsed_ms = round((time.perf_counter() - start) * 1000, 2)
             anomaly_report = await self._metrics.record(elapsed_ms)
@@ -1489,7 +1501,7 @@ class EnhancedFilter:
         await self._bloom.clear()
         async with self._cache_lock:
             self._text_cache.clear()
-        logger.info("Filter v14.3.1 caches cleared")
+        logger.info("Filter v14.3.2 caches cleared")
 
     def shutdown(self) -> None:
         self._regex_guard.shutdown()
