@@ -1,24 +1,16 @@
 #!/usr/bin/env python3
 """
-filter_engine.py — v14.3
+filter_engine.py — v14.3.1
 
-Hardened/optimized evolution of v14.2 with full compatibility fixes.
+Hardened/optimized evolution of v14.3 with critical fix:
+- Fixed AttributeError: '_fuzzy_only_for' was referenced inside _load_keyword_sets
+  before being assigned in __init__. Now fuzzy settings are read BEFORE calling
+  _load_keyword_sets, and _load_keyword_sets uses safe getattr fallback.
+- All previous fixes retained (syntax, key_phrases, original_text, normalization,
+  clause-level negation, fuzzy settings from JSON, prefilter min_words=1).
 
-Key fixes:
-- Syntax: removed invalid characters/capitalization, corrected all variable names.
-- Field naming: unified `key_phrases` (was `Key_phrases`) to avoid AttributeError.
-- Original text preservation: `original_text` added to results and analysis.
-- Keyword normalization: all loaded terms are normalized (lowercase + Arabic normalize)
-  to guarantee matching against cleaned input.
-- Negation detection: clause-level resolution handling — a resolution phrase does not
-  suppress the whole message if a new request appears after it.
-- Fuzzy fallback: now reads `fuzzy_matching` settings from keywords.json (or CFG),
-  and builds candidate terms from the categories specified there.
-- Prefilter: default min_words lowered to 1 to allow short high-signal requests;
-  actual value remains configurable via CFG.
-- Thread safety and stability improvements.
-
-All original public methods and return shapes are preserved (plus additive fields).
+Compatibility: FilterResult, TrieNode, WeightedTrie, OptimizedBloomFilter, ShardedLRUCache,
+Prefilter, EnhancedFilter, ModerationService.
 """
 
 from __future__ import annotations
@@ -147,9 +139,7 @@ class FilterResult:
 
 
 class Prefilter:
-    """Prefilter with lowered default min_words to allow short high-signal requests.
-    Still enforces emptiness, emoji limits, and Arabic ratio.
-    """
+    """Prefilter with lowered default min_words to allow short high-signal requests."""
 
     @staticmethod
     def check(text: str, min_words: int = 1, max_emojis: int = 5) -> Tuple[bool, str, Dict[str, Any]]:
@@ -192,7 +182,7 @@ class Prefilter:
 
 
 class OptimizedBloomFilter:
-    """Same as v14.2, with corrected variable names."""
+    """Same as v14.3, with corrected variable names."""
 
     __slots__ = ("_size", "_hash_count", "_bit_array", "_lock", "_hash_cache",
                  "_added_count", "_reset_threshold")
@@ -389,6 +379,19 @@ class EnhancedFilter:
         self._last_stats_reset = time.time()
         self._raw_keywords: Dict[str, Any] = KEYWORDS
 
+        # Read fuzzy settings from keywords.json/CFG BEFORE loading keywords.
+        # This prevents AttributeError in _load_keyword_sets.
+        fuzzy_data = self._raw_keywords.get("fuzzy_matching", {})
+        self._fuzzy_enabled = (
+            _cfg("FUZZY_FALLBACK_ENABLED", fuzzy_data.get("enabled", True))
+            and RAPIDFUZZ_AVAILABLE
+        )
+        self._fuzzy_score_cutoff = _cfg("FUZZY_SCORE_CUTOFF", 85.0)
+        self._fuzzy_max_edit_distance = _cfg("FUZZY_MAX_EDIT_DISTANCE", fuzzy_data.get("max_edit_distance", 1))
+        self._fuzzy_min_token_length = _cfg("FUZZY_MIN_TOKEN_LENGTH", fuzzy_data.get("minimum_token_length", 5))
+        self._fuzzy_only_for = fuzzy_data.get("only_for", [])
+
+        # Now load keywords and build tries.
         self._load_keyword_sets()
         self._build_tries()
 
@@ -409,19 +412,8 @@ class EnhancedFilter:
         self._adaptive_intent = AdaptiveWeights(self._intent_weights, alpha=_cfg("ADAPTIVE_ALPHA", 0.05))
         self._adaptive_academic = AdaptiveWeights(self._academic_weights, alpha=_cfg("ADAPTIVE_ALPHA", 0.05))
 
-        # Fuzzy settings: read from CFG first, then from keywords.json
-        fuzzy_data = self._raw_keywords.get("fuzzy_matching", {})
-        self._fuzzy_enabled = (
-            _cfg("FUZZY_FALLBACK_ENABLED", fuzzy_data.get("enabled", True))
-            and RAPIDFUZZ_AVAILABLE
-        )
-        self._fuzzy_score_cutoff = _cfg("FUZZY_SCORE_CUTOFF", 85.0)
-        self._fuzzy_max_edit_distance = _cfg("FUZZY_MAX_EDIT_DISTANCE", fuzzy_data.get("max_edit_distance", 1))
-        self._fuzzy_min_token_length = _cfg("FUZZY_MIN_TOKEN_LENGTH", fuzzy_data.get("minimum_token_length", 5))
-        self._fuzzy_only_for = fuzzy_data.get("only_for", [])
-
         logger.info(
-            "Filter v14.3 ready | intent_verbs={} | academic_objects={} | negation={} | boost_patterns={} | "
+            "Filter v14.3.1 ready | intent_verbs={} | academic_objects={} | negation={} | boost_patterns={} | "
             "distance_scoring={} | fuzzy_fallback={}",
             len(self._intent_verbs_all),
             len(self._academic_objects_all),
@@ -612,7 +604,6 @@ class EnhancedFilter:
 
         # Ad signals
         self._ad_signals: Dict[str, Any] = kw.get("advertisement_signals", {})
-        # Normalize all ad-related lists
         for key in ["hard_signals", "medium_signals", "cta_signals", "institution_terms"]:
             if key in self._ad_signals and isinstance(self._ad_signals[key], list):
                 self._ad_signals[key] = _norm_list(self._ad_signals[key])
@@ -687,7 +678,6 @@ class EnhancedFilter:
         dialect_data = kw.get("dialect_mapping", {})
         for category, mapping in dialect_data.items():
             if isinstance(mapping, dict):
-                # Normalize both keys and values
                 for k, v in mapping.items():
                     nk = self._normalize_term(k)
                     nv = self._normalize_term(v)
@@ -718,7 +708,7 @@ class EnhancedFilter:
                 except Exception:
                     pass
 
-        # Scoring weights (documentation only, not used in code)
+        # Scoring weights (documentation only)
         self._scoring_weights: Dict[str, float] = {}
         weights_data = kw.get("scoring_weights", {})
         positive_modules = weights_data.get("positive_modules", {})
@@ -806,7 +796,8 @@ class EnhancedFilter:
 
         # Fuzzy candidate terms: combine from categories specified in fuzzy_matching.only_for
         fuzzy_terms_set = set()
-        only_for = self._fuzzy_only_for or ["intent_verbs"]  # default
+        # Use safe getattr to avoid AttributeError if called before __init__ sets _fuzzy_only_for
+        only_for = getattr(self, "_fuzzy_only_for", []) or ["intent_verbs"]
         if "intent_verbs" in only_for:
             fuzzy_terms_set.update(self._intent_verbs_all)
         if "request_phrases" in only_for:
@@ -824,6 +815,17 @@ class EnhancedFilter:
     def reload_keywords(self, path: str = "keywords.json") -> None:
         from config import load_keywords
         fresh = load_keywords(path)
+        # Re-read fuzzy settings if they changed in the new file
+        fuzzy_data = fresh.get("fuzzy_matching", {})
+        self._fuzzy_enabled = (
+            _cfg("FUZZY_FALLBACK_ENABLED", fuzzy_data.get("enabled", True))
+            and RAPIDFUZZ_AVAILABLE
+        )
+        self._fuzzy_score_cutoff = _cfg("FUZZY_SCORE_CUTOFF", 85.0)
+        self._fuzzy_max_edit_distance = _cfg("FUZZY_MAX_EDIT_DISTANCE", fuzzy_data.get("max_edit_distance", 1))
+        self._fuzzy_min_token_length = _cfg("FUZZY_MIN_TOKEN_LENGTH", fuzzy_data.get("minimum_token_length", 5))
+        self._fuzzy_only_for = fuzzy_data.get("only_for", [])
+
         self._load_keyword_sets(fresh)
         # Re-seed adaptive weights on reload.
         if hasattr(self, "_adaptive_intent"):
@@ -932,7 +934,6 @@ class EnhancedFilter:
         score += min(0.4, url_count * 0.2)
         emoji_count = len(safe_findall(EMOJI_PATTERN, text))
         score += min(0.2, emoji_count * 0.04)
-        # Precompile repeated char pattern
         repeated_pattern = re.compile(r"(.)\1{4,}")
         if safe_search(repeated_pattern, text):
             score += 0.15
@@ -1014,20 +1015,15 @@ class EnhancedFilter:
         Improved negation detection with clause-awareness.
         Resolution phrases are only full negation if no new request appears after them.
         """
-        # Check resolution phrases
         resolution_match = self._resolution_trie.search_first(text)
         if resolution_match:
             res_phrase, _, res_pos = resolution_match
-            # If there is an intent verb after the resolution phrase, treat as not fully negated
             if intent_pos is not None and intent_pos > res_pos:
                 # New request after resolution: not a pure resolution
                 logger.debug("Resolution phrase '{}' found but intent appears later; not fully negated", res_phrase)
-                # Return low negation score (e.g., 0.2) to slightly dampen confidence but not ignore
                 return True, 0.2, [f"resolution_phrase_with_new_request: {res_phrase}"]
-            # Otherwise full negation
             return True, 1.0, [f"resolution_phrase: {res_phrase}"]
 
-        # Post-clause negators
         post_clause = self._negation.get("post_clause_negators", [])
         if isinstance(post_clause, list):
             for neg in post_clause:
@@ -1036,7 +1032,6 @@ class EnhancedFilter:
                         return False, 0.0, []
                     return True, 0.8, [f"post_clause_negator: {neg}"]
 
-        # Pre-verb negators with scoping
         pre_verb_data = self._negation.get("pre_verb_negators", {})
         if isinstance(pre_verb_data, dict):
             pre_verbs = pre_verb_data.get("terms", [])
@@ -1055,7 +1050,7 @@ class EnhancedFilter:
                     if intent_pos is not None:
                         token_distance = self._token_distance(text, pos, intent_pos)
                         if token_distance > self.NEGATION_SCOPE_TOKENS:
-                            continue  # out of scope, ignore this negator
+                            continue
 
                     return True, 0.6, [f"pre_verb_negator: {pv}"]
 
@@ -1083,7 +1078,6 @@ class EnhancedFilter:
                 if distance >= 16:
                     return float(data.get("score_multiplier", 0.15))
 
-        # Fallback
         if text_len > 100:
             if distance <= 10:
                 return 0.9
@@ -1109,10 +1103,9 @@ class EnhancedFilter:
         if not self._fuzzy_enabled or not cleaned.strip():
             return None
         tokens = cleaned.split()
-        if not tokens or not self._all_fuzzy_terms:
+        if not tokens or not getattr(self, '_all_fuzzy_terms', []):
             return None
 
-        # Apply minimum token length filter
         if len(cleaned) < self._fuzzy_min_token_length:
             return None
 
@@ -1125,7 +1118,6 @@ class EnhancedFilter:
         if not best:
             return None
         term, score, _ = best
-        # Use adaptive weight if available, else default
         weight = self._adaptive_intent.get(term, self._intent_weights.get(term, 0.7)) * 0.85
         pos = cleaned.find(tokens[0])
         return term, weight, max(pos, 0)
@@ -1497,14 +1489,14 @@ class EnhancedFilter:
         await self._bloom.clear()
         async with self._cache_lock:
             self._text_cache.clear()
-        logger.info("Filter v14.3 caches cleared")
+        logger.info("Filter v14.3.1 caches cleared")
 
     def shutdown(self) -> None:
         self._regex_guard.shutdown()
 
 
 class ModerationService:
-    """Unified façade over EnhancedFilter (same as v14.2, no changes needed)."""
+    """Unified façade over EnhancedFilter (same as v14.3, no changes needed)."""
 
     def __init__(self, filter_: Optional[EnhancedFilter] = None,
                  timeout_s: float = 2.0, max_concurrency: int = 32) -> None:
