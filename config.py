@@ -30,14 +30,6 @@ v13.1 (this pass) — targeted fix, config.py ONLY:
     CircuitBreaker no longer uses it to *guess* a FloodWait duration — it
     honors the exact FloodWaitError.seconds value from Telegram instead.
     This var is effectively legacy/unused by the hardened monitors.py.
-
-ADDITIONAL FIXES IN THIS UPDATE (v13.1.1):
-  * MIN_MESSAGE_LENGTH lowered from 10 to 2 to allow short high-signal
-    messages (e.g. "محتاج") to pass validation and reach the scoring engine.
-  * PREFILTER_MIN_WORDS lowered from 2 to 1 to allow one-word requests.
-  * Added missing config fields used via _cfg() in filter_engine.py v14.3.2:
-    REGEX_TIMEOUT_S, REGEX_GUARD_WORKERS, METRICS_WINDOW, METRICS_Z_THRESHOLD,
-    METRICS_ENABLED, ADAPTIVE_ALPHA, FUZZY_FALLBACK_ENABLED, FUZZY_SCORE_CUTOFF.
 """
 
 from __future__ import annotations
@@ -263,7 +255,7 @@ class SecretManager:
 load_dotenv("accounts.env")
 
 # =============================================================================
-# Core Config Dataclass v13.1.1 – جميع المتغيرات
+# Core Config Dataclass v13.1 – جميع المتغيرات
 # =============================================================================
 @dataclass(frozen=True, slots=True)
 class _ConfigData:
@@ -428,21 +420,8 @@ class _ConfigData:
     TEXT_CACHE_SIZE: int
     TEXT_CACHE_TTL: int
 
-    # ── NEW in v13.1.1: fields used by filter_engine v14.3.2 ──
-    REGEX_TIMEOUT_S: float
-    REGEX_GUARD_WORKERS: int
-
-    METRICS_WINDOW: int
-    METRICS_Z_THRESHOLD: float
-    METRICS_ENABLED: bool
-
-    ADAPTIVE_ALPHA: float
-
-    FUZZY_FALLBACK_ENABLED: bool
-    FUZZY_SCORE_CUTOFF: float
-
 # =============================================================================
-# Config Builder v13.1.1
+# Config Builder v13.1
 # =============================================================================
 class Config:
     _instance: Optional[_ConfigData] = None
@@ -539,7 +518,7 @@ class Config:
             SECURE_SESSIONS=SecretManager.get_bool("SECURE_SESSIONS", False),
             # ========== الرسائل ==========
             MAX_MESSAGE_LENGTH=SecretManager.get_int("MAX_MESSAGE_LENGTH", 5000, required=False),
-            MIN_MESSAGE_LENGTH=SecretManager.get_int("MIN_MESSAGE_LENGTH", 2, required=False),  # FIX: 2 بدلاً من 10
+            MIN_MESSAGE_LENGTH=SecretManager.get_int("MIN_MESSAGE_LENGTH", 10, required=False),
             MAX_WORDS_COUNT=SecretManager.get_int("MAX_WORDS_COUNT", 20, required=False),
             # ========== الكاش والطابور ==========
             MAX_CACHE_SIZE=SecretManager.get_int("MAX_CACHE_SIZE", 10000, required=False),
@@ -609,7 +588,7 @@ class Config:
             SESSION_REFRESH_INTERVAL=SecretManager.get_int("SESSION_REFRESH_INTERVAL", 43200, required=False),
             # ========== Prefilter ==========
             PREFILTER_ENABLED=SecretManager.get_bool("PREFILTER_ENABLED", True),
-            PREFILTER_MIN_WORDS=SecretManager.get_int("PREFILTER_MIN_WORDS", 1, required=False),  # FIX: 1 بدلاً من 2
+            PREFILTER_MIN_WORDS=SecretManager.get_int("PREFILTER_MIN_WORDS", 2, required=False),
             PREFILTER_MAX_EMOJIS=SecretManager.get_int("PREFILTER_MAX_EMOJIS", 5, required=False),
             # ========== المراقبة ==========
             PROMETHEUS_ENABLED=SecretManager.get_bool("PROMETHEUS_ENABLED", False),
@@ -653,23 +632,11 @@ class Config:
             # ========== الكاش ==========
             TEXT_CACHE_SIZE=SecretManager.get_int("TEXT_CACHE_SIZE", 5000, required=False),
             TEXT_CACHE_TTL=SecretManager.get_int("TEXT_CACHE_TTL", 300, required=False),
-            # ========== NEW: Security / Regex Guard ==========
-            REGEX_TIMEOUT_S=SecretManager.get_float("REGEX_TIMEOUT_S", 0.25, required=False),
-            REGEX_GUARD_WORKERS=SecretManager.get_int("REGEX_GUARD_WORKERS", 4, required=False),
-            # ========== NEW: Metrics ==========
-            METRICS_WINDOW=SecretManager.get_int("METRICS_WINDOW", 2000, required=False),
-            METRICS_Z_THRESHOLD=SecretManager.get_float("METRICS_Z_THRESHOLD", 3.5, required=False),
-            METRICS_ENABLED=SecretManager.get_bool("METRICS_ENABLED", True),
-            # ========== NEW: Adaptive ==========
-            ADAPTIVE_ALPHA=SecretManager.get_float("ADAPTIVE_ALPHA", 0.05, required=False),
-            # ========== NEW: Fuzzy Fallback ==========
-            FUZZY_FALLBACK_ENABLED=SecretManager.get_bool("FUZZY_FALLBACK_ENABLED", True),
-            FUZZY_SCORE_CUTOFF=SecretManager.get_float("FUZZY_SCORE_CUTOFF", 85.0, required=False),
         )
 
         cls._instance = cfg
         logger.info(
-            f"Config v13.1.1 built: DB={db_type} | "
+            f"Config v13.1 built: DB={db_type} | "
             f"PROCESSING_WORKERS={workers} | "
             f"DASHBOARD={'ON' if cfg.DASHBOARD_ENABLED else 'OFF'} | "
             f"FUZZY={'ON' if cfg.FUZZY_MATCHING_ENABLED else 'OFF'} | "
@@ -956,7 +923,7 @@ def get_memory_info() -> Dict[str, Any]:
     return {"rss_mb": 0, "vms_mb": 0, "percent": 0.0}
 
 logger.info(
-    f"config.py v13.1.1 loaded | Accounts: {len(ACCOUNTS)} | Workers: {CFG.PROCESSING_WORKERS} | "
+    f"config.py v13.1 loaded | Accounts: {len(ACCOUNTS)} | Workers: {CFG.PROCESSING_WORKERS} | "
     f"DB_URL: {'YES' if os.getenv('DATABASE_URL') else 'NO'} | "
     f"DASHBOARD: {'ON' if CFG.DASHBOARD_ENABLED else 'OFF'} | "
     f"INTENT_ENGINE: v13.1 (template-boost fix applied)"
