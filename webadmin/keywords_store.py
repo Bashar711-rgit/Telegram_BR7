@@ -17,9 +17,9 @@ from typing import Any, Dict, List, Optional
 
 from loguru import logger
 
-from config import CFG, KEYWORDS
+from config import CFG, KEYWORDS, PROJECT_DIR
 
-KEYWORDS_FILE = "keywords.json"
+KEYWORDS_FILE = str(PROJECT_DIR / "keywords.json")
 _lock = asyncio.Lock()
 
 

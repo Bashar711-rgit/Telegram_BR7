@@ -92,7 +92,7 @@ except ImportError:
 
 from telethon import TelegramClient, events as tl_events
 
-from config import CFG, ACCOUNTS, KEYWORDS, InputSanitizer, logger
+from config import CFG, ACCOUNTS, KEYWORDS, logger
 from database import EnhancedDatabase
 from filter_engine import EnhancedFilter
 from monitors import EnhancedAccountMonitor, HealthMonitor
@@ -482,6 +482,11 @@ class EnhancedTelegramBot:
             logger.info(f"Health server started on port {port}")
         except OSError as e:
             logger.error(f"Could not bind health server to port {port}: {e}")
+            # v13.2 fix (audit M-8): on a bind failure the task used to hang
+            # forever on a never-set Event. Exit cleanly so the failure is
+            # visible and Render's supervisor can restart the process.
+            await runner.cleanup()
+            return
 
         await asyncio.Event().wait()
 
@@ -552,7 +557,6 @@ class EnhancedTelegramBot:
                 uptime = time.monotonic() - self._start_time
                 h, rem = divmod(int(uptime), 3600)
                 m_min = rem // 60
-                rl = self.rate_limiter.status()
                 mem = self.memory_monitor.check()
                 qsize = await self.db.queue_size()
                 connected = sum(1 for m in self.monitors if m.is_connected)
@@ -749,7 +753,6 @@ class EnhancedTelegramBot:
             await event.reply("<b>أوامر البوت:</b>\n/stats – إحصائيات\n/status – حالة الحسابات\n/accounts – التفاصيل\n/health – الصحة\n/dashboard – لوحة التحكم\n/block <id> – حظر\n/unblock <id> – رفع حظر\n/purge – تفريغ الطابور", parse_mode="html")
         elif cmd == "stats":
             db_stats = await self.db.get_stats()
-            filter_tel = await self.filter.get_telemetry()
             rl = self.rate_limiter.status()
             uptime = time.monotonic() - self._start_time
             h, rem = divmod(int(uptime), 3600)

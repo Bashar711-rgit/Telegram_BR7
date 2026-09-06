@@ -1155,18 +1155,35 @@ class EnhancedFilter:
                         self._stats["prefilter_rejected"] += 1
                     return self._result("ignore", 0.0, [reason], original_text=original_text)
 
+            # ── v14.4 fix (audit H-1): cache BEFORE bloom, and the bloom can
+            # no longer turn a repeated text into an "ignore/duplicate"
+            # decision. The old order was:
+            #     bloom.contains(key) → return ignore("duplicate")
+            #     cache lookup (unreachable for repeats)
+            # Because every analyzed text was bloom-added, the SECOND time
+            # anyone posted the same normalized text (extremely common for
+            # short student requests posted by different users) the filter
+            # silently dropped it as "duplicate" instead of returning its
+            # (cached) analysis — a large false-negative surface. Now the
+            # exact-match cache is consulted first and RETURNS the previous
+            # analysis on a hit; the bloom is kept only as a statistical
+            # "this text was seen before" hint and never short-circuits the
+            # decision.
+            async with self._cache_lock:
+                cached_result = self._text_cache.get(cache_key)
+            if cached_result is not None:
+                async with self._stats_lock:
+                    self._stats["cache_hits"] += 1
+                result = dict(cached_result)
+                result["analysis_time_ms"] = round((time.perf_counter() - start) * 1000, 2)
+                return result
+
             if await self._bloom.contains(cache_key):
+                # Bloom hit + cache miss = stale cache entry (TTL expired) or
+                # a false positive. Either way, fall through to a fresh full
+                # analysis — never to an automatic "duplicate" ignore.
                 async with self._stats_lock:
                     self._stats["bloom_hits"] += 1
-                return self._result("ignore", 0.0, ["duplicate"], original_text=original_text)
-
-            async with self._cache_lock:
-                if cache_key in self._text_cache:
-                    async with self._stats_lock:
-                        self._stats["cache_hits"] += 1
-                    result = dict(self._text_cache[cache_key])
-                    result["analysis_time_ms"] = round((time.perf_counter() - start) * 1000, 2)
-                    return result
 
             await self._bloom.add(cache_key)
 

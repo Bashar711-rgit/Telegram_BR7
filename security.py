@@ -36,7 +36,7 @@ from __future__ import annotations
 import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
-from typing import Any, Final, List, Optional, Pattern, Union
+from typing import Any, Final, List, Optional, Union
 
 from loguru import logger
 

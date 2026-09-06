@@ -492,10 +492,22 @@ async function apiFetch(endpoint, options = {}) {
 }
 
 // ================================================================
+// XSS GUARD (audit H-3): every dynamic value interpolated into HTML
+// must pass through esc() first.
+// ================================================================
+function esc(s) {
+    return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+// ================================================================
 // WEBSOCKET
 // ================================================================
 function connectWebSocket() {
-    const wsUrl = `ws://${window.location.host}/ws`;
+    // v3.1 (audit H-2/L-1): wss:// on HTTPS pages (ws:// is blocked as mixed
+    // content and never connected on Render), and the same dashboard token
+    // is sent as a query param — the server rejects unauthenticated sockets.
+    const wsProto = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
+    const wsUrl = `${wsProto}${window.location.host}/ws?token=${encodeURIComponent(AUTH_TOKEN)}`;
     WS = new WebSocket(wsUrl);
     
     WS.onopen = () => {
@@ -516,7 +528,14 @@ function connectWebSocket() {
         }
     };
     
-    WS.onclose = () => {
+    WS.onclose = (event) => {
+        if (event.code === 1008) {
+            // Policy violation = authentication failure. Do not retry in a loop.
+            console.warn('WebSocket rejected: invalid dashboard token');
+            document.getElementById('status-badge').innerHTML = '<i class="fas fa-circle text-red-400 text-xs ml-1"></i> رمز غير صالح';
+            logout();
+            return;
+        }
         console.warn('WebSocket disconnected, reconnecting...');
         document.getElementById('status-badge').innerHTML = '<i class="fas fa-circle text-red-400 text-xs ml-1"></i> غير متصل';
         setTimeout(connectWebSocket, 3000);
@@ -574,14 +593,14 @@ function renderAccounts(accounts) {
         <div class="bg-gray-700/50 p-3 rounded-lg flex flex-wrap justify-between items-center border border-gray-600">
             <div class="flex flex-wrap items-center gap-3">
                 <span class="status-dot ${acc.connected ? 'online' : 'offline'}"></span>
-                <span class="font-bold text-white">${acc.name}</span>
-                <span class="text-sm text-gray-400">${acc.phone}</span>
-                <span class="text-xs bg-gray-600 px-2 py-0.5 rounded">الأولوية ${acc.priority}</span>
+                <span class="font-bold text-white">${esc(acc.name)}</span>
+                <span class="text-sm text-gray-400">${esc(acc.phone)}</span>
+                <span class="text-xs bg-gray-600 px-2 py-0.5 rounded">الأولوية ${esc(acc.priority)}</span>
             </div>
             <div class="flex flex-wrap items-center gap-3 text-sm">
-                <span class="text-gray-400"><i class="fas fa-bell ml-1"></i> ${acc.alerts}</span>
-                <span class="text-gray-400"><i class="fas fa-queue ml-1"></i> ${acc.queued}</span>
-                ${acc.last_error ? `<span class="text-red-400 text-xs" title="${acc.last_error}"><i class="fas fa-exclamation-triangle ml-1"></i></span>` : ''}
+                <span class="text-gray-400"><i class="fas fa-bell ml-1"></i> ${esc(acc.alerts)}</span>
+                <span class="text-gray-400"><i class="fas fa-queue ml-1"></i> ${esc(acc.queued)}</span>
+                ${acc.last_error ? `<span class="text-red-400 text-xs" title="${esc(acc.last_error)}"><i class="fas fa-exclamation-triangle ml-1"></i></span>` : ''}
             </div>
         </div>
     `).join('');
@@ -599,9 +618,9 @@ function renderRecentAlerts(alerts) {
     }
     container.innerHTML = alerts.slice(0, 10).map(a => `
         <div class="bg-gray-700/30 p-2 rounded-lg flex flex-wrap justify-between items-center border border-gray-700 text-sm">
-            <span><i class="fas fa-bell text-yellow-400 ml-1"></i> <span class="font-medium">${a.keyword || 'غير معروف'}</span></span>
-            <span class="text-gray-400">${a.account_name || ''}</span>
-            <span class="text-gray-500 text-xs">${a.created_at || ''}</span>
+            <span><i class="fas fa-bell text-yellow-400 ml-1"></i> <span class="font-medium">${esc(a.keyword || 'غير معروف')}</span></span>
+            <span class="text-gray-400">${esc(a.account_name || '')}</span>
+            <span class="text-gray-500 text-xs">${esc(a.created_at || '')}</span>
         </div>
     `).join('');
 }
@@ -657,17 +676,17 @@ async function loadMessages() {
             container.innerHTML = data.messages.map(m => `
                 <div class="bg-gray-700/30 p-3 rounded-lg border border-gray-700 text-sm">
                     <div class="flex flex-wrap justify-between text-gray-400 text-xs mb-1">
-                        <span><i class="fas fa-user ml-1"></i> ${m.sender_id || 'غير معروف'}</span>
+                        <span><i class="fas fa-user ml-1"></i> ${esc(m.sender_id || 'غير معروف')}</span>
                         <span>${new Date(m.created_at || Date.now()).toLocaleString('ar')}</span>
                     </div>
-                    <div class="text-white">${m.message_text || '(بدون نص)'}</div>
+                    <div class="text-white">${esc(m.message_text || '(بدون نص)')}</div>
                 </div>
             `).join('');
         } else {
             container.innerHTML = '<div class="text-gray-500 text-center py-4">لا توجد رسائل</div>';
         }
     } catch (e) {
-        container.innerHTML = `<div class="text-red-400 text-center py-4">خطأ: ${e.message}</div>`;
+        container.innerHTML = `<div class="text-red-400 text-center py-4">خطأ: ${esc(e.message)}</div>`;
     }
 }
 
@@ -682,17 +701,17 @@ async function searchMessages() {
             container.innerHTML = data.messages.map(m => `
                 <div class="bg-gray-700/30 p-3 rounded-lg border border-gray-700 text-sm">
                     <div class="flex flex-wrap justify-between text-gray-400 text-xs mb-1">
-                        <span><i class="fas fa-user ml-1"></i> ${m.sender_id || 'غير معروف'}</span>
+                        <span><i class="fas fa-user ml-1"></i> ${esc(m.sender_id || 'غير معروف')}</span>
                         <span>${new Date(m.created_at || Date.now()).toLocaleString('ar')}</span>
                     </div>
-                    <div class="text-white">${m.message_text || '(بدون نص)'}</div>
+                    <div class="text-white">${esc(m.message_text || '(بدون نص)')}</div>
                 </div>
             `).join('');
         } else {
             container.innerHTML = '<div class="text-gray-500 text-center py-4">لا توجد نتائج</div>';
         }
     } catch (e) {
-        container.innerHTML = `<div class="text-red-400 text-center py-4">خطأ: ${e.message}</div>`;
+        container.innerHTML = `<div class="text-red-400 text-center py-4">خطأ: ${esc(e.message)}</div>`;
     }
 }
 
@@ -708,18 +727,18 @@ async function loadAlerts() {
             container.innerHTML = data.alerts.map(a => `
                 <div class="bg-gray-700/30 p-3 rounded-lg border border-gray-700 text-sm">
                     <div class="flex flex-wrap justify-between text-gray-400 text-xs mb-1">
-                        <span><i class="fas fa-bell text-yellow-400 ml-1"></i> <span class="text-emerald-400">${a.keyword || 'غير معروف'}</span></span>
-                        <span>${a.account_name || ''}</span>
+                        <span><i class="fas fa-bell text-yellow-400 ml-1"></i> <span class="text-emerald-400">${esc(a.keyword || 'غير معروف')}</span></span>
+                        <span>${esc(a.account_name || '')}</span>
                         <span>${new Date(a.created_at || Date.now()).toLocaleString('ar')}</span>
                     </div>
-                    <div class="text-white text-xs truncate">${a.alert_text || '(بدون نص)'}</div>
+                    <div class="text-white text-xs truncate">${esc(a.alert_text || '(بدون نص)')}</div>
                 </div>
             `).join('');
         } else {
             container.innerHTML = '<div class="text-gray-500 text-center py-4">لا توجد تنبيهات</div>';
         }
     } catch (e) {
-        container.innerHTML = `<div class="text-red-400 text-center py-4">خطأ: ${e.message}</div>`;
+        container.innerHTML = `<div class="text-red-400 text-center py-4">خطأ: ${esc(e.message)}</div>`;
     }
 }
 
@@ -734,18 +753,18 @@ async function searchAlerts() {
             container.innerHTML = data.alerts.map(a => `
                 <div class="bg-gray-700/30 p-3 rounded-lg border border-gray-700 text-sm">
                     <div class="flex flex-wrap justify-between text-gray-400 text-xs mb-1">
-                        <span><i class="fas fa-bell text-yellow-400 ml-1"></i> <span class="text-emerald-400">${a.keyword || 'غير معروف'}</span></span>
-                        <span>${a.account_name || ''}</span>
+                        <span><i class="fas fa-bell text-yellow-400 ml-1"></i> <span class="text-emerald-400">${esc(a.keyword || 'غير معروف')}</span></span>
+                        <span>${esc(a.account_name || '')}</span>
                         <span>${new Date(a.created_at || Date.now()).toLocaleString('ar')}</span>
                     </div>
-                    <div class="text-white text-xs truncate">${a.alert_text || '(بدون نص)'}</div>
+                    <div class="text-white text-xs truncate">${esc(a.alert_text || '(بدون نص)')}</div>
                 </div>
             `).join('');
         } else {
             container.innerHTML = '<div class="text-gray-500 text-center py-4">لا توجد نتائج</div>';
         }
     } catch (e) {
-        container.innerHTML = `<div class="text-red-400 text-center py-4">خطأ: ${e.message}</div>`;
+        container.innerHTML = `<div class="text-red-400 text-center py-4">خطأ: ${esc(e.message)}</div>`;
     }
 }
 
@@ -763,14 +782,19 @@ async function loadKeywords() {
             container.innerHTML = '<div class="text-gray-500 text-center py-4">لا توجد كلمات في هذه الفئة</div>';
             return;
         }
+        // v3.1 (audit H-3): no user data is interpolated into inline onclick
+        // JS strings — data attributes + delegation are injection-proof.
         container.innerHTML = words.map(w => `
             <div class="bg-gray-700/30 p-2 rounded-lg flex justify-between items-center border border-gray-700">
-                <span class="text-sm">${w}</span>
-                <button onclick="deleteKeyword('${category}','${w}')" class="text-red-400 hover:text-red-300 text-sm transition"><i class="fas fa-times"></i></button>
+                <span class="text-sm">${esc(w)}</span>
+                <button data-kw-category="${esc(category)}" data-kw-value="${esc(w)}" class="kw-delete text-red-400 hover:text-red-300 text-sm transition"><i class="fas fa-times"></i></button>
             </div>
         `).join('');
+        container.querySelectorAll('.kw-delete').forEach(btn => {
+            btn.addEventListener('click', () => deleteKeyword(btn.dataset.kwCategory, btn.dataset.kwValue));
+        });
     } catch (e) {
-        container.innerHTML = `<div class="text-red-400 text-center py-4">خطأ: ${e.message}</div>`;
+        container.innerHTML = `<div class="text-red-400 text-center py-4">خطأ: ${esc(e.message)}</div>`;
     }
 }
 
@@ -825,9 +849,9 @@ async function loadBlocked() {
         if (senders.senders && senders.senders.length > 0) {
             sendersContainer.innerHTML = senders.senders.map(s => `
                 <div class="bg-gray-700/30 p-2 rounded-lg flex justify-between items-center border border-gray-700 text-sm">
-                    <span><i class="fas fa-user ml-1"></i> ${s.sender_id}</span>
-                    <span class="text-gray-400 text-xs">${s.reason || 'لا يوجد سبب'}</span>
-                    <button onclick="unblockSender(${s.sender_id})" class="text-emerald-400 hover:text-emerald-300 text-sm"><i class="fas fa-undo"></i></button>
+                    <span><i class="fas fa-user ml-1"></i> ${esc(s.sender_id)}</span>
+                    <span class="text-gray-400 text-xs">${esc(s.reason || 'لا يوجد سبب')}</span>
+                    <button onclick="unblockSender(${parseInt(s.sender_id, 10) || 0})" class="text-emerald-400 hover:text-emerald-300 text-sm"><i class="fas fa-undo"></i></button>
                 </div>
             `).join('');
         } else {
@@ -838,9 +862,9 @@ async function loadBlocked() {
         if (chats.chats && chats.chats.length > 0) {
             chatsContainer.innerHTML = chats.chats.map(c => `
                 <div class="bg-gray-700/30 p-2 rounded-lg flex justify-between items-center border border-gray-700 text-sm">
-                    <span><i class="fas fa-comment ml-1"></i> ${c.chat_id}</span>
-                    <span class="text-gray-400 text-xs">${c.reason || 'لا يوجد سبب'}</span>
-                    <button onclick="unblockChat(${c.chat_id})" class="text-emerald-400 hover:text-emerald-300 text-sm"><i class="fas fa-undo"></i></button>
+                    <span><i class="fas fa-comment ml-1"></i> ${esc(c.chat_id)}</span>
+                    <span class="text-gray-400 text-xs">${esc(c.reason || 'لا يوجد سبب')}</span>
+                    <button onclick="unblockChat(${parseInt(c.chat_id, 10) || 0})" class="text-emerald-400 hover:text-emerald-300 text-sm"><i class="fas fa-undo"></i></button>
                 </div>
             `).join('');
         } else {

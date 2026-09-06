@@ -16,9 +16,9 @@ from typing import Any, Dict
 
 from loguru import logger
 
-from config import CFG
+from config import CFG, PROJECT_DIR
 
-SETTINGS_FILE = os.path.join("data", "runtime_settings.json")
+SETTINGS_FILE = str(PROJECT_DIR / "data" / "runtime_settings.json")
 _lock = asyncio.Lock()
 
 # key -> (CFG field or None, type, min, max, live-applied)

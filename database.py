@@ -93,11 +93,11 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import io
 import os
 import sqlite3
 import time
 import zlib
+from datetime import datetime
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -106,7 +106,7 @@ from typing import Any, Deque, Dict, List, Optional, Tuple
 from cachetools import TTLCache
 from loguru import logger
 
-from config import CFG, fast_hash, json_dumps, json_loads
+from config import CFG, json_dumps, json_loads
 
 # =============================================================================
 # Conditional imports
@@ -741,10 +741,13 @@ class EnhancedDatabase:
     async def purge_queue(self) -> int:
         try:
             if self.db_type == "sqlite":
-                await self._execute("DELETE FROM processing_queue")
-                count = self._sqlite_conn.total_changes
+                # v9.1 fix (audit M-4): total_changes is cumulative; use the
+                # DELETE cursor's rowcount so the admin /purge command reports
+                # the real number of removed rows.
+                cursor = await self._execute("DELETE FROM processing_queue")
+                deleted = cursor.rowcount or 0
                 await self._commit()
-                return count
+                return deleted
             else:
                 result = await self._pool.execute("DELETE FROM processing_queue")
                 return int(result.split()[1])
@@ -774,6 +777,32 @@ class EnhancedDatabase:
             logger.error(f"add_dead_letter error: {e}")
             return False
 
+    @staticmethod
+    def _coerce_created_at(value: Any) -> float:
+        """
+        Convert dead_letters.created_at to a unix timestamp.
+
+        v9.1 fix (found by the test suite): SQLite's CURRENT_TIMESTAMP
+        yields a STRING ("YYYY-MM-DD HH:MM:SS"); the old code called
+        str.timestamp() on it — an AttributeError on every row, silently
+        swallowed by the except → get_dead_letters() always returned [] on
+        SQLite. Handles float/int, ISO strings and SQLite datetime strings.
+        """
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, datetime):
+            return value.timestamp()
+        text = str(value).strip()
+        for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S"):
+            try:
+                return datetime.strptime(text, fmt).timestamp()
+            except ValueError:
+                continue
+        try:
+            return float(text)
+        except ValueError:
+            return time.time()
+
     async def get_dead_letters(self, limit: int = 100, only_unresolved: bool = True) -> List[DeadLetterRecord]:
         try:
             condition = "WHERE resolved = 0" if only_unresolved else ""
@@ -789,11 +818,7 @@ class EnhancedDatabase:
                     error_text=r["error_text"],
                     retry_count=r["retry_count"],
                     resolved=bool(r["resolved"]),
-                    timestamp=(
-                        r["created_at"]
-                        if isinstance(r["created_at"], (int, float))
-                        else r["created_at"].timestamp()
-                    ),
+                    timestamp=self._coerce_created_at(r["created_at"]),
                 ))
             return records
         except Exception as e:
@@ -858,16 +883,15 @@ class EnhancedDatabase:
         cutoff = time.time() - days * 86400
         total = 0
         try:
-            # Normal time-based cleanup
-            await self._execute("DELETE FROM dead_letters WHERE resolved = 1")
-            if self.db_type == "sqlite":
-                total += self._sqlite_conn.total_changes
+            # v9.1 fix (audit M-4): rowcount-based counting — the previous
+            # cumulative total_changes arithmetic reported inflated numbers.
+            cur = await self._execute("DELETE FROM dead_letters WHERE resolved = 1")
+            total += cur.rowcount or 0
 
-            await self._execute(
+            cur = await self._execute(
                 "DELETE FROM dead_letters WHERE created_at < ?", (cutoff,)
             )
-            if self.db_type == "sqlite":
-                total += self._sqlite_conn.total_changes
+            total += cur.rowcount or 0
 
             # Hard row cap (fix #11)
             row = await self._fetchone(
@@ -876,17 +900,16 @@ class EnhancedDatabase:
             current_count = int(row["cnt"]) if row else 0
             if current_count > _DEAD_LETTER_MAX_ROWS:
                 excess = current_count - _DEAD_LETTER_MAX_ROWS
-                await self._execute(
+                cur = await self._execute(
                     "DELETE FROM dead_letters WHERE id IN ("
                     "  SELECT id FROM dead_letters ORDER BY resolved DESC, created_at ASC LIMIT ?"
                     ")",
                     (excess,),
                 )
-                if self.db_type == "sqlite":
-                    total += self._sqlite_conn.total_changes
+                total += cur.rowcount or 0
                 logger.warning(
                     f"dead_letters exceeded hard cap ({_DEAD_LETTER_MAX_ROWS}), "
-                    f"evicted {excess} rows"
+                    f"evicted {cur.rowcount or 0} rows"
                 )
 
             await self._commit()
@@ -899,14 +922,28 @@ class EnhancedDatabase:
 
     # ─── Messages ─────────────────────────────────────────────────────────────
     async def try_insert_message(self, rec: MessageRecord) -> bool:
+        """
+        Insert a message, returning True only when the row is genuinely new.
+
+        v9.1 fix (audit C-3, SQLite): the old code read
+        ``self._sqlite_conn.total_changes`` — a CUMULATIVE counter over the
+        whole connection lifetime — as the "was it inserted?" signal. After
+        the very first successful insert of the process, that counter is
+        permanently non-zero, so is_new was effectively always True:
+        DB-level dedup never fired, duplicates were re-alerted after restart
+        and sender_stats.total_messages was inflated on every duplicate.
+        The insert result is now taken from cursor.rowcount (1 = inserted,
+        0 = ignored by INSERT OR IGNORE).
+        """
         async with self._hash_lock:
             if rec.message_hash in self.message_cache:
                 return False
             self.message_cache.append(rec.message_hash)
 
         try:
+            changed = 0
             if self.db_type == "sqlite":
-                await self._execute(
+                cursor = await self._execute(
                     "INSERT OR IGNORE INTO messages "
                     "(message_hash, chat_id, sender_id, message_text, keyword_found, score, spam_score, timestamp) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -916,15 +953,18 @@ class EnhancedDatabase:
                         rec.score, rec.spam_score, rec.timestamp,
                     ),
                 )
-                changed = self._sqlite_conn.total_changes
-                await self._execute(
-                    "INSERT INTO sender_stats (sender_id, total_messages, first_seen) "
-                    "VALUES (?, 1, ?) "
-                    "ON CONFLICT(sender_id) DO UPDATE SET "
-                    "total_messages = total_messages + 1, "
-                    "updated_at = CURRENT_TIMESTAMP",
-                    (rec.sender_id, rec.timestamp),
-                )
+                changed = cursor.rowcount or 0
+                if changed:
+                    # Only count sender activity for genuinely new messages
+                    # (previously inflated on every duplicate delivery).
+                    await self._execute(
+                        "INSERT INTO sender_stats (sender_id, total_messages, first_seen) "
+                        "VALUES (?, 1, ?) "
+                        "ON CONFLICT(sender_id) DO UPDATE SET "
+                        "total_messages = total_messages + 1, "
+                        "updated_at = CURRENT_TIMESTAMP",
+                        (rec.sender_id, rec.timestamp),
+                    )
                 await self._commit()
             else:
                 result = await self._pool.execute(
@@ -937,14 +977,15 @@ class EnhancedDatabase:
                     rec.score, rec.spam_score, rec.timestamp,
                 )
                 changed = 1 if result == "INSERT 0 1" else 0
-                await self._pool.execute(
-                    "INSERT INTO sender_stats (sender_id, total_messages, first_seen) "
-                    "VALUES ($1, 1, $2) "
-                    "ON CONFLICT (sender_id) DO UPDATE SET "
-                    "total_messages = sender_stats.total_messages + 1, "
-                    "updated_at = CURRENT_TIMESTAMP",
-                    rec.sender_id, rec.timestamp,
-                )
+                if changed:
+                    await self._pool.execute(
+                        "INSERT INTO sender_stats (sender_id, total_messages, first_seen) "
+                        "VALUES ($1, 1, $2) "
+                        "ON CONFLICT (sender_id) DO UPDATE SET "
+                        "total_messages = sender_stats.total_messages + 1, "
+                        "updated_at = CURRENT_TIMESTAMP",
+                        rec.sender_id, rec.timestamp,
+                    )
 
             if changed:
                 async with self._stats_lock:
@@ -1225,12 +1266,11 @@ class EnhancedDatabase:
         cutoff = time.time() - days * 86400
         total = 0
         try:
-            await self._execute("DELETE FROM messages WHERE timestamp < ?", (cutoff,))
-            if self.db_type == "sqlite":
-                total += self._sqlite_conn.total_changes
-            await self._execute("DELETE FROM alerts WHERE timestamp < ?", (cutoff,))
-            if self.db_type == "sqlite":
-                total += self._sqlite_conn.total_changes
+            # v9.1 fix (audit M-4): rowcount-based counting.
+            cur = await self._execute("DELETE FROM messages WHERE timestamp < ?", (cutoff,))
+            total += cur.rowcount or 0
+            cur = await self._execute("DELETE FROM alerts WHERE timestamp < ?", (cutoff,))
+            total += cur.rowcount or 0
             await self._commit()
             if total > 500 and self.db_type == "sqlite":
                 await self._execute("PRAGMA optimize")
@@ -1264,10 +1304,15 @@ class EnhancedDatabase:
 
     # ─── Background Tasks ─────────────────────────────────────────────────────
     async def start_writer(self) -> None:
-        if self._writer_task is None:
+        # v9.1 fix (audit H-5): a previous close() leaves cancelled/done task
+        # objects behind; only checking `is None` meant a reconnect could
+        # never restart the writer+backup pair, so batched alerts accumulated
+        # in memory until the hard cap evicted them (alert records LOST).
+        if self._writer_task is None or self._writer_task.done():
             self._writer_task = asyncio.create_task(self._writer_loop(), name="db_writer")
+        if self._backup_task is None or self._backup_task.done():
             self._backup_task = asyncio.create_task(self._backup_loop(), name="db_backup")
-            logger.info("Database background tasks started (writer + backup)")
+        logger.info("Database background tasks started (writer + backup)")
 
     # Note: start_cleanup() intentionally removed (fix #5). Cleanup is owned
     # by main.py::EnhancedTelegramBot._cleanup_loop exclusively.
@@ -1423,7 +1468,7 @@ class EnhancedDatabase:
             # PostgreSQL has its own backup/replication infrastructure
             return
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
         while self.is_connected:
             try:
@@ -1618,34 +1663,75 @@ class EnhancedDatabase:
         return await self._fetchall(sql, tuple(params))
 
     async def get_hourly_stats(self, hours: int = 24) -> List[Dict[str, Any]]:
+        """
+        Hourly aggregates for the last N hours.
+
+        v9.1 fix (audit H-6): the previous single query referenced
+        ``decision`` / ``confidence`` columns on the *messages* table — those
+        columns only exist on *alerts* — so the query raised
+        "no such column" on every call and the admin dashboard's hourly chart
+        was permanently empty. Message counts now come from ``messages`` and
+        decision/confidence aggregates from ``alerts``; the two result sets
+        are merged per hour in Python (works identically on SQLite and PG).
+        """
         cutoff = time.time() - (hours * 3600)
-        if self.db_type == "sqlite":
-            sql = """
-                SELECT
-                    strftime('%Y-%m-%d %H:00:00', datetime(timestamp, 'unixepoch')) as hour,
-                    COUNT(*) as messages_count,
-                    SUM(CASE WHEN keyword_found IS NOT NULL THEN 1 ELSE 0 END) as alerts_count,
-                    SUM(CASE WHEN decision = 'accept' THEN 1 ELSE 0 END) as accepted_count,
-                    AVG(CASE WHEN confidence > 0 THEN confidence END) as avg_confidence
-                FROM messages
-                WHERE timestamp >= ?
-                GROUP BY hour
-                ORDER BY hour ASC
-            """
-        else:
-            sql = """
-                SELECT
-                    to_char(to_timestamp(timestamp), 'YYYY-MM-DD HH24:00:00') as hour,
-                    COUNT(*) as messages_count,
-                    SUM(CASE WHEN keyword_found IS NOT NULL THEN 1 ELSE 0 END) as alerts_count,
-                    SUM(CASE WHEN decision = 'accept' THEN 1 ELSE 0 END) as accepted_count,
-                    AVG(CASE WHEN confidence > 0 THEN confidence END) as avg_confidence
-                FROM messages
-                WHERE timestamp >= $1
-                GROUP BY hour
-                ORDER BY hour ASC
-            """
-        return await self._fetchall(sql, (cutoff,))
+        messages_sql = """
+            SELECT strftime('%Y-%m-%d %H:00:00', datetime(timestamp, 'unixepoch')) as hour,
+                   COUNT(*) as messages_count
+            FROM messages
+            WHERE timestamp >= ?
+            GROUP BY hour
+        """ if self.db_type == "sqlite" else """
+            SELECT to_char(to_timestamp(timestamp), 'YYYY-MM-DD HH24:00:00') as hour,
+                   COUNT(*) as messages_count
+            FROM messages
+            WHERE timestamp >= $1
+            GROUP BY hour
+        """
+        alerts_sql = """
+            SELECT strftime('%Y-%m-%d %H:00:00', datetime(timestamp, 'unixepoch')) as hour,
+                   COUNT(*) as alerts_count,
+                   SUM(CASE WHEN decision = 'accept' THEN 1 ELSE 0 END) as accepted_count,
+                   AVG(CASE WHEN confidence > 0 THEN confidence END) as avg_confidence
+            FROM alerts
+            WHERE timestamp >= ?
+            GROUP BY hour
+        """ if self.db_type == "sqlite" else """
+            SELECT to_char(to_timestamp(timestamp), 'YYYY-MM-DD HH24:00:00') as hour,
+                   COUNT(*) as alerts_count,
+                   SUM(CASE WHEN decision = 'accept' THEN 1 ELSE 0 END) as accepted_count,
+                   AVG(CASE WHEN confidence > 0 THEN confidence END) as avg_confidence
+            FROM alerts
+            WHERE timestamp >= $1
+            GROUP BY hour
+        """
+        try:
+            msg_rows = await self._fetchall(messages_sql, (cutoff,))
+            alert_rows = await self._fetchall(alerts_sql, (cutoff,))
+        except Exception as e:
+            logger.error(f"get_hourly_stats error: {e}")
+            return []
+
+        merged: "Dict[str, Dict[str, Any]]" = {}
+        for r in msg_rows:
+            merged[str(r["hour"])] = {
+                "hour": str(r["hour"]),
+                "messages_count": int(r["messages_count"] or 0),
+                "alerts_count": 0,
+                "accepted_count": 0,
+                "avg_confidence": 0.0,
+            }
+        for r in alert_rows:
+            hour = str(r["hour"])
+            entry = merged.setdefault(
+                hour,
+                {"hour": hour, "messages_count": 0, "alerts_count": 0, "accepted_count": 0, "avg_confidence": 0.0},
+            )
+            entry["alerts_count"] = int(r["alerts_count"] or 0)
+            entry["accepted_count"] = int(r["accepted_count"] or 0)
+            entry["avg_confidence"] = round(float(r["avg_confidence"] or 0.0), 3)
+
+        return sorted(merged.values(), key=lambda x: x["hour"])
 
     async def get_top_keywords(self, limit: int = 20) -> List[Dict[str, Any]]:
         sql = """
@@ -1753,13 +1839,17 @@ class EnhancedDatabase:
     # ─── Close ────────────────────────────────────────────────────────────────
     async def close(self) -> None:
         self.is_connected = False
-        for task in (self._writer_task, self._backup_task):
+        for name in ("_writer_task", "_backup_task"):
+            task = getattr(self, name)
             if task and not task.done():
                 task.cancel()
                 try:
                     await task
                 except asyncio.CancelledError:
                     pass
+            # Reset refs so a subsequent connect() → start_writer() can
+            # actually restart them (audit H-5).
+            setattr(self, name, None)
         await self._flush()
         if self.db_type == "sqlite" and self._sqlite_conn:
             await self._sqlite_conn.close()

@@ -36,17 +36,24 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import json
 import os
 import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Final, List, Optional, Tuple
+from urllib.parse import unquote, urlparse
 
 from cryptography.fernet import Fernet
 from dotenv import load_dotenv
 from loguru import logger
+
+# =============================================================================
+# Project root (absolute) — every file path below is anchored here so the app
+# behaves identically no matter what the current working directory is
+# (Render, systemd, cron and IDE runners all start with different CWDs).
+# =============================================================================
+PROJECT_DIR: Final[Path] = Path(__file__).resolve().parent
 
 # =============================================================================
 # JSON fallback (orjson if available)
@@ -79,27 +86,42 @@ except ImportError:
 # DATABASE_URL Parser
 # =============================================================================
 def parse_database_url(url: str) -> Dict[str, Any]:
-    """Parse PostgreSQL DATABASE_URL into connection parameters."""
-    pattern = r"postgresql://([^:]+):([^@]+)@([^:]+):(\d+)/(.+)$"
-    match = re.match(pattern, url)
-    if not match:
-        pattern_no_port = r"postgresql://([^:]+):([^@]+)@([^/]+)/(.+)$"
-        match = re.match(pattern_no_port, url)
-        if not match:
-            raise ValueError(f"Invalid DATABASE_URL format")
-        return {
-            "user": match.group(1),
-            "password": match.group(2),
-            "host": match.group(3),
-            "port": 5432,
-            "database": match.group(4),
-        }
+    """
+    Parse a PostgreSQL DATABASE_URL into connection parameters.
+
+    v13.2 fix (audit C-2): the previous regex-based parser failed on real
+    Render/database-provider URLs in three ways:
+      * legacy ``postgres://`` scheme (older Render/provisioners) was rejected;
+      * query strings such as ``?sslmode=require`` leaked into the database
+        name, so asyncpg tried to connect to a non-existent database;
+      * percent-encoded credentials (e.g. ``p%40ss``) were NOT decoded, so any
+        password containing special characters silently mismatched.
+
+    Uses urllib.parse instead of regex; secrets are never logged.
+    """
+    raw = (url or "").strip()
+    if raw.startswith("postgres://"):
+        # asyncpg speaks "postgresql://" — normalise the legacy scheme.
+        raw = "postgresql://" + raw[len("postgres://"):]
+
+    parsed = urlparse(raw)
+    if parsed.scheme != "postgresql":
+        raise ValueError(
+            "Invalid DATABASE_URL format (expected postgresql:// or postgres://)"
+        )
+    if not parsed.hostname:
+        raise ValueError("Invalid DATABASE_URL: missing host")
+
+    database = (parsed.path or "").lstrip("/")
+    if not database:
+        raise ValueError("Invalid DATABASE_URL: missing database name")
+
     return {
-        "user": match.group(1),
-        "password": match.group(2),
-        "host": match.group(3),
-        "port": int(match.group(4)),
-        "database": match.group(5),
+        "user": unquote(parsed.username) if parsed.username else None,
+        "password": unquote(parsed.password) if parsed.password else None,
+        "host": parsed.hostname,
+        "port": parsed.port or 5432,
+        "database": database,
     }
 
 # =============================================================================
@@ -173,7 +195,7 @@ class SecretManager:
                 except Exception as e:
                     logger.warning(f"Invalid SECRET_KEY_OVERRIDE: {e}, falling back to file")
 
-            key_file = Path(".secret_key")
+            key_file = PROJECT_DIR / ".secret_key"
             if key_file.exists():
                 key = key_file.read_bytes()
             else:
@@ -250,9 +272,9 @@ class SecretManager:
         cls._cache.clear()
 
 # =============================================================================
-# Load .env
+# Load .env — anchored to the project directory, not the CWD (audit M-3)
 # =============================================================================
-load_dotenv("accounts.env")
+load_dotenv(PROJECT_DIR / "accounts.env")
 
 # =============================================================================
 # Core Config Dataclass v13.1 – جميع المتغيرات
@@ -459,6 +481,12 @@ class Config:
 
         download_path = Path(SecretManager.get("DOWNLOAD_PATH", "downloads", required=False))
         sessions_dir = Path(SecretManager.get("SESSIONS_DIR", "sessions", required=False))
+        # Relative paths are anchored to the project directory so the app is
+        # independent of the process CWD (audit M-3).
+        if not download_path.is_absolute():
+            download_path = PROJECT_DIR / download_path
+        if not sessions_dir.is_absolute():
+            sessions_dir = PROJECT_DIR / sessions_dir
         download_path.mkdir(parents=True, exist_ok=True)
         sessions_dir.mkdir(parents=True, exist_ok=True)
 
@@ -474,10 +502,23 @@ class Config:
         db_user = None
         db_password = None
 
-        database_url = os.getenv("DATABASE_URL")
+        database_url = (os.getenv("DATABASE_URL") or "").strip()
         if database_url:
+            # v13.2 fix (audit C-1): a VALID postgres DATABASE_URL now WINS
+            # over DB_TYPE. render.yaml ships DB_TYPE=sqlite as a bootstrap
+            # default, which previously meant a user who added DATABASE_URL
+            # for persistence was silently ignored and the bot kept writing
+            # to ephemeral SQLite — the exact data-loss scenario render.yaml's
+            # own docs claim cannot happen. If the URL is present but NOT a
+            # valid postgres URL, we keep DB_TYPE unchanged and warn loudly.
             try:
                 parsed = parse_database_url(database_url)
+                if db_type != "postgresql":
+                    logger.warning(
+                        f"DATABASE_URL is set but DB_TYPE={db_type!r} — "
+                        "switching DB_TYPE to 'postgresql' (DATABASE_URL takes precedence)"
+                    )
+                    db_type = "postgresql"
                 db_host = parsed["host"]
                 db_port = parsed["port"]
                 db_name = parsed["database"]
@@ -485,7 +526,10 @@ class Config:
                 db_password = parsed["password"]
                 logger.info("Database config loaded from DATABASE_URL")
             except Exception as e:
-                logger.error(f"Failed to parse DATABASE_URL: {e}, falling back to individual vars")
+                logger.error(
+                    f"Failed to parse DATABASE_URL: {e} — keeping DB_TYPE={db_type!r} "
+                    "and falling back to individual DB_* vars if set"
+                )
                 db_host = SecretManager.get("DB_HOST", None, required=False)
                 db_port = SecretManager.get_int("DB_PORT", 5432, required=False)
                 db_name = SecretManager.get("DB_NAME", None, required=False)
@@ -499,13 +543,20 @@ class Config:
             db_password = SecretManager.get("DB_PASSWORD", None, required=False)
 
         # ── بناء الكائن مع جميع المتغيرات ──
+        # Relative file paths are anchored to PROJECT_DIR so the process CWD
+        # never changes where the DB / logs live (audit M-3).
+        log_file_raw = SecretManager.get("LOG_FILE", "bot.log", required=False)
+        db_file_raw = SecretManager.get("DB_FILE", "telegram_bot.db", required=False)
+        log_file_path = str(PROJECT_DIR / log_file_raw) if not os.path.isabs(log_file_raw) else log_file_raw
+        db_file_path = str(PROJECT_DIR / db_file_raw) if not os.path.isabs(db_file_raw) else db_file_raw
+
         cfg = _ConfigData(
             # ========== الأساسيات ==========
             TARGET_GROUP_ID=tg,
             ADMIN_CHAT_ID=admin,
-            LOG_FILE=SecretManager.get("LOG_FILE", "bot.log", required=False),
+            LOG_FILE=log_file_path,
             DB_TYPE=db_type,
-            DB_FILE=SecretManager.get("DB_FILE", "telegram_bot.db", required=False),
+            DB_FILE=db_file_path,
             DB_HOST=db_host,
             DB_PORT=db_port,
             DB_NAME=db_name,
@@ -648,7 +699,7 @@ class Config:
     @classmethod
     def reload(cls) -> _ConfigData:
         SecretManager.clear_cache()
-        load_dotenv("accounts.env", override=True)
+        load_dotenv(PROJECT_DIR / "accounts.env", override=True)
         cls._instance = None
         return cls.build()
 
@@ -745,7 +796,12 @@ _KW_CATEGORIES: Final[List[str]] = [
     "templates", "template_patterns",
 ]
 
-def load_keywords(path: str = "keywords.json") -> Dict[str, Any]:
+def load_keywords(path: Optional[str] = None) -> Dict[str, Any]:
+    """Load keywords.json (absolute by default, anchored to PROJECT_DIR)."""
+    if path is None:
+        path = str(PROJECT_DIR / "keywords.json")
+    elif not os.path.isabs(path):
+        path = str(PROJECT_DIR / path)
     default: Dict[str, Any] = {c: {} for c in _KW_CATEGORIES}
     if not os.path.exists(path):
         logger.warning(f"Keywords file not found: {path} - using empty defaults")
@@ -827,8 +883,11 @@ def load_accounts() -> List[Dict[str, Any]]:
                 "last_error": None,
             }
             accounts.append(acc)
+            # PII: never log the full phone number (audit M-9) — mask middle digits.
+            phone = str(acc["phone"])
+            masked_phone = ("*" * max(0, len(phone) - 4)) + phone[-4:] if phone else ""
             logger.debug(
-                f"Account loaded: {acc['name']} (phone={acc['phone']}) "
+                f"Account loaded: {acc['name']} (phone={masked_phone}) "
                 f"session_string={'YES' if acc['session_string'] else 'NO'}"
             )
         except (EnvironmentError, ValueError) as e:

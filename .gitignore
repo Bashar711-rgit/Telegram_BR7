@@ -14,6 +14,11 @@ sessions/
 *.db-wal
 *.db-shm
 
+# ========== Backups & runtime data (contain secrets — NEVER commit) ==========
+backups/
+data/
+*.gz
+
 # ========== Logs & Downloads ==========
 *.log
 downloads/

@@ -876,12 +876,11 @@ class EnhancedAccountMonitor:
             if not self.client or not self.is_connected:
                 return False
             account_name = self.account["name"]
+            old_client = self.client
+            old_handler = self._handler_func
             try:
                 logger.info(f"Rotating session for {account_name}")
                 session_string = self.client.session.save()
-
-                old_client = self.client
-                old_handler = self._handler_func
 
                 from telethon.sessions import StringSession
                 new_client = TelegramClient(StringSession(session_string), **self._client_kwargs())
@@ -890,6 +889,7 @@ class EnhancedAccountMonitor:
                     logger.error(f"Session rotation: new client unauthorized for {account_name}, aborting rotation")
                     try: await new_client.disconnect()
                     except Exception: pass
+                    # Old client stays connected and owns the handler — safe abort.
                     return False
 
                 # Only now tear down the old client/handler — the new
@@ -909,9 +909,21 @@ class EnhancedAccountMonitor:
                 logger.info(f"Session rotated successfully for {account_name}")
                 return True
             except Exception as e:
+                # v9.8 fix (audit M-2): on a mid-rotation failure the old
+                # client used to be orphaned (still connected, still holding
+                # the event handler) while self.client was cleared to None —
+                # a duplicate-processing + resource leak. Restore the old
+                # client as the live one and let the normal reconnect path
+                # take over if it is actually dead.
                 logger.error(f"Session rotation failed for {account_name}: {e}")
-                self.is_connected = False
-                self.client = None
+                self.client = old_client if (old_client and self._is_client_alive(old_client)) else None
+                self.is_connected = self.client is not None
+                if not self.is_connected:
+                    self._handler_func = None
+                    try:
+                        if old_client: await old_client.disconnect()
+                    except Exception:
+                        pass
                 return False
 
 

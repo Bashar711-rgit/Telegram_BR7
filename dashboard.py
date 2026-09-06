@@ -110,7 +110,7 @@ import json
 import os
 import time
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import aiohttp
@@ -389,13 +389,26 @@ manager = ConnectionManager()
 # =============================================================================
 
 async def _update_stats_loop(app: FastAPI):
-    """Push live stats over WebSocket every 2s (fix #4: corrected field names)."""
+    """Push live stats over WebSocket every 2s (fix #4: corrected field names).
+
+    v3.1 (audit M-6): with no WebSocket clients connected the loop now only
+    refreshes app.state.stats_cache every 5th cycle (10 s) instead of running
+    ~7 COUNT/aggregate queries against the DB every 2 s 24/7. The full-rate
+    push resumes automatically as soon as a client connects.
+    """
+    cycle = 0
     while True:
         try:
             await asyncio.sleep(2)
+            cycle += 1
             db = app.state.db
             bot = getattr(app.state, "bot_ref", None)
             if not db.is_connected:
+                continue
+            has_clients = bool(manager.active_connections)
+            if not has_clients and (cycle % 5) != 1:
+                # No WS clients: keep the /api/stats cache fresh-ish at a
+                # ~10 s cadence instead of hammering the DB every 2 s.
                 continue
 
             db_stats = await db.get_stats()
@@ -638,7 +651,7 @@ async def health(request: Request):
         "accounts_with_session": sum(1 for a in ACCOUNTS if a.get("session_string")),
         "accounts_total": len(ACCOUNTS),
         "uptime": uptime,
-        "time": datetime.utcnow().isoformat() + "Z",
+        "time": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     })
 
 
@@ -1238,7 +1251,14 @@ async def login_verify_password(data: LoginVerifyPassword):
 
 
 async def _login_success_response(prefix: str, result: Dict[str, Any]) -> JSONResponse:
-    """حفظ الجلسة في متغيرات Render وإرجاع النتيجة."""
+    """حفظ الجلسة في متغيرات Render وإرجاع النتيجة.
+
+    v3.1 (audit H-4): the Session String is a full account credential. It is
+    no longer ever returned in the API response or displayed in the browser
+    (previously it was leaked in the JSON body whenever the Render save
+    failed). If the automatic save fails, the user re-runs the /login flow
+    or enters the value manually from Render's own dashboard.
+    """
     env_key = f"{prefix}_SESSION_STRING"
     save = await render_upsert_env(env_key, result["session_string"])
     logger.info(f"Login completed for {prefix} ({result.get('user')}): env {env_key} saved={save.get('saved')}")
@@ -1251,8 +1271,7 @@ async def _login_success_response(prefix: str, result: Dict[str, Any]) -> JSONRe
         "saved_to_render": save.get("saved", False),
         "save_reason": save.get("reason", ""),
         "note": "تم حفظ الجلسة - ستعيد Render نشر الخدمة تلقائياً وسيتصل الحساب خلال دقائق" if save.get("saved")
-                else "تعذر الحفظ التلقائي - انسخ Session String وأضفه يدوياً في متغيرات Render",
-        "session_string": result["session_string"] if not save.get("saved") else None,
+                else "تعذر الحفظ التلقائي في Render - أعد المحاولة لاحقاً أو أدخل الجلسة يدوياً من لوحة Render (الجلسة لا تُعرض هنا لأسباب أمنية)",
     })
 
 
@@ -1352,6 +1371,7 @@ a { color:#38bdf8; }
 let currentPrefix = null;
 const $ = id => document.getElementById(id);
 const token = () => $('token').value.trim();
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 $('token').value = localStorage.getItem('dash_token') || '';
 $('token').addEventListener('change', () => { localStorage.setItem('dash_token', token()); loadAccounts(); });
 
@@ -1380,7 +1400,7 @@ async function loadAccounts() {
       const tr = document.createElement('tr');
       const sess = a.has_session_string ? '<span class="badge b-green">موجودة</span>' : '<span class="badge b-yellow">مطلوبة</span>';
       const conn = a.connected ? '<span class="badge b-green">متصل</span>' : '<span class="badge b-red">غير متصل</span>';
-      tr.innerHTML = `<td>${a.name}</td><td class="mono">${a.phone_masked}</td><td>${sess}</td><td>${conn}</td>`;
+      tr.innerHTML = `<td>${esc(a.name)}</td><td class="mono">${esc(a.phone_masked)}</td><td>${sess}</td><td>${conn}</td>`;
       tb.appendChild(tr);
       const op = document.createElement('option');
       op.value = a.prefix; op.textContent = `${a.name} (${a.phone_masked})${a.connected ? ' ✅' : ''}`;
@@ -1419,12 +1439,12 @@ async function verifyPassword() {
 }
 function finishLogin(d) {
   setStep(4);
-  let html = `✅ تم تسجيل الدخول بنجاح: <b>${d.user}</b><br>`;
+  let html = `✅ تم تسجيل الدخول بنجاح: <b>${esc(d.user)}</b><br>`;
   if (d.saved_to_render) {
-    html += `💾 حُفظت الجلسة في <span class="mono">${d.env_key}</span><br>🔄 ستعيد Render النشر تلقائياً وسيتصل الحساب خلال دقائق.`;
+    html += `💾 حُفظت الجلسة في <span class="mono">${esc(d.env_key)}</span><br>🔄 ستعيد Render النشر تلقائياً وسيتصل الحساب خلال دقائق.`;
   } else {
-    html += `⚠️ ${d.note}<br>السبب: ${d.save_reason || ''}`;
-    if (d.session_string) html += `<br><br>Session String:<br><span class="mono">${d.session_string}</span>`;
+    // SECURITY (audit H-4): the Session String is never shown in the browser.
+    html += `⚠️ ${esc(d.note || '')}<br>السبب: ${esc(d.save_reason || '')}`;
   }
   show(d.saved_to_render ? 'ok' : 'err', html);
   setTimeout(loadAccounts, 2000);
@@ -1437,11 +1457,35 @@ if (token()) loadAccounts();
 """
 
 # =============================================================================
-# WebSocket Endpoint (fix #10: cleanup on ALL exception paths)
+# WebSocket Endpoint
 # =============================================================================
+
+def _verify_ws_token(websocket: WebSocket) -> bool:
+    """
+    v3.1 (audit H-2): /ws used to accept ANY unauthenticated connection and
+    stream live stats that include FULL phone numbers and account details.
+    Browsers cannot set an Authorization header on a WebSocket handshake, so
+    the dashboard client passes the same DASHBOARD_AUTH_TOKEN as a
+    `?token=` query parameter; comparison is timing-safe.
+    """
+    supplied = (websocket.query_params.get("token") or "").strip()
+    if not supplied:
+        return False
+    return hmac.compare_digest(supplied, CFG.DASHBOARD_AUTH_TOKEN)
+
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
+    if not _verify_ws_token(websocket):
+        # Accept-then-close is the only cross-browser way to deny a WS
+        # handshake with a meaningful code (1008 = Policy Violation).
+        await websocket.accept()
+        await websocket.close(code=1008)
+        logger.warning(
+            "Rejected unauthenticated WebSocket handshake "
+            f"from {websocket.client.host if websocket.client else 'unknown'}"
+        )
+        return
     await manager.connect(websocket)
     try:
         if websocket.app.state.stats_cache:

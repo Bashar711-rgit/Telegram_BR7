@@ -25,14 +25,15 @@ import csv
 import io
 import os
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from loguru import logger
 from pydantic import BaseModel, Field
 
-from config import ACCOUNTS, CFG
+from config import ACCOUNTS
 from webadmin import auth, backup, keywords_store, logs_reader, render_api, settings_store
 
 router = APIRouter()
@@ -175,10 +176,15 @@ async def auth_csrf(session: Dict[str, Any] = Protected):
 # ===========================================================================
 # SPA
 # ===========================================================================
+# v1.1 (audit M-1): anchored to the package/project directory — the previous
+# CWD-relative "templates/admin.html" returned 500 whenever the process was
+# started from any directory other than the repo root.
+_ADMIN_TEMPLATE = Path(__file__).resolve().parent.parent / "templates" / "admin.html"
+
+
 @router.get("/admin", response_class=HTMLResponse)
 async def admin_spa():
-    template_path = os.path.join("templates", "admin.html")
-    with open(template_path, "r", encoding="utf-8") as f:
+    with open(_ADMIN_TEMPLATE, "r", encoding="utf-8") as f:
         return HTMLResponse(f.read())
 
 

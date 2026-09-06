@@ -20,14 +20,14 @@ from typing import Any, Dict, List
 
 from loguru import logger
 
-from config import CFG
+from config import CFG, PROJECT_DIR
 from webadmin import keywords_store
 
-BACKUP_DIR = "backups"
+BACKUP_DIR = str(PROJECT_DIR / "backups")
 _DB_FILE = "telegram_bot.db"
 _LOG_FILE = "bot.log"
 _ENV_FILES = ("accounts.env", ".env")
-_SETTINGS_FILE = os.path.join("data", "runtime_settings.json")
+_SETTINGS_FILE = str(PROJECT_DIR / "data" / "runtime_settings.json")
 
 
 def _db_path() -> str:
