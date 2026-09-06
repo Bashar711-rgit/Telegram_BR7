@@ -322,6 +322,11 @@
         <!-- TAB: KEYWORDS -->
         <!-- ========================================================== -->
         <div id="tab-keywords" class="tab-content hidden">
+            <div class="mb-3 text-sm text-gray-400">
+                <span class="bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 rounded-lg px-3 py-1.5 inline-flex items-center gap-2">
+                    <i class="fas fa-database"></i> الحفظ المباشر مفعّل — تُحفظ كل إضافة/حذف في قاعدة البيانات وتبقى بعد إعادة النشر
+                </span>
+            </div>
             <div class="flex flex-wrap gap-2 mb-4">
                 <select id="keyword-category" class="bg-gray-700 border border-gray-600 rounded-lg px-4 py-2 text-white">
                     <option value="request">طلب مباشر</option>
@@ -368,31 +373,22 @@
         </div>
 
         <!-- ========================================================== -->
-        <!-- TAB: SETTINGS -->
+        <!-- TAB: SETTINGS (v3.1 — dynamic, saved directly to DB)       -->
         <!-- ========================================================== -->
         <div id="tab-settings" class="tab-content hidden">
-            <div class="space-y-4 max-w-2xl">
-                <div class="flex flex-wrap items-center gap-4">
-                    <label class="text-gray-400 w-44"><i class="fas fa-bell ml-1"></i> التنبيهات/دقيقة</label>
-                    <input type="number" id="setting-alerts-per-minute" class="bg-gray-700 border border-gray-600 rounded-lg px-4 py-2 w-28 text-white">
+            <div class="max-w-3xl">
+                <div id="settings-persistence" class="mb-4 text-sm text-gray-400">
+                    <i class="fas fa-database ml-1"></i> جاري التحميل...
                 </div>
-                <div class="flex flex-wrap items-center gap-4">
-                    <label class="text-gray-400 w-44"><i class="fas fa-clock ml-1"></i> فترة التهدئة (ث)</label>
-                    <input type="number" id="setting-cooldown" class="bg-gray-700 border border-gray-600 rounded-lg px-4 py-2 w-28 text-white">
+                <div id="settings-form" class="space-y-6">
+                    <div class="text-center text-gray-500 py-6">جاري تحميل الإعدادات...</div>
                 </div>
-                <div class="flex flex-wrap items-center gap-4">
-                    <label class="text-gray-400 w-44"><i class="fas fa-filter ml-1"></i> Prefilter</label>
-                    <input type="checkbox" id="setting-prefilter" class="w-5 h-5 accent-emerald-500">
-                </div>
-                <div class="flex flex-wrap items-center gap-4">
-                    <label class="text-gray-400 w-44"><i class="fas fa-language ml-1"></i> فلترة اللغة</label>
-                    <input type="checkbox" id="setting-language-filter" class="w-5 h-5 accent-emerald-500">
-                </div>
-                <div class="flex flex-wrap gap-4">
-                    <button onclick="saveSettings()" class="bg-emerald-500 hover:bg-emerald-600 px-6 py-2 rounded-lg transition"><i class="fas fa-save ml-1"></i> حفظ الإعدادات</button>
+                <div id="settings-status" class="mt-4 space-y-1 text-sm"></div>
+                <div class="flex flex-wrap gap-4 mt-6">
+                    <button onclick="saveSettings()" class="bg-emerald-500 hover:bg-emerald-600 px-6 py-2 rounded-lg transition"><i class="fas fa-save ml-1"></i> حفظ مباشر</button>
+                    <button onclick="loadSettings()" class="bg-gray-600 hover:bg-gray-700 px-6 py-2 rounded-lg transition"><i class="fas fa-undo ml-1"></i> تحديث</button>
                     <button onclick="purgeQueue()" class="bg-red-500 hover:bg-red-600 px-6 py-2 rounded-lg transition"><i class="fas fa-trash ml-1"></i> تفريغ الطابور</button>
                     <button onclick="restartBot()" class="btn-warning px-6 py-2 rounded-lg transition"><i class="fas fa-sync ml-1"></i> إعادة تشغيل البوت</button>
-                    <button onclick="stopBot()" class="btn-danger px-6 py-2 rounded-lg transition"><i class="fas fa-stop ml-1"></i> إيقاف البوت</button>
                 </div>
             </div>
         </div>
@@ -769,15 +765,70 @@ async function searchAlerts() {
 }
 
 // ================================================================
-// KEYWORDS
+// KEYWORDS (v3.1 — dynamic categories from the real structure + DB persistence)
 // ================================================================
+let KEYWORDS_DATA = {};
+
+// Walk the keywords tree and collect every list-of-strings leaf (dotted
+// path) — including EMPTY lists so users can re-fill them. Metadata keys
+// ("_") are never editable.
+function walkKeywordLists(node, prefix, out) {
+    if (Array.isArray(node)) {
+        if (node.every(x => typeof x === 'string')) out.push({ path: prefix, items: node });
+        return;
+    }
+    if (node && typeof node === 'object') {
+        for (const [k, v] of Object.entries(node)) {
+            if (k.startsWith('_')) continue;
+            walkKeywordLists(v, prefix ? `${prefix}.${k}` : k, out);
+        }
+    }
+}
+
+function resolveKeywordPath(obj, dotted) {
+    return dotted.split('.').reduce(
+        (acc, part) => (acc && Object.prototype.hasOwnProperty.call(acc, part)) ? acc[part] : undefined,
+        obj
+    );
+}
+
+const KEYWORDS_GROUP_LABELS = {
+    request_phrases: 'عبارات الطلب', academic_objects: 'الموضوعات الأكاديمية',
+    templates: 'القوالب', advertisement_signals: 'مؤشرات الإعلان',
+    urgency_markers: 'مؤشرات الاستعجال', ignore_signals: 'إشارات التجاهل',
+    subject_markers: 'مؤشرات الموضوع', university_context: 'سياق الجامعة',
+    emoji_signals: 'إشارات الإيموجي', high_confidence_boost_patterns: 'معززات الثقة',
+    negation: 'النفي', ad_blockers: 'الروابط المحظورة'
+};
+
+function fillCategorySelect() {
+    const sel = document.getElementById('keyword-category');
+    const previous = sel.value;
+    const lists = [];
+    walkKeywordLists(KEYWORDS_DATA, '', lists);
+    const groups = {};
+    lists.forEach(l => {
+        const top = l.path.split('.')[0];
+        (groups[top] = groups[top] || []).push(l);
+    });
+    sel.innerHTML = Object.keys(groups).sort().map(top => {
+        const label = KEYWORDS_GROUP_LABELS[top] || top;
+        return `<optgroup label="${esc(label)}">` + groups[top].map(l =>
+            `<option value="${esc(l.path)}">${esc(l.path)} (${l.items.length})</option>`
+        ).join('') + '</optgroup>';
+    }).join('');
+    if (previous && [...sel.options].some(o => o.value === previous)) sel.value = previous;
+}
+
 async function loadKeywords() {
     const container = document.getElementById('keywords-list');
-    const category = document.getElementById('keyword-category').value;
     container.innerHTML = '<div class="text-center text-gray-500 py-4">جاري التحميل...</div>';
     try {
         const data = await apiFetch('/api/keywords');
-        const words = data.keywords[category] || [];
+        KEYWORDS_DATA = data.keywords || {};
+        fillCategorySelect();
+        const category = document.getElementById('keyword-category').value;
+        const words = resolveKeywordPath(KEYWORDS_DATA, category) || [];
         if (words.length === 0) {
             container.innerHTML = '<div class="text-gray-500 text-center py-4">لا توجد كلمات في هذه الفئة</div>';
             return;
@@ -932,31 +983,100 @@ async function unblockChat(chat_id) {
 }
 
 // ================================================================
-// SETTINGS
+// SETTINGS (v3.1 — dynamic form loaded from the API, direct DB save)
 // ================================================================
-function loadSettings() {
-    document.getElementById('setting-alerts-per-minute').value = 20;
-    document.getElementById('setting-cooldown').value = 300;
-    document.getElementById('setting-prefilter').checked = true;
-    document.getElementById('setting-language-filter').checked = true;
+let SETTINGS_SCHEMA = {};
+
+function settingLabel(key) {
+    return (SETTINGS_SCHEMA[key] && SETTINGS_SCHEMA[key].label) || key;
+}
+
+async function loadSettings() {
+    const form = document.getElementById('settings-form');
+    try {
+        const data = await apiFetch('/api/settings');
+        SETTINGS_SCHEMA = data.schema || {};
+        renderSettings(data);
+    } catch (e) {
+        form.innerHTML = `<div class="text-red-400 text-center py-4">خطأ في تحميل الإعدادات: ${esc(e.message)}</div>`;
+    }
+}
+
+function renderSettings(data) {
+    const persist = data.persistence || {};
+    const badge = document.getElementById('settings-persistence');
+    const dbNames = { postgresql: 'PostgreSQL', sqlite: 'SQLite', none: 'غير متصلة', unknown: 'غير معروفة' };
+    badge.innerHTML = persist.enabled
+        ? `<span class="bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 rounded-lg px-3 py-1.5 inline-flex items-center gap-2"><i class="fas fa-database"></i> الحفظ المباشر نشط (${esc(dbNames[persist.db_type] || persist.db_type)}) — كل تعديل يُكتب فوراً في قاعدة البيانات وتبقى بعد إعادة النشر</span>`
+        : `<span class="bg-yellow-500/10 border border-yellow-500/30 text-yellow-300 rounded-lg px-3 py-1.5 inline-flex items-center gap-2"><i class="fas fa-exclamation-triangle"></i> قاعدة البيانات غير متصلة — لن تُحفظ التعديلات</span>`;
+
+    const groups = {};
+    Object.entries(SETTINGS_SCHEMA).forEach(([key, spec]) => {
+        const g = groups[spec.group] = groups[spec.group] || { label: spec.group_label, fields: [] };
+        g.fields.push([key, spec]);
+    });
+    const order = ['destinations', 'alerts', 'filtering'];
+    const icons = { destinations: 'fa-bullseye', alerts: 'fa-bell', filtering: 'fa-filter' };
+    const form = document.getElementById('settings-form');
+    form.innerHTML = order.filter(g => groups[g]).map(g => `
+        <div class="bg-gray-800/50 border border-gray-700 rounded-xl p-4">
+            <h3 class="text-md font-bold text-gray-200 mb-3"><i class="fas ${icons[g]} ml-1"></i> ${esc(groups[g].label)}</h3>
+            <div class="space-y-3">
+                ${groups[g].fields.map(([key, spec]) => renderSettingField(key, spec, data.settings[key])).join('')}
+            </div>
+        </div>
+    `).join('');
+}
+
+function renderSettingField(key, spec, value) {
+    const hint = [];
+    if (spec.min !== null && spec.max !== null) hint.push(`المدى: ${spec.min} - ${spec.max}`);
+    if (spec.note) hint.push(spec.note);
+    const hintHtml = hint.length ? `<div class="w-full text-xs text-gray-500 mt-1">${esc(hint.join(' • '))}</div>` : '';
+    const label = `<label class="text-gray-300 text-sm flex-1 min-w-[180px]" for="setting-${esc(key)}">${esc(spec.label)}</label>`;
+    let input;
+    if (spec.type === 'bool') {
+        input = `<input type="checkbox" id="setting-${esc(key)}" data-setting="${esc(key)}" ${value ? 'checked' : ''} class="w-5 h-5 accent-emerald-500">`;
+    } else {
+        input = `<input type="number" step="${spec.type === 'int' ? '1' : '0.01'}" id="setting-${esc(key)}" data-setting="${esc(key)}" value="${esc(value ?? '')}" ${spec.min !== null ? `min="${spec.min}"` : ''} ${spec.max !== null ? `max="${spec.max}"` : ''} class="bg-gray-700 border border-gray-600 rounded-lg px-3 py-1.5 w-36 text-white text-sm">`;
+    }
+    return `<div class="flex flex-wrap items-center gap-3">${label}${input}${hintHtml}</div>`;
 }
 
 async function saveSettings() {
-    const data = {
-        max_alerts_per_minute: parseInt(document.getElementById('setting-alerts-per-minute').value) || undefined,
-        alert_cooldown: parseInt(document.getElementById('setting-cooldown').value) || undefined,
-        prefilter_enabled: document.getElementById('setting-prefilter').checked,
-        language_filter: document.getElementById('setting-language-filter').checked,
-    };
+    const updates = {};
+    document.querySelectorAll('[data-setting]').forEach(el => {
+        if (el.type === 'checkbox') {
+            updates[el.dataset.setting] = el.checked;
+        } else {
+            const v = el.value.trim();
+            if (v !== '') updates[el.dataset.setting] = v; // server coerces + validates
+        }
+    });
+    const status = document.getElementById('settings-status');
+    if (!Object.keys(updates).length) {
+        status.innerHTML = '<div class="text-yellow-400">لا توجد تغييرات للحفظ</div>';
+        return;
+    }
+    status.innerHTML = '<div class="text-gray-400">جاري الحفظ المباشر...</div>';
     try {
         const result = await apiFetch('/api/settings', {
             method: 'POST',
-            body: JSON.stringify(data)
+            body: JSON.stringify({ updates })
         });
-        if (result.success) alert('✅ تم حفظ الإعدادات');
-        else alert('❌ فشل حفظ الإعدادات');
+        const rows = [];
+        Object.entries(result.applied_live || {}).forEach(([k, v]) =>
+            rows.push(`<div class="text-emerald-300"><i class="fas fa-check-circle ml-1"></i> ${esc(settingLabel(k))} = ${esc(v)} — طُبِّق فوراً وحُفِظ في قاعدة البيانات</div>`));
+        Object.entries(result.stored_only || {}).forEach(([k, v]) =>
+            rows.push(`<div class="text-blue-300"><i class="fas fa-save ml-1"></i> ${esc(settingLabel(k))} = ${esc(v)} — حُفِظ في قاعدة البيانات (يُطبَّق عند إعادة التشغيل)</div>`));
+        Object.entries(result.errors || {}).forEach(([k, msg]) =>
+            rows.push(`<div class="text-red-300"><i class="fas fa-times-circle ml-1"></i> ${esc(settingLabel(k))}: ${esc(msg)}</div>`));
+        if (result.success && !result.persisted_to_db)
+            rows.push('<div class="text-yellow-300"><i class="fas fa-exclamation-triangle ml-1"></i> تحذير: لم يكتمل الحفظ في قاعدة البيانات</div>');
+        status.innerHTML = rows.join('') || '<div class="text-gray-400">لا يوجد تغيير</div>';
+        if (Object.keys(result.errors || {}).length === 0) loadSettings(); // refresh effective values
     } catch (e) {
-        alert('❌ خطأ: ' + e.message);
+        status.innerHTML = `<div class="text-red-300">خطأ: ${esc(e.message)}</div>`;
     }
 }
 

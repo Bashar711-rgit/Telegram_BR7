@@ -1,11 +1,50 @@
 #!/usr/bin/env python3
 """
-dashboard.py – Telegram Bot Control Panel v3.0 (HARDENED, IntentEngine-compatible)
+dashboard.py – Telegram Bot Control Panel v3.1 (DYNAMIC, DB-PERSISTED)
 FastAPI + WebSocket Dashboard for EnhancedTelegramBot
 Compatible with: config.py v13.1, filter_engine.py v14.1, database.py v9.0,
                   monitors.py v9.7, main.py v13.1, keywords.json v15.1
 
-v3.0 (this pass) — full audit fix, dashboard.py ONLY:
+v3.1 (this pass) — Dynamic Dashboard with DIRECT persistence (dashboard.py +
+dashboard_store.py + templates/dashboard.html):
+
+  NEW  #1  — Direct-to-database persistence: every keyword edit and every
+             settings change is written to a new `app_settings` key-value
+             table in the SAME database the bot already uses (PostgreSQL on
+             Render, SQLite locally). Render's ephemeral filesystem no longer
+             wipes user edits on redeploy/restart — on boot the dashboard
+             lifespan restores all persisted overrides and re-applies them.
+
+  NEW  #2  — Real dynamic Settings: GET /api/settings exposes effective
+             values + a validated schema (11 settings across Destinations /
+             Alerts / Filtering groups). POST /api/settings validates,
+             writes to the DB FIRST, then applies live: CFG-backed fields
+             via object.__setattr__ (CFG is read at call time by
+             monitors/filter_engine — no restart), rate-limiter fields via
+             bot.rate_limiter. The old "frozen dataclass — not supported"
+             rejections are gone.
+
+  NEW  #3  — Dynamic Keywords UI: the category dropdown is now built from
+             the REAL keywords.json structure (every list-of-strings leaf,
+             dotted paths, live counts) instead of 10 hardcoded entries of
+             which 9 were empty lists. Adding/deleting now targets the
+             sections the filter actually uses.
+
+  NEW  #4  — Editable alert destination: TARGET_GROUP_ID and ADMIN_CHAT_ID
+             can be changed from the Settings tab (target applies live on
+             the next alert; admin-command handler rebinds on restart).
+             Both persist across redeploys.
+
+  FIXED    — Keyword add/delete used to 500 whenever no bot was attached
+             (dashboard-only mode) because "bot not initialized" was treated
+             as a reload failure and rolled back. It is now a soft success:
+             file + DB stay written, filter loads at boot.
+
+v3.0 — full audit fix (H-2/H-3/H-4, M-6, fixes #1-#12): WebSocket token auth,
+XSS-guarded templates, atomic keyword writes with rollback, real filter
+reload, single DB ownership, stats throttling. See git history.
+
+v3.0 (audit detail) — full audit fix, dashboard.py ONLY:
 
   FIXED #1  — Non-existent runtime reload call: filter_engine.py v14.1 exposes
               a real reload_keywords() (and a backward-compat alias
@@ -133,6 +172,7 @@ from telethon.errors import (
 )
 
 from config import CFG, ACCOUNTS
+import dashboard_store  # v3.1: direct-to-DB persistence for settings/keywords
 from database import EnhancedDatabase
 
 try:
@@ -188,13 +228,12 @@ class BlockChat(BaseModel):
     reason: str = ""
 
 
-class SettingsUpdate(BaseModel):
-    max_alerts_per_minute: Optional[int] = None
-    max_alerts_per_hour: Optional[int] = None
-    alert_cooldown: Optional[int] = None
-    prefilter_enabled: Optional[bool] = None
-    processing_workers: Optional[int] = None
-    language_filter: Optional[bool] = None
+class SettingsBody(BaseModel):
+    """v3.1: flexible settings body — {"updates": {...}} or a flat dict of
+    validated setting names. Actual validation happens in dashboard_store."""
+
+    updates: Optional[Dict[str, Any]] = None
+    model_config = {"extra": "allow"}
 
 
 class LoginSendCode(BaseModel):
@@ -278,6 +317,24 @@ async def lifespan(app: FastAPI):
     if getattr(app.state, "bot_ref", None) is None:
         app.state.bot_ref = None
 
+    # v3.1 — direct persistence: make sure the settings table exists and
+    # re-apply every DB-persisted override (settings live-applied to CFG,
+    # keywords.json restored from the DB copy). Runs in BOTH modes:
+    # bot-attached (bot.db reused) and dashboard-only (own SQLite/PG conn).
+    # Never allowed to break startup.
+    try:
+        await dashboard_store.ensure_table(app.state.db)
+        restore = await dashboard_store.restore_all(app)
+        if not (
+            restore["settings_applied"]
+            or restore["settings_stored"]
+            or restore["keywords_restored"]
+            or restore["keywords_skipped_same"]
+        ):
+            logger.info("dashboard_store: nothing persisted yet — first boot baseline")
+    except Exception as e:
+        logger.error(f"dashboard_store boot restore failed (continuing): {e}")
+
     app.state.stats_cache = {}
     app.state.stats_update_task = asyncio.create_task(_update_stats_loop(app), name="dashboard_stats_loop")
 
@@ -287,7 +344,7 @@ async def lifespan(app: FastAPI):
 
     app.state.stats_update_task.add_done_callback(_stats_task_done)
 
-    logger.info("Dashboard v3.0 (hardened) started successfully")
+    logger.info("Dashboard v3.1 (dynamic, DB-persisted) started successfully")
     yield
 
     # Shutdown
@@ -313,8 +370,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Telegram Bot Dashboard",
-    description="لوحة تحكم متقدمة لبوت تيليجرام مع IntentEngine (hardened)",
-    version="3.0.0",
+    description="لوحة تحكم ديناميكية لبوت تيليجرام مع IntentEngine — تعديلات تُحفظ مباشرة في قاعدة البيانات",
+    version="3.1.0",
     lifespan=lifespan,
 )
 
@@ -589,7 +646,11 @@ async def _reload_filter_keywords(app: FastAPI) -> Dict[str, Any]:
     """
     bot = getattr(app.state, "bot_ref", None)
     if not bot or not getattr(bot, "filter", None):
-        return {"applied": False, "error": "bot not yet initialized — file updated but runtime not reloaded"}
+        # v3.1: "bot not initialized" is NOT a failure — the file (and DB
+        # mirror) stay written; the filter loads keywords.json at boot and
+        # boot-restore reloads it. Only genuine reload exceptions roll back.
+        return {"applied": False, "error": None,
+                "note": "البوت لم يُهيأ بعد — حُفِظ في الملف وقاعدة البيانات وسيُحمَّل عند الإقلاع"}
     try:
         bot.filter.reload_keywords(KEYWORDS_FILE)
         return {"applied": True, "error": None}
@@ -822,7 +883,7 @@ async def get_keywords(request: Request):
         if raw is not None:
             return JSONResponse({"keywords": raw, "source": "runtime"})
     try:
-        data = await _read_keywords_file()
+        data = await _read_keywords_file(KEYWORDS_FILE)
         return JSONResponse({"keywords": data, "source": "disk"})
     except Exception as e:
         logger.error(f"get_keywords: failed reading {KEYWORDS_FILE}: {e}")
@@ -842,7 +903,7 @@ async def add_keyword(data: KeywordCreate, request: Request):
 
     async with _keywords_file_lock:
         try:
-            all_data = await _read_keywords_file()
+            all_data = await _read_keywords_file(KEYWORDS_FILE)
         except FileNotFoundError:
             raise HTTPException(status_code=404, detail=f"{KEYWORDS_FILE} not found")
         except json.JSONDecodeError as e:
@@ -859,24 +920,32 @@ async def add_keyword(data: KeywordCreate, request: Request):
         original_snapshot = json.loads(json.dumps(all_data, ensure_ascii=False))
         target_list.append(keyword)
 
-        await _write_keywords_file(all_data)
+        await _write_keywords_file(all_data, KEYWORDS_FILE)
         reload_result = await _reload_filter_keywords(request.app)
 
         if not reload_result["applied"] and reload_result["error"] is not None:
             # Genuine reload failure (not just "bot not initialized yet") —
             # roll back the file so persisted and runtime state don't diverge.
-            await _write_keywords_file(original_snapshot)
+            await _write_keywords_file(original_snapshot, KEYWORDS_FILE)
             raise HTTPException(
                 status_code=500,
                 detail=f"keywords.json rolled back — runtime reload failed: {reload_result['error']}",
             )
+
+        # v3.1 — DIRECT SAVE: mirror the full keyword set to the database so
+        # the edit survives Render redeploys (file system is ephemeral).
+        persisted = False
+        db = getattr(request.app.state, "db", None)
+        if db is not None and db.is_connected:
+            persisted = await dashboard_store.persist_keywords(db, all_data)
 
         return JSONResponse({
             "success": True,
             "keyword": keyword,
             "category": path,
             "runtime_reloaded": reload_result["applied"],
-            "note": None if reload_result["applied"] else reload_result["error"],
+            "persisted_to_db": persisted,
+            "note": None if reload_result["applied"] else (reload_result.get("error") or reload_result.get("note")),
         })
 
 
@@ -888,7 +957,7 @@ async def delete_keyword(data: KeywordDelete, request: Request):
 
     async with _keywords_file_lock:
         try:
-            all_data = await _read_keywords_file()
+            all_data = await _read_keywords_file(KEYWORDS_FILE)
         except FileNotFoundError:
             raise HTTPException(status_code=404, detail=f"{KEYWORDS_FILE} not found")
         except json.JSONDecodeError as e:
@@ -905,21 +974,28 @@ async def delete_keyword(data: KeywordDelete, request: Request):
         original_snapshot = json.loads(json.dumps(all_data, ensure_ascii=False))
         target_list.remove(keyword)
 
-        await _write_keywords_file(all_data)
+        await _write_keywords_file(all_data, KEYWORDS_FILE)
         reload_result = await _reload_filter_keywords(request.app)
 
         if not reload_result["applied"] and reload_result["error"] is not None:
-            await _write_keywords_file(original_snapshot)
+            await _write_keywords_file(original_snapshot, KEYWORDS_FILE)
             raise HTTPException(
                 status_code=500,
                 detail=f"keywords.json rolled back — runtime reload failed: {reload_result['error']}",
             )
 
+        # v3.1 — DIRECT SAVE: mirror the deletion to the database too.
+        persisted = False
+        db = getattr(request.app.state, "db", None)
+        if db is not None and db.is_connected:
+            persisted = await dashboard_store.persist_keywords(db, all_data)
+
         return JSONResponse({
             "success": True,
             "category": path,
             "runtime_reloaded": reload_result["applied"],
-            "note": None if reload_result["applied"] else reload_result["error"],
+            "persisted_to_db": persisted,
+            "note": None if reload_result["applied"] else (reload_result.get("error") or reload_result.get("note")),
         })
 
 
@@ -967,38 +1043,76 @@ async def unblock_chat(chat_id: int, request: Request):
     return JSONResponse({"success": True})
 
 
+@app.get("/api/settings", dependencies=[Depends(verify_token)])
+async def get_settings(request: Request):
+    """
+    v3.1: current effective values + editable schema + persistence status.
+    This is what the dynamic Settings tab renders from — no more hardcoded
+    placeholder values in the UI.
+    """
+    db = getattr(request.app.state, "db", None)
+    return JSONResponse(
+        {
+            "success": True,
+            "settings": dashboard_store.current_values(request.app),
+            "schema": dashboard_store.schema_for_ui(),
+            "persistence": {
+                "db_type": getattr(db, "db_type", "unknown") if db else "none",
+                "enabled": db is not None and db.is_connected,
+                "table": "app_settings",
+            },
+        }
+    )
+
+
 @app.post("/api/settings", dependencies=[Depends(verify_token)])
-async def update_settings(data: SettingsUpdate, request: Request):
+async def update_settings(data: SettingsBody, request: Request):
     """
-    FIX #6: CFG is a frozen dataclass (config.py `@dataclass(frozen=True)`) —
-    assigning CFG.PREFILTER_ENABLED / CFG.LANGUAGE_FILTER raises
-    FrozenInstanceError on every call. Those are now reported as
-    unsupported rather than crashing; only genuinely mutable runtime state
-    (AdaptiveRateLimiter's limits) is applied.
-    """
-    bot = request.app.state.bot_ref
-    if not bot:
-        raise HTTPException(status_code=503, detail="Bot not yet initialized")
+    v3.1 — DIRECT SAVE: every validated change is written to the
+    `app_settings` table in the SAME database the bot already uses
+    (PostgreSQL on Render), BEFORE being applied live. Survives redeploys.
 
+    Live-apply strategy per field:
+      * CFG-backed fields  → object.__setattr__ on the frozen dataclass
+        (CFG is read at call time by monitors/filter_engine, so changes
+        take effect on the next processed message — no restart).
+      * Rate-limiter fields → applied to bot.rate_limiter directly.
+
+    Accepts both {"updates": {...}} and the legacy flat body.
+    """
+    updates = data.updates if isinstance(data.updates, dict) else data.model_dump(exclude={"updates"}, exclude_none=True)
+    if not isinstance(updates, dict) or not updates:
+        raise HTTPException(status_code=400, detail="لا توجد إعدادات صالحة في الطلب")
+
+    clean, errors = dashboard_store.validate_updates(updates)
+
+    db = getattr(request.app.state, "db", None)
+    persisted = False
+    if clean and db is not None and db.is_connected:
+        try:
+            # 1) DIRECT SAVE first — DB is the source of truth
+            await dashboard_store.set_many(db, {k: json.dumps(v) for k, v in clean.items()})
+            persisted = True
+        except Exception as e:
+            logger.error(f"settings persist to DB failed: {e}")
+
+    # 2) live-apply after the write-through succeeded (or db unavailable)
     applied: Dict[str, Any] = {}
-    skipped: Dict[str, str] = {}
+    stored: Dict[str, Any] = {}
+    for key, value in clean.items():
+        status = dashboard_store.apply_setting(request.app, key, value)
+        (applied if status == "applied" else stored)[key] = value
 
-    if data.max_alerts_per_minute is not None:
-        bot.rate_limiter._max_min = data.max_alerts_per_minute
-        applied["max_alerts_per_minute"] = data.max_alerts_per_minute
-    if data.max_alerts_per_hour is not None:
-        bot.rate_limiter._max_hr = data.max_alerts_per_hour
-        applied["max_alerts_per_hour"] = data.max_alerts_per_hour
-    if data.prefilter_enabled is not None:
-        skipped["prefilter_enabled"] = "CFG is an immutable frozen dataclass at runtime — not supported"
-    if data.language_filter is not None:
-        skipped["language_filter"] = "CFG is an immutable frozen dataclass at runtime — not supported"
-    if data.alert_cooldown is not None:
-        skipped["alert_cooldown"] = "CFG is an immutable frozen dataclass at runtime — not supported"
-    if data.processing_workers is not None:
-        skipped["processing_workers"] = "worker pool is created once at startup — requires a process restart"
-
-    return JSONResponse({"success": True, "applied": applied, "skipped": skipped})
+    return JSONResponse(
+        {
+            "success": not errors,
+            "applied_live": applied,
+            "stored_only": stored,
+            "errors": errors,
+            "persisted_to_db": persisted,
+            "settings": dashboard_store.current_values(request.app),
+        }
+    )
 
 
 @app.post("/api/purge", dependencies=[Depends(verify_token)])

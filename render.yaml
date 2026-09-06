@@ -2,7 +2,7 @@
 # render.yaml – Telegram Bot v2.0 (HARDENED EDITION)
 # Compatible with:
 #   main.py v13.1 | config.py v13.1 | database.py v9.0
-#   monitors.py v9.7 | filter_engine.py v14.1 | dashboard.py v3.0
+#   monitors.py v9.7 | filter_engine.py v14.1 | dashboard.py v3.1
 #   keywords.json v15.1
 #
 # ملاحظة أمنية: هذا الملف لا يحتوي أي أسرار.
@@ -140,7 +140,7 @@ services:
         generateValue: true
 
       # ════════════════════════════════════════════════════════════
-      # Dashboard (dashboard.py v3.0)
+      # Dashboard (dashboard.py v3.1)
       # ════════════════════════════════════════════════════════════
       - key: DASHBOARD_ENABLED
         value: "true"
@@ -150,7 +150,7 @@ services:
 
       # CORS: أضف نطاقاتك المسموحة مفصولة بفاصلة إذا كان لديك
       # frontend منفصل يحتاج cross-origin access.
-      # تركه فارغاً يُعطّل CORS (آمن بشكل افتراضي — dashboard.py v3.0).
+      # تركه فارغاً يُعطّل CORS (آمن بشكل افتراضي — dashboard.py v3.1).
       - key: DASHBOARD_CORS_ORIGINS
         value: ""
 
@@ -166,7 +166,7 @@ services:
         sync: false       # يُضاف يدوياً أو تلقائياً من Render
 
       # ════════════════════════════════════════════════════════════
-      # Render API — لصفحة /login في dashboard.py v3.0
+      # Render API — لصفحة /login في dashboard.py v3.1
       # تُتيح حفظ SESSION_STRING تلقائياً في env vars الخدمة
       # ════════════════════════════════════════════════════════════
       - key: RENDER_API_KEY
