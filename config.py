@@ -385,6 +385,11 @@ class _ConfigData:
     CONNECTION_TIMEOUT: int
     SESSION_REFRESH_INTERVAL: int
 
+    # ── Fast Capture (deletion-race protection, monitors v9.8) ──
+    FAST_CAPTURE_ENABLED: bool
+    CAPTURE_BUFFER_SIZE: int
+    CAPTURE_TTL_SECONDS: int
+
     # ── Prefilter ──
     PREFILTER_ENABLED: bool
     PREFILTER_MIN_WORDS: int
@@ -637,6 +642,16 @@ class Config:
             # ========== الاتصال ==========
             CONNECTION_TIMEOUT=SecretManager.get_int("CONNECTION_TIMEOUT", 30, required=False),
             SESSION_REFRESH_INTERVAL=SecretManager.get_int("SESSION_REFRESH_INTERVAL", 43200, required=False),
+            # ========== Fast Capture (حماية سباق بوتات الحذف) ==========
+            # v9.8: "احفظ أولاً، حلل ثانياً" — text is persisted in RAM the
+            # instant the NewMessage handler fires, before ANY await, so a
+            # deletion bot that removes the message milliseconds later can
+            # never make the pipeline lose it. Code default stays False; the
+            # production rollout sets FAST_CAPTURE_ENABLED=true in Render env
+            # (documented kill switch — flip to false to disable instantly).
+            FAST_CAPTURE_ENABLED=SecretManager.get_bool("FAST_CAPTURE_ENABLED", False),
+            CAPTURE_BUFFER_SIZE=SecretManager.get_int("CAPTURE_BUFFER_SIZE", 1000, required=False),
+            CAPTURE_TTL_SECONDS=SecretManager.get_int("CAPTURE_TTL_SECONDS", 30, required=False),
             # ========== Prefilter ==========
             PREFILTER_ENABLED=SecretManager.get_bool("PREFILTER_ENABLED", True),
             # v14.4 filter: 1 (was 2) — short high-signal requests ("محتاج",

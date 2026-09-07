@@ -253,6 +253,17 @@ services:
       - key: DEAD_LETTER_MAX_ROWS
         value: "5000"     # الحد الأقصى لصفوف dead_letters
 
+      # Fast Capture — monitors.py v9.8 (حماية سباق بوتات الحذف)
+      # "احفظ أولاً، حلل ثانياً": النص يُحفظ في الذاكرة لحظة وصول الرسالة
+      # قبل أي await، فلا يمكن لبوت الحذف أن يُفقدنا النص أبداً.
+      # Kill switch: اجعل FAST_CAPTURE_ENABLED=false لتعطيل الميزة فوراً.
+      - key: FAST_CAPTURE_ENABLED
+        value: "true"     # غيّرها إلى false للتعطيل الفوري (قاطع طوارئ)
+      - key: CAPTURE_BUFFER_SIZE
+        value: "1000"     # أقصى عدد رسائل محفوظة في الذاكرة
+      - key: CAPTURE_TTL_SECONDS
+        value: "30"       # مدة الاحتفاظ بالرسالة المحفوظة (ثانية)
+
       # Resource pressure check — database.py v9.0 (إصلاح #12)
       - key: DB_PRESSURE_CHECK_EVERY
         value: "12"

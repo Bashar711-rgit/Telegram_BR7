@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-monitors.py – Account Monitor v9.7.1 (STABLE 24/7 EDITION, HARDENED)
+monitors.py – Account Monitor v9.8.0 (STABLE 24/7 EDITION, HARDENED + FAST CAPTURE)
 - إصلاح تدوير الجلسة (إعادة تسجيل المعالج)
 - تحسين إعادة الاتصال واكتشاف العميل الميت
 - دعم كامل لـ IntentEngine
@@ -32,6 +32,28 @@ v9.7.1 (this fix) — alert gating fix:
     short messages like "ابي" or "بنات". Now we explicitly check
     `decision == "accept"` in addition to `valid`.
 
+v9.8 (this fix) — Fast Capture: protection against deletion bots:
+  * المبدأ: "احفظ أولاً، حلل ثانياً". Admin deletion bots can remove a group
+    message within milliseconds of it being posted. If our own processing
+    (queue handoff, DB writes, filter analysis, any later re-fetch) is ever
+    interrupted, the text would be gone. FastCaptureBuffer now persists the
+    raw text SYNCHRONOUSLY (zero awaits) as the first pipeline step after
+    the cheap sync early-return checks, keyed by (chat_id, msg_id) with a
+    TTL + maxsize cap.
+  * A MessageDeleted handler claims each deletion notice exactly once
+    (shared buffer across all account clients), logs the captured text for
+    diagnostics, and — if the message was never handed to the normal
+    pipeline (handler crash between capture and add_to_queue) — re-submits
+    a rebuilt event through the standard pipeline, where the existing
+    message_hash dedup guarantees no duplicate alerts.
+  * Fallback at alert time: if the pipeline's copy of the text is empty but
+    the capture holds it, the captured text is used (length-bounded).
+  * Gated by CFG.FAST_CAPTURE_ENABLED (env FAST_CAPTURE_ENABLED, default
+    false; production rollout sets true in Render env — documented kill
+    switch). Buffer sizing via CAPTURE_BUFFER_SIZE / CAPTURE_TTL_SECONDS.
+  * /health (dashboard + fallback server) exposes a fast_capture snapshot
+    (enabled/size/saved/deleted_captured/deleted_recovered/...).
+
 See the accompanying engineering report for the full list of changes,
 the retry_count propagation fix (process_event_from_queue / _send_alert),
 and documented FOLLOW-UP items for other files.
@@ -41,7 +63,7 @@ import asyncio
 import os
 import secrets
 import time
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple, Set
 from cachetools import LRUCache, TTLCache
 from loguru import logger
@@ -105,6 +127,203 @@ def build_telegram_links(chat_id: int, message_id: int, username: str = None) ->
         links["group"] = f"https://t.me/c/{inner}"
         links["message"] = f"https://t.me/c/{inner}/{message_id}"
     return links
+
+
+# =============================================================================
+# FastCaptureBuffer — save-first protection against deletion bots (v9.8)
+# المبدأ: "احفظ أولاً، حلل ثانياً"
+# =============================================================================
+class FastCaptureBuffer:
+    """
+    In-memory save-first buffer keyed by (chat_id, msg_id).
+
+    When a monitored group receives a message, an admin deletion bot can
+    remove it within tens of milliseconds. Whatever happens afterwards in
+    our pipeline (queue handoff, DB writes, filter analysis, any later
+    re-fetch), the raw text must already be safe in RAM. That is exactly
+    what this buffer guarantees: `save()` is called SYNCHRONOUSLY as the
+    first step of the NewMessage handler — after the cheap sync
+    early-return checks, before the FIRST await anywhere.
+
+    Deliberate deviations from the reference design (and why):
+      * save()/get() are synchronous. An ``async def save`` that awaits an
+        asyncio.Lock would introduce a yield point between handler start
+        and text capture — the exact race this class exists to close. The
+        single asyncio event loop makes plain dict access atomic; no lock
+        is needed.
+      * TTL sweeping is lazy (amortized on save, at most one sweep per
+        _GC_EVERY seconds) instead of a background cleanup task — nothing
+        extra to track and cancel on disconnect (v9.7 discipline: every
+        background task must be tracked).
+      * The instance is a module-level singleton shared by all account
+        monitors: the same group message seen by several accounts lands on
+        the same key, and MessageDeleted notices arriving on multiple
+        clients are deduplicated by claim_deleted().
+
+    Lifecycle flags per entry:
+      queued          — the event was handed to the DB queue / DLQ / media pipeline
+      alerted         — the alert for this message was successfully sent
+      deleted_claimed — a MessageDeleted notice for it was already claimed once
+      recovered       — it was re-submitted through the pipeline by the
+                        MessageDeleted recovery path
+    """
+
+    __slots__ = ("_buf", "_maxsize", "_ttl", "_last_gc", "_stats")
+
+    _GC_EVERY = 5.0  # seconds between lazy TTL sweeps
+
+    def __init__(self, maxsize: int = 1000, ttl: int = 30):
+        self._buf: "OrderedDict[Tuple[int, int], Dict[str, Any]]" = OrderedDict()
+        self._maxsize = max(1, int(maxsize))
+        self._ttl = max(1, int(ttl))
+        self._last_gc: float = 0.0
+        self._stats: Dict[str, int] = defaultdict(int)
+
+    @property
+    def enabled(self) -> bool:
+        return bool(getattr(CFG, "FAST_CAPTURE_ENABLED", False))
+
+    # ── core (SYNC — never await, never raise) ────────────────────────────
+    def save(
+        self,
+        chat_id: Optional[int],
+        msg_id: int,
+        text: str,
+        sender_id: int = 0,
+        sender_name: str = "",
+        account: str = "",
+    ) -> None:
+        now = time.time()
+        self._gc(now)
+        key = (int(chat_id or 0), int(msg_id or 0))
+        prev = self._buf.get(key)
+        if prev is not None:
+            # Same message delivered via several account clients: refresh
+            # content but keep the FIRST-seen ts (TTL = time since arrival).
+            prev["text"] = text
+            if sender_id:
+                prev["sender_id"] = sender_id
+            if sender_name:
+                prev["sender_name"] = sender_name
+            self._stats["saved"] += 1
+            return
+        self._buf[key] = {
+            "text": text,
+            "sender_id": int(sender_id or 0),
+            "sender_name": sender_name,
+            "chat_id": key[0],
+            "msg_id": key[1],
+            "ts": now,
+            "account": account,
+            "queued": False,
+            "alerted": False,
+            "deleted_claimed": False,
+            "recovered": False,
+        }
+        self._stats["saved"] += 1
+        while len(self._buf) > self._maxsize:
+            self._buf.popitem(last=False)
+            self._stats["evicted"] += 1
+
+    def get(self, chat_id: Optional[int], msg_id: int) -> Optional[Dict[str, Any]]:
+        key = (int(chat_id or 0), int(msg_id or 0))
+        entry = self._buf.get(key)
+        if entry is None:
+            return None
+        if time.time() - entry["ts"] > self._ttl:
+            del self._buf[key]
+            self._stats["expired"] += 1
+            return None
+        return entry
+
+    def find_by_msg_id(self, msg_id: int) -> Optional[Dict[str, Any]]:
+        """Fallback lookup for MessageDeleted updates that carry no chat_id
+        (private chats / small groups): scan by msg_id only."""
+        msg_id = int(msg_id or 0)
+        for key, entry in self._buf.items():
+            if entry["msg_id"] == msg_id:
+                if time.time() - entry["ts"] > self._ttl:
+                    del self._buf[key]
+                    self._stats["expired"] += 1
+                    return None
+                return entry
+        return None
+
+    def lookup(self, chat_id: Optional[int], msg_id: int) -> Optional[Dict[str, Any]]:
+        if chat_id is not None:
+            return self.get(chat_id, msg_id)
+        return self.find_by_msg_id(msg_id)
+
+    def mark_queued(self, chat_id: Optional[int], msg_id: int) -> None:
+        entry = self.lookup(chat_id, msg_id)
+        if entry is not None:
+            entry["queued"] = True
+
+    def mark_alerted(self, chat_id: Optional[int], msg_id: int) -> None:
+        entry = self.lookup(chat_id, msg_id)
+        if entry is not None:
+            entry["alerted"] = True
+
+    def claim_deleted(self, chat_id: Optional[int], msg_id: int) -> Optional[Dict[str, Any]]:
+        """Exactly-once claim of a MessageDeleted notice. All account
+        clients share this buffer, so the same deletion arriving on several
+        connections is logged/recovered once."""
+        entry = self.lookup(chat_id, msg_id)
+        if entry is None or entry.get("deleted_claimed"):
+            return None
+        entry["deleted_claimed"] = True
+        return entry
+
+    def inc(self, name: str, delta: int = 1) -> None:
+        self._stats[name] += delta
+
+    def _gc(self, now: float) -> None:
+        if now - self._last_gc < self._GC_EVERY:
+            return
+        self._last_gc = now
+        expired = [k for k, v in self._buf.items() if now - v["ts"] > self._ttl]
+        for k in expired:
+            del self._buf[k]
+            self._stats["expired"] += 1
+
+    # ── introspection ─────────────────────────────────────────────────────
+    def size(self) -> int:
+        return len(self._buf)
+
+    def stats(self) -> Dict[str, int]:
+        return dict(self._stats)
+
+    def clear(self) -> None:
+        self._buf.clear()
+
+
+_capture = FastCaptureBuffer(
+    maxsize=getattr(CFG, "CAPTURE_BUFFER_SIZE", 1000),
+    ttl=getattr(CFG, "CAPTURE_TTL_SECONDS", 30),
+)
+logger.info(
+    f"Fast Capture Buffer initialized | enabled={_capture.enabled} | "
+    f"maxsize={_capture._maxsize} | ttl={_capture._ttl}s"
+)
+
+
+def get_capture_snapshot() -> Dict[str, Any]:
+    """Read-only snapshot for /health and dashboard diagnostics.
+
+    Standard counter keys are ALWAYS present (zero-filled) so the health
+    contract is stable for dashboards/alerting."""
+    try:
+        base = {
+            "saved": 0, "expired": 0, "evicted": 0,
+            "deleted_captured": 0, "deleted_recovered": 0, "fallback_used": 0,
+        }
+        return {
+            "enabled": _capture.enabled,
+            "size": _capture.size(),
+            **{**base, **_capture.stats()},
+        }
+    except Exception:
+        return {"enabled": False, "size": 0}
 
 
 # =============================================================================
@@ -466,6 +685,7 @@ class EnhancedAccountMonitor:
         self._send_cb = CircuitBreaker(f"send_{account['name']}", failure_threshold=5, recovery_timeout=60.0)
         self._entity_cb = CircuitBreaker(f"entity_{account['name']}", failure_threshold=3, recovery_timeout=30.0)
         self._bot_ref: Any = None; self._handler_func = None
+        self._deleted_handler_func: Optional[Callable] = None
         self._stats: Dict[str, Any] = {
             "messages_processed": 0, "alerts_sent": 0, "errors": 0, "duplicates": 0, "rate_limited": 0,
             "send_errors": 0, "queue_processed": 0, "media_processed": 0, "avg_processing_time_ms": 0.0,
@@ -695,6 +915,10 @@ class EnhancedAccountMonitor:
                 try: self.client.remove_event_handler(self._handler_func)
                 except Exception as e: logger.debug(f"remove_event_handler failed [{self.account['name']}]: {e}")
             self._handler_func = None
+            if self._deleted_handler_func is not None:
+                try: self.client.remove_event_handler(self._deleted_handler_func)
+                except Exception as e: logger.debug(f"remove deleted-handler failed [{self.account['name']}]: {e}")
+            self._deleted_handler_func = None
             try: await self.client.disconnect()
             except Exception as e: logger.debug(f"disconnect during cleanup failed [{self.account['name']}]: {e}")
             self.client = None
@@ -706,6 +930,10 @@ class EnhancedAccountMonitor:
         if self._handler_func is not None and self.client:
             try: self.client.remove_event_handler(self._handler_func)
             except Exception as e: logger.debug(f"remove_event_handler (pre-register) failed [{self.account['name']}]: {e}")
+        if self._deleted_handler_func is not None and self.client:
+            try: self.client.remove_event_handler(self._deleted_handler_func)
+            except Exception as e: logger.debug(f"remove deleted-handler (pre-register) failed [{self.account['name']}]: {e}")
+            self._deleted_handler_func = None
         @self.client.on(events.NewMessage())
         async def _handler(event: events.NewMessage.Event):
             start_time = time.perf_counter()
@@ -716,6 +944,11 @@ class EnhancedAccountMonitor:
                 msg_date = event.message.date
                 if msg_date and self.started_at > 0:
                     if msg_date.timestamp() < self.started_at - 5: return
+                # ══ FAST CAPTURE (v9.8): أول شيء قبل أي await ══
+                # كل الفحوص أعلاه متزامنة، والحفظ هنا متزامن أيضاً (بدون أي
+                # await) — لا يقع أي yield بين وصول الحدث وتخزين النص.
+                if _capture.enabled:
+                    self._fast_capture(event)
                 event_data = await self._event_to_dict(event)
                 if event_data.get("has_media"):
                     # Media is offloaded to a tracked background task instead
@@ -727,6 +960,9 @@ class EnhancedAccountMonitor:
                     media = event.message.media
                     event_data["media_object"] = media if event_data["media_type"] in ("photo", "document") else None
                     await self._spawn_media_task(event_data)
+                    if _capture.enabled:
+                        # الميديا الآن مملوكة لمهمة الخلفية — لا إنعاش لاحق
+                        _capture.mark_queued(event_data.get("chat_id"), event_data.get("message_id"))
                     processing_time = (time.perf_counter() - start_time) * 1000
                     await self._update_avg_time(processing_time)
                     await self._inc_stat("media_processed"); await self._inc_stat("messages_processed")
@@ -763,6 +999,10 @@ class EnhancedAccountMonitor:
                         RuntimeError(f"add_to_queue: insert failed (result={queue_result})"),
                         retry_count=0,
                     )
+                # النص الآن مملوك إما للطابور أو لـ DLQ — علّم الإدخال كـ
+                # queued حتى لا يحاول مسار MessageDeleted إنعاشه لاحقاً.
+                if _capture.enabled:
+                    _capture.mark_queued(event_data.get("chat_id"), event_data.get("message_id"))
                 processing_time = (time.perf_counter() - start_time) * 1000
                 await self._update_avg_time(processing_time)
                 await self._inc_stat("messages_processed")
@@ -770,6 +1010,11 @@ class EnhancedAccountMonitor:
                 logger.error(f"Handler error [{self.account['name']}]: {e}")
                 await self._inc_stat("errors"); self._stats["last_error"] = str(e)
         self._handler_func = _handler
+        # v9.8: MessageDeleted diagnostics + recovery (fast capture).
+        @self.client.on(events.MessageDeleted())
+        async def _deleted_handler(event: events.MessageDeleted.Event):
+            await self._handle_deleted_event(event)
+        self._deleted_handler_func = _deleted_handler
         logger.info(f"Event handler registered for {self.account['name']}")
 
 
@@ -840,6 +1085,146 @@ class EnhancedAccountMonitor:
         return "other"
 
 
+    # ── Fast Capture (v9.8): deletion-race protection ──────────────────
+    def _fast_capture(self, event: events.NewMessage.Event) -> None:
+        """SYNC save-first capture — must never await and never raise.
+
+        Called from the NewMessage handler AFTER the cheap synchronous
+        early-return checks and BEFORE the first await (the queue
+        handoff). Captures the raw text (body or media caption) so a
+        deletion bot that removes the message milliseconds later cannot
+        make the pipeline lose it.
+        """
+        if not _capture.enabled:
+            return
+        try:
+            msg = event.message
+            text = (getattr(msg, "text", None) or getattr(msg, "message", None) or "")
+            if not text:
+                return  # voice/photo-only content — nothing to protect
+            sender = getattr(event, "sender", None)
+            _capture.save(
+                chat_id=event.chat_id,
+                msg_id=msg.id,
+                text=text.strip(),
+                sender_id=getattr(event, "sender_id", 0) or 0,
+                sender_name=(getattr(sender, "first_name", None) or "") if sender else "",
+                account=self.account["name"],
+            )
+        except Exception as cap_err:
+            logger.debug(f"capture_save_error [{self.account['name']}]: {cap_err}")
+
+    async def _handle_deleted_event(self, event: events.MessageDeleted.Event) -> None:
+        """Diagnostics + recovery for deleted messages (v9.8 fast capture).
+
+        For every deleted message that was previously captured:
+          1. Log the captured text exactly once, even when N account
+             clients receive the same deletion notice (claim_deleted).
+          2. If the event never reached the normal pipeline (handler crashed
+             between capture and the queue handoff), re-submit a rebuilt
+             event through the standard pipeline — the message_hash dedup in
+             _store_message makes this safe even if the original handoff was
+             still in flight.
+        """
+        if not _capture.enabled:
+            return
+        try:
+            chat_id = getattr(event, "chat_id", None)
+            deleted_ids = getattr(event, "deleted_ids", None)
+            if deleted_ids is None:
+                single = getattr(event, "deleted_id", None)
+                deleted_ids = [single] if single is not None else []
+            deleted_ids = list(deleted_ids or [])
+            if not deleted_ids:
+                return
+            for msg_id in deleted_ids:
+                entry = _capture.claim_deleted(chat_id, msg_id)
+                if entry is None:
+                    continue
+                logger.info(
+                    f"🗑️ deleted_captured | chat={entry['chat_id']} | msg={entry['msg_id']} | "
+                    f"sender={entry['sender_name']} | queued={entry['queued']} | "
+                    f"alerted={entry['alerted']} | text={entry['text'][:80]}"
+                )
+                _capture.inc("deleted_captured")
+                if not entry["queued"] and not entry["alerted"] and not entry["recovered"]:
+                    entry["recovered"] = True
+                    _capture.inc("deleted_recovered")
+                    await self._spawn_recovery_task(dict(entry))
+        except Exception as e:
+            logger.debug(f"deleted-event handling error [{self.account['name']}]: {e}")
+
+    async def _spawn_recovery_task(self, entry: Dict[str, Any]) -> None:
+        """Re-submits a captured-but-never-queued message through the
+        standard pipeline inside a tracked background task (same tracking /
+        cancellation discipline as _spawn_media_task)."""
+        event_data: Dict[str, Any] = {
+            "chat_id": entry.get("chat_id"),
+            "message_id": entry.get("msg_id"),
+            "sender_id": entry.get("sender_id", 0) or 0,
+            "sender_username": None,
+            "sender_first_name": entry.get("sender_name"),
+            "sender_last_name": None,
+            "sender_access_hash": None,
+            "chat_access_hash": None,
+            "chat_username": None,
+            "text": entry.get("text", ""),
+            "has_text": bool(entry.get("text")),
+            "has_media": False,
+            "media_type": None,
+            "account_name": entry.get("account") or self.account["name"],
+            "timestamp": entry.get("ts") or time.time(),
+            "_fast_capture_recovery": True,
+        }
+
+        async def _run():
+            async with self._pipeline_sem:
+                try:
+                    logger.info(
+                        f"♻️ capture_recovery | chat={event_data['chat_id']} | "
+                        f"msg={event_data['message_id']} [{self.account['name']}] — "
+                        f"re-submitting captured text through the pipeline"
+                    )
+                    await self.process_event_from_queue(event_data)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.error(f"capture_recovery error [{self.account['name']}]: {e}")
+                    await self._dlq.push(event_data, e, retry_count=0)
+
+        task = asyncio.create_task(
+            _run(),
+            name=f"capture_recovery_{self.account['name']}_{event_data.get('message_id')}",
+        )
+        async with self._media_task_lock:
+            self._media_tasks.add(task)
+        task.add_done_callback(self._on_media_task_done)
+
+    def _recover_captured_text(self, data: Dict[str, Any]) -> Optional[str]:
+        """v9.8 fallback at alert time: if the pipeline's copy of the text
+        is empty but the fast-capture buffer holds it, return the captured
+        text (length-bounded) so the alert can still go out with the real
+        content instead of being treated as a no-content event."""
+        if not _capture.enabled:
+            return None
+        if data.get("text"):
+            return None  # the pipeline already has the text
+        if data.get("has_media") and not data.get("media_object"):
+            return None  # pure media event without caption — nothing to recover
+        entry = _capture.lookup(data.get("chat_id"), data.get("message_id"))
+        if not entry:
+            return None
+        cap_text = (entry.get("text") or "").strip()
+        if cap_text and CFG.MIN_MESSAGE_LENGTH <= len(cap_text) <= CFG.MAX_MESSAGE_LENGTH:
+            logger.info(
+                f"fast_capture fallback | chat={data.get('chat_id')} | "
+                f"msg={data.get('message_id')} — text recovered from capture buffer"
+            )
+            _capture.inc("fallback_used")
+            return cap_text
+        return None
+
+
     def _start_session_rotation(self):
         if self._session_rotate_task and not self._session_rotate_task.done(): return
         self._session_rotate_task = asyncio.create_task(self._session_rotate_loop())
@@ -898,6 +1283,10 @@ class EnhancedAccountMonitor:
                 if old_handler:
                     try: old_client.remove_event_handler(old_handler)
                     except Exception as e: logger.debug(f"remove_event_handler during rotation failed [{account_name}]: {e}")
+                if self._deleted_handler_func:
+                    try: old_client.remove_event_handler(self._deleted_handler_func)
+                    except Exception as e: logger.debug(f"remove deleted-handler during rotation failed [{account_name}]: {e}")
+                    self._deleted_handler_func = None
                 try: await old_client.disconnect()
                 except Exception as e: logger.debug(f"old client disconnect during rotation failed [{account_name}]: {e}")
 
@@ -992,6 +1381,10 @@ class EnhancedAccountMonitor:
         if not await self._validate_event(data): return
         msg_hash, validated_text, is_new = await self._store_message(data)
         if not is_new: await self._inc_stat("duplicates"); return
+        # v9.8 fast-capture fallback: recover the text from the buffer if
+        # the pipeline's own copy is empty (deleted-message edge cases).
+        if validated_text is None:
+            validated_text = self._recover_captured_text(data)
         await self._analyze_and_alert(data, msg_hash, validated_text)
 
 
@@ -1143,6 +1536,8 @@ class EnhancedAccountMonitor:
             return payload
         try:
             await self._send_cb.call(do_send)
+            if _capture.enabled:
+                _capture.mark_alerted(data.get("chat_id"), data.get("message_id"))
             safe_keyword = keyword
             if isinstance(safe_keyword, (tuple, list)): safe_keyword = safe_keyword[0] if safe_keyword else ""
             if not isinstance(safe_keyword, str): safe_keyword = str(safe_keyword) if safe_keyword is not None else ""
@@ -1159,6 +1554,8 @@ class EnhancedAccountMonitor:
             logger.error(f"Send alert error [{account_name}]: {e} - trying fallback")
             try:
                 await send_client.send_message(CFG.TARGET_GROUP_ID, alert_text, buttons=buttons, parse_mode=None, link_preview=False)
+                if _capture.enabled:
+                    _capture.mark_alerted(data.get("chat_id"), data.get("message_id"))
             except Exception as fe:
                 logger.error(f"Fallback failed [{account_name}]: {fe}")
                 await self._inc_stat("send_errors")
@@ -1193,6 +1590,10 @@ class EnhancedAccountMonitor:
                     try: self.client.remove_event_handler(self._handler_func)
                     except Exception as e: logger.debug(f"remove_event_handler during disconnect failed [{self.account['name']}]: {e}")
                 self._handler_func = None
+                if self._deleted_handler_func:
+                    try: self.client.remove_event_handler(self._deleted_handler_func)
+                    except Exception as e: logger.debug(f"remove deleted-handler during disconnect failed [{self.account['name']}]: {e}")
+                self._deleted_handler_func = None
                 if CFG.SECURE_SESSIONS:
                     try:
                         session_path = f"{self.account['session']}.session"

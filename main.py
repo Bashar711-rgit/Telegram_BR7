@@ -95,7 +95,7 @@ from telethon import TelegramClient, events as tl_events
 from config import CFG, ACCOUNTS, KEYWORDS, logger
 from database import EnhancedDatabase
 from filter_engine import EnhancedFilter
-from monitors import EnhancedAccountMonitor, HealthMonitor
+from monitors import EnhancedAccountMonitor, HealthMonitor, get_capture_snapshot
 
 # Import Dashboard
 try:
@@ -467,6 +467,7 @@ class EnhancedTelegramBot:
                 "queue_size": await self.db.queue_size(),
                 "db_healthy": self.db.db_healthy,
                 "monitors": sum(1 for m in self.monitors if m.is_connected),
+                "fast_capture": get_capture_snapshot(),
             })
 
         app.router.add_get('/health', health_handler)
