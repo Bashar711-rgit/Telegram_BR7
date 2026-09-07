@@ -381,7 +381,7 @@ class EnhancedDatabase:
             self.is_connected = True
             await self.start_writer()
             # Note: start_cleanup() intentionally NOT called here (fix #5)
-            logger.info(f"Database connected: {self.db_type.upper()} v9.1")
+            logger.info(f"Database connected: {self.db_type.upper()} v9.2")
             return True
         except Exception as e:
             logger.error(f"Database connection failed: {e}")
@@ -1100,11 +1100,22 @@ class EnhancedDatabase:
 
     async def update_sender_reputation(self, sender_id: int, is_valid: bool) -> None:
         try:
+            # v9.2 fix: SQLite's scalar MIN(a, b) / MAX(a, b) do not exist in
+            # PostgreSQL (max/min there are aggregates only) — the production
+            # log showed "function max(numeric, double precision) does not
+            # exist" on every reputation update. The portable PostgreSQL
+            # equivalents are LEAST / GREATEST.
+            if self.db_type == "postgresql":
+                bump_expr = "LEAST(100.0, reputation_score + 2.0)"
+                drop_expr = "GREATEST(0.0, reputation_score - 1.0)"
+            else:
+                bump_expr = "MIN(100.0, reputation_score + 2.0)"
+                drop_expr = "MAX(0.0, reputation_score - 1.0)"
             if is_valid:
                 await self._execute(
                     "UPDATE sender_stats SET "
                     "valid_requests = valid_requests + 1, "
-                    "reputation_score = MIN(100.0, reputation_score + 2.0), "
+                    f"reputation_score = {bump_expr}, "
                     "updated_at = CURRENT_TIMESTAMP "
                     "WHERE sender_id = ?",
                     (sender_id,),
@@ -1113,7 +1124,7 @@ class EnhancedDatabase:
                 await self._execute(
                     "UPDATE sender_stats SET "
                     "invalid_requests = invalid_requests + 1, "
-                    "reputation_score = MAX(0.0, reputation_score - 1.0), "
+                    f"reputation_score = {drop_expr}, "
                     "updated_at = CURRENT_TIMESTAMP "
                     "WHERE sender_id = ?",
                     (sender_id,),
