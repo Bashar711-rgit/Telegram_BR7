@@ -390,6 +390,15 @@ class _ConfigData:
     CAPTURE_BUFFER_SIZE: int
     CAPTURE_TTL_SECONDS: int
 
+    # ── Sender Intelligence / Resolver (backend-only enrichment, v9.9) ──
+    SENDER_INTEL_ENABLED: bool
+    SENDER_ENTITY_CACHE_SIZE: int
+    SENDER_ENTITY_CACHE_TTL: int
+    SENDER_RESOLVE_MAX_RETRIES: int
+    SENDER_RESOLVE_BACKOFF_BASE: float
+    SENDER_RESOLVE_BACKOFF_MAX: float
+    SENDER_FLOOD_MAX_SLEEP: int
+
     # ── Prefilter ──
     PREFILTER_ENABLED: bool
     PREFILTER_MIN_WORDS: int
@@ -652,6 +661,15 @@ class Config:
             FAST_CAPTURE_ENABLED=SecretManager.get_bool("FAST_CAPTURE_ENABLED", False),
             CAPTURE_BUFFER_SIZE=SecretManager.get_int("CAPTURE_BUFFER_SIZE", 1000, required=False),
             CAPTURE_TTL_SECONDS=SecretManager.get_int("CAPTURE_TTL_SECONDS", 30, required=False),
+            # Sender Intelligence: passive, failure-safe backend enrichment
+            # (never changes alert output). Kill switch: SENDER_INTEL_ENABLED=false.
+            SENDER_INTEL_ENABLED=SecretManager.get_bool("SENDER_INTEL_ENABLED", True),
+            SENDER_ENTITY_CACHE_SIZE=SecretManager.get_int("SENDER_ENTITY_CACHE_SIZE", 2000, required=False),
+            SENDER_ENTITY_CACHE_TTL=SecretManager.get_int("SENDER_ENTITY_CACHE_TTL", 900, required=False),
+            SENDER_RESOLVE_MAX_RETRIES=SecretManager.get_int("SENDER_RESOLVE_MAX_RETRIES", 3, required=False),
+            SENDER_RESOLVE_BACKOFF_BASE=SecretManager.get_float("SENDER_RESOLVE_BACKOFF_BASE", 0.5, required=False),
+            SENDER_RESOLVE_BACKOFF_MAX=SecretManager.get_float("SENDER_RESOLVE_BACKOFF_MAX", 8.0, required=False),
+            SENDER_FLOOD_MAX_SLEEP=SecretManager.get_int("SENDER_FLOOD_MAX_SLEEP", 5, required=False),
             # ========== Prefilter ==========
             PREFILTER_ENABLED=SecretManager.get_bool("PREFILTER_ENABLED", True),
             # v14.4 filter: 1 (was 2) — short high-signal requests ("محتاج",

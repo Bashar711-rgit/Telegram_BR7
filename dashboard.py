@@ -709,6 +709,13 @@ async def health(request: Request):
         fast_capture = get_capture_snapshot()
     except Exception:
         fast_capture = {"enabled": False, "available": False}
+    # v9.9 sender intelligence: resolver/cache metrics (additive, degrades
+    # gracefully when sender_resolver is absent in dashboard-only mode).
+    try:
+        from sender_resolver import get_sender_intel_snapshot
+        sender_intel = get_sender_intel_snapshot()
+    except Exception:
+        sender_intel = {"enabled": False, "available": False}
     return JSONResponse({
         "status": "ok" if (db_ok and db_healthy) else "degraded",
         "database": "ok" if db_ok else "down",
@@ -719,6 +726,7 @@ async def health(request: Request):
         "accounts_with_session": sum(1 for a in ACCOUNTS if a.get("session_string")),
         "accounts_total": len(ACCOUNTS),
         "fast_capture": fast_capture,
+        "sender_intel": sender_intel,
         "uptime": uptime,
         "time": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     })
