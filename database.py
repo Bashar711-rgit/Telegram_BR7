@@ -376,11 +376,12 @@ class EnhancedDatabase:
             else:
                 await self._connect_postgresql()
             await self._create_tables()
+            await self._migrate_bigint_ids()
             await self._create_indexes()
             self.is_connected = True
             await self.start_writer()
             # Note: start_cleanup() intentionally NOT called here (fix #5)
-            logger.info(f"Database connected: {self.db_type.upper()} v9.0")
+            logger.info(f"Database connected: {self.db_type.upper()} v9.1")
             return True
         except Exception as e:
             logger.error(f"Database connection failed: {e}")
@@ -579,8 +580,13 @@ class EnhancedDatabase:
             if s:
                 if self.db_type == "postgresql":
                     s = (
-                        s.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "SERIAL PRIMARY KEY")
+                        s.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "BIGSERIAL PRIMARY KEY")
+                        .replace("sender_id INTEGER PRIMARY KEY", "sender_id BIGINT PRIMARY KEY")
+                        .replace("chat_id INTEGER PRIMARY KEY", "chat_id BIGINT PRIMARY KEY")
                         .replace("INTEGER NOT NULL", "BIGINT NOT NULL")
+                        .replace("access_hash INTEGER,", "access_hash BIGINT,")
+                        .replace("last_chat_id INTEGER,", "last_chat_id BIGINT,")
+                        .replace("last_message_id INTEGER,", "last_message_id BIGINT,")
                         .replace("REAL DEFAULT (unixepoch())", "DOUBLE PRECISION DEFAULT EXTRACT(EPOCH FROM NOW())")
                         .replace("DATETIME DEFAULT CURRENT_TIMESTAMP", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
                         .replace("REAL NOT NULL", "DOUBLE PRECISION NOT NULL")
@@ -589,6 +595,46 @@ class EnhancedDatabase:
                     )
                 await self._execute(s)
         await self._commit()
+
+    async def _migrate_bigint_ids(self) -> None:
+        """v9.1: widen Telegram-ID columns from INTEGER (int32) to BIGINT.
+
+        Telegram IDs overflow signed 32-bit integers: supergroup chats are
+        -100XXXXXXXXXX and modern user IDs reach ~9 billion, while int32
+        caps at 2147483647. Older databases were created with INTEGER
+        PRIMARY KEY columns (the SQLite->PostgreSQL translation never
+        widened bare PK columns), so writes failed with "value out of
+        int32 range". Idempotent: ALTER to BIGINT on an already-BIGINT
+        column is a cheap no-op on these small tables.
+        """
+        if self.db_type != "postgresql":
+            return
+        stmts = [
+            "ALTER TABLE sender_stats    ALTER COLUMN sender_id       TYPE BIGINT",
+            "ALTER TABLE sender_contacts ALTER COLUMN sender_id       TYPE BIGINT",
+            "ALTER TABLE sender_contacts ALTER COLUMN access_hash     TYPE BIGINT",
+            "ALTER TABLE sender_contacts ALTER COLUMN last_chat_id    TYPE BIGINT",
+            "ALTER TABLE sender_contacts ALTER COLUMN last_message_id TYPE BIGINT",
+            "ALTER TABLE blocked_senders ALTER COLUMN sender_id       TYPE BIGINT",
+            "ALTER TABLE blocked_chats   ALTER COLUMN chat_id         TYPE BIGINT",
+        ]
+        applied = 0
+        for st in stmts:
+            table = st.split()[2]
+            column = st.split("ALTER COLUMN ")[1].split()[0]
+            try:
+                await self._execute(st)
+                applied += 1
+            except Exception as e:
+                logger.warning(
+                    f"bigint migration: {table}.{column} skipped: "
+                    f"{type(e).__name__}: {str(e)[:120]}"
+                )
+        await self._commit()
+        logger.info(
+            f"Database migration v9.1: Telegram-ID columns widened to BIGINT "
+            f"({applied}/{len(stmts)} applied)"
+        )
 
     async def _create_indexes(self) -> None:
         indexes = [
