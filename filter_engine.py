@@ -1,21 +1,41 @@
 #!/usr/bin/env python3
 """
-filter_engine.py — v14.3.2
+filter_engine.py — v14.4.0
 
-Hardened/optimized evolution of v14.3.1 with critical fix:
-- Ensured result.valid is always synchronized with the final decision.
-  Previously, a "review" decision could leave result.valid = True,
-  causing monitors.py to send alerts for borderline messages (e.g. "ابي").
-  Now valid is only True when decision == "accept".
+v14.4.0 — accuracy overhaul (precision + recall):
+* Word-boundary validation for ALL precision tries (request/indirect/urgency/
+  implicit/context/boost/ignore/spam/ad/education/negation). Arabic clitic
+  prefixes (و ف ب ل ك ال وال بال ...) are still accepted, so "الاستاذ" and
+  "وابي" match while "كتابي"→"ابي" and "محل"→"حل" no longer do.
+* Negation rebuilt on full-token regex: the affirmation "لا" / negator "مش"
+  can no longer match INSIDE "علاج" / "للمشكلة" / "المادة" (was silently
+  dropping huge volumes of legitimate requests). Clause boundaries are now
+  checked BETWEEN the negator and the intent (not before the negator),
+  post_clause negators only negate when the request precedes them, and
+  negation_exceptions are scoped to ±6 tokens of the negator.
+* Fuzzy fallback is token-level (fuzz.ratio per token, length-windowed) —
+  the old whole-text partial_ratio re-introduced substring false positives
+  and reported a wrong intent position.
+* Best-match selection: request/context tries return the HIGHEST-WEIGHT
+  valid match (tier-aware), not merely the first positional one.
+* Implicit availability questions ("مين يساعد", "عندي واجب") now produce a
+  keyword and are scored on the weighted pipeline alone; expert-only context
+  ("احتاج دكتور") is capped at review; template boost is gated on academic
+  specificity and skipped entirely for ad-like texts.
+* Length modifier relaxes for messages carrying a specific academic object;
+  bare intents bottom out at "review" (never ignored, never auto-accepted).
+* Prefilter counts the Arabic ratio over LETTERS (digits/latin no longer
+  dilute it) and the emoji cap exempts neutral emojis.
+* Help expressions (مساعده/فزعه/توضيح...) feed the grammar + academic
+  components so "محتاج مساعده" is no longer dropped.
 
-Retained all previous fixes:
-  * Syntax errors corrected.
-  * Field naming unified (key_phrases).
+Retained all previous fixes (v14.3.2):
+  * result.valid always synchronized with the final decision.
+  * Syntax errors corrected; field naming unified (key_phrases).
   * Original text preserved (original_text field).
   * Keywords normalized on load.
   * Clause-level negation (resolution phrases do not suppress new requests).
   * Fuzzy settings read from keywords.json/CFG.
-  * Prefilter min_words lowered to 1 (configurable).
   * Thread-safe and stable.
 
 Compatibility: FilterResult, TrieNode, WeightedTrie, OptimizedBloomFilter,
@@ -76,6 +96,92 @@ except ImportError:
 # --------------------------------------------------------------------------
 def _cfg(name: str, default: Any) -> Any:
     return getattr(CFG, name, default)
+
+
+# v14.4: Arabic clitic prefixes that may legitimately precede a keyword
+# inside the same word ("الاستاذ", "وابي", "للواجب"). Any other letter run
+# before a candidate match invalidates it ("كتابي" must NOT match "ابي",
+# "محل" must NOT match "حل").
+_PREFIX_CLITICS: Final[frozenset] = frozenset({
+    "و", "ف", "ب", "ل", "ك",
+    "ال", "وال", "بال", "فال", "كال", "لل", "ولل",
+})
+
+_SENTINEL_CHARS: Final[frozenset] = frozenset(
+    " \t\r\n.,!?؟،؛:;()[]{}\"'“”«»…-_/\\|=+*&^%$#@~`<>%0123456789"
+)
+
+
+def _is_arabic_letter(ch: str) -> bool:
+    return "\u0621" <= ch <= "\u064a"
+
+
+def valid_word_boundary(text: str, start: int) -> bool:
+    """True when ``text[start:]`` begins a word (or follows Arabic clitics).
+
+    The run of Arabic letters immediately before ``start`` must be empty
+    (word start) or exactly one of the known clitic prefixes. Suffix
+    continuation after the match is always allowed ("واجبي" matches
+    "واجب"). Non-Arabic characters (digits, latin, punctuation) act as
+    boundaries.
+    """
+    j = start
+    while j > 0 and _is_arabic_letter(text[j - 1]):
+        j -= 1
+    if j == start:
+        return True
+    return text[j:start] in _PREFIX_CLITICS
+
+
+_NEG_DELIMS = r"[\s.,!?؟،؛:;()\-/\"'«»…]"
+
+
+def _boundary_regex(negs: List[str]) -> Optional[re.Pattern]:
+    """Compile a full-token alternation for negator phrases.
+
+    Both sides of every match must be word edges, so "مش" can never match
+    inside "مشكلة" and "لا" can never match inside "علاج".
+    """
+    negs = sorted({n for n in negs if n}, key=len, reverse=True)
+    if not negs:
+        return None
+    body = "|".join(re.escape(n) for n in negs)
+    try:
+        return re.compile(
+            r"(?:(?<=^)|(?<=" + _NEG_DELIMS + r"))(?:"
+            + body + r")(?=$|" + _NEG_DELIMS + r")"
+        )
+    except re.error as exc:
+        logger.error("Failed to compile negation pattern: {}", exc)
+        return None
+
+
+def _expand_al_variants(terms: Set[str]) -> Set[str]:
+    """v14.4: Arabic attaches "ال" to EACH word of a phrase — "تحليل
+    احصايي" never literally appears inside "التحليل الاحصايي". Generate
+    the definite-article variants for multi-word keywords so the tries can
+    match definite noun phrases. Single words are already handled by the
+    clitic boundary check. Combinatorics are capped at 2^3 expansions per
+    phrase (phrases here are 2-4 words)."""
+    out: Set[str] = set(terms)
+    for term in terms:
+        words = term.split(" ")
+        if len(words) < 2 or len(words) > 4:
+            continue
+        options: List[Set[str]] = []
+        expandable = 0
+        for w in words:
+            if len(w) >= 3 and not w.startswith("ال"):
+                options.append({w, "ال" + w})
+                expandable += 1
+            else:
+                options.append({w})
+        if expandable == 0 or expandable > 3:
+            continue
+        import itertools
+        for combo in itertools.product(*options):
+            out.add(" ".join(combo))
+    return out
 
 
 @dataclass(slots=True)
@@ -148,10 +254,21 @@ class FilterResult:
 
 
 class Prefilter:
-    """Prefilter with lowered default min_words to allow short high-signal requests."""
+    """Prefilter with lowered default min_words to allow short high-signal requests.
+
+    v14.4: the Arabic ratio is computed over LETTERS only (digits/latin/
+    punctuation no longer dilute it — "حل homework 2" is a valid Arabic
+    request), and the emoji cap can exempt neutral emojis (students are
+    expressive; ad-style emoji spam is not).
+    """
 
     @staticmethod
-    def check(text: str, min_words: int = 1, max_emojis: int = 5) -> Tuple[bool, str, Dict[str, Any]]:
+    def check(
+        text: str,
+        min_words: int = 1,
+        max_emojis: int = 5,
+        emoji_exempt: Optional[Set[str]] = None,
+    ) -> Tuple[bool, str, Dict[str, Any]]:
         metadata = {
             "word_count": 0,
             "emoji_count": 0,
@@ -170,7 +287,8 @@ class Prefilter:
         if word_count < min_words:
             return False, f"too_few_words_{word_count}", metadata
 
-        emojis = safe_findall(EMOJI_PATTERN, text)
+        exempt = emoji_exempt or set()
+        emojis = [e for e in safe_findall(EMOJI_PATTERN, text) if e not in exempt]
         emoji_count = len(emojis)
         metadata["emoji_count"] = emoji_count
 
@@ -178,7 +296,8 @@ class Prefilter:
             return False, f"too_many_emojis_{emoji_count}", metadata
 
         arabic_chars = sum(1 for c in text if '\u0600' <= c <= '\u06FF')
-        arabic_ratio = arabic_chars / max(len(text), 1)
+        letter_chars = sum(1 for c in text if c.isalpha())
+        arabic_ratio = (arabic_chars / letter_chars) if letter_chars else 0.0
         metadata["arabic_ratio"] = arabic_ratio
 
         if arabic_ratio < 0.1:
@@ -353,6 +472,9 @@ class EnhancedFilter:
         {"أ": "ا", "إ": "ا", "آ": "ا", "ة": "ه", "ى": "ي", "ئ": "ي", "ؤ": "و"}
     )
     NEGATION_SCOPE_TOKENS: Final[int] = 6
+    # v14.4: the analyzer's own floor — the ops-level CFG.MIN_MESSAGE_LENGTH
+    # (10 chars) silently killed short high-signal requests ("ابي حل").
+    FILTER_MIN_MESSAGE_CHARS: Final[int] = 3
 
     _PATTERNS: Dict[str, re.Pattern] = {
         "phone": PHONE_PATTERN,
@@ -422,7 +544,7 @@ class EnhancedFilter:
         self._adaptive_academic = AdaptiveWeights(self._academic_weights, alpha=_cfg("ADAPTIVE_ALPHA", 0.05))
 
         logger.info(
-            "Filter v14.3.2 ready | intent_verbs={} | academic_objects={} | negation={} | boost_patterns={} | "
+            "Filter v14.4.0 ready | intent_verbs={} | academic_objects={} | negation={} | boost_patterns={} | "
             "distance_scoring={} | fuzzy_fallback={}",
             len(self._intent_verbs_all),
             len(self._academic_objects_all),
@@ -642,15 +764,46 @@ class EnhancedFilter:
         self._ad_blockers: Set[str] = set(kw.get("ad_blockers", []))
         self._ad_blockers = {b.lower() for b in self._ad_blockers if isinstance(b, str)}
 
-        # Ignore signals
+        # v14.4: hard-only ad trie for the _is_blocked short-circuit — hard
+        # signals + strong/individual providers + commercial link domains.
+        # Medium signals (خصم/عرض خاص...) stay score-only: a single medium
+        # word must never insta-kill a legitimate message.
+        _hard_terms: Set[str] = set()
+        _hs = self._ad_signals.get("hard_signals", [])
+        if isinstance(_hs, list):
+            _hard_terms.update(_hs)
+        _provider = self._ad_signals.get("provider_profile", {})
+        if isinstance(_provider, dict):
+            for pkey in ("strong_provider", "individual_provider"):
+                plist = _provider.get(pkey, [])
+                if isinstance(plist, list):
+                    _hard_terms.update(plist)
+        _hard_terms.update(self._ad_blockers)
+        self._ad_hard_trie = WeightedTrie(_hard_terms)
+
+        # Ignore signals — v14.4 two-tier:
+        #   strong (social/politics/health/entertainment) → early hard ignore.
+        #   weak (greetings/thanks/affirmations/wellbeing/reactions) → ignore
+        #   only when the message carries NO request keyword ("السلام عليكم
+        #   عندي مشروع تخرج" must not die because of the greeting, and
+        #   "ما عرفت احل" must not die because of the affirmation "عرفت").
+        _ignore_weak_keys = {"greetings", "thanks", "affirmations", "wellbeing", "reactions"}
         ignore_data = kw.get("ignore_signals", {})
         self._ignore_all: Set[str] = set()
+        self._ignore_weak: Set[str] = set()
+        self._ignore_strong: Set[str] = set()
         for category, terms in ignore_data.items():
             if isinstance(terms, list):
-                self._ignore_all.update(_norm_set(terms))
+                normed = _norm_set(terms)
+                self._ignore_all.update(normed)
+                if category in _ignore_weak_keys:
+                    self._ignore_weak.update(normed)
+                else:
+                    self._ignore_strong.update(normed)
 
         # Help expressions
         self._help_expressions: Set[str] = _norm_set(kw.get("help_expressions", []))
+        self._help_trie = WeightedTrie(self._help_expressions)
 
         # Action verbs
         action_verbs_data = kw.get("action_verbs", {})
@@ -691,8 +844,11 @@ class EnhancedFilter:
                     nk = self._normalize_term(k)
                     nv = self._normalize_term(v)
                     self._dialect_map[nk] = nv
-        self._dialect_pattern: Optional[re.Pattern] = None
-        self._build_dialect_pattern()
+        # NOTE: _build_dialect_pattern() is invoked at the END of this method
+        # (after the final keyword sets exist) so it can exclude mapping
+        # sources that are prefixes of known keywords — e.g. the phrase-level
+        # mapping "مين يعرف"→"من يعرف" must NOT apply inside the recognized
+        # keyword "مين يعرف احد" (that mismatch caused real false negatives).
 
         # University context
         self._university_context: Set[str] = set()
@@ -700,6 +856,21 @@ class EnhancedFilter:
         for key, value in university_data.items():
             if isinstance(value, list):
                 self._university_context.update(_norm_set(value))
+
+        # v14.4: concrete departments / academic levels (تمريض، شبكات، هندسه،
+        # ماجستير...) are strong academic signals — promote them to object-tier
+        # weights so best-match selection prefers them over generic context.
+        for strong_key in ("academic_departments", "academic_levels"):
+            for term in _norm_list(university_data.get(strong_key, [])):
+                self._academic_weights.setdefault(term, 1.0)
+                self._academic_objects_all.add(term)
+
+        # v14.4: expert/role words are ambiguous on their own ("احتاج دكتور")
+        # — messages whose ONLY context is one of these are capped at review.
+        self._expert_words: Set[str] = {"خبير", "متخصص", "مختص", "فاهم", "شاطر", "محترف"}
+        roles = university_data.get("university_roles", [])
+        if isinstance(roles, list):
+            self._expert_words.update(_norm_set(roles))
 
         # Distance config
         self._distance_config: Dict[str, Any] = kw.get("distance_scoring_config", {})
@@ -731,12 +902,28 @@ class EnhancedFilter:
         if isinstance(boundaries, list):
             self._clause_boundaries.update(_norm_set(boundaries))
 
+        # v14.4: full-token boundary regexes — negators must be standalone
+        # words ("مش" must not match inside "مشكلة", "لا" not inside "علاج").
+        pre_verb_terms = []
+        if isinstance(pre_verb, dict):
+            pre_verb_terms = [t for t in pre_verb.get("terms", []) if isinstance(t, str)]
+        self._pre_verb_pattern = _boundary_regex(pre_verb_terms)
+        post_clause_terms = post_clause if isinstance(post_clause, list) else []
+        self._post_clause_pattern = _boundary_regex(post_clause_terms)
+
         # Build final sets
         self.request_words: Set[str] = set(self._intent_verbs_all).union(self._request_phrases_all)
         self.context_words: Set[str] = set(self._academic_objects_all).union(self._university_context)
         self.indirect_words: Set[str] = set(self._indirect_request_all).union(self._implicit_request_all)
         self.urgency_words: Set[str] = self._urgency_all
         self.ignore_words: Set[str] = self._ignore_all
+
+        # v14.4: definite-article phrase variants ("تحليل الاحصايي")
+        self.request_words = _expand_al_variants(self.request_words)
+        self.context_words = _expand_al_variants(self.context_words)
+        self.indirect_words = _expand_al_variants(self.indirect_words)
+        self.urgency_words = _expand_al_variants(self.urgency_words)
+        self.implicit_words_variants = _expand_al_variants(self._implicit_request_all)
 
         self.advertisement_words: Set[str] = set()
         for signal_list in ["hard_signals", "medium_signals"]:
@@ -790,13 +977,14 @@ class EnhancedFilter:
         self._indirect_trie = WeightedTrie(self.indirect_words)
         self._urgency_trie = WeightedTrie(self.urgency_words)
         self._ignore_trie = WeightedTrie(self.ignore_words)
+        self._ignore_strong_trie = WeightedTrie(self._ignore_strong)
         self._ad_trie = WeightedTrie(self.advertisement_words)
         self._education_trie = WeightedTrie(self.education_words)
 
         self._negation_trie = WeightedTrie(self._negation_all)
         self._resolution_trie = WeightedTrie(self._resolution_phrases)
         self._boost_trie = WeightedTrie(self._boost_patterns)
-        self._implicit_trie = WeightedTrie(self._implicit_request_all)
+        self._implicit_trie = WeightedTrie(self.implicit_words_variants)
         self._spam_trie = WeightedTrie(self._spam_all)
         self._ad_blocker_trie = WeightedTrie(self._ad_blockers)
 
@@ -815,7 +1003,75 @@ class EnhancedFilter:
             fuzzy_terms_set.update(self._boost_patterns)
         self._all_fuzzy_terms: List[str] = list(fuzzy_terms_set)
 
+        # v14.4: token-level fuzzy buckets (single-word terms grouped by
+        # length) — replaces the whole-text partial_ratio scan which matched
+        # short terms INSIDE unrelated words ("كتابي"→"ابي").
+        self._fuzzy_terms_by_len: Dict[int, List[str]] = {}
+        for term in self._all_fuzzy_terms:
+            if term and " " not in term:
+                self._fuzzy_terms_by_len.setdefault(len(term), []).append(term)
+
         self._raw_keywords = kw
+
+        # v14.4: now that the final sets exist, build the dialect pattern
+        # with keyword-aware source exclusion.
+        self._dialect_pattern = None
+        self._build_dialect_pattern()
+
+    # ------------------------------------------------------------------
+    # v14.4 boundary-aware search helpers
+    # ------------------------------------------------------------------
+    def _search_all_valid(self, trie: WeightedTrie, text: str) -> List[Tuple[str, float, int]]:
+        """All trie matches that start at a word boundary (or after clitics)."""
+        return [
+            (word, weight, pos)
+            for (word, weight, pos) in trie.search_all(text)
+            if valid_word_boundary(text, pos)
+        ]
+
+    def _search_first_valid(self, trie: WeightedTrie, text: str) -> Optional[Tuple[str, float, int]]:
+        for word, weight, pos in self._search_all_valid(trie, text):
+            return (word, weight, pos)
+        return None
+
+    @staticmethod
+    def _search_best(
+        trie: WeightedTrie,
+        text: str,
+        weight_of,
+    ) -> Optional[Tuple[str, float, int]]:
+        """Highest-weight boundary-valid match (ties → earliest position)."""
+        best: Optional[Tuple[str, float, int]] = None
+        best_key: Optional[Tuple[float, int]] = None
+        seen: Set[str] = set()
+        for word, _static_weight, pos in trie.search_all(text):
+            if word in seen or not valid_word_boundary(text, pos):
+                continue
+            seen.add(word)
+            key = (weight_of(word), -pos)
+            if best_key is None or key > best_key:
+                best, best_key = (word, weight_of(word), pos), key
+        return best
+
+    def _search_best_context(
+        self, text: str, intent_pos: Optional[int]
+    ) -> Tuple[Optional[Tuple[str, float, int]], List[Tuple[str, float, int]]]:
+        """Pick the strongest academic-object match; ties break by proximity
+        to the intent verb (falls back to earliest)."""
+        candidates = []
+        seen: Set[str] = set()
+        for word, _w, pos in self._context_trie.search_all(text):
+            if word in seen or not valid_word_boundary(text, pos):
+                continue
+            seen.add(word)
+            candidates.append((word, self._adaptive_academic.get(word, 0.7), pos))
+        if not candidates:
+            return None, []
+        if intent_pos is None:
+            best = max(candidates, key=lambda c: (c[1], -c[2]))
+        else:
+            best = max(candidates, key=lambda c: (c[1], -abs(c[2] - intent_pos)))
+        return best, candidates
 
     def _build_tries(self) -> None:
         # Tries are built inside _load_keyword_sets; kept for API compatibility.
@@ -868,7 +1124,21 @@ class EnhancedFilter:
         if not self._dialect_map:
             self._dialect_pattern = None
             return
-        variants = sorted(self._dialect_map.keys(), key=len, reverse=True)
+        # v14.4: exclude mapping sources that are prefixes of known keywords —
+        # phrase-level mapping inside a recognized keyword destroyed the match
+        # ("مين يعرف"→"من يعرف" broke the keyword "مين يعرف احد").
+        known = (
+            getattr(self, "request_words", set())
+            | getattr(self, "context_words", set())
+            | getattr(self, "indirect_words", set())
+            | getattr(self, "_boost_patterns", set())
+        )
+        sources = [
+            src
+            for src in self._dialect_map
+            if src and not any(k != src and k.startswith(src) for k in known)
+        ]
+        variants = sorted(sources, key=len, reverse=True)
         escaped = [re.escape(v) for v in variants if v]
         if not escaped:
             self._dialect_pattern = None
@@ -913,27 +1183,24 @@ class EnhancedFilter:
         return cleaned, original
 
     def _is_arabic(self, text: str) -> Tuple[bool, float]:
+        """v14.4: ratio computed over LETTERS only — digits/latin in mixed
+        student messages ("حل assignment 2") no longer dilute it."""
         if not text:
             return False, 0.0
-        count = sum(1 for c in text if c in self.ARABIC_CHARS)
-        ratio = count / max(len(text), 1)
-        if ratio > 0.35:
+        arabic_count = sum(1 for c in text if c in self.ARABIC_CHARS)
+        if arabic_count == 0:
+            return False, 0.0
+        letter_count = sum(1 for c in text if c.isalpha())
+        ratio = arabic_count / max(letter_count, 1)
+        if ratio >= 0.12:
             return True, ratio
-        if ratio < 0.12:
-            if LANGDETECT_AVAILABLE:
-                try:
-                    if detect(text) == "ar":
-                        return True, 0.9
-                except Exception as exc:
-                    logger.debug("langdetect failed: {}", exc)
-            return False, ratio
         if LANGDETECT_AVAILABLE:
             try:
                 lang = detect(text)
-                return lang == "ar", 0.85 if lang == "ar" else 0.6
+                return lang == "ar", (0.85 if lang == "ar" else ratio)
             except Exception as exc:
                 logger.debug("langdetect failed: {}", exc)
-        return ratio > 0.25, ratio
+        return ratio >= 0.12, ratio
 
     def _spam_score(self, text: str) -> float:
         score = 0.0
@@ -1021,10 +1288,34 @@ class EnhancedFilter:
 
     def _detect_negation(self, text: str, intent_pos: Optional[int]) -> Tuple[bool, float, List[str]]:
         """
-        Improved negation detection with clause-awareness.
-        Resolution phrases are only full negation if no new request appears after them.
+        v14.4: boundary-aware, clause-scoped negation.
+
+        * Negators are matched as FULL tokens (regex) — "لا" can no longer
+          fire inside "علاج"/"السلام" and "مش" not inside "للمشكلة".
+        * pre_verb negators only suppress an intent within the same clause
+          (no clause boundary BETWEEN them) and within NEGATION_SCOPE_TOKENS.
+        * post_clause negators ("ما عاد", "ما ابي"...) only suppress a
+          request that came BEFORE them; a new request after them is a soft
+          signal (0.2), not a kill.
+        * negation_exceptions back the negation off only when they occur
+          near the negator.
         """
-        resolution_match = self._resolution_trie.search_first(text)
+        exception_positions: List[int] = []
+        for word, _w, pos in self._search_all_valid(self._resolution_trie, text):
+            exception_positions.append(pos)
+        for ex in self._negation_exceptions:
+            start = text.find(ex)
+            if start != -1 and valid_word_boundary(text, start):
+                exception_positions.append(start)
+
+        def _exception_near(pos: int) -> bool:
+            for ex_pos in exception_positions:
+                if abs(pos - ex_pos) <= (self.NEGATION_SCOPE_TOKENS + 1) * 3:
+                    return True
+            return False
+
+        # 1) Resolution phrases ("تم الحل", "خلصت"...)
+        resolution_match = self._search_first_valid(self._resolution_trie, text)
         if resolution_match:
             res_phrase, _, res_pos = resolution_match
             if intent_pos is not None and intent_pos > res_pos:
@@ -1033,35 +1324,39 @@ class EnhancedFilter:
                 return True, 0.2, [f"resolution_phrase_with_new_request: {res_phrase}"]
             return True, 1.0, [f"resolution_phrase: {res_phrase}"]
 
-        post_clause = self._negation.get("post_clause_negators", [])
-        if isinstance(post_clause, list):
-            for neg in post_clause:
-                if neg in text:
-                    if any(ex in text for ex in self._negation_exceptions):
-                        return False, 0.0, []
-                    return True, 0.8, [f"post_clause_negator: {neg}"]
+        # 2) post_clause negators ("ما عاد", "ما بقى", "ما ابي"...)
+        if self._post_clause_pattern is not None:
+            for m in self._post_clause_pattern.finditer(text):
+                neg_pos = m.start()
+                if _exception_near(neg_pos):
+                    continue
+                if intent_pos is not None and intent_pos > neg_pos:
+                    # request AFTER the withdrawal phrase → new request wins
+                    return True, 0.2, [f"post_clause_with_new_request: {m.group()}"]
+                return True, 0.8, [f"post_clause_negator: {m.group()}"]
 
-        pre_verb_data = self._negation.get("pre_verb_negators", {})
-        if isinstance(pre_verb_data, dict):
-            pre_verbs = pre_verb_data.get("terms", [])
-            if isinstance(pre_verbs, list):
-                for pv in pre_verbs:
-                    pos = text.find(pv)
-                    if pos == -1:
+        # 3) pre_verb negators ("ما", "مو", "لا"...)
+        if self._pre_verb_pattern is not None:
+            for m in self._pre_verb_pattern.finditer(text):
+                neg_pos = m.start()
+                if _exception_near(neg_pos):
+                    continue
+                if intent_pos is not None:
+                    # a clause boundary between the negator and the intent
+                    # starts a new clause — the negation does not cross it
+                    between = text[neg_pos:intent_pos]
+                    if any(b in between for b in self._clause_boundaries):
                         continue
-                    if any(ex in text for ex in self._negation_exceptions):
-                        return False, 0.0, []
-                    if _cfg("NEGATION_CLAUSE_BOUNDARIES_ENABLED", True):
-                        before_text = text[:pos]
-                        if any(boundary in before_text for boundary in self._clause_boundaries):
-                            return False, 0.0, []
-
-                    if intent_pos is not None:
-                        token_distance = self._token_distance(text, pos, intent_pos)
-                        if token_distance > self.NEGATION_SCOPE_TOKENS:
-                            continue
-
-                    return True, 0.6, [f"pre_verb_negator: {pv}"]
+                    dist = self._token_distance(text, neg_pos, intent_pos)
+                    if dist > self.NEGATION_SCOPE_TOKENS:
+                        continue
+                    # v14.4: "ما طلعت متسقة ... وياليت احد يشرح" — the
+                    # negator denies an EARLIER verb, not the request. Only
+                    # a negator immediately attached to the intent (or with
+                    # no intent at all) suppresses it strongly.
+                    neg_score = 0.8 if dist <= 1 else 0.25
+                    return True, neg_score, [f"pre_verb_negator: {m.group()}"]
+                return True, 0.8, [f"pre_verb_negator: {m.group()}"]
 
         return False, 0.0, []
 
@@ -1109,46 +1404,66 @@ class EnhancedFilter:
         return 0.9
 
     def _fuzzy_intent_fallback(self, cleaned: str) -> Optional[Tuple[str, float, int]]:
+        """v14.4: token-level fuzzy match against single-word intent terms.
+
+        The previous whole-text ``partial_ratio`` scan matched short terms
+        INSIDE unrelated longer words ("كتابي" fuzzy-matched "ابي" at 100)
+        and reported the position of the first TOKEN instead of the matched
+        term — corrupting both negation scoping and distance scoring.
+        Now every token is compared with ``fuzz.ratio`` against terms of a
+        similar length window only.
+        """
         if not self._fuzzy_enabled or not cleaned.strip():
             return None
-        tokens = cleaned.split()
-        if not tokens or not getattr(self, '_all_fuzzy_terms', []):
+        if not getattr(self, "_fuzzy_terms_by_len", {}):
             return None
 
-        if len(cleaned) < self._fuzzy_min_token_length:
-            return None
-
-        best = rf_process.extractOne(
-            cleaned,
-            self._all_fuzzy_terms,
-            scorer=fuzz.partial_ratio,
-            score_cutoff=self._fuzzy_score_cutoff,
-        )
-        if not best:
-            return None
-        term, score, _ = best
-        weight = self._adaptive_intent.get(term, self._intent_weights.get(term, 0.7)) * 0.85
-        pos = cleaned.find(tokens[0])
-        return term, weight, max(pos, 0)
+        max_dist = max(1, int(self._fuzzy_max_edit_distance))
+        best: Optional[Tuple[str, float, int]] = None
+        best_score = 0.0
+        offset = 0
+        for token in cleaned.split():
+            token_start = offset
+            offset += len(token) + 1
+            if len(token) < self._fuzzy_min_token_length:
+                continue
+            candidates: List[str] = list(self._fuzzy_terms_by_len.get(len(token), []))
+            for delta in range(1, max_dist + 1):
+                candidates.extend(self._fuzzy_terms_by_len.get(len(token) + delta, []))
+            for term in candidates:
+                scored = rf_process.extractOne(
+                    token, [term], scorer=fuzz.ratio, score_cutoff=self._fuzzy_score_cutoff
+                )
+                if scored and scored[1] > best_score:
+                    weight = self._adaptive_intent.get(term, self._intent_weights.get(term, 0.7)) * 0.85
+                    best, best_score = (term, weight, token_start), scored[1]
+        return best
 
     async def analyze(self, text: str) -> Dict[str, Any]:
         start = time.perf_counter()
         original_text = text
 
         try:
+            if not isinstance(text, str):
+                return self._result("ignore", 0.0, ["invalid_input"], original_text=original_text)
             if len(text) > CFG.MAX_MESSAGE_LENGTH:
                 return self._result("ignore", 0.0, ["too_long"], original_text=original_text)
 
-            validated = InputSanitizer.validate_message_text(text)
-            if validated is None:
-                return self._result("ignore", 0.0, ["invalid_input"], original_text=original_text)
+            # v14.4: analyzer-local 3-char floor — the ops-level
+            # MIN_MESSAGE_LENGTH (10) silently killed short high-signal
+            # requests ("ابي حل", "فزعه"); anything that short and junky is
+            # handled by the ignore/spam tries below anyway.
+            validated = text.strip()
+            if len(validated) < self.FILTER_MIN_MESSAGE_CHARS:
+                return self._result("ignore", 0.0, ["too_short"], original_text=original_text)
 
             cleaned, original = self._clean(validated)
             cache_key = hashlib.blake2b(cleaned.encode(), digest_size=16).hexdigest()[:32]
 
             if CFG.PREFILTER_ENABLED:
                 ok, reason, metadata = Prefilter.check(
-                    cleaned, _cfg("PREFILTER_MIN_WORDS", 1), CFG.PREFILTER_MAX_EMOJIS
+                    cleaned, _cfg("PREFILTER_MIN_WORDS", 1), CFG.PREFILTER_MAX_EMOJIS,
+                    emoji_exempt=getattr(self, "_neutral_emoji", set()),
                 )
                 if not ok:
                     async with self._stats_lock:
@@ -1200,18 +1515,29 @@ class EnhancedFilter:
                     self._stats["spam"] += 1
                 return self._result("ignore", 0.0, ["spam_detected"], original_text=original_text)
 
-            if self._spam_trie.search_first(cleaned):
+            # v14.4: boundary-valid short-circuits — the affirmation "لا"
+            # must not match inside "علاج/الاكسل/الاختبار" and kill real
+            # requests via the ignore/spam tries.
+            if self._search_first_valid(self._spam_trie, cleaned):
                 async with self._stats_lock:
                     self._stats["spam"] += 1
                 return self._result("ignore", 0.0, ["spam_pattern"], original_text=original_text)
 
-            if self._ignore_trie.search_first(cleaned):
+            # v14.4: boundary-valid + STRONG-ONLY early ignore — weak social
+            # signals (greetings/thanks/affirmations) are evaluated later and
+            # never suppress messages that carry a request keyword.
+            if self._search_first_valid(self._ignore_strong_trie, cleaned):
                 return self._result("ignore", 0.0, ["ignore_pattern"], original_text=original_text)
 
-            if self._ad_blocker_trie.search_first(cleaned):
+            if self._search_first_valid(self._ad_blocker_trie, cleaned):
                 return self._result("ignore", 0.0, ["ad_blocker"], original_text=original_text)
 
-            intent_match = self._request_trie.search_first(cleaned)
+            # v14.4: boundary-aware, best-weight matching everywhere.
+            intent_match = self._search_best(
+                self._request_trie,
+                cleaned,
+                lambda t: self._adaptive_intent.get(t, self._intent_weights.get(t, 0.7)),
+            )
             fuzzy_used = False
             if intent_match is None:
                 fuzzy = self._fuzzy_intent_fallback(cleaned)
@@ -1221,12 +1547,11 @@ class EnhancedFilter:
                     async with self._stats_lock:
                         self._stats["fuzzy_path"] += 1
 
-            indirect_match = self._indirect_trie.search_first(cleaned)
-            urgency_match = self._urgency_trie.search_first(cleaned)
-            implicit_match = self._implicit_trie.search_first(cleaned)
-            boost_match = self._boost_trie.search_first(cleaned)
-            context_matches = self._context_trie.search_all(cleaned)
-            academic_match = context_matches[0] if context_matches else None
+            indirect_match = self._search_first_valid(self._indirect_trie, cleaned)
+            urgency_match = self._search_first_valid(self._urgency_trie, cleaned)
+            implicit_match = self._search_first_valid(self._implicit_trie, cleaned)
+            boost_match = self._search_first_valid(self._boost_trie, cleaned)
+            help_match = self._search_first_valid(self._help_trie, cleaned)
 
             intent_word = intent_match[0] if intent_match else None
             intent_pos = intent_match[2] if intent_match else None
@@ -1235,14 +1560,23 @@ class EnhancedFilter:
                 else (intent_match[1] if fuzzy_used and intent_match else 0.0)
             )
 
-            academic_word = academic_match[0] if academic_match else None
-            academic_pos = academic_match[2] if academic_match else None
-            academic_weight = self._adaptive_academic.get(academic_word, 0.7) if academic_word else 0.0
-
             urgency_marker = urgency_match[0] if urgency_match else None
             urgent = urgency_match is not None
             is_implicit = implicit_match is not None
-            boost = 0.25 if boost_match else 0.0
+
+            # v14.4: implicit availability/problem requests anchor the intent
+            # when no explicit intent verb exists ("مين يساعد", "عندي واجب") —
+            # anchored BEFORE negation/distance so their scope is correct.
+            if is_implicit and not intent_word:
+                intent_weight = 0.7
+                intent_pos = implicit_match[2]
+
+            # v14.4: strongest academic object (tier weight, then proximity
+            # to the intent anchor) instead of "first positional match".
+            academic_match, context_matches = self._search_best_context(cleaned, intent_pos)
+            academic_word = academic_match[0] if academic_match else None
+            academic_pos = academic_match[2] if academic_match else None
+            academic_weight = self._adaptive_academic.get(academic_word, 0.7) if academic_word else 0.0
 
             is_negated, neg_score, neg_reasons = self._detect_negation(cleaned, intent_pos)
             if is_negated and neg_score > 0.7:
@@ -1260,13 +1594,23 @@ class EnhancedFilter:
             result = FilterResult()
             result.original_text = original
 
-            if self._is_blocked(cleaned, result):
-                return self._convert_result(result, is_arabic, arabic_ratio, ad_score, start)
-
-            keyword = intent_word or (indirect_match[0] if indirect_match else None)
+            keyword = intent_word or (
+                indirect_match[0] if indirect_match else None
+            ) or (
+                implicit_match[0] if implicit_match else None
+            )
             if not keyword:
+                # v14.4: weak ignore signals (greetings/thanks/...) apply only
+                # when the message carries no request keyword at all.
+                if self._search_first_valid(self._ignore_trie, cleaned):
+                    result.valid = False
+                    result.reason = "ignore_pattern"
+                    return self._convert_result(result, is_arabic, arabic_ratio, ad_score, start)
                 result.valid = False
                 result.reason = "no_keyword"
+                return self._convert_result(result, is_arabic, arabic_ratio, ad_score, start)
+
+            if self._is_blocked(cleaned, result, ad_score):
                 return self._convert_result(result, is_arabic, arabic_ratio, ad_score, start)
 
             score = CFG.SCORE_DIRECT_MATCH if intent_word else 0
@@ -1276,7 +1620,7 @@ class EnhancedFilter:
             if urgent:
                 score += CFG.SCORE_URGENCY
 
-            if indirect_match and not intent_word:
+            if (indirect_match or is_implicit) and not intent_word:
                 score += CFG.SCORE_INDIRECT
                 result.indirect = True
 
@@ -1288,7 +1632,8 @@ class EnhancedFilter:
             result.fuzzy_matched = fuzzy_used
             result.reason = (
                 "keyword_found" if intent_word
-                else ("indirect_request" if indirect_match else "no_keyword")
+                else ("indirect_request" if indirect_match
+                      else ("implicit_request" if is_implicit else "no_keyword"))
             )
             result.context_type = (
                 "academic_request" if context_matches
@@ -1303,8 +1648,9 @@ class EnhancedFilter:
             grammar_score = 0.0
             if CFG.DISTANCE_SCORING_ENABLED:
                 grammar_match = (
-                    self._subject_markers_trie.search_first(cleaned)
-                    or self._action_verbs_trie.search_first(cleaned)
+                    self._search_first_valid(self._subject_markers_trie, cleaned)
+                    or self._search_first_valid(self._action_verbs_trie, cleaned)
+                    or help_match
                 )
                 grammar_score = 1.0 if grammar_match else 0.0
 
@@ -1331,10 +1677,16 @@ class EnhancedFilter:
                 ) / weight_sum
                 weighted_confidence = max(0.0, min(1.0, weighted_confidence))
 
-            result.confidence = (
-                (legacy_confidence + weighted_confidence) / 2.0
-                if weighted_confidence is not None else legacy_confidence
-            )
+            # v14.4: implicit-only requests are scored on the weighted
+            # pipeline alone — the legacy additive score is intent-centric
+            # and systematically under-rates them.
+            if weighted_confidence is not None and not intent_word and is_implicit:
+                result.confidence = weighted_confidence
+            else:
+                result.confidence = (
+                    (legacy_confidence + weighted_confidence) / 2.0
+                    if weighted_confidence is not None else legacy_confidence
+                )
 
             result.intent_verb = intent_word
             result.academic_object = academic_word
@@ -1353,6 +1705,8 @@ class EnhancedFilter:
                 result.reasons.append(f"urgency: {urgency_marker}")
             if is_implicit:
                 result.reasons.append("implicit_request")
+            if help_match:
+                result.reasons.append(f"help_expression: {help_match[0]}")
             if is_negated:
                 result.reasons.extend(neg_reasons)
             if ad_score > 0.3:
@@ -1364,13 +1718,26 @@ class EnhancedFilter:
 
             token_count = len(cleaned.split())
             length_modifier = self._get_length_modifier(token_count)
+            # v14.4: a specific academic object carries its own context —
+            # relax the short-message discount proportionally.
+            if academic_word:
+                relief = max(0.0, min(1.0, (academic_weight - 0.5) / 0.5))
+                length_modifier = length_modifier + (1.0 - length_modifier) * relief
             result.confidence *= length_modifier
 
             if is_negated:
                 result.confidence *= (1 - neg_score * 0.7)
             result.confidence *= (1 - ad_score * 0.9)
 
-            if boost_match:
+            # v14.4: template boost is gated — ad-like texts get nothing, and
+            # patterns over generic/expert context only give a weak bump.
+            boost = 0.0
+            if boost_match and ad_score <= 0.3:
+                specific = (
+                    self._academic_weights.get(academic_word, 0.0) >= 0.75
+                    if academic_word else False
+                )
+                boost = 0.25 if specific else 0.10
                 result.confidence += boost
 
             result.confidence = max(0.0, min(1.0, result.confidence))
@@ -1383,6 +1750,9 @@ class EnhancedFilter:
                 "grammar_score": round(grammar_score, 4),
                 "distance_score": round(distance_score, 4),
                 "length_modifier": round(length_modifier, 4),
+                "boost": round(boost, 3),
+                "negation_score": round(neg_score, 3),
+                "ad_score": round(ad_score, 3),
             }
 
             if result.confidence >= CFG.CONFIDENCE_ACCEPT_THRESHOLD:
@@ -1391,6 +1761,34 @@ class EnhancedFilter:
                 result.decision = "review"
             else:
                 result.decision = "ignore"
+
+            # ── v14.4 calibration caps ────────────────────────────────────
+            # 1) bare intents ("ابي", "محتاج", "مين يساعد") bottom out at
+            #    review: never silently ignored, never auto-accepted.
+            if (
+                result.decision != "accept"
+                and not academic_word and not help_match
+                and token_count <= 2
+            ):
+                result.confidence = max(result.confidence, _cfg("CONFIDENCE_REVIEW_THRESHOLD", 0.40) + 0.05)
+                result.decision = "review"
+            # 2) expert-only context ("احتاج دكتور") stays review until a
+            #    specific academic object disambiguates it.
+            if (
+                result.decision == "accept"
+                and academic_word in getattr(self, "_expert_words", set())
+                and not (self._academic_weights.get(academic_word, 0.0) >= 0.75)
+            ):
+                result.decision = "review"
+                result.reasons.append("capped: expert_only_context")
+            # 3) resolution + new request in one message → at most review
+            #    (documented engine limitation in keywords.json test_cases).
+            if result.decision == "accept" and any(
+                r.startswith(("resolution_phrase_with_new_request", "post_clause_with_new_request"))
+                for r in result.reasons
+            ):
+                result.decision = "review"
+                result.reasons.append("capped: resolution_with_new_request")
 
             # ===== الإصلاح الحاسم: مزامنة valid مع القرار النهائي =====
             result.valid = (result.decision == "accept")
@@ -1450,15 +1848,19 @@ class EnhancedFilter:
             self._stats["feedback_events"] += 1
         return weight
 
-    def _is_blocked(self, text: str, result: FilterResult) -> bool:
-        if self._ad_trie.search_first(text):
+    def _is_blocked(self, text: str, result: FilterResult, ad_score: float = 0.0) -> bool:
+        """v14.4: only HARD commercial signals short-circuit to ignore.
+
+        Medium signals (خصم/عرض خاص) are score-only now, a single ad-style
+        emoji no longer hard-blocks (it feeds _detect_advertisement instead),
+        and institution terms block only alongside real commercial signals
+        (a student writing "مكتب خدمات الجامعه" is not an advertiser).
+        """
+        if self._search_first_valid(self._ad_hard_trie, text):
             result.reason = "advertisement"
             return True
-        if self._education_trie.search_first(text):
+        if ad_score >= 0.3 and self._search_first_valid(self._education_trie, text):
             result.reason = "education_provider"
-            return True
-        if any(em in text for em in self.emoji_advertisement):
-            result.reason = "advertisement_emoji"
             return True
         return False
 

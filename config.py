@@ -639,7 +639,10 @@ class Config:
             SESSION_REFRESH_INTERVAL=SecretManager.get_int("SESSION_REFRESH_INTERVAL", 43200, required=False),
             # ========== Prefilter ==========
             PREFILTER_ENABLED=SecretManager.get_bool("PREFILTER_ENABLED", True),
-            PREFILTER_MIN_WORDS=SecretManager.get_int("PREFILTER_MIN_WORDS", 2, required=False),
+            # v14.4 filter: 1 (was 2) — short high-signal requests ("محتاج",
+            # "فزعه") are legitimate; junk single words are handled by the
+            # ignore/spam tries inside the engine, not by word count.
+            PREFILTER_MIN_WORDS=SecretManager.get_int("PREFILTER_MIN_WORDS", 1, required=False),
             PREFILTER_MAX_EMOJIS=SecretManager.get_int("PREFILTER_MAX_EMOJIS", 5, required=False),
             # ========== المراقبة ==========
             PROMETHEUS_ENABLED=SecretManager.get_bool("PROMETHEUS_ENABLED", False),

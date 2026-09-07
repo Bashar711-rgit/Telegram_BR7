@@ -301,6 +301,16 @@ def _read_keywords_file() -> Optional[Dict[str, Any]]:
         return None
 
 
+def _kw_version(data: Optional[Dict[str, Any]]):
+    """Semantic-ish version tuple from _meta.version ("15.3.0" -> (15, 3, 0))."""
+    try:
+        raw = str(((data or {}).get("_meta") or {}).get("version", "0"))
+        parts = tuple(int(p) for p in raw.split(".") if p.isdigit())
+        return parts or (0,)
+    except Exception:
+        return (0,)
+
+
 async def persist_keywords(db: Any, data: Dict[str, Any]) -> bool:
     """Mirror the full keywords.json content to the DB (direct save)."""
     try:
@@ -359,12 +369,26 @@ async def restore_all(app: Any) -> Dict[str, Any]:
         status = apply_setting(app, key, value)
         (result["settings_applied"] if status == "applied" else result["settings_stored"]).append(key)
 
-    # 2) keywords
+    # 2) keywords — v15.3: version-gated restore. A NEWER shipped
+    # keywords.json (code deploy) wins once and updates the DB mirror;
+    # otherwise the dashboard's DB copy (user's live edits) still wins.
     kw = await load_keywords(db)
     if kw is not None:
         current = _read_keywords_file()
         if current == kw:
             result["keywords_skipped_same"] = True
+        elif _kw_version(current) > _kw_version(kw):
+            try:
+                from dashboard import KEYWORDS_FILE
+
+                await persist_keywords(db, current)
+                result["keywords_shipped_newer"] = True
+                logger.info(
+                    "dashboard_store: shipped keywords.json ({}) is newer than DB copy ({}) — DB mirror refreshed from file",
+                    _kw_version(current), _kw_version(kw),
+                )
+            except Exception as e:
+                logger.error(f"dashboard_store: keywords mirror refresh failed: {e}")
         else:
             try:
                 from dashboard import KEYWORDS_FILE, _reload_filter_keywords, _write_keywords_file
