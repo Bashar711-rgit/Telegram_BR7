@@ -377,11 +377,12 @@ class EnhancedDatabase:
                 await self._connect_postgresql()
             await self._create_tables()
             await self._migrate_bigint_ids()
+            await self._migrate_sender_intel()
             await self._create_indexes()
             self.is_connected = True
             await self.start_writer()
             # Note: start_cleanup() intentionally NOT called here (fix #5)
-            logger.info(f"Database connected: {self.db_type.upper()} v9.2")
+            logger.info(f"Database connected: {self.db_type.upper()} v9.3")
             return True
         except Exception as e:
             logger.error(f"Database connection failed: {e}")
@@ -538,6 +539,23 @@ class EnhancedDatabase:
                 last_message_id INTEGER,
                 last_message_link TEXT,
                 last_group_link TEXT,
+                phone TEXT,
+                is_bot BOOLEAN DEFAULT FALSE,
+                is_verified BOOLEAN DEFAULT FALSE,
+                is_premium BOOLEAN DEFAULT FALSE,
+                is_scam BOOLEAN DEFAULT FALSE,
+                is_fake BOOLEAN DEFAULT FALSE,
+                is_restricted BOOLEAN DEFAULT FALSE,
+                is_deleted BOOLEAN DEFAULT FALSE,
+                is_contact BOOLEAN DEFAULT FALSE,
+                is_mutual_contact BOOLEAN DEFAULT FALSE,
+                photo_available BOOLEAN,
+                restriction_reason TEXT,
+                lang_code TEXT,
+                status TEXT,
+                usernames TEXT,
+                last_seen REAL,
+                last_updated REAL,
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
             );
             CREATE TABLE IF NOT EXISTS system_health (
@@ -587,6 +605,8 @@ class EnhancedDatabase:
                         .replace("access_hash INTEGER,", "access_hash BIGINT,")
                         .replace("last_chat_id INTEGER,", "last_chat_id BIGINT,")
                         .replace("last_message_id INTEGER,", "last_message_id BIGINT,")
+                        .replace("last_seen REAL,", "last_seen DOUBLE PRECISION,")
+                        .replace("last_updated REAL,", "last_updated DOUBLE PRECISION,")
                         .replace("REAL DEFAULT (unixepoch())", "DOUBLE PRECISION DEFAULT EXTRACT(EPOCH FROM NOW())")
                         .replace("DATETIME DEFAULT CURRENT_TIMESTAMP", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
                         .replace("REAL NOT NULL", "DOUBLE PRECISION NOT NULL")
@@ -635,6 +655,73 @@ class EnhancedDatabase:
             f"Database migration v9.1: Telegram-ID columns widened to BIGINT "
             f"({applied}/{len(stmts)} applied)"
         )
+
+    # ── sender-intel columns (v9.3, backward-compatible) ──────────────────
+    _SENDER_INTEL_COLUMNS = [
+        # (name, sqlite/pg type suffix) — types valid on BOTH dialects.
+        ("phone", "TEXT"),
+        ("is_bot", "BOOLEAN DEFAULT FALSE"),
+        ("is_verified", "BOOLEAN DEFAULT FALSE"),
+        ("is_premium", "BOOLEAN DEFAULT FALSE"),
+        ("is_scam", "BOOLEAN DEFAULT FALSE"),
+        ("is_fake", "BOOLEAN DEFAULT FALSE"),
+        ("is_restricted", "BOOLEAN DEFAULT FALSE"),
+        ("is_deleted", "BOOLEAN DEFAULT FALSE"),
+        ("is_contact", "BOOLEAN DEFAULT FALSE"),
+        ("is_mutual_contact", "BOOLEAN DEFAULT FALSE"),
+        ("photo_available", "BOOLEAN"),
+        ("restriction_reason", "TEXT"),
+        ("lang_code", "TEXT"),
+        ("status", "TEXT"),
+        ("usernames", "TEXT"),
+        ("last_seen", "DOUBLE PRECISION"),
+        ("last_updated", "DOUBLE PRECISION"),
+    ]
+
+    async def _migrate_sender_intel(self) -> None:
+        """v9.3: enrich sender_contacts with full sender metadata.
+
+        Backward compatible by construction:
+          * columns are ADDED, never renamed/dropped (no data loss)
+          * existing queries (JOIN on sender_id) are unaffected
+          * idempotent — safe on every boot, cheap no-op afterwards
+        PostgreSQL uses ADD COLUMN IF NOT EXISTS; SQLite is pragma-checked
+        per column (no IF NOT EXISTS support there).
+        """
+        table = "sender_contacts"
+        existing: set = set()
+        if self.db_type == "postgresql":
+            rows = await self._fetchall(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name = ?",
+                (table,),
+            )
+            existing = {r["column_name"] for r in rows}
+        else:
+            rows = await self._fetchall(f"PRAGMA table_info({table})", ())
+            existing = {r["name"] for r in rows}
+
+        added = 0
+        for name, decl in self._SENDER_INTEL_COLUMNS:
+            if name in existing:
+                continue
+            try:
+                if self.db_type == "postgresql":
+                    # normalize DOUBLE PRECISION -> DOUBLE PRECISION (already valid)
+                    await self._execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {name} {decl}")
+                else:
+                    # SQLite has no DOUBLE PRECISION alias issue, but keep native types
+                    sqlite_decl = decl.replace("DOUBLE PRECISION", "REAL")
+                    await self._execute(f"ALTER TABLE {table} ADD COLUMN {name} {sqlite_decl}")
+                added += 1
+            except Exception as e:
+                logger.warning(
+                    f"sender-intel migration: {table}.{name} skipped: "
+                    f"{type(e).__name__}: {str(e)[:120]}"
+                )
+        await self._commit()
+        if added:
+            logger.info(f"Database migration v9.3: sender_contacts enriched (+{added} columns)")
 
     async def _create_indexes(self) -> None:
         indexes = [
@@ -1045,58 +1132,143 @@ class EnhancedDatabase:
             logger.error(f"try_insert_message error: {e}")
             return False
 
-    # ─── Sender Contacts ──────────────────────────────────────────────────────
+    # ─── Sender Contacts ────────────────────────────────────────────────   
+    # v9.3 update policy (engineering brief #22/#24):
+    #   * identity fields (username/access_hash/names/phone/metadata):
+    #       new NON-NULL value → update; new NULL value → KEEP the stored
+    #       value (COALESCE) — a transient entity without a username must
+    #       never erase the historical one.
+    #   * last-seen context (last_chat_id/last_message_id): always the
+    #       newest message (these are "where we saw them last" fields).
+    #   * last_updated: always refreshed; updated_at: always refreshed.
+    _CONTACT_COLS = (
+        "sender_id, access_hash, username, first_name, last_name, "
+        "last_chat_id, last_message_id, last_message_link, last_group_link, "
+        "phone, is_bot, is_verified, is_premium, is_scam, is_fake, "
+        "is_restricted, is_deleted, is_contact, is_mutual_contact, "
+        "photo_available, restriction_reason, lang_code, status, usernames, "
+        "last_seen, last_updated"
+    )
+
+    def _contact_params(self, s: Dict[str, Any]) -> tuple:
+        """Ordered params for _CONTACT_COLS (SQLite tuple form)."""
+        return (
+            s["sender_id"], s.get("access_hash"), s.get("username"),
+            s.get("first_name"), s.get("last_name"),
+            s.get("chat_id"), s.get("message_id"),
+            s.get("msg_link"), s.get("group_link"),
+            s.get("phone"), s.get("is_bot"), s.get("is_verified"),
+            s.get("is_premium"), s.get("is_scam"), s.get("is_fake"),
+            s.get("is_restricted"), s.get("is_deleted"), s.get("is_contact"),
+            s.get("is_mutual_contact"), s.get("photo_available"),
+            s.get("restriction_reason"), s.get("lang_code"), s.get("status"),
+            s.get("usernames"), s.get("last_seen"), s.get("last_updated"),
+        )
+
     async def upsert_sender_contact(self, sender_data: Dict[str, Any]) -> None:
+        """persist (requirement #11/#24). Never deletes a row (deleted
+        accounts keep their historical identity, requirement #23)."""
         try:
+            import time as _time
+            data = dict(sender_data)
+            data.setdefault("last_updated", _time.time())
+            # usernames stored as JSON text when a list is provided
+            if isinstance(data.get("usernames"), (list, tuple)):
+                import json as _json
+                data["usernames"] = _json.dumps(list(data["usernames"]), ensure_ascii=False)
+            p = self._contact_params(data)
+            n = len(p)
             if self.db_type == "sqlite":
-                await self._execute(
-                    "INSERT INTO sender_contacts "
-                    "(sender_id, access_hash, username, first_name, last_name, "
-                    " last_chat_id, last_message_id, last_message_link, last_group_link) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
-                    "ON CONFLICT(sender_id) DO UPDATE SET "
-                    "access_hash = excluded.access_hash, "
-                    "username = excluded.username, "
-                    "first_name = excluded.first_name, "
-                    "last_name = excluded.last_name, "
+                placeholders = ", ".join(["?"] * n)
+                set_clause = (
+                    "access_hash = COALESCE(excluded.access_hash, sender_contacts.access_hash), "
+                    "username = COALESCE(excluded.username, sender_contacts.username), "
+                    "first_name = COALESCE(excluded.first_name, sender_contacts.first_name), "
+                    "last_name = COALESCE(excluded.last_name, sender_contacts.last_name), "
                     "last_chat_id = excluded.last_chat_id, "
                     "last_message_id = excluded.last_message_id, "
-                    "last_message_link = excluded.last_message_link, "
-                    "last_group_link = excluded.last_group_link, "
-                    "updated_at = CURRENT_TIMESTAMP",
-                    (
-                        sender_data["sender_id"], sender_data.get("access_hash"),
-                        sender_data.get("username"), sender_data.get("first_name"),
-                        sender_data.get("last_name"), sender_data.get("chat_id"),
-                        sender_data.get("message_id"), sender_data.get("msg_link"),
-                        sender_data.get("group_link"),
-                    ),
+                    "last_message_link = COALESCE(excluded.last_message_link, sender_contacts.last_message_link), "
+                    "last_group_link = COALESCE(excluded.last_group_link, sender_contacts.last_group_link), "
+                    "phone = COALESCE(excluded.phone, sender_contacts.phone), "
+                    "is_bot = COALESCE(excluded.is_bot, sender_contacts.is_bot), "
+                    "is_verified = COALESCE(excluded.is_verified, sender_contacts.is_verified), "
+                    "is_premium = COALESCE(excluded.is_premium, sender_contacts.is_premium), "
+                    "is_scam = COALESCE(excluded.is_scam, sender_contacts.is_scam), "
+                    "is_fake = COALESCE(excluded.is_fake, sender_contacts.is_fake), "
+                    "is_restricted = COALESCE(excluded.is_restricted, sender_contacts.is_restricted), "
+                    "is_deleted = COALESCE(excluded.is_deleted, sender_contacts.is_deleted), "
+                    "is_contact = COALESCE(excluded.is_contact, sender_contacts.is_contact), "
+                    "is_mutual_contact = COALESCE(excluded.is_mutual_contact, sender_contacts.is_mutual_contact), "
+                    "photo_available = COALESCE(excluded.photo_available, sender_contacts.photo_available), "
+                    "restriction_reason = COALESCE(excluded.restriction_reason, sender_contacts.restriction_reason), "
+                    "lang_code = COALESCE(excluded.lang_code, sender_contacts.lang_code), "
+                    "status = COALESCE(excluded.status, sender_contacts.status), "
+                    "usernames = COALESCE(excluded.usernames, sender_contacts.usernames), "
+                    "last_seen = COALESCE(excluded.last_seen, sender_contacts.last_seen), "
+                    "last_updated = excluded.last_updated, "
+                    "updated_at = CURRENT_TIMESTAMP"
+                )
+                await self._execute(
+                    f"INSERT INTO sender_contacts ({self._CONTACT_COLS}) "
+                    f"VALUES ({placeholders}) "
+                    "ON CONFLICT(sender_id) DO UPDATE SET " + set_clause,
+                    p,
                 )
                 await self._commit()
             else:
-                await self._pool.execute(
-                    "INSERT INTO sender_contacts "
-                    "(sender_id, access_hash, username, first_name, last_name, "
-                    " last_chat_id, last_message_id, last_message_link, last_group_link) "
-                    "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) "
-                    "ON CONFLICT (sender_id) DO UPDATE SET "
-                    "access_hash = EXCLUDED.access_hash, "
-                    "username = EXCLUDED.username, "
-                    "first_name = EXCLUDED.first_name, "
-                    "last_name = EXCLUDED.last_name, "
+                placeholders = ", ".join(["?"] * n)
+                set_clause = (
+                    "access_hash = COALESCE(EXCLUDED.access_hash, sender_contacts.access_hash), "
+                    "username = COALESCE(EXCLUDED.username, sender_contacts.username), "
+                    "first_name = COALESCE(EXCLUDED.first_name, sender_contacts.first_name), "
+                    "last_name = COALESCE(EXCLUDED.last_name, sender_contacts.last_name), "
                     "last_chat_id = EXCLUDED.last_chat_id, "
                     "last_message_id = EXCLUDED.last_message_id, "
-                    "last_message_link = EXCLUDED.last_message_link, "
-                    "last_group_link = EXCLUDED.last_group_link, "
-                    "updated_at = CURRENT_TIMESTAMP",
-                    sender_data["sender_id"], sender_data.get("access_hash"),
-                    sender_data.get("username"), sender_data.get("first_name"),
-                    sender_data.get("last_name"), sender_data.get("chat_id"),
-                    sender_data.get("message_id"), sender_data.get("msg_link"),
-                    sender_data.get("group_link"),
+                    "last_message_link = COALESCE(EXCLUDED.last_message_link, sender_contacts.last_message_link), "
+                    "last_group_link = COALESCE(EXCLUDED.last_group_link, sender_contacts.last_group_link), "
+                    "phone = COALESCE(EXCLUDED.phone, sender_contacts.phone), "
+                    "is_bot = COALESCE(EXCLUDED.is_bot, sender_contacts.is_bot), "
+                    "is_verified = COALESCE(EXCLUDED.is_verified, sender_contacts.is_verified), "
+                    "is_premium = COALESCE(EXCLUDED.is_premium, sender_contacts.is_premium), "
+                    "is_scam = COALESCE(EXCLUDED.is_scam, sender_contacts.is_scam), "
+                    "is_fake = COALESCE(EXCLUDED.is_fake, sender_contacts.is_fake), "
+                    "is_restricted = COALESCE(EXCLUDED.is_restricted, sender_contacts.is_restricted), "
+                    "is_deleted = COALESCE(EXCLUDED.is_deleted, sender_contacts.is_deleted), "
+                    "is_contact = COALESCE(EXCLUDED.is_contact, sender_contacts.is_contact), "
+                    "is_mutual_contact = COALESCE(EXCLUDED.is_mutual_contact, sender_contacts.is_mutual_contact), "
+                    "photo_available = COALESCE(EXCLUDED.photo_available, sender_contacts.photo_available), "
+                    "restriction_reason = COALESCE(EXCLUDED.restriction_reason, sender_contacts.restriction_reason), "
+                    "lang_code = COALESCE(EXCLUDED.lang_code, sender_contacts.lang_code), "
+                    "status = COALESCE(EXCLUDED.status, sender_contacts.status), "
+                    "usernames = COALESCE(EXCLUDED.usernames, sender_contacts.usernames), "
+                    "last_seen = COALESCE(EXCLUDED.last_seen, sender_contacts.last_seen), "
+                    "last_updated = EXCLUDED.last_updated, "
+                    "updated_at = CURRENT_TIMESTAMP"
+                )
+                # _pg() translates the ?-placeholders to $N form; the SET
+                # clause contains no placeholders (EXCLUDED.<col> only).
+                await self._pool.execute(
+                    _pg(
+                        f"INSERT INTO sender_contacts ({self._CONTACT_COLS}) "
+                        f"VALUES ({placeholders}) "
+                        "ON CONFLICT (sender_id) DO UPDATE SET " + set_clause
+                    ),
+                    *p,
                 )
         except Exception as e:
             logger.error(f"upsert_sender_contact error: {e}")
+
+    async def get_sender_contact(self, sender_id: int) -> Optional[Dict[str, Any]]:
+        """DB fallback for the resolver / recovery paths. Returns the full
+        stored contact row (or None)."""
+        try:
+            return await self._fetchone(
+                "SELECT * FROM sender_contacts WHERE sender_id = ?",
+                (sender_id,),
+            )
+        except Exception as e:
+            logger.debug(f"get_sender_contact error: {e}")
+            return None
 
     async def update_sender_reputation(self, sender_id: int, is_valid: bool) -> None:
         try:

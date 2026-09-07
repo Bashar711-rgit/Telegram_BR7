@@ -264,6 +264,25 @@ services:
       - key: CAPTURE_TTL_SECONDS
         value: "30"       # مدة الاحتفاظ بالرسالة المحفوظة (ثانية)
 
+      # Sender Intelligence / Resolver — sender_resolver.py v1.0 (monitors v9.9)
+      # طبقة خلفية فقط: تُثري بيانات المرسل (username/access_hash/أعلام الحساب)
+      # لحظة وصول الرسالة وتحفظها في sender_contacts. لا تغيّر شكل التنبيهات
+      # إطلاقاً. Kill switch: اجعل SENDER_INTEL_ENABLED=false للتعطيل الفوري.
+      - key: SENDER_INTEL_ENABLED
+        value: "true"     # غيّرها إلى false للتعطيل الفوري (قاطع طوارئ)
+      - key: SENDER_ENTITY_CACHE_SIZE
+        value: "2000"     # حجم كاش الكيانات (TTLCache)
+      - key: SENDER_ENTITY_CACHE_TTL
+        value: "900"      # مدة صلاحية كاش الكيانات (ثانية)
+      - key: SENDER_RESOLVE_MAX_RETRIES
+        value: "3"        # أقصى عدد محاولات للأخطاء المؤقتة فقط
+      - key: SENDER_RESOLVE_BACKOFF_BASE
+        value: "0.5"      # أساس التراجع الأسي (ثانية)
+      - key: SENDER_RESOLVE_BACKOFF_MAX
+        value: "8"        # الحد الأقصى للتأخير بين المحاولات (ثانية)
+      - key: SENDER_FLOOD_MAX_SLEEP
+        value: "5"        # ننام بانتظار FloodWait فقط إن كانت ≤ هذه القيمة
+
       # Resource pressure check — database.py v9.0 (إصلاح #12)
       - key: DB_PRESSURE_CHECK_EVERY
         value: "12"
