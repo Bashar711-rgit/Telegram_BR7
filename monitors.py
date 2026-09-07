@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-monitors.py – Account Monitor v9.8.0 (STABLE 24/7 EDITION, HARDENED + FAST CAPTURE)
+monitors.py – Account Monitor v9.9.0 (STABLE 24/7 EDITION, HARDENED + FAST CAPTURE + SENDER INTELLIGENCE)
 - إصلاح تدوير الجلسة (إعادة تسجيل المعالج)
 - تحسين إعادة الاتصال واكتشاف العميل الميت
 - دعم كامل لـ IntentEngine
@@ -54,6 +54,30 @@ v9.8 (this fix) — Fast Capture: protection against deletion bots:
   * /health (dashboard + fallback server) exposes a fast_capture snapshot
     (enabled/size/saved/deleted_captured/deleted_recovered/...).
 
+v9.9 (this pass) — Sender Intelligence / Sender Contact Resolver:
+  * Backend-ONLY enrichment layer (sender_resolver.py). 🚨 The alert
+    contract is untouched: same text, same field order, same emojis, same
+    HTML, same buttons, same links. _build_alert()/send paths are unchanged;
+    they simply receive richer sender data through the same keys.
+  * FastCaptureBuffer entries now also carry the full sender snapshot
+    (username / first_name / last_name / access_hash + metadata flags)
+    captured synchronously from event.sender at arrival (requirement #9:
+    if NewMessage → deleted → recovery, the sender data must survive).
+  * _event_to_dict() keeps every existing key with the same values and
+    ADDS sender_* metadata keys (additive, backward compatible). When
+    event.sender is missing, one deduplicated resolver lookup fills it
+    AFTER the fast capture has already protected the text.
+  * Recovery/DLQ rebuilt events now reuse the captured sender fields and
+    fall back to sender_contacts in the DB — they NEVER blank sender data
+    to None when the original values exist (requirement #10).
+  * DB upsert policy: new non-null value → update; new null value → keep
+    the stored value (COALESCE) for identity fields (requirement #24).
+  * Resolver: entity cache (TTL) + in-flight dedup + exponential backoff
+    with jitter for transient errors + FloodWait honored with the exact
+    Telegram seconds + precise internal failure reasons (logs/DB only).
+  * Gated by CFG.SENDER_INTEL_ENABLED (env SENDER_INTEL_ENABLED, default
+    true; kill switch for instant disable without code changes).
+
 See the accompanying engineering report for the full list of changes,
 the retry_count propagation fix (process_event_from_queue / _send_alert),
 and documented FOLLOW-UP items for other files.
@@ -82,6 +106,12 @@ from telethon.tl.types import (
 from config import CFG, InputSanitizer, fast_hash
 from database import EnhancedDatabase, MessageRecord, AlertRecord, DeadLetterRecord
 from filter_engine import EnhancedFilter
+from sender_resolver import (
+    extract_flat as _sender_extract_flat,
+    extract_sender as _sender_extract,
+    meta_to_contact_fields as _sender_meta_to_contact,
+    sender_intel,
+)
 
 
 # (نفس الدوال المساعدة من النسخة الأصلية: resolve_chat_entity, build_telegram_links)
@@ -192,11 +222,13 @@ class FastCaptureBuffer:
         sender_id: int = 0,
         sender_name: str = "",
         account: str = "",
+        sender_meta: Optional[Dict[str, Any]] = None,
     ) -> None:
         now = time.time()
         self._gc(now)
         key = (int(chat_id or 0), int(msg_id or 0))
         prev = self._buf.get(key)
+        meta = sender_meta or {}
         if prev is not None:
             # Same message delivered via several account clients: refresh
             # content but keep the FIRST-seen ts (TTL = time since arrival).
@@ -205,12 +237,28 @@ class FastCaptureBuffer:
                 prev["sender_id"] = sender_id
             if sender_name:
                 prev["sender_name"] = sender_name
+            # v9.9 sender-intel merge — destructive-NULL-free (brief #24):
+            # a later duplicate delivery may only ADD or REFRESH non-null
+            # sender values; it can never blank an already-captured field.
+            for f in ("sender_username", "sender_first_name", "sender_last_name"):
+                v = meta.get(f)
+                if v:
+                    prev[f] = v
+            if meta.get("sender_access_hash") is not None:
+                prev["sender_access_hash"] = meta["sender_access_hash"]
+            if meta.get("sender_meta_full") is not None:
+                prev["sender_meta_full"] = meta["sender_meta_full"]
             self._stats["saved"] += 1
             return
         self._buf[key] = {
             "text": text,
             "sender_id": int(sender_id or 0),
             "sender_name": sender_name,
+            "sender_username": meta.get("sender_username"),
+            "sender_first_name": meta.get("sender_first_name"),
+            "sender_last_name": meta.get("sender_last_name"),
+            "sender_access_hash": meta.get("sender_access_hash"),
+            "sender_meta_full": meta.get("sender_meta_full"),
             "chat_id": key[0],
             "msg_id": key[1],
             "ts": now,
@@ -1059,13 +1107,26 @@ class EnhancedAccountMonitor:
 
 
     async def _event_to_dict(self, event: events.NewMessage.Event) -> Dict[str, Any]:
-        sender = event.sender; chat = event.chat
+        sender = event.sender
+        # v9.9: the fast capture has ALREADY protected text+sender synchronously
+        # before this point, so one deduplicated resolver lookup here is safe:
+        # it only enriches AFTER the save-first guarantee. When event.sender
+        # is absent (entity not embedded in the update), a single shared
+        # in-flight-deduped resolution fills it (requirement #3/#8: prefer
+        # event.sender; get_entity only as a bounded fallback).
+        if sender is None and CFG.SENDER_INTEL_ENABLED and getattr(event, "sender_id", None):
+            try:
+                sender = await sender_intel.fetch_event_sender(event, self.client)
+            except Exception as e:
+                logger.debug(f"sender_entity_fetch [{self.account['name']}]: {type(e).__name__}")
+                sender = None
+        chat = event.chat
         text = event.message.text or ""; caption = getattr(event.message, "message", "") or ""
         full_text = (text or caption).strip()
         media = event.message.media; media_type = self._get_media_type(media)
         has_media = media_type in ("photo", "document")
         chat_username = getattr(chat, "username", None) if chat else None
-        return {
+        event_data = {
             "chat_id": event.chat_id, "message_id": event.message.id,
             "sender_id": getattr(event, "sender_id", 0) or 0,
             "sender_username": getattr(sender, "username", None), "sender_first_name": getattr(sender, "first_name", None),
@@ -1074,6 +1135,15 @@ class EnhancedAccountMonitor:
             "text": full_text, "has_text": bool(full_text), "has_media": has_media, "media_type": media_type,
             "account_name": self.account["name"], "timestamp": time.time(),
         }
+        # v9.9 sender intelligence: ADDITIVE metadata keys only. Every key
+        # above keeps its exact name and semantics (backward compatible);
+        # downstream alert rendering reads the SAME keys as before.
+        if CFG.SENDER_INTEL_ENABLED and sender is not None:
+            try:
+                event_data.update(_sender_extract_flat(sender))
+            except Exception as e:
+                logger.debug(f"sender_flat_extract [{self.account['name']}]: {type(e).__name__}")
+        return event_data
 
 
     @staticmethod
@@ -1085,15 +1155,15 @@ class EnhancedAccountMonitor:
         return "other"
 
 
-    # ── Fast Capture (v9.8): deletion-race protection ──────────────────
+    # ── Fast Capture (v9.8/v9.9): deletion-race protection ─────────────
     def _fast_capture(self, event: events.NewMessage.Event) -> None:
         """SYNC save-first capture — must never await and never raise.
 
         Called from the NewMessage handler AFTER the cheap synchronous
         early-return checks and BEFORE the first await (the queue
-        handoff). Captures the raw text (body or media caption) so a
-        deletion bot that removes the message milliseconds later cannot
-        make the pipeline lose it.
+        handoff). Captures the raw text (body or media caption) AND the
+        full sender snapshot (v9.9) so a deletion bot that removes the
+        message milliseconds later cannot make the pipeline lose either.
         """
         if not _capture.enabled:
             return
@@ -1103,6 +1173,22 @@ class EnhancedAccountMonitor:
             if not text:
                 return  # voice/photo-only content — nothing to protect
             sender = getattr(event, "sender", None)
+            # v9.9: build the sender snapshot synchronously (pure getattr —
+            # zero API calls, zero awaits). Failure-safe by design.
+            sender_meta: Optional[Dict[str, Any]] = None
+            if CFG.SENDER_INTEL_ENABLED and sender is not None:
+                try:
+                    meta = _sender_extract(sender)
+                    if meta:
+                        sender_meta = {
+                            "sender_username": meta.get("username"),
+                            "sender_first_name": meta.get("first_name"),
+                            "sender_last_name": meta.get("last_name"),
+                            "sender_access_hash": meta.get("access_hash"),
+                            "sender_meta_full": meta,
+                        }
+                except Exception as meta_err:
+                    logger.debug(f"capture_sender_meta_error [{self.account['name']}]: {meta_err}")
             _capture.save(
                 chat_id=event.chat_id,
                 msg_id=msg.id,
@@ -1110,6 +1196,7 @@ class EnhancedAccountMonitor:
                 sender_id=getattr(event, "sender_id", 0) or 0,
                 sender_name=(getattr(sender, "first_name", None) or "") if sender else "",
                 account=self.account["name"],
+                sender_meta=sender_meta,
             )
         except Exception as cap_err:
             logger.debug(f"capture_save_error [{self.account['name']}]: {cap_err}")
@@ -1158,14 +1245,19 @@ class EnhancedAccountMonitor:
         """Re-submits a captured-but-never-queued message through the
         standard pipeline inside a tracked background task (same tracking /
         cancellation discipline as _spawn_media_task)."""
+        # v9.9 (brief #10): the rebuilt event REUSES the sender data saved
+        # in the fast capture (username / names / access_hash) instead of
+        # blanking them to None. Missing fields fall back to the persisted
+        # sender_contacts row — never the reverse (no NULL overwrites).
+        entry_sender_id = entry.get("sender_id", 0) or 0
         event_data: Dict[str, Any] = {
             "chat_id": entry.get("chat_id"),
             "message_id": entry.get("msg_id"),
-            "sender_id": entry.get("sender_id", 0) or 0,
-            "sender_username": None,
-            "sender_first_name": entry.get("sender_name"),
-            "sender_last_name": None,
-            "sender_access_hash": None,
+            "sender_id": entry_sender_id,
+            "sender_username": entry.get("sender_username"),
+            "sender_first_name": entry.get("sender_first_name") or entry.get("sender_name"),
+            "sender_last_name": entry.get("sender_last_name"),
+            "sender_access_hash": entry.get("sender_access_hash"),
             "chat_access_hash": None,
             "chat_username": None,
             "text": entry.get("text", ""),
@@ -1176,6 +1268,13 @@ class EnhancedAccountMonitor:
             "timestamp": entry.get("ts") or time.time(),
             "_fast_capture_recovery": True,
         }
+        # Restore the richer metadata snapshot (flags like is_bot/premium/…)
+        meta_full = entry.get("sender_meta_full")
+        if isinstance(meta_full, dict) and meta_full:
+            event_data.update(_sender_meta_to_contact(meta_full))
+        # DB fallback ONLY for fields the capture could not provide —
+        # existing (non-None) values are never overwritten (brief #10/#24).
+        await self._enrich_sender_from_db(event_data)
 
         async def _run():
             async with self._pipeline_sem:
@@ -1199,6 +1298,36 @@ class EnhancedAccountMonitor:
         async with self._media_task_lock:
             self._media_tasks.add(task)
         task.add_done_callback(self._on_media_task_done)
+
+    async def _enrich_sender_from_db(self, data: Dict[str, Any]) -> None:
+        """v9.9 sender-intel DB fallback: fill ONLY the sender fields the
+        event/recovery data is missing from the persisted sender_contacts
+        row. Never overwrites an existing non-null value with another value
+        or with None (brief #10/#24) — and never raises."""
+        try:
+            sender_id = data.get("sender_id")
+            if not sender_id or not self.db or not CFG.SENDER_INTEL_ENABLED:
+                return
+            missing_identity = (
+                not data.get("sender_username")
+                or data.get("sender_access_hash") is None
+                or not data.get("sender_first_name")
+            )
+            if not missing_identity:
+                return
+            row = await self.db.get_sender_contact(int(sender_id))
+            if not row:
+                return
+            if not data.get("sender_username"):
+                data["sender_username"] = row.get("username")
+            if data.get("sender_access_hash") is None:
+                data["sender_access_hash"] = row.get("access_hash")
+            if not data.get("sender_first_name"):
+                data["sender_first_name"] = row.get("first_name")
+            if not data.get("sender_last_name"):
+                data["sender_last_name"] = row.get("last_name")
+        except Exception as e:
+            logger.debug(f"sender_db_enrich error [{self.account['name']}]: {type(e).__name__}")
 
     def _recover_captured_text(self, data: Dict[str, Any]) -> Optional[str]:
         """v9.8 fallback at alert time: if the pipeline's copy of the text
@@ -1443,9 +1572,19 @@ class EnhancedAccountMonitor:
             await self._inc_stat("alerts_sent")
             async with self._stats_lock: self._stats["last_alert_time"] = time.time()
         try:
-            await self.db.upsert_sender_contact({"sender_id": sender_id, "access_hash": data.get("sender_access_hash"),
+            # v9.9: persist the FULL sender snapshot (identity + metadata)
+            # into sender_contacts. Identity fields follow the COALESCE
+            # policy in database.py: new non-null → update, null → keep.
+            contact = {
+                "sender_id": sender_id, "access_hash": data.get("sender_access_hash"),
                 "username": data.get("sender_username"), "first_name": data.get("sender_first_name"),
-                "last_name": data.get("sender_last_name"), "chat_id": data["chat_id"], "message_id": data["message_id"]})
+                "last_name": data.get("sender_last_name"), "chat_id": data["chat_id"], "message_id": data["message_id"],
+            }
+            if CFG.SENDER_INTEL_ENABLED:
+                contact.update(_sender_meta_to_contact(data))
+                # last-seen status label captured at arrival (may be stale
+                # later, hence stored, never trusted for delivery decisions)
+            await self.db.upsert_sender_contact(contact)
         except Exception as e: logger.warning(f"upsert_sender_contact failed [{self.account['name']}]: {e}")
         processing_time = (time.perf_counter() - start_time) * 1000
         await self._update_avg_time(processing_time)

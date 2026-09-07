@@ -96,6 +96,7 @@ from config import CFG, ACCOUNTS, KEYWORDS, logger
 from database import EnhancedDatabase
 from filter_engine import EnhancedFilter
 from monitors import EnhancedAccountMonitor, HealthMonitor, get_capture_snapshot
+from sender_resolver import get_sender_intel_snapshot
 
 # Import Dashboard
 try:
@@ -468,6 +469,7 @@ class EnhancedTelegramBot:
                 "db_healthy": self.db.db_healthy,
                 "monitors": sum(1 for m in self.monitors if m.is_connected),
                 "fast_capture": get_capture_snapshot(),
+                "sender_intel": get_sender_intel_snapshot(),
             })
 
         app.router.add_get('/health', health_handler)
