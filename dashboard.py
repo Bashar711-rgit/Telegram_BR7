@@ -886,6 +886,41 @@ async def get_dead_letters_endpoint(request: Request, limit: int = 100, only_unr
         return JSONResponse({"dead_letters": [], "total": 0})
 
 
+@app.get("/api/analytics", dependencies=[Depends(verify_token)])
+async def get_analytics(request: Request, hours: int = 24):
+    """Read-only analytics for the dashboard's statistics page.
+
+    Aggregates three EXISTING database queries (no new tables, no writes):
+      - get_hourly_stats(hours)   -> per-hour messages/alerts/accepted/conf
+      - get_top_keywords(10)      -> keyword usage ranking
+      - get_top_senders(10)       -> most active senders + reputation
+    Never raises — every block degrades to an empty list.
+    """
+    db = request.app.state.db
+    hours = max(1, min(int(hours or 24), 168))
+    try:
+        hourly = await db.get_hourly_stats(hours=hours)
+    except Exception as e:
+        logger.error(f"analytics hourly failed: {e}")
+        hourly = []
+    try:
+        top_keywords = await db.get_top_keywords(limit=10)
+    except Exception as e:
+        logger.error(f"analytics top_keywords failed: {e}")
+        top_keywords = []
+    try:
+        top_senders = await db.get_top_senders(limit=10)
+    except Exception as e:
+        logger.error(f"analytics top_senders failed: {e}")
+        top_senders = []
+    return JSONResponse({
+        "hours": hours,
+        "hourly": hourly,
+        "top_keywords": [dict(r) for r in top_keywords] if top_keywords else [],
+        "top_senders": [dict(r) for r in top_senders] if top_senders else [],
+    })
+
+
 @app.get("/api/keywords", dependencies=[Depends(verify_token)])
 async def get_keywords(request: Request):
     """
