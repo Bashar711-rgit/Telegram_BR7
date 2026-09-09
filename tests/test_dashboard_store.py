@@ -349,6 +349,132 @@ class TestSettingsAPI:
         assert r.status_code == 400
 
 
+class TestDynamicSettingsV910:
+    """اختبار 8 (طلب المستخدم): Dashboard → Database → Runtime بدون restart.
+    يغطي المفاتيح الجديدة v9.10 (dedup / الأزرار / الفلترة / المراقبة / الحدود)."""
+
+    V910_KEYS = [
+        "dedup_enabled", "dedup_window_seconds",
+        "alert_with_buttons", "alert_with_copy_button", "alert_max_text_len", "alert_show_score",
+        "spam_score_threshold", "fuzzy_matching_enabled", "negation_enabled",
+        "distance_scoring_enabled", "ad_detection_enabled", "prefilter_max_emojis",
+        "fast_capture_enabled", "sender_intel_enabled", "health_check_interval", "stats_interval",
+        "message_queue_size", "db_batch_interval", "dead_letter_max_retries",
+        "dead_letter_cleanup_days", "cleanup_interval", "memory_threshold_mb",
+    ]
+
+    @pytest.mark.asyncio
+    async def test_all_v910_keys_in_schema(self, client, clean_app_settings):
+        r = await client.get("/api/settings", headers=AUTH)
+        body = r.json()
+        for key in self.V910_KEYS:
+            assert key in body["schema"], f"missing setting key: {key}"
+            assert key in body["settings"], f"missing effective value: {key}"
+        assert body["schema"]["dedup_enabled"]["type"] == "bool"
+        assert body["schema"]["dedup_window_seconds"]["type"] == "int"
+
+    @pytest.mark.asyncio
+    async def test_dedup_window_dashboard_to_db_to_runtime(self, client, clean_app_settings):
+        """تغيير إعداد من اللوحة → يُكتب في DB → يُطبَّق على CFG فوراً."""
+        from config import CFG
+
+        original = CFG.DEDUP_WINDOW_SECONDS
+        try:
+            r = await client.post(
+                "/api/settings",
+                headers=AUTH,
+                json={"updates": {"dedup_window_seconds": 3600}},
+            )
+            assert r.status_code == 200
+            body = r.json()
+            assert body["success"] is True
+            assert body["persisted_to_db"] is True
+            assert body["applied_live"]["dedup_window_seconds"] == 3600
+            # Runtime تغيّر فوراً — بدون أي restart
+            assert CFG.DEDUP_WINDOW_SECONDS == 3600
+            # DB يحمل القيمة (Single Source of Truth)
+            stored = await dashboard_store.get_all(clean_app_settings)
+            assert json.loads(stored["dedup_window_seconds"]) == 3600
+            # والقراءة اللاحقة تعرض القيمة الفعالة الجديدة
+            r2 = await client.get("/api/settings", headers=AUTH)
+            assert r2.json()["settings"]["dedup_window_seconds"] == 3600
+        finally:
+            object.__setattr__(CFG, "DEDUP_WINDOW_SECONDS", original)
+
+    @pytest.mark.asyncio
+    async def test_dedup_enabled_bool_toggle_live(self, client, clean_app_settings):
+        from config import CFG
+
+        original = CFG.DEDUP_ENABLED
+        try:
+            r = await client.post(
+                "/api/settings", headers=AUTH,
+                json={"updates": {"dedup_enabled": False}},
+            )
+            assert r.status_code == 200
+            assert CFG.DEDUP_ENABLED is False
+            # يعود True عبر نفس المسار
+            r2 = await client.post(
+                "/api/settings", headers=AUTH,
+                json={"updates": {"dedup_enabled": True}},
+            )
+            assert CFG.DEDUP_ENABLED is True
+        finally:
+            object.__setattr__(CFG, "DEDUP_ENABLED", original)
+
+    @pytest.mark.asyncio
+    async def test_alert_button_toggles_live(self, client, clean_app_settings):
+        from config import CFG
+
+        orig_btn, orig_copy = CFG.ALERT_WITH_BUTTONS, CFG.ALERT_WITH_COPY_BUTTON
+        try:
+            r = await client.post(
+                "/api/settings", headers=AUTH,
+                json={"updates": {"alert_with_buttons": False, "alert_with_copy_button": False}},
+            )
+            assert r.status_code == 200
+            assert CFG.ALERT_WITH_BUTTONS is False
+            assert CFG.ALERT_WITH_COPY_BUTTON is False
+        finally:
+            object.__setattr__(CFG, "ALERT_WITH_BUTTONS", orig_btn)
+            object.__setattr__(CFG, "ALERT_WITH_COPY_BUTTON", orig_copy)
+
+    @pytest.mark.asyncio
+    async def test_out_of_range_rejected(self, client, clean_app_settings):
+        r = await client.post(
+            "/api/settings", headers=AUTH,
+            json={"updates": {"dedup_window_seconds": 10}},  # أقل من min=60
+        )
+        body = r.json()
+        assert body["success"] is False
+        assert "dedup_window_seconds" in body["errors"]
+
+    @pytest.mark.asyncio
+    async def test_restore_after_boot_applies_v910_settings(self, clean_store):
+        """اختبار 9: بعد إعادة التشغيل تُحمَّل آخر إعدادات محفوظة في DB."""
+        from config import CFG
+
+        originals = (CFG.DEDUP_ENABLED, CFG.DEDUP_WINDOW_SECONDS, CFG.FAST_CAPTURE_ENABLED)
+        try:
+            await dashboard_store.set_many(clean_store, {
+                "dedup_enabled": json.dumps(False),
+                "dedup_window_seconds": json.dumps(7200),
+                "fast_capture_enabled": json.dumps(True),
+            })
+            result = await dashboard_store.restore_all(FakeApp(clean_store))
+            assert "dedup_enabled" in result["settings_applied"]
+            assert "dedup_window_seconds" in result["settings_applied"]
+            assert "fast_capture_enabled" in result["settings_applied"]
+            assert CFG.DEDUP_ENABLED is False
+            assert CFG.DEDUP_WINDOW_SECONDS == 7200
+            assert CFG.FAST_CAPTURE_ENABLED is True
+        finally:
+            (o1, o2, o3) = originals
+            object.__setattr__(CFG, "DEDUP_ENABLED", o1)
+            object.__setattr__(CFG, "DEDUP_WINDOW_SECONDS", o2)
+            object.__setattr__(CFG, "FAST_CAPTURE_ENABLED", o3)
+
+
 class TestKeywordsPersistenceAPI:
     @pytest.mark.asyncio
     async def test_add_keyword_persists_to_db(self, client, clean_app_settings, tmp_path, monkeypatch):

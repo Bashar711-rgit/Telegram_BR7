@@ -1652,7 +1652,10 @@ function renderSettings(data) {
         const g = groups[spec.group] = groups[spec.group] || { label: spec.group_label, fields: [] };
         g.fields.push([key, spec]);
     });
-    const order = { destinations: '🎯', alerts: '🔔', filtering: '🎯' };
+    const order = {
+        destinations: '🎯', alerts: '🔔', dedup: '🛡️', filtering: '🧠',
+        monitoring: '📡', limits: '⚙️'
+    };
     const form = document.getElementById('settings-form');
     if (!form) return;
     form.innerHTML = Object.keys(order).filter(g => groups[g]).map(g => `

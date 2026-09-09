@@ -390,6 +390,10 @@ class _ConfigData:
     CAPTURE_BUFFER_SIZE: int
     CAPTURE_TTL_SECONDS: int
 
+    # ── Alert Dedup (v9.10 — cross-account/re-send alert barrier) ──
+    DEDUP_ENABLED: bool
+    DEDUP_WINDOW_SECONDS: int
+
     # ── Sender Intelligence / Resolver (backend-only enrichment, v9.9) ──
     SENDER_INTEL_ENABLED: bool
     SENDER_ENTITY_CACHE_SIZE: int
@@ -661,6 +665,11 @@ class Config:
             FAST_CAPTURE_ENABLED=SecretManager.get_bool("FAST_CAPTURE_ENABLED", False),
             CAPTURE_BUFFER_SIZE=SecretManager.get_int("CAPTURE_BUFFER_SIZE", 1000, required=False),
             CAPTURE_TTL_SECONDS=SecretManager.get_int("CAPTURE_TTL_SECONDS", 30, required=False),
+            # v9.10 dedup: يمنع تكرار التنبيهات (نفس المرسل بنفس النص، عبر أي
+            # حساب من الحسابات الستة أو إعادة إرسال). كلتا القيمتين قابلتان
+            # للتعديل الحي من لوحة التحكم (DEDUP_ENABLED / DEDUP_WINDOW_SECONDS).
+            DEDUP_ENABLED=SecretManager.get_bool("DEDUP_ENABLED", True),
+            DEDUP_WINDOW_SECONDS=SecretManager.get_int("DEDUP_WINDOW_SECONDS", 86400, required=False),
             # Sender Intelligence: passive, failure-safe backend enrichment
             # (never changes alert output). Kill switch: SENDER_INTEL_ENABLED=false.
             SENDER_INTEL_ENABLED=SecretManager.get_bool("SENDER_INTEL_ENABLED", True),

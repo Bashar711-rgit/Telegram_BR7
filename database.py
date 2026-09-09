@@ -592,6 +592,13 @@ class EnhancedDatabase:
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
             );
+            CREATE TABLE IF NOT EXISTS alert_dedup (
+                fingerprint TEXT PRIMARY KEY,
+                sender_id INTEGER,
+                first_seen REAL NOT NULL,
+                last_seen REAL NOT NULL,
+                hits INTEGER DEFAULT 1
+            );
         """
         for stmt in stmts.split(";"):
             s = stmt.strip()
@@ -742,6 +749,9 @@ class EnhancedDatabase:
             "CREATE INDEX IF NOT EXISTS idx_alr_time_sender ON alerts(timestamp DESC, sender_id)",
             "CREATE INDEX IF NOT EXISTS idx_alr_decision  ON alerts(decision)",
             "CREATE INDEX IF NOT EXISTS idx_alr_confidence ON alerts(confidence)",
+            # v9.10 dedup: fast expiry-scan for the periodic cleanup
+            "CREATE INDEX IF NOT EXISTS idx_dedup_first_seen ON alert_dedup(first_seen)",
+            "CREATE INDEX IF NOT EXISTS idx_dedup_sender     ON alert_dedup(sender_id)",
         ]
         for idx in indexes:
             await self._execute(idx)
@@ -1335,6 +1345,131 @@ class EnhancedDatabase:
             return row["message_text"] if row else None
         except Exception:
             return None
+
+    # ─── Alert Dedup (v9.10 — cross-account/re-send alert barrier) ───────────
+    async def claim_alert_fingerprint(
+        self, fingerprint: str, first_seen: float, window_hint: int = 86400
+    ) -> bool:
+        """
+        Atomically claim a content fingerprint. Returns True only for the
+        FIRST claim within the window; every concurrent/duplicate claim of
+        the same fingerprint returns False (SQLite: single serialized
+        connection; PostgreSQL: ON CONFLICT DO NOTHING is atomic).
+
+        A row whose last_seen is older than the window is REFRESHED (the
+        new message restarts the window) instead of being treated as a
+        duplicate — old fingerprints never block new, legitimate repeats.
+        """
+        try:
+            if self.db_type == "sqlite":
+                cursor = await self._execute(
+                    "INSERT OR IGNORE INTO alert_dedup "
+                    "(fingerprint, sender_id, first_seen, last_seen, hits) "
+                    "VALUES (?, ?, ?, ?, 1)",
+                    (fingerprint, None, first_seen, first_seen),
+                )
+                inserted = bool(cursor.rowcount)
+                if inserted:
+                    await self._commit()
+                    return True
+                # row exists — is it still inside the window?
+                row = await self._fetchone(
+                    "SELECT last_seen FROM alert_dedup WHERE fingerprint = ?",
+                    (fingerprint,),
+                )
+                if row is None:
+                    # raced out from under us (concurrent cleanup) — treat as first
+                    return True
+                last_seen = float(row.get("last_seen") or 0.0)
+                if first_seen - last_seen > max(1, window_hint):
+                    # window expired: refresh in place (restart the window)
+                    await self._execute(
+                        "UPDATE alert_dedup SET first_seen = ?, last_seen = ?, hits = 1 "
+                        "WHERE fingerprint = ?",
+                        (first_seen, first_seen, fingerprint),
+                    )
+                    await self._commit()
+                    return True
+                # still within the window — a real duplicate
+                await self._execute(
+                    "UPDATE alert_dedup SET last_seen = ?, hits = hits + 1 "
+                    "WHERE fingerprint = ?",
+                    (first_seen, fingerprint),
+                )
+                await self._commit()
+                return False
+            else:
+                # PostgreSQL: SELECT … FOR UPDATE inside one transaction —
+                # same semantics as the SQLite branch, atomically serialized
+                # against concurrent workers/instances.
+                async with self._pool.acquire() as conn:
+                    async with conn.transaction():
+                        row = await conn.fetchrow(
+                            "SELECT last_seen FROM alert_dedup "
+                            "WHERE fingerprint = $1 FOR UPDATE",
+                            fingerprint,
+                        )
+                        if row is None:
+                            await conn.execute(
+                                "INSERT INTO alert_dedup "
+                                "(fingerprint, sender_id, first_seen, last_seen, hits) "
+                                "VALUES ($1, NULL, $2, $2, 1)",
+                                fingerprint, first_seen,
+                            )
+                            return True
+                        last_seen = float(row["last_seen"] or 0.0)
+                        if first_seen - last_seen > max(1, window_hint):
+                            # window expired: refresh in place (restart it)
+                            await conn.execute(
+                                "UPDATE alert_dedup SET first_seen = $2, last_seen = $2, "
+                                "hits = 1 WHERE fingerprint = $1",
+                                fingerprint, first_seen,
+                            )
+                            return True
+                        await conn.execute(
+                            "UPDATE alert_dedup SET last_seen = $2, hits = hits + 1 "
+                            "WHERE fingerprint = $1",
+                            fingerprint, first_seen,
+                        )
+                        return False
+        except Exception as e:
+            logger.error(f"claim_alert_fingerprint error: {e}")
+            raise
+
+    async def release_alert_fingerprint(self, fingerprint: str) -> None:
+        """Free a claimed fingerprint after a failed alert send so the DLQ
+        retry path can claim it again later."""
+        try:
+            await self._execute(
+                "DELETE FROM alert_dedup WHERE fingerprint = ?", (fingerprint,)
+            )
+            await self._commit()
+        except Exception as e:
+            logger.debug(f"release_alert_fingerprint error: {e}")
+
+    async def cleanup_alert_fingerprints(self, max_age_seconds: int = 86400) -> int:
+        """Delete fingerprints older than the dedup window (called from
+        main.py's single cleanup loop). Returns the number of removed rows."""
+        cutoff = time.time() - max(1, max_age_seconds)
+        try:
+            cur = await self._execute(
+                "DELETE FROM alert_dedup WHERE last_seen < ?", (cutoff,)
+            )
+            deleted = cur.rowcount or 0
+            await self._commit()
+            if deleted:
+                logger.debug(f"alert_dedup cleanup: {deleted} expired fingerprints removed")
+            return deleted
+        except Exception as e:
+            logger.error(f"cleanup_alert_fingerprints error: {e}")
+            return 0
+
+    async def dedup_row_count(self) -> int:
+        try:
+            row = await self._fetchone("SELECT COUNT(*) AS cnt FROM alert_dedup")
+            return int(row["cnt"]) if row else 0
+        except Exception:
+            return 0
 
     # ─── Blocklists ───────────────────────────────────────────────────────────
     async def is_blocked_sender(self, sender_id: int) -> bool:

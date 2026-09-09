@@ -716,6 +716,12 @@ async def health(request: Request):
         sender_intel = get_sender_intel_snapshot()
     except Exception:
         sender_intel = {"enabled": False, "available": False}
+    # v9.10 alert dedup: cross-account/re-send barrier snapshot.
+    try:
+        from dedup import get_dedup_snapshot
+        dedup = get_dedup_snapshot()
+    except Exception:
+        dedup = {"enabled": False, "window_seconds": 0, "mem_size": 0}
     return JSONResponse({
         "status": "ok" if (db_ok and db_healthy) else "degraded",
         "database": "ok" if db_ok else "down",
@@ -727,6 +733,7 @@ async def health(request: Request):
         "accounts_total": len(ACCOUNTS),
         "fast_capture": fast_capture,
         "sender_intel": sender_intel,
+        "dedup": dedup,
         "uptime": uptime,
         "time": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     })

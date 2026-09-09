@@ -1,6 +1,20 @@
 #!/usr/bin/env python3
 """
-filter_engine.py — v14.4.0
+filter_engine.py — v14.5.0
+
+v14.5.0 — performance + normalization pass (بدون أي تغيير في دلالات القرار):
+* EARLY EXIT («Fail Fast»): الرسائل بلا كلمة مفتاحية (لا intent ولا
+  indirect ولا implicit) تخرج فوراً بعد فحص weak-ignore — فحوص
+  urgency/boost/help/context/negation/ads لم تعد تُنفَّذ عليها (كانت أكبر
+  هدر زمني في المسار الراكد: معظم رسائل المجموعات ليست طلبات).
+* WeightedTrie skip: مواضع البداية التي يسبقها run حروف عربية أطول من
+  أقصى clitic (3) تُتخطى في search_all/search_first — كانت ستُرفض حتماً
+  بواسطة valid_word_boundary، فالنتائج متطابقة 100% والمسح أسرع بكثير.
+* _clean يضيف: تقليص تكرار الحروف العربية (4+ → 3) و توحيد الأرقام
+  العربية-الهندية ٠-٩ → 0-9 (تقليل False Negatives للمدّ والأخطاء
+  الشائعة؛ كلمات الـ ignore "ههه/هههه" تبقى آمنة — لا تقليص أقل من 3).
+* _spam_score: نمط التكرار كان يُجمَّع (re.compile) عند كل استدعاء —
+  أصبح ثابتاً صنفياً (نفس النمط والنتيجة).
 
 v14.4.0 — accuracy overhaul (precision + recall):
 * Word-boundary validation for ALL precision tries (request/indirect/urgency/
@@ -111,6 +125,22 @@ _SENTINEL_CHARS: Final[frozenset] = frozenset(
     " \t\r\n.,!?؟،؛:;()[]{}\"'“”«»…-_/\\|=+*&^%$#@~`<>%0123456789"
 )
 
+# v14.5: أقصى طول لحرف رابط عربي (clitic) في valid_word_boundary — يستخدم
+# لتخطي مواضع منتصف الكلمة في مسح الـ tries بدون تغيير النتائج إطلاقاً:
+# أي موقع بداية يسبقه run حروف عربية أطول من هذا العدد سيُرفض حتماً بواسطة
+# valid_word_boundary، فلا داعي لفحصه من الأساس (تسريع كبير للمسح).
+_MAX_CLITIC_LEN: Final[int] = 3  # "وال" أطول صيغة في _PREFIX_CLITICS
+
+# v14.5: تطبيع خفيف إضافي داخل _clean (الهدف: تقليل FN بدون المساس بالدقة):
+#  * تقليص تكرار الحروف (4+ → 3): "هههههه"→"ههه" (يبقى مطابقاً لكلمة
+#    الـ ignore "ههه")، "مررررررا"→"مرررا" — الأخطاء الشائعة للمدّ
+#    لم تعد تُفلت الكلمات التي تحوي حرفاً ممدوداً بكثرة.
+#  * توحيد الأرقام العربية-الهندية ٠-٩ → 0-9 (رسائل مختلطة عربي/أرقام).
+#  ملاحظة أمان: تم اختيار 4+→3 وليس 2+→1 عمداً — كلمات الـ ignore
+#  "ههه" و"هههه" في keywords.json يجب أن تظل قابلة للمطابقة.
+_AR_REPEAT_4PLUS: Final = re.compile(r"([\u0621-\u064A])\1{3,}")
+_AR_DIGIT_MAP: Final = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
+
 
 def _is_arabic_letter(ch: str) -> bool:
     return "\u0621" <= ch <= "\u064a"
@@ -131,6 +161,23 @@ def valid_word_boundary(text: str, start: int) -> bool:
     if j == start:
         return True
     return text[j:start] in _PREFIX_CLITICS
+
+
+def _run_of_arabic_before(text: str, start: int) -> int:
+    """v14.5: طول الـ run الحروف العربية مباشرة قبل ``start``.
+
+    يستخدمه WeightedTrie لتخطي مواضع البداية المستحيلة بسرعة: أي run
+    أطول من أقصى clitic (3) يعني أن valid_word_boundary سيرفض الموقع
+    حتماً، فالفحص هنا = هدر زمني بحت.
+    """
+    j = start
+    count = 0
+    while j > 0 and _is_arabic_letter(text[j - 1]):
+        j -= 1
+        count += 1
+        if count > _MAX_CLITIC_LEN:
+            return count  # early exit — سيرفض valid_word_boundary حتماً
+    return count
 
 
 _NEG_DELIMS = r"[\s.,!?؟،؛:;()\-/\"'«»…]"
@@ -440,6 +487,12 @@ class WeightedTrie:
         limit = min(len(text), 1000)
         max_depth = min(self._max_word_len + 1, 60)
         for start in range(limit):
+            # v14.5 perf: skip مواضع منتصف الكلمة الطويلة — أي موقع يسبقه
+            # run حروف عربية أطول من أقصى clitic (3) سيُرفض بواسطة
+            # valid_word_boundary في كل مسارات الاستدعاء، فلا فائدة من
+            # فحصه. النتائج متطابقة 100% مع مسار أسرع بكثير.
+            if _run_of_arabic_before(text, start) > _MAX_CLITIC_LEN:
+                continue
             node = self._root
             for i in range(start, min(start + max_depth, len(text))):
                 ch = text[i]
@@ -455,6 +508,9 @@ class WeightedTrie:
         limit = min(len(text), 1000)
         max_depth = min(self._max_word_len + 1, 60)
         for start in range(limit):
+            # v14.5 perf: نفس تخطي مواضع منتصف الكلمة في search_first.
+            if _run_of_arabic_before(text, start) > _MAX_CLITIC_LEN:
+                continue
             node = self._root
             for i in range(start, min(start + max_depth, len(text))):
                 ch = text[i]
@@ -1174,11 +1230,21 @@ class EnhancedFilter:
             return capped
 
     def _clean(self, text: str) -> Tuple[str, str]:
-        """Returns (cleaned_for_matching, original_preserved)."""
+        """Returns (cleaned_for_matching, original_preserved).
+
+        v14.5: بعد التطبيع الأساسي يضاف (تقليل False Negatives):
+          * تقليص تكرار الحروف العربية (4+ → 3) — رسائل المدّ ("مرررررا"،
+            "ههههههه") تعود قابلة للمطابقة، وكلمات الـ ignore "ههه" و
+            "هههه" في keywords.json تبقى آمنة تماماً (لا تقليص أقل من 3).
+          * توحيد الأرقام العربية-الهندية (٠-٩ → 0-9) للرسائل المختلطة.
+        """
         original = text
         cleaned = WS_PATTERN.sub(" ", text).strip()
         cleaned = cleaned.lower()
         cleaned = self._normalize_arabic(cleaned)
+        if _AR_REPEAT_4PLUS.search(cleaned):
+            cleaned = _AR_REPEAT_4PLUS.sub(r"\1\1\1", cleaned)
+        cleaned = cleaned.translate(_AR_DIGIT_MAP)
         cleaned = self._apply_dialect_mapping(cleaned)
         return cleaned, original
 
@@ -1202,6 +1268,8 @@ class EnhancedFilter:
                 logger.debug("langdetect failed: {}", exc)
         return ratio >= 0.12, ratio
 
+    _REPEAT_CHARS_PATTERN: Final = re.compile(r"(.)\1{4,}")
+
     def _spam_score(self, text: str) -> float:
         score = 0.0
         if safe_search(PHONE_PATTERN, text):
@@ -1210,8 +1278,9 @@ class EnhancedFilter:
         score += min(0.4, url_count * 0.2)
         emoji_count = len(safe_findall(EMOJI_PATTERN, text))
         score += min(0.2, emoji_count * 0.04)
-        repeated_pattern = re.compile(r"(.)\1{4,}")
-        if safe_search(repeated_pattern, text):
+        # v14.5 perf: النمط كان يُترجم (re.compile) عند كل استدعاء — الآن
+        # ثابت صنفي مُجمّع مرة واحدة (نفس النمط، نفس النتيجة).
+        if safe_search(self._REPEAT_CHARS_PATTERN, text):
             score += 0.15
         return min(score, 1.0)
 
@@ -1548,10 +1617,7 @@ class EnhancedFilter:
                         self._stats["fuzzy_path"] += 1
 
             indirect_match = self._search_first_valid(self._indirect_trie, cleaned)
-            urgency_match = self._search_first_valid(self._urgency_trie, cleaned)
             implicit_match = self._search_first_valid(self._implicit_trie, cleaned)
-            boost_match = self._search_first_valid(self._boost_trie, cleaned)
-            help_match = self._search_first_valid(self._help_trie, cleaned)
 
             intent_word = intent_match[0] if intent_match else None
             intent_pos = intent_match[2] if intent_match else None
@@ -1560,8 +1626,6 @@ class EnhancedFilter:
                 else (intent_match[1] if fuzzy_used and intent_match else 0.0)
             )
 
-            urgency_marker = urgency_match[0] if urgency_match else None
-            urgent = urgency_match is not None
             is_implicit = implicit_match is not None
 
             # v14.4: implicit availability/problem requests anchor the intent
@@ -1570,6 +1634,38 @@ class EnhancedFilter:
             if is_implicit and not intent_word:
                 intent_weight = 0.7
                 intent_pos = implicit_match[2]
+
+            # ── v14.5 EARLY EXIT («Fail Fast / Early Exit») ─────────────
+            # لا نية صريحة ولا طلب غير مباشر ولا ضمني ⇒ الرسالة بلا كلمة
+            # مفتاحية قطعاً. فحوص urgency/boost/help/context/negation/ads
+            # لا تغيّر قرار هذا المسار إطلاقاً (النتيجة "no_keyword" أو
+            # "ignore_pattern" في كل الأحوال) — تُتخطى كلها فوراً بدلاً
+            # من تنفيذها على رسائل خارج النطاق (أكبر مكسب أداء للمسار
+            # الراكد: معظم رسائل المجموعات ليست طلبات).
+            keyword = intent_word or (
+                indirect_match[0] if indirect_match else None
+            ) or (
+                implicit_match[0] if implicit_match else None
+            )
+            if not keyword:
+                result = FilterResult()
+                result.original_text = original
+                # v14.4: weak ignore signals (greetings/thanks/...) apply only
+                # when the message carries no request keyword at all.
+                if self._search_first_valid(self._ignore_trie, cleaned):
+                    result.valid = False
+                    result.reason = "ignore_pattern"
+                    return self._convert_result(result, is_arabic, arabic_ratio, 0.0, start)
+                result.valid = False
+                result.reason = "no_keyword"
+                return self._convert_result(result, is_arabic, arabic_ratio, 0.0, start)
+            # ── كلمة مفتاحية موجودة — المتابعة بالمسار الكامل كما هو ──
+            urgency_match = self._search_first_valid(self._urgency_trie, cleaned)
+            boost_match = self._search_first_valid(self._boost_trie, cleaned)
+            help_match = self._search_first_valid(self._help_trie, cleaned)
+
+            urgency_marker = urgency_match[0] if urgency_match else None
+            urgent = urgency_match is not None
 
             # v14.4: strongest academic object (tier weight, then proximity
             # to the intent anchor) instead of "first positional match".
@@ -1593,22 +1689,6 @@ class EnhancedFilter:
 
             result = FilterResult()
             result.original_text = original
-
-            keyword = intent_word or (
-                indirect_match[0] if indirect_match else None
-            ) or (
-                implicit_match[0] if implicit_match else None
-            )
-            if not keyword:
-                # v14.4: weak ignore signals (greetings/thanks/...) apply only
-                # when the message carries no request keyword at all.
-                if self._search_first_valid(self._ignore_trie, cleaned):
-                    result.valid = False
-                    result.reason = "ignore_pattern"
-                    return self._convert_result(result, is_arabic, arabic_ratio, ad_score, start)
-                result.valid = False
-                result.reason = "no_keyword"
-                return self._convert_result(result, is_arabic, arabic_ratio, ad_score, start)
 
             if self._is_blocked(cleaned, result, ad_score):
                 return self._convert_result(result, is_arabic, arabic_ratio, ad_score, start)

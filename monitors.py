@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-monitors.py – Account Monitor v9.9.0 (STABLE 24/7 EDITION, HARDENED + FAST CAPTURE + SENDER INTELLIGENCE)
+monitors.py – Account Monitor v9.10.0 (STABLE 24/7 EDITION, HARDENED + FAST CAPTURE + SENDER INTELLIGENCE + CROSS-ACCOUNT DEDUP + DYNAMIC BUTTONS)
 - إصلاح تدوير الجلسة (إعادة تسجيل المعالج)
 - تحسين إعادة الاتصال واكتشاف العميل الميت
 - دعم كامل لـ IntentEngine
@@ -78,6 +78,32 @@ v9.9 (this pass) — Sender Intelligence / Sender Contact Resolver:
   * Gated by CFG.SENDER_INTEL_ENABLED (env SENDER_INTEL_ENABLED, default
     true; kill switch for instant disable without code changes).
 
+v9.10 (this pass) — Cross-Account Dedup + Dynamic Alert Buttons:
+  * منع تكرار التنبيهات بالكامل (dedup.py):
+      - نفس المرسل بنفس النص = تنبيه واحد فقط — حتى لو التُقطت عبر الحسابات
+        الستة أو أُعيد إرسالها برسالة/مجموعة جديدة. البصمة =
+        fast_hash(sender_id + normalized_text) — مرسلان مختلفان بنفس النص
+        يمران (طلبان حقيقيان)، والمتشابهة جزئياً تبقى مختلفة.
+      - طبقتان: ذاكرة LRU (فحص فوري O(1)، آتومي داخل الـ event loop) +
+        جدول alert_dedup في DB (INSERT claim آتومي — ينجو من إعادة
+        التشغيل ويمنع السباق بين الـ workers).
+      - الحجز قبل الإرسال وفكّه عند كل فشل (FloodWait/استثناء/fallback
+        فاشل) حتى لا تعيد محاولة DLQ الإرسال فتُمنع ظلماً.
+      - المكررات تُحسب في stats["duplicates"] ولا تستهلك rate-limiter.
+      - فشل-آمن: خطأ DB → الحماية بالذاكرة فقط والتنبيه الأول يمر.
+      - DEDUP_ENABLED / DEDUP_WINDOW_SECONDS قابلان للتعديل حياً من اللوحة
+        (تُقرأ من CFG عند كل claim — تطبيق فوري بدون إعادة تشغيل).
+  * الأزرار الديناميكية أسفل كل تنبيه (كود المستخدم المدمج حرفياً):
+      - build_dynamic_buttons(): [ 💬 مراسلة ] [ 📨 عرض الرسالة ] في صف
+        واحد. مراسلة: t.me/{username} أو tg://openmessage?user_id=؛
+        عرض الرسالة: t.me/{chat}/{msg} عامة أو t.me/c/{inner}/{msg} خاصة.
+      - الزر الذي تفتقر بياناته لا يُعرض إطلاقاً (لا أزرار مكسورة)، وزر
+        📋 نسخ النص يبقى مضافاً لنفس الصف عند ALERT_WITH_COPY_BUTTON.
+      - زر "👤 فتح الحساب" القديم حُذف (استُوعب بالكامل في "💬 مراسلة"
+        الذي يغطي نفس الحالتين بشكل أدق). نص التنبيه HTML نفسه لم يتغير.
+  * المسار الكامل: Event → Extract → msg_hash dedup (DB) → فلترة →
+    rate-limit → **content dedup (هنا)** → بناء التنبيه + الأزرار → إرسال.
+
 See the accompanying engineering report for the full list of changes,
 the retry_count propagation fix (process_event_from_queue / _send_alert),
 and documented FOLLOW-UP items for other files.
@@ -106,6 +132,7 @@ from telethon.tl.types import (
 from config import CFG, InputSanitizer, fast_hash
 from database import EnhancedDatabase, MessageRecord, AlertRecord, DeadLetterRecord
 from filter_engine import EnhancedFilter
+from dedup import content_fingerprint, get_deduplicator  # v9.10 cross-account dedup
 from sender_resolver import (
     extract_flat as _sender_extract_flat,
     extract_sender as _sender_extract,
@@ -115,6 +142,7 @@ from sender_resolver import (
 
 
 # (نفس الدوال المساعدة من النسخة الأصلية: resolve_chat_entity, build_telegram_links)
+# v9.10: get_dedup_snapshot مُصدَّر من هنا للوحة/health عبر dedup.get_dedup_snapshot
 async def resolve_chat_entity(client: TelegramClient, data: Dict[str, Any]) -> Any:
     username = data.get("username") or data.get("sender_username") or data.get("chat_username")
     if username:
@@ -157,6 +185,55 @@ def build_telegram_links(chat_id: int, message_id: int, username: str = None) ->
         links["group"] = f"https://t.me/c/{inner}"
         links["message"] = f"https://t.me/c/{inner}/{message_id}"
     return links
+
+
+# ============================================================================
+# v9.10 — Dynamic alert buttons (طلب المستخدم — كود مدمج حرفياً)
+#
+# زرّان ديناميكيان في صف واحد أسفل كل تنبيه:
+#   [ 💬 مراسلة ]  [ 📨 عرض الرسالة ]
+#
+# القواعد:
+#   * مرسل لديه Username      → 💬 مراسلة → https://t.me/{username}
+#   * مرسل بدون Username      → 💬 مراسلة → tg://openmessage?user_id={id}
+#   * مجموعة عامة             → 📨 عرض الرسالة → https://t.me/{chat}/{msg_id}
+#   * مجموعة خاصة             → 📨 عرض الرسالة → https://t.me/c/{inner}/{msg_id}
+#   * بيانات ناقصة            → الزر المكسور لا يُعرض إطلاقاً (لا أزرار مكسورة)
+# ============================================================================
+def build_dynamic_buttons(sender: dict, chat: dict) -> list | None:
+    row = []
+
+    sender_id = sender.get("id")
+    username = (sender.get("username") or "").strip().lstrip("@")
+
+    # زر مراسلة
+    if username:
+        contact_url = f"https://t.me/{username}"
+    elif sender_id:
+        contact_url = f"tg://openmessage?user_id={sender_id}"
+    else:
+        contact_url = None
+
+    if contact_url:
+        row.append(Button.url("💬 مراسلة", contact_url))
+
+    # زر عرض الرسالة
+    chat_id = chat.get("id")
+    message_id = chat.get("message_id")
+    chat_uname = (chat.get("username") or "").strip().lstrip("@")
+
+    msg_url = None
+
+    if chat_uname and message_id:
+        msg_url = f"https://t.me/{chat_uname}/{message_id}"
+    elif chat_id and message_id:
+        inner = str(chat_id).replace("-100", "", 1)
+        msg_url = f"https://t.me/c/{inner}/{message_id}"
+
+    if msg_url:
+        row.append(Button.url("📨 عرض الرسالة", msg_url))
+
+    return [row] if row else None
 
 
 # =============================================================================
@@ -859,13 +936,29 @@ class EnhancedAccountMonitor:
             msg_html = f'<a href="{msg_link}"><b>عرض الرسالة الأصلية</b></a>' if msg_link != "#" else "الرابط غير متاح"
             group_card = f'<blockquote dir="rtl">{msg_html}</blockquote>'
         alert = (f"<b>الرسالة:</b>\n{message_html}\n\n👤: {sender_link}\n\n{group_card}")
+        # v9.10: الأزرار الديناميكية [ 💬 مراسلة ] [ 📨 عرض الرسالة ] في صف
+        # واحد — تُبنى من بيانات المرسل/المحادثة المتوفرة، والزر الذي تفتقر
+        # بياناته لا يُعرض إطلاقاً (لا أزرار مكسورة). زر النسخ الاختياري يُضاف
+        # لنفس الصف عند تفعيل CFG.ALERT_WITH_COPY_BUTTON (قابل للتعديل حياً
+        # من لوحة التحكم).
         buttons = None
         if CFG.ALERT_WITH_BUTTONS:
-            row = []
-            if username: row.append(Button.url("💬 مراسلة", f"https://t.me/{username.lstrip('@')}"))
-            row.append(Button.url("👤 فتح الحساب", f"tg://user?id={sender_id}"))
-            if CFG.ALERT_WITH_COPY_BUTTON: row.append(Button.inline("📋 نسخ النص", f"copy_{analysis.get('msg_hash', '')}"))
-            if row: buttons = [row]
+            dynamic = build_dynamic_buttons(
+                sender={
+                    "id": sender_id,
+                    "username": username,
+                },
+                chat={
+                    "id": chat.get("id"),
+                    "message_id": chat.get("message_id"),
+                    "username": chat.get("username"),
+                },
+            )
+            row = list(dynamic[0]) if dynamic else []
+            if CFG.ALERT_WITH_COPY_BUTTON:
+                row.append(Button.inline("📋 نسخ النص", f"copy_{analysis.get('msg_hash', '')}"))
+            if row:
+                buttons = [row]
         return alert, buttons
 
 
@@ -1641,7 +1734,23 @@ class EnhancedAccountMonitor:
         send_client = await self._resolve_send_client()
         if not send_client:
             logger.error(f"No available client to send alert [{account_name}]"); await self._inc_stat("send_errors"); return
+        # ── v9.10: حاجز منع تكرار التنبيهات (بعد rate-limit وقبل أي عمل مكلف) ──
+        # نفس المرسل بنفس النص عبر أي حساب من الحسابات الستة = تنبيه واحد فقط.
+        # الحجز آتومي (ذاكرة + DB) — وعند فشل الإرسال يُفك لإعادة المحاولة.
+        dedup_fp = content_fingerprint(sender_id, text)
+        if not await get_deduplicator().check_and_claim(dedup_fp):
+            await self._inc_stat("duplicates")
+            logger.info(
+                f"Duplicate alert blocked [{account_name}] | msg_hash={msg_hash} | "
+                f"sender={sender_id} | fp={dedup_fp[:12]} (cross-account/re-send dedup)"
+            )
+            return
         chat_info = await self._chat_info(send_client, chat_id, message_id, chat_access_hash=chat_access_hash, chat_username=chat_username)
+        # v9.10: بيانات الأزرار الديناميكية — _build_alert تبني [ مراسلة /
+        # عرض الرسالة ] من المعرفات الخام نفسها المستخدمة في روابط النص.
+        chat_info["id"] = chat_id
+        chat_info["message_id"] = message_id
+        chat_info["username"] = chat_username
         analysis["msg_hash"] = msg_hash
         sender = {"id": sender_id, "display": display_name, "username": sender_username, "access_hash": sender_access_hash}
         alert_text, buttons = self._build_alert(sender, chat_info, keyword, text, analysis)
@@ -1687,6 +1796,8 @@ class EnhancedAccountMonitor:
             logger.warning(
                 f"Alert send throttled [{account_name}] msg_hash={msg_hash}: {type(e).__name__}: {e}"
             )
+            # فشل الإرسال — فك حجز الـ dedup حتى تتمكن إعادة محاولة DLQ من الإرسال لاحقاً
+            await get_deduplicator().release(dedup_fp)
             await self._dlq.push(_retry_payload(), e, retry_count=retry_count)
             await self._inc_stat("send_errors"); raise
         except Exception as e:
@@ -1698,6 +1809,8 @@ class EnhancedAccountMonitor:
             except Exception as fe:
                 logger.error(f"Fallback failed [{account_name}]: {fe}")
                 await self._inc_stat("send_errors")
+                # فشل نهائي — فك الحجز لإعادة محاولة DLQ لاحقاً
+                await get_deduplicator().release(dedup_fp)
                 await self._dlq.push(_retry_payload(), fe, retry_count=retry_count)
 
 

@@ -94,6 +94,7 @@ from telethon import TelegramClient, events as tl_events
 
 from config import CFG, ACCOUNTS, KEYWORDS, logger
 from database import EnhancedDatabase
+from dedup import get_dedup_snapshot, init_deduplicator
 from filter_engine import EnhancedFilter
 from monitors import EnhancedAccountMonitor, HealthMonitor, get_capture_snapshot
 from sender_resolver import get_sender_intel_snapshot
@@ -470,6 +471,7 @@ class EnhancedTelegramBot:
                 "monitors": sum(1 for m in self.monitors if m.is_connected),
                 "fast_capture": get_capture_snapshot(),
                 "sender_intel": get_sender_intel_snapshot(),
+                "dedup": get_dedup_snapshot(),
             })
 
         app.router.add_get('/health', health_handler)
@@ -612,6 +614,14 @@ class EnhancedTelegramBot:
                 dl_cleaned = await self.db.cleanup_dead_letters(days=CFG.DEAD_LETTER_CLEANUP_DAYS)
                 if dl_cleaned:
                     logger.info(f"Dead letter cleanup: {dl_cleaned} records removed")
+                # v9.10: تنظيف بصمات منع التكرار المنتهية (تساوي نافذة الـ dedup الحية)
+                try:
+                    from dedup import get_deduplicator
+                    expired = await get_deduplicator().cleanup_expired()
+                    if expired:
+                        logger.info(f"Dedup cleanup: {expired} expired fingerprints removed")
+                except Exception as e:
+                    logger.debug(f"Dedup cleanup skipped: {e}")
                 gc.collect()
             except asyncio.CancelledError:
                 break
@@ -853,6 +863,11 @@ class EnhancedTelegramBot:
         if not await self.db.connect():
             logger.error("Database connection failed - aborting")
             return False
+
+        # v9.10: تهيئة حاجز منع تكرار التنبيهات (بعد اتصال DB مباشرة —
+        # singleton مشترك بين كل المراقبين، وجدول alert_dedup يُنشأ ضمن
+        # _create_tables في connect()).
+        init_deduplicator(self.db)
 
         # Start the web layer FIRST so Render's health check passes immediately
         # and the Dashboard stays reachable even before/without any account

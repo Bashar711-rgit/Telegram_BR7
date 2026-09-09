@@ -79,6 +79,38 @@ SETTINGS_SCHEMA: Dict[str, Dict[str, Any]] = {
         "label": "فترة التهدئة (ثانية)", "type": int, "min": 0, "max": 86400,
         "cfg": "ALERT_COOLDOWN", "limiter": False, "group": "alerts",
     },
+    "alert_with_buttons": {
+        "label": "أزرار التنبيه (مراسلة / عرض الرسالة)", "type": bool,
+        "min": None, "max": None,
+        "cfg": "ALERT_WITH_BUTTONS", "limiter": False, "group": "alerts",
+        "note": "زرّا 💬 مراسلة و📨 عرض الرسالة أسفل كل تنبيه — يُطبَّق فوراً على التنبيه القادم.",
+    },
+    "alert_with_copy_button": {
+        "label": "زر نسخ النص 📋", "type": bool,
+        "min": None, "max": None,
+        "cfg": "ALERT_WITH_COPY_BUTTON", "limiter": False, "group": "alerts",
+    },
+    "alert_max_text_len": {
+        "label": "أقصى طول لنص التنبيه (حرف)", "type": int, "min": 50, "max": 4000,
+        "cfg": "ALERT_MAX_TEXT_LEN", "limiter": False, "group": "alerts",
+    },
+    "alert_show_score": {
+        "label": "إظهار الدرجة في التنبيه", "type": bool,
+        "min": None, "max": None,
+        "cfg": "ALERT_SHOW_SCORE", "limiter": False, "group": "alerts",
+    },
+    # ── Anti-Duplicate (v9.10) ──────────────────────────────────────────
+    "dedup_enabled": {
+        "label": "منع تكرار التنبيهات", "type": bool,
+        "min": None, "max": None,
+        "cfg": "DEDUP_ENABLED", "limiter": False, "group": "dedup",
+        "note": "نفس المرسل بنفس النص = تنبيه واحد فقط حتى لو التُقطت عبر الحسابات الستة أو أُعيد إرسالها — يُطبَّق فوراً.",
+    },
+    "dedup_window_seconds": {
+        "label": "نافذة منع التكرار (ثانية)", "type": int, "min": 60, "max": 2592000,
+        "cfg": "DEDUP_WINDOW_SECONDS", "limiter": False, "group": "dedup",
+        "note": "بعد انتهاء النافذة تعيد نفس الرسالة من نفس المرسل الظهور. 86400 = 24 ساعة (افتراضي).",
+    },
     # ── Filtering ─────────────────────────────────────────────────────────
     "min_message_length": {
         "label": "أقصر رسالة تُفحص (حرف)", "type": int, "min": 1, "max": 10000,
@@ -109,12 +141,93 @@ SETTINGS_SCHEMA: Dict[str, Dict[str, Any]] = {
         "note": "يجب أن يكون أقل من حد القبول.",
         "validate": None,  # cross-field check happens in validate_updates
     },
+    # ── Filtering (إضافات v9.10) ─────────────────────────────────────────
+    "spam_score_threshold": {
+        "label": "حد كشف السبام (0-1)", "type": float, "min": 0.1, "max": 1.0,
+        "cfg": "SPAM_SCORE_THRESHOLD", "limiter": False, "group": "filtering",
+        "note": "أقل = قبض أشد على الرسائل المزعجة.",
+    },
+    "fuzzy_matching_enabled": {
+        "label": "المطابقة الضبابية (الأخطاء الإملائية)", "type": bool,
+        "min": None, "max": None,
+        "cfg": "FUZZY_MATCHING_ENABLED", "limiter": False, "group": "filtering",
+        "note": "تلتقط الكلمات المفتاحية رغم الأخطاء الإملائية البسيطة.",
+    },
+    "negation_enabled": {
+        "label": "كشف النفي (تقليل التنبيهات الخاطئة)", "type": bool,
+        "min": None, "max": None,
+        "cfg": "NEGATION_ENABLED", "limiter": False, "group": "filtering",
+    },
+    "distance_scoring_enabled": {
+        "label": "تسجيل المسافة الدلالية", "type": bool,
+        "min": None, "max": None,
+        "cfg": "DISTANCE_SCORING_ENABLED", "limiter": False, "group": "filtering",
+    },
+    "ad_detection_enabled": {
+        "label": "كشف الإعلانات والمزعجات", "type": bool,
+        "min": None, "max": None,
+        "cfg": "AD_DETECTION_ENABLED", "limiter": False, "group": "filtering",
+    },
+    "prefilter_max_emojis": {
+        "label": "أقصى عدد إيموجي في الرسالة", "type": int, "min": 0, "max": 100,
+        "cfg": "PREFILTER_MAX_EMOJIS", "limiter": False, "group": "filtering",
+    },
+    # ── Monitoring (v9.10) ────────────────────────────────────────────────
+    "fast_capture_enabled": {
+        "label": "الالتقاط السريع (حماية من بوتات الحذف)", "type": bool,
+        "min": None, "max": None,
+        "cfg": "FAST_CAPTURE_ENABLED", "limiter": False, "group": "monitoring",
+        "note": "يحفظ النص فور وصوله قبل أي تحليل — رسائل الحذف لا تُفقد.",
+    },
+    "sender_intel_enabled": {
+        "label": "ذكاء المرسل (إثراء البيانات)", "type": bool,
+        "min": None, "max": None,
+        "cfg": "SENDER_INTEL_ENABLED", "limiter": False, "group": "monitoring",
+    },
+    "health_check_interval": {
+        "label": "فاصل فحص الصحة (ثانية)", "type": int, "min": 15, "max": 3600,
+        "cfg": "HEALTH_CHECK_INTERVAL", "limiter": False, "group": "monitoring",
+    },
+    "stats_interval": {
+        "label": "فاصل تقرير الإحصائيات (ثانية)", "type": int, "min": 300, "max": 86400,
+        "cfg": "STATS_INTERVAL", "limiter": False, "group": "monitoring",
+    },
+    # ── Limits & System (v9.10) ───────────────────────────────────────────
+    "message_queue_size": {
+        "label": "سعة طابور المعالجة (رسالة)", "type": int, "min": 100, "max": 100000,
+        "cfg": "MESSAGE_QUEUE_SIZE", "limiter": False, "group": "limits",
+        "note": "عند الامتلاء يُستبعد الأقدم/الأدنى أولوية.",
+    },
+    "db_batch_interval": {
+        "label": "فاصل كتابة التنبيهات المجمعّة (ثانية)", "type": int, "min": 1, "max": 60,
+        "cfg": "DB_BATCH_INTERVAL", "limiter": False, "group": "limits",
+    },
+    "dead_letter_max_retries": {
+        "label": "أقصى محاولات إعادة الرسائل الفاشلة", "type": int, "min": 0, "max": 20,
+        "cfg": "DEAD_LETTER_MAX_RETRIES", "limiter": False, "group": "limits",
+    },
+    "dead_letter_cleanup_days": {
+        "label": "عمر سجلات الفشل قبل التنظيف (يوم)", "type": int, "min": 1, "max": 90,
+        "cfg": "DEAD_LETTER_CLEANUP_DAYS", "limiter": False, "group": "limits",
+    },
+    "cleanup_interval": {
+        "label": "فاصل التنظيف الدوري (ثانية)", "type": int, "min": 3600, "max": 604800,
+        "cfg": "CLEANUP_INTERVAL", "limiter": False, "group": "limits",
+    },
+    "memory_threshold_mb": {
+        "label": "حد ضغط التخزين (ميغابايت)", "type": int, "min": 64, "max": 4096,
+        "cfg": "MEMORY_THRESHOLD_MB", "limiter": False, "group": "limits",
+        "note": "عند تجاوز حجم قاعدة البيانات هذا الحد يُطلق تنظيف طارئ.",
+    },
 }
 
 _UI_GROUPS = {
     "destinations": "الوجهات",
     "alerts": "التنبيهات",
+    "dedup": "منع التكرار",
     "filtering": "الفلترة",
+    "monitoring": "المراقبة",
+    "limits": "الحدود والنظام",
 }
 
 
