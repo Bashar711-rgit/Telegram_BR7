@@ -722,6 +722,12 @@ async def health(request: Request):
         dedup = get_dedup_snapshot()
     except Exception:
         dedup = {"enabled": False, "window_seconds": 0, "mem_size": 0}
+    # v9.11 anti-spam: Watch List → Permanent Ignore snapshot (additive).
+    try:
+        from antispam import get_antispam_snapshot
+        antispam = get_antispam_snapshot()
+    except Exception:
+        antispam = {"enabled": False, "available": False}
     return JSONResponse({
         "status": "ok" if (db_ok and db_healthy) else "degraded",
         "database": "ok" if db_ok else "down",
@@ -734,6 +740,7 @@ async def health(request: Request):
         "fast_capture": fast_capture,
         "sender_intel": sender_intel,
         "dedup": dedup,
+        "antispam": antispam,
         "uptime": uptime,
         "time": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     })
