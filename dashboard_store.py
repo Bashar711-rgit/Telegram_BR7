@@ -111,6 +111,51 @@ SETTINGS_SCHEMA: Dict[str, Dict[str, Any]] = {
         "cfg": "DEDUP_WINDOW_SECONDS", "limiter": False, "group": "dedup",
         "note": "بعد انتهاء النافذة تعيد نفس الرسالة من نفس المرسل الظهور. 86400 = 24 ساعة (افتراضي).",
     },
+    # ── Anti-Spam (v9.11: Watch List → Confirmation → Permanent Ignore) ──
+    "antispam_enabled": {
+        "label": "مكافحة السبام (مراقبة → تجاهل دائم)", "type": bool,
+        "min": None, "max": None,
+        "cfg": "ANTISPAM_ENABLED", "limiter": False, "group": "antispam",
+        "note": "مراقبة المعلنين المتكررين (Cross-Group Spam) — التأكيد يوقف تنبيهاتهم نهائياً ويضيفهم لقائمة التجاهل الدائم.",
+    },
+    "antispam_watch_duration_seconds": {
+        "label": "مدة المراقبة (ثانية)", "type": int, "min": 60, "max": 3600,
+        "cfg": "ANTISPAM_WATCH_DURATION_SECONDS", "limiter": False, "group": "antispam",
+        "note": "600 = 10 دقائق (الموصى به). المستخدم تحت المراقبة يستمر في تلقي التنبيهات كالمعتاد.",
+    },
+    "antispam_burst_messages": {
+        "label": "عدد رسائل الإندفاع للمراقبة", "type": int, "min": 2, "max": 10,
+        "cfg": "ANTISPAM_BURST_MESSAGES", "limiter": False, "group": "antispam",
+        "note": "شرط المراقبة 1: نشر هذا العدد خلال نافذة الإندفاع (افتراضي 2 خلال 60 ثانية).",
+    },
+    "antispam_burst_window_seconds": {
+        "label": "نافذة الإندفاع (ثانية)", "type": int, "min": 30, "max": 600,
+        "cfg": "ANTISPAM_BURST_WINDOW_SECONDS", "limiter": False, "group": "antispam",
+    },
+    "antispam_similarity_threshold": {
+        "label": "حد التشابه للمراقبة (0-1)", "type": float, "min": 0.5, "max": 1.0,
+        "cfg": "ANTISPAM_SIMILARITY_THRESHOLD", "limiter": False, "group": "antispam",
+        "note": "شرط المراقبة 2: رسائل متشابهة بنسبة ≥ 80% خلال 5 دقائق (افتراضي 0.8).",
+    },
+    "antispam_similarity_window_seconds": {
+        "label": "نافذة التشابه (ثانية)", "type": int, "min": 60, "max": 1800,
+        "cfg": "ANTISPAM_SIMILARITY_WINDOW_SECONDS", "limiter": False, "group": "antispam",
+    },
+    "antispam_direct_spam_groups": {
+        "label": "مجموعات التصنيف المباشر", "type": int, "min": 2, "max": 10,
+        "cfg": "ANTISPAM_DIRECT_SPAM_GROUPS", "limiter": False, "group": "antispam",
+        "note": "نفس الرسالة/المعنى في هذا العدد من المجموعات خلال 5 دقائق = مزعج مباشرة دون مراقبة (افتراضي 4).",
+    },
+    "antispam_confirm_messages": {
+        "label": "رسائل تأكيد السبام (10 دقائق)", "type": int, "min": 3, "max": 50,
+        "cfg": "ANTISPAM_CONFIRM_MESSAGES", "limiter": False, "group": "antispam",
+        "note": "شرط التأكيد: 5 رسائل أو أكثر خلال 10 دقائق أثناء المراقبة (افتراضي 5).",
+    },
+    "antispam_confirm_groups": {
+        "label": "مجموعات تأكيد السبام (10 دقائق)", "type": int, "min": 2, "max": 10,
+        "cfg": "ANTISPAM_CONFIRM_GROUPS", "limiter": False, "group": "antispam",
+        "note": "شرط التأكيد: 3 مجموعات أو أكثر خلال 10 دقائق أثناء المراقبة (افتراضي 3).",
+    },
     # ── Filtering ─────────────────────────────────────────────────────────
     "min_message_length": {
         "label": "أقصر رسالة تُفحص (حرف)", "type": int, "min": 1, "max": 10000,
@@ -225,6 +270,7 @@ _UI_GROUPS = {
     "destinations": "الوجهات",
     "alerts": "التنبيهات",
     "dedup": "منع التكرار",
+    "antispam": "مكافحة السبام",
     "filtering": "الفلترة",
     "monitoring": "المراقبة",
     "limits": "الحدود والنظام",

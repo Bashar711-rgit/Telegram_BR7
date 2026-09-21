@@ -482,6 +482,56 @@ services:
       - key: ALERT_WITH_COPY_BUTTON
         value: "true"
 
+      # v9.11: زر «تواصل مع المرسل» (الرسائل الجاهزة)
+      - key: ALERT_WITH_CONTACT_BUTTON
+        value: "true"
+
+      # ════════════════════════════════════════════════════════════
+      # Anti-Spam (v9.11 — Watch List → Confirmation → Permanent Ignore)
+      # ════════════════════════════════════════════════════════════
+      - key: ANTISPAM_ENABLED
+        value: "true"
+
+      - key: ANTISPAM_WATCH_DURATION_SECONDS
+        value: "600"      # 10 دقائق مراقبة
+
+      - key: ANTISPAM_BURST_MESSAGES
+        value: "2"        # رسالتان خلال 60 ثانية → مراقبة
+
+      - key: ANTISPAM_BURST_WINDOW_SECONDS
+        value: "60"
+
+      - key: ANTISPAM_SIMILARITY_THRESHOLD
+        value: "0.80"     # تشابه ≥ 80% خلال 5 دقائق → مراقبة
+
+      - key: ANTISPAM_SIMILARITY_WINDOW_SECONDS
+        value: "300"
+
+      - key: ANTISPAM_CATEGORY_WINDOW_SECONDS
+        value: "300"      # أكثر من طلب من فئات مختلفة خلال 5 دقائق → مراقبة
+
+      - key: ANTISPAM_DIRECT_SPAM_GROUPS
+        value: "4"        # نفس الرسالة في 4 مجموعات خلال 5 دقائق → مزعج مباشرة
+
+      - key: ANTISPAM_DIRECT_SPAM_WINDOW_SECONDS
+        value: "300"
+
+      - key: ANTISPAM_CONFIRM_WINDOW_SECONDS
+        value: "300"
+
+      - key: ANTISPAM_CONFIRM_MESSAGES
+        value: "5"        # 5 رسائل خلال 10 دقائق → تأكيد
+
+      - key: ANTISPAM_CONFIRM_GROUPS
+        value: "3"        # 3 مجموعات خلال 10 دقائق → تأكيد
+
+      - key: ANTISPAM_CONFIRM_ACTIVITY_WINDOW_SECONDS
+        value: "600"
+
+      # الرسائل الجاهزة لزر «تواصل مع المرسل» (JSON اختياري — الافتراضيات مدمجة)
+      # - key: CONTACT_TEMPLATES_JSON
+      #   sync: false
+
       # ════════════════════════════════════════════════════════════
       # Health
       # ════════════════════════════════════════════════════════════

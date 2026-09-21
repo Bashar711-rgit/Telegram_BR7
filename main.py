@@ -91,10 +91,21 @@ except ImportError:
     AIOHTTP_AVAILABLE = False
 
 from telethon import TelegramClient, events as tl_events
+from telethon.errors import FloodWaitError
+from telethon.tl.types import InputPeerUser
 
-from config import CFG, ACCOUNTS, KEYWORDS, logger
+from config import (
+    CFG,
+    ACCOUNTS,
+    KEYWORDS,
+    logger,
+    get_contact_templates,
+    contact_template_labels,
+    InputSanitizer,
+)
 from database import EnhancedDatabase
 from dedup import get_dedup_snapshot, init_deduplicator
+from antispam import get_antispam, setup_antispam, get_antispam_snapshot
 from filter_engine import EnhancedFilter
 from monitors import EnhancedAccountMonitor, HealthMonitor, get_capture_snapshot
 from sender_resolver import get_sender_intel_snapshot
@@ -340,6 +351,12 @@ class EnhancedTelegramBot:
         self._main_client_lock = asyncio.Lock()
         self._admin_handler_func: Any = None
         self._copy_handler_func: Any = None
+        # v9.11: معالجات زر «تواصل مع المرسل» + الردود الرقمية في مجموعة التنبيهات
+        self._contact_handler_funcs: List[Any] = []
+        self._target_reply_handler_func: Any = None
+        # خريطة (رسالة التنبيه في المجموعة الهدف → بصمة الرسالة) لدعم مسار
+        # الرد البديل: رد بـ«تواصل» أو برقم 1-5 على أي تنبيه/قائمة.
+        self._alert_msg_map: Dict[int, str] = {}
 
     # ─── Task tracking helper (M-05 / M-16) ────────────────────────────────
     def _track_task(self, coro: Any, name: str) -> asyncio.Task:
@@ -452,6 +469,231 @@ class EnhancedTelegramBot:
         self._copy_handler_func = copy_handler
         logger.info("Copy button callback handler registered")
 
+    # ─── Contact-button handlers (v9.11 — زر «تواصل مع المرسل») ──────────────
+    def _note_alert_message(self, msg_id: Any, msg_hash: str) -> None:
+        """سجّل موضع رسالة التنبيه/القائمة في المجموعة الهدف (خريطة محدودة).
+
+        تدعم مسار الرد البديل: رد المشرف بـ«تواصل» أو برقم على رسالة
+        التنبيه نفسها. الخريطة في الذاكرة فقط (تعاد التعبئة مع كل تنبيه جديد).
+        """
+        try:
+            mid = int(msg_id)
+        except (TypeError, ValueError):
+            return
+        if not msg_hash:
+            return
+        try:
+            if len(self._alert_msg_map) > 2000:
+                keep = list(self._alert_msg_map.items())[-1000:]
+                self._alert_msg_map = dict(keep)
+            self._alert_msg_map[mid] = msg_hash
+        except Exception:
+            pass
+
+    async def _send_contact_template(self, msg_hash: str, index: int) -> tuple:
+        """يرسل الرسالة الجاهزة رقم index إلى المرسل الأصلي للتنبيه مباشرة.
+
+        حل المرسل (الأفضل أولاً): username → InputPeerUser(access_hash) →
+        get_entity(sender_id) — أفضل الحلول المتاحة ضمن Telethon.
+        """
+        templates = get_contact_templates()
+        if not (1 <= index <= len(templates)):
+            return False, "رقم الرسالة الجاهزة غير صالح"
+        info = await self.db.get_alert_sender_by_hash(msg_hash)
+        if not info:
+            return False, "تعذر العثور على بيانات المرسل الأصلي (تنبيه قديم؟)"
+        sender_id = info.get("sender_id")
+        if not sender_id:
+            return False, "معرّف المرسل غير متوفر"
+        client = self.main_client
+        if client is None:
+            return False, "لا يوجد اتصال متاح حالياً"
+        text = templates[index - 1]
+        username = (info.get("username") or "").strip().lstrip("@")
+        access_hash = info.get("access_hash")
+        peer = None
+        if username:
+            peer = username
+        elif access_hash:
+            try:
+                peer = InputPeerUser(user_id=int(sender_id), access_hash=int(access_hash))
+            except (TypeError, ValueError):
+                peer = None
+        try:
+            if peer is None:
+                # آخر خيار متاح: الحل بالمعرّف الخام (ينجح إذا كان الحساب قد
+                # رأى هذا المرسل في مجموعة مشتركة)
+                await client.send_message(int(sender_id), text, link_preview=False)
+            else:
+                await client.send_message(peer, text, link_preview=False)
+            logger.info(
+                f"Contact template #{index} sent to sender={sender_id} "
+                f"(msg_hash={str(msg_hash)[:12]}...) by supervisor flow"
+            )
+            return True, "تم إرسال الرسالة إلى المرسل"
+        except Exception as e:
+            logger.warning(f"Contact template send failed sender={sender_id}: {e}")
+            hint = "المستخدم حظر الرسائل الخاصة" if "block" in str(e).lower() else str(e)[:100]
+            return False, f"فشل الإرسال: {hint}"
+
+    async def _register_contact_handlers(self) -> None:
+        """معالجات زر «تواصل مع المرسل» — المسار الأساسي والاحتياطي.
+
+        المسار الأساسي (Inline callbacks — مثل نمط زر النسخ القائم):
+            cnt_{hash}    → إظهار قائمة الرسائل الجاهزة كاملة.
+            tpl{i}_{hash} → إرسال الرسالة الجاهزة i إلى صاحب الطلب مباشرة.
+            cnx_{hash}    → إلغاء وحذف رسالة القائمة.
+
+        المسار الاحتياطي (رد في مجموعة التنبيهات — يعمل دائماً حتى لو لم
+        تُسلَّم أحداث الأزرار التفاعلية لحساب مستخدم):
+            الرد على التنبيه بـ «تواصل» → إظهار القائمة.
+            الرد على التنبيه/القائمة برقم 1..N → إرسال الرسالة المختارة.
+        """
+        if not self.main_client:
+            return
+        for fn in list(self._contact_handler_funcs):
+            try:
+                self.main_client.remove_event_handler(fn)
+            except Exception as e:
+                logger.debug(f"remove contact handler failed: {e}")
+        self._contact_handler_funcs = []
+        if self._target_reply_handler_func is not None:
+            try:
+                self.main_client.remove_event_handler(self._target_reply_handler_func)
+            except Exception as e:
+                logger.debug(f"remove target-reply handler failed: {e}")
+            self._target_reply_handler_func = None
+
+        from telethon import Button  # local import — نفس كائن Button في monitors
+        from config import InputSanitizer
+
+        templates = get_contact_templates()
+        labels = contact_template_labels(len(templates))
+        client = self.main_client
+
+        def _picker_text(msg_hash: str) -> str:
+            lines = ["📨 <b>الرسائل الجاهزة — اختر واحدة لإرسالها إلى صاحب الطلب:</b>", ""]
+            for i, t in enumerate(templates, 1):
+                lines.append(f"{i}️⃣ {InputSanitizer.escape_html(InputSanitizer.truncate(t, 200))}")
+            lines.append("")
+            lines.append("اضغط الزر المناسب، أو رد على هذه الرسالة برقم الخيار.")
+            return "\n".join(lines)
+
+        def _picker_buttons(msg_hash: str) -> list:
+            rows: list = []
+            row: list = []
+            for i in range(1, len(templates) + 1):
+                row.append(Button.inline(f"{i} {labels[i - 1]}", f"tpl{i}_{msg_hash}"))
+                if len(row) == 2:
+                    rows.append(row)
+                    row = []
+            if row:
+                rows.append(row)
+            rows.append([Button.inline("✖ إلغاء", f"cnx_{msg_hash}")])
+            return rows
+
+        async def _show_picker(chat_key: Any, msg_hash: str, reply_to: Any = None) -> None:
+            sent = await client.send_message(
+                chat_key if chat_key else CFG.TARGET_GROUP_ID,
+                _picker_text(msg_hash),
+                buttons=_picker_buttons(msg_hash),
+                parse_mode="html",
+                link_preview=False,
+                reply_to=reply_to,
+            )
+            if sent is not None and getattr(sent, "id", None):
+                self._note_alert_message(sent.id, msg_hash)
+
+        # ── cnt_: إظهار قائمة الرسائل الجاهزة ─────────────────────────────
+        @client.on(tl_events.CallbackQuery(pattern=r"^cnt_"))
+        async def _cnt_handler(event):
+            try:
+                msg_hash = event.data.decode("utf-8", "ignore").split("_", 1)[1]
+                info = await self.db.get_alert_sender_by_hash(msg_hash)
+                if not info:
+                    await event.answer("⚠️ تعذر العثور على بيانات المرسل الأصلي", alert=True)
+                    return
+                await _show_picker(
+                    getattr(event, "chat_id", None) or CFG.TARGET_GROUP_ID,
+                    msg_hash,
+                    reply_to=getattr(event, "message_id", None),
+                )
+                await event.answer()
+            except Exception as e:
+                logger.error(f"cnt_ handler error: {e}")
+                try:
+                    await event.answer("حدث خطأ — أعد المحاولة", alert=True)
+                except Exception:
+                    pass
+
+        # ── tpl{i}_: إرسال الرسالة الجاهزة المختارة إلى المرسل ────────────
+        @client.on(tl_events.CallbackQuery(pattern=r"^tpl\d+_"))
+        async def _tpl_handler(event):
+            try:
+                raw = event.data.decode("utf-8", "ignore")
+                head, _, msg_hash = raw.partition("_")
+                index = int(head[3:])
+                ok, msg = await self._send_contact_template(msg_hash, index)
+                if ok:
+                    try:
+                        await event.delete()  # تنظيف رسالة القائمة
+                    except Exception:
+                        pass
+                await event.answer(f"✅ {msg}" if ok else f"⚠️ {msg}", alert=not ok)
+            except Exception as e:
+                logger.error(f"tpl handler error: {e}")
+                try:
+                    await event.answer("حدث خطأ أثناء الإرسال", alert=True)
+                except Exception:
+                    pass
+
+        # ── cnx_: إلغاء القائمة ────────────────────────────────────────────
+        @client.on(tl_events.CallbackQuery(pattern=r"^cnx_"))
+        async def _cnx_handler(event):
+            try:
+                try:
+                    await event.delete()
+                except Exception:
+                    pass
+                await event.answer("تم الإلغاء")
+            except Exception:
+                pass
+
+        self._contact_handler_funcs = [_cnt_handler, _tpl_handler, _cnx_handler]
+
+        # ── مسار الرد البديل في مجموعة التنبيهات ───────────────────────────
+        target_id = CFG.TARGET_GROUP_ID
+        if target_id:
+            @client.on(tl_events.NewMessage(chats=target_id, incoming=True))
+            async def _target_reply_handler(event):
+                try:
+                    if not event.is_reply:
+                        return
+                    text = (event.message.text or "").strip()
+                    if not text:
+                        return
+                    replied_id = getattr(event.message, "reply_to_msg_id", None)
+                    if replied_id is None or replied_id not in self._alert_msg_map:
+                        return  # ليس رداً على تنبيه/قائمة — تجاهل بصمت
+                    msg_hash = self._alert_msg_map.get(replied_id)
+                    low = text.lower()
+                    if low in ("تواصل", "/تواصل", "contact", "/contact", "قائمة", "/قائمة", "رسائل"):
+                        await _show_picker(target_id, msg_hash, reply_to=event.message.id)
+                    elif text.isdigit():
+                        index = int(text)
+                        if 1 <= index <= len(templates):
+                            ok, msg = await self._send_contact_template(msg_hash, index)
+                            await event.reply(f"{'✅' if ok else '⚠️'} {msg}")
+                except Exception as e:
+                    logger.error(f"target reply handler error: {e}")
+            self._target_reply_handler_func = _target_reply_handler
+
+        logger.info(
+            f"Contact-button handlers registered "
+            f"({len(templates)} ready-made templates, reply-fallback "
+            f"{'on' if target_id else 'off'})"
+        )
+
     # ─── Health HTTP Server (fallback when Dashboard is disabled) ─────────────
     async def _health_server(self):
         if not AIOHTTP_AVAILABLE:
@@ -472,6 +714,7 @@ class EnhancedTelegramBot:
                 "fast_capture": get_capture_snapshot(),
                 "sender_intel": get_sender_intel_snapshot(),
                 "dedup": get_dedup_snapshot(),
+                "antispam": get_antispam_snapshot(),
             })
 
         app.router.add_get('/health', health_handler)
@@ -692,6 +935,8 @@ class EnhancedTelegramBot:
                     )
                     await self._register_admin_commands()
                     await self._register_copy_handler()
+                    # v9.11: أعد ربط معالجات زر التواصل أيضاً على العميل الجديد
+                    await self._register_contact_handlers()
                     return
             logger.error("Main client failover: no connected/alive monitor client available")
 
@@ -746,7 +991,7 @@ class EnhancedTelegramBot:
 
         @self.main_client.on(tl_events.NewMessage(
             chats=CFG.ADMIN_CHAT_ID, incoming=True,
-            pattern=r"^/(stats|status|help|block|unblock|purge|accounts|health|filter_stats|dashboard)(.*)$",
+            pattern=r"^/(stats|status|help|block|unblock|purge|accounts|health|filter_stats|dashboard|spam|unspam|contact)(.*)$",
         ))
         async def _admin_handler(event: Any) -> None:
             try:
@@ -763,7 +1008,7 @@ class EnhancedTelegramBot:
         cmd = cmd.lstrip("/").lower()
 
         if cmd == "help":
-            await event.reply("<b>أوامر البوت:</b>\n/stats – إحصائيات\n/status – حالة الحسابات\n/accounts – التفاصيل\n/health – الصحة\n/dashboard – لوحة التحكم\n/block <id> – حظر\n/unblock <id> – رفع حظر\n/purge – تفريغ الطابور", parse_mode="html")
+            await event.reply("<b>أوامر البوت:</b>\n/stats – إحصائيات\n/status – حالة الحسابات\n/accounts – التفاصيل\n/health – الصحة\n/dashboard – لوحة التحكم\n/block &lt;id&gt; – حظر\n/unblock &lt;id&gt; – رفع حظر\n/purge – تفريغ الطابور\n/spam – قوائم مكافحة السبام\n/unspam &lt;id&gt; – إزالة من تجاهل السبام\n/contact – الرسائل الجاهزة", parse_mode="html")
         elif cmd == "stats":
             db_stats = await self.db.get_stats()
             rl = self.rate_limiter.status()
@@ -853,6 +1098,46 @@ class EnhancedTelegramBot:
         elif cmd == "purge":
             count = await self.db.purge_queue()
             await event.reply(f"🗑 تم مسح {count} رسالة من الطابور")
+        elif cmd == "spam":
+            # v9.11: تقرير مكافحة السبام — لقطة + قائمة المراقبة + التجاهل الدائم
+            snap = get_antispam().snapshot()
+            watched = await self.db.get_recent_watchlist(limit=8, active_only=True)
+            ignored = await self.db.get_spam_ignored(limit=10)
+            lines = [
+                "<b>🛡 مكافحة السبام</b>",
+                f"الحالة: {'✅ مفعّل' if snap.get('enabled') else '⛔ معطّل'}",
+                f"مراقَبون الآن: {snap.get('active_watch', 0)} | مصنّفون كمزعجين: {snap.get('permanently_ignored', 0)}",
+                f"إجمالي المراقبة: {snap.get('watch_added', 0)} | تأكيدات سبام: {snap.get('spam_confirmed', 0)} | تصنيف مباشر: {snap.get('direct_spam', 0)}",
+            ]
+            if watched:
+                lines.append("\n<b>👀 تحت المراقبة حالياً:</b>")
+                for w in watched:
+                    until = w.get("watch_until") or 0
+                    left = max(0, int(until - time.time()))
+                    lines.append(f"• <code>{w.get('sender_id')}</code> — باقي {left // 60}د — {(w.get('reason') or '')[:80]}")
+            if ignored:
+                lines.append("\n<b>🚫 تجاهل دائم:</b>")
+                for u in ignored:
+                    lines.append(f"• <code>{u.get('sender_id')}</code> — {(u.get('reason') or '')[:80]}")
+            await event.reply("\n".join(lines), parse_mode="html")
+        elif cmd == "unspam":
+            uid = args.strip()
+            if uid.lstrip("-").isdigit():
+                ok = await get_antispam().unignore(int(uid))
+                if ok:
+                    await event.reply(f"✅ تمت إزالة {uid} من قائمة تجاهل السبام — ستُعالج رسائله وستعود التنبيهات")
+                else:
+                    await event.reply(f"⚠️ تعذرت الإزالة من قاعدة البيانات — راجع السجلات")
+            else:
+                await event.reply("❌ استخدام: /unspam <user_id>")
+        elif cmd == "contact":
+            # v9.11: عرض الرسائل الجاهزة الحالية (لزر «تواصل مع المرسل»)
+            templates = get_contact_templates()
+            lines = ["<b>📨 الرسائل الجاهزة الحالية:</b>", ""]
+            for i, t in enumerate(templates, 1):
+                lines.append(f"{i}️⃣ {InputSanitizer.escape_html(t)}")
+            lines.append("\nℹ️ تُعدّل عبر متغير البيئة CONTACT_TEMPLATES_JSON ثم إعادة التشغيل.")
+            await event.reply("\n".join(lines), parse_mode="html")
 
     # ─── Initialization ────────────────────────────────────────────────────────
     async def initialize(self) -> bool:
@@ -868,6 +1153,10 @@ class EnhancedTelegramBot:
         # singleton مشترك بين كل المراقبين، وجدول alert_dedup يُنشأ ضمن
         # _create_tables في connect()).
         init_deduplicator(self.db)
+
+        # v9.11: تهيئة محرك مكافحة السبام وتحميل قائمة التجاهل الدائم من DB
+        # (قبل تشغيل أي مراقب — حتى تُتجاهل رسائل المصنفين كمزعجين منذ اللحظة الأولى).
+        await setup_antispam(self.db)
 
         # Start the web layer FIRST so Render's health check passes immediately
         # and the Dashboard stays reachable even before/without any account
@@ -937,6 +1226,8 @@ class EnhancedTelegramBot:
 
         await self._register_admin_commands()
         await self._register_copy_handler()
+        # v9.11: معالجات زر «تواصل مع المرسل» + مسار الرد البديل
+        await self._register_contact_handlers()
 
         # Background Tasks (M-05/M-16: all tracked uniformly)
         self._consumer_task = self._track_task(self._consumer_loop(), "consumer")

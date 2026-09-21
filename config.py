@@ -369,6 +369,24 @@ class _ConfigData:
     ALERT_SHOW_SCORE: bool
     ALERT_MAX_TEXT_LEN: int
     ALERT_WITH_COPY_BUTTON: bool
+    ALERT_WITH_CONTACT_BUTTON: bool
+
+    # ── Anti-Spam (المرحلة الثانية: Watch List → Confirmation → Permanent Ignore) ──
+    ANTISPAM_ENABLED: bool
+    ANTISPAM_WATCH_DURATION_SECONDS: int
+    ANTISPAM_BURST_MESSAGES: int
+    ANTISPAM_BURST_WINDOW_SECONDS: int
+    ANTISPAM_SIMILARITY_THRESHOLD: float
+    ANTISPAM_SIMILARITY_WINDOW_SECONDS: int
+    ANTISPAM_CATEGORY_WINDOW_SECONDS: int
+    ANTISPAM_DIRECT_SPAM_GROUPS: int
+    ANTISPAM_DIRECT_SPAM_WINDOW_SECONDS: int
+    ANTISPAM_CONFIRM_WINDOW_SECONDS: int
+    ANTISPAM_CONFIRM_MESSAGES: int
+    ANTISPAM_CONFIRM_GROUPS: int
+    ANTISPAM_CONFIRM_ACTIVITY_WINDOW_SECONDS: int
+    ANTISPAM_MEMORY_PER_USER: int
+    ANTISPAM_MAX_TRACKED_USERS: int
 
     # ── Memory Limits ──
     ENTITY_CACHE_MAX_SIZE: int
@@ -643,6 +661,32 @@ class Config:
             ALERT_SHOW_SCORE=SecretManager.get_bool("ALERT_SHOW_SCORE", True),
             ALERT_MAX_TEXT_LEN=SecretManager.get_int("ALERT_MAX_TEXT_LEN", 350, required=False),
             ALERT_WITH_COPY_BUTTON=SecretManager.get_bool("ALERT_WITH_COPY_BUTTON", True),
+            # زر «تواصل مع المرسل» (المرحلة الأولى): يفتح قائمة الرسائل الجاهزة
+            ALERT_WITH_CONTACT_BUTTON=SecretManager.get_bool("ALERT_WITH_CONTACT_BUTTON", True),
+            # ========== مكافحة السبام (المرحلة الثانية) ==========
+            # Watch List (10 دقائق مراقبة) → Spam Confirmation → Permanent Ignore.
+            # لا يتجاهل ولا يحظر أحداً عند المراقبة — فقط بعد تأكيد السبام.
+            ANTISPAM_ENABLED=SecretManager.get_bool("ANTISPAM_ENABLED", True),
+            ANTISPAM_WATCH_DURATION_SECONDS=SecretManager.get_int("ANTISPAM_WATCH_DURATION_SECONDS", 600, required=False),
+            # شرط المراقبة 1: رسالتان خلال 60 ثانية
+            ANTISPAM_BURST_MESSAGES=SecretManager.get_int("ANTISPAM_BURST_MESSAGES", 2, required=False),
+            ANTISPAM_BURST_WINDOW_SECONDS=SecretManager.get_int("ANTISPAM_BURST_WINDOW_SECONDS", 60, required=False),
+            # شرط المراقبة 2: تشابه نصي/دلالي ≥ 80% خلال 5 دقائق
+            ANTISPAM_SIMILARITY_THRESHOLD=SecretManager.get_float("ANTISPAM_SIMILARITY_THRESHOLD", 0.80, required=False),
+            ANTISPAM_SIMILARITY_WINDOW_SECONDS=SecretManager.get_int("ANTISPAM_SIMILARITY_WINDOW_SECONDS", 300, required=False),
+            # شرط المراقبة 3: أكثر من طلب من فئات مختلفة خلال 5 دقائق
+            ANTISPAM_CATEGORY_WINDOW_SECONDS=SecretManager.get_int("ANTISPAM_CATEGORY_WINDOW_SECONDS", 300, required=False),
+            # تصنيف مباشر كمزعج: نفس الرسالة/المعنى في ≥ 4 مجموعات خلال 5 دقائق
+            ANTISPAM_DIRECT_SPAM_GROUPS=SecretManager.get_int("ANTISPAM_DIRECT_SPAM_GROUPS", 4, required=False),
+            ANTISPAM_DIRECT_SPAM_WINDOW_SECONDS=SecretManager.get_int("ANTISPAM_DIRECT_SPAM_WINDOW_SECONDS", 300, required=False),
+            # شروط تأكيد السبام أثناء المراقبة
+            ANTISPAM_CONFIRM_WINDOW_SECONDS=SecretManager.get_int("ANTISPAM_CONFIRM_WINDOW_SECONDS", 300, required=False),
+            ANTISPAM_CONFIRM_MESSAGES=SecretManager.get_int("ANTISPAM_CONFIRM_MESSAGES", 5, required=False),
+            ANTISPAM_CONFIRM_GROUPS=SecretManager.get_int("ANTISPAM_CONFIRM_GROUPS", 3, required=False),
+            ANTISPAM_CONFIRM_ACTIVITY_WINDOW_SECONDS=SecretManager.get_int("ANTISPAM_CONFIRM_ACTIVITY_WINDOW_SECONDS", 600, required=False),
+            # حدود الذاكرة لسجل النشاط لكل مستخدم
+            ANTISPAM_MEMORY_PER_USER=SecretManager.get_int("ANTISPAM_MEMORY_PER_USER", 50, required=False),
+            ANTISPAM_MAX_TRACKED_USERS=SecretManager.get_int("ANTISPAM_MAX_TRACKED_USERS", 5000, required=False),
             # ========== الذاكرة ==========
             ENTITY_CACHE_MAX_SIZE=SecretManager.get_int("ENTITY_CACHE_MAX_SIZE", 1500, required=False),
             PROCESSED_HASHES_MAX_SIZE=SecretManager.get_int("PROCESSED_HASHES_MAX_SIZE", 8000, required=False),
@@ -995,6 +1039,50 @@ def async_retry(
 # =============================================================================
 def fast_hash(data: str) -> str:
     return hashlib.blake2b(data.encode("utf-8"), digest_size=16).hexdigest()
+
+# =============================================================================
+# الرسائل الجاهزة — زر «تواصل مع المرسل» (المرحلة الأولى، طلب المستخدم)
+# =============================================================================
+# تُعرض القائمة كاملة للمشرف عند الضغط على الزر، ويُرسل النص المختار كما هو
+# إلى صاحب الإعلان/الطلب. يمكن تجاوز القائمة عبر متغير البيئة
+# CONTACT_TEMPLATES_JSON (قائمة JSON من النصوص) دون تعديل الكود.
+DEFAULT_CONTACT_TEMPLATES: Final[List[str]] = [
+    "السلام عليكم، إذا تبي أحد يسوي لك بحث، أرسل الموضوع وتفاصيل البحث وتبشر بأمور تبيض الوجه، والدفع بعد الإنجاز.",
+    "السلام عليكم، إذا تبي أحد يسوي لك CV ثقة والدفع بعد الإنجاز: 0578568011",
+    "السلام عليكم، إذا تبي مختص يحل لك الواجبات: 0578568011",
+    "السلام عليكم، تبي مختص ثقة يحل واجبات: 0578568011",
+    "السلام عليكم، ما يهمك نسوي لك مشروعك والدفع بعد الإنجاز وشغل يبيض الوجه.",
+]
+
+# تسميات مختصرة للأزرار الرقمية في قائمة الاختيار (بنفس ترتيب القائمة أعلاه)
+CONTACT_TEMPLATE_LABELS: Final[List[str]] = ["بحث", "CV", "واجبات", "واجبات", "مشروع"]
+
+
+def get_contact_templates() -> List[str]:
+    """قائمة الرسائل الجاهزة (قابلة للتجاوز عبر CONTACT_TEMPLATES_JSON)."""
+    raw = (os.getenv("CONTACT_TEMPLATES_JSON") or "").strip()
+    if raw:
+        try:
+            import json as _json
+            data = _json.loads(raw)
+            if (
+                isinstance(data, list)
+                and data
+                and all(isinstance(x, str) and x.strip() for x in data)
+            ):
+                return [x.strip() for x in data][:8]  # حد أقصى 8 قوالب (بيانات الزر ≤ 64 بايت)
+        except Exception as e:  # pragma: no cover — config fallback
+            logger.warning(f"CONTACT_TEMPLATES_JSON invalid, using defaults: {e}")
+    return list(DEFAULT_CONTACT_TEMPLATES)
+
+
+def contact_template_labels(count: int) -> List[str]:
+    """تسميات أزرار القائمة — افتراضية أو عامة عند تجاوز عدد القوالب."""
+    labels = list(CONTACT_TEMPLATE_LABELS)
+    out: List[str] = []
+    for i in range(max(1, count)):
+        out.append(labels[i] if i < len(labels) else f"رسالة {i + 1}")
+    return out
 
 # =============================================================================
 # Score bar utility

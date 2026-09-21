@@ -133,6 +133,7 @@ from config import CFG, InputSanitizer, fast_hash
 from database import EnhancedDatabase, MessageRecord, AlertRecord, DeadLetterRecord
 from filter_engine import EnhancedFilter
 from dedup import content_fingerprint, get_deduplicator  # v9.10 cross-account dedup
+from antispam import get_antispam  # v9.11 anti-spam (Watch List → Permanent Ignore)
 from sender_resolver import (
     extract_flat as _sender_extract_flat,
     extract_sender as _sender_extract,
@@ -188,52 +189,64 @@ def build_telegram_links(chat_id: int, message_id: int, username: str = None) ->
 
 
 # ============================================================================
-# v9.10 — Dynamic alert buttons (طلب المستخدم — كود مدمج حرفياً)
+# v9.11 — Dynamic alert buttons (المرحلة الأولى: الأزرار الثلاثة المطلوبة)
 #
-# زرّان ديناميكيان في صف واحد أسفل كل تنبيه:
-#   [ 💬 مراسلة ]  [ 📨 عرض الرسالة ]
+# أسفل كل تنبيه صفّان من الأزرار:
+#   الصف 1: [ عرض الرسالة ]  [ تواصل مع المرسل ]
+#   الصف 2: [ مراسلة ]  [ 📋 نسخ النص (ميزة قائمة — اختيارية) ]
 #
 # القواعد:
-#   * مرسل لديه Username      → 💬 مراسلة → https://t.me/{username}
-#   * مرسل بدون Username      → 💬 مراسلة → tg://openmessage?user_id={id}
-#   * مجموعة عامة             → 📨 عرض الرسالة → https://t.me/{chat}/{msg_id}
-#   * مجموعة خاصة             → 📨 عرض الرسالة → https://t.me/c/{inner}/{msg_id}
-#   * بيانات ناقصة            → الزر المكسور لا يُعرض إطلاقاً (لا أزرار مكسورة)
+#   * عرض الرسالة  → URL: t.me/{chat}/{msg} عامة أو t.me/c/{inner}/{msg} خاصة
+#                    (أفضل حل متاح ضمن Telethon للمجموعات الخاصة — يعمل لأعضائها)
+#   * تواصل مع المرسل → Inline callback (cnt_{msg_hash}): يفتح قائمة الرسائل
+#                    الجاهزة ليختار المشرف واحدة فتُرسل إلى صاحب الطلب مباشرة
+#   * مراسلة       → URL: t.me/{username} أو tg://openmessage?user_id={id}
+#   * بيانات ناقصة → الزر المكسور لا يُعرض إطلاقاً (لا أزرار مكسورة)
 # ============================================================================
-def build_dynamic_buttons(sender: dict, chat: dict) -> list | None:
-    row = []
+def build_dynamic_buttons(sender: dict, chat: dict, msg_hash: str = None) -> list | None:
+    rows: list = []
+    row1 = []
+    row2 = []
 
     sender_id = sender.get("id")
     username = (sender.get("username") or "").strip().lstrip("@")
 
-    # زر مراسلة
+    # ── زر «عرض الرسالة» (الأول — فتح الرسالة الأصلية في مصدرها) ──
+    chat_id = chat.get("id")
+    message_id = chat.get("message_id")
+    chat_uname = (chat.get("username") or "").strip().lstrip("@")
+
+    msg_url = None
+    if chat_uname and message_id:
+        msg_url = f"https://t.me/{chat_uname}/{message_id}"
+    elif chat_id and message_id:
+        inner = str(chat_id).replace("-100", "", 1)
+        msg_url = f"https://t.me/c/{inner}/{message_id}"
+    if msg_url:
+        row1.append(Button.url("عرض الرسالة", msg_url))
+
+    # ── زر «تواصل مع المرسل» (الثاني — قائمة الرسائل الجاهزة) ──
+    if msg_hash and sender_id and CFG.ALERT_WITH_CONTACT_BUTTON:
+        # بيانات الاستدعاء: cnt_ + بصمة الرسالة (32 حرفاً = 36 بايت ≤ 64)
+        row1.append(Button.inline("تواصل مع المرسل", f"cnt_{msg_hash}"))
+
+    if row1:
+        rows.append(row1)
+
+    # ── زر «مراسلة» (الثالث — فتح محادثة مباشرة مع المرسل، بدون أي إرسال) ──
     if username:
         contact_url = f"https://t.me/{username}"
     elif sender_id:
         contact_url = f"tg://openmessage?user_id={sender_id}"
     else:
         contact_url = None
-
     if contact_url:
-        row.append(Button.url("💬 مراسلة", contact_url))
+        row2.append(Button.url("مراسلة", contact_url))
 
-    # زر عرض الرسالة
-    chat_id = chat.get("id")
-    message_id = chat.get("message_id")
-    chat_uname = (chat.get("username") or "").strip().lstrip("@")
+    if row2:
+        rows.append(row2)
 
-    msg_url = None
-
-    if chat_uname and message_id:
-        msg_url = f"https://t.me/{chat_uname}/{message_id}"
-    elif chat_id and message_id:
-        inner = str(chat_id).replace("-100", "", 1)
-        msg_url = f"https://t.me/c/{inner}/{message_id}"
-
-    if msg_url:
-        row.append(Button.url("📨 عرض الرسالة", msg_url))
-
-    return [row] if row else None
+    return rows if rows else None
 
 
 # =============================================================================
@@ -936,11 +949,13 @@ class EnhancedAccountMonitor:
             msg_html = f'<a href="{msg_link}"><b>عرض الرسالة الأصلية</b></a>' if msg_link != "#" else "الرابط غير متاح"
             group_card = f'<blockquote dir="rtl">{msg_html}</blockquote>'
         alert = (f"<b>الرسالة:</b>\n{message_html}\n\n👤: {sender_link}\n\n{group_card}")
-        # v9.10: الأزرار الديناميكية [ 💬 مراسلة ] [ 📨 عرض الرسالة ] في صف
-        # واحد — تُبنى من بيانات المرسل/المحادثة المتوفرة، والزر الذي تفتقر
-        # بياناته لا يُعرض إطلاقاً (لا أزرار مكسورة). زر النسخ الاختياري يُضاف
-        # لنفس الصف عند تفعيل CFG.ALERT_WITH_COPY_BUTTON (قابل للتعديل حياً
-        # من لوحة التحكم).
+        # v9.11: الأزرار الثلاثة المطلوبة في صفّين:
+        #   [ عرض الرسالة ] [ تواصل مع المرسل ]
+        #   [ مراسلة ] [ 📋 نسخ النص ]
+        # الزر الذي تفتقر بياناته لا يُعرض إطلاقاً (لا أزرار مكسورة).
+        # زر النسخ (ميزة قائمة) يُضاف للصف الثاني عند تفعيل
+        # CFG.ALERT_WITH_COPY_BUTTON، وزر التواصل قابل للتعطيل عبر
+        # CFG.ALERT_WITH_CONTACT_BUTTON (كلاهما حي من لوحة التحكم).
         buttons = None
         if CFG.ALERT_WITH_BUTTONS:
             dynamic = build_dynamic_buttons(
@@ -953,12 +968,15 @@ class EnhancedAccountMonitor:
                     "message_id": chat.get("message_id"),
                     "username": chat.get("username"),
                 },
+                msg_hash=(analysis or {}).get("msg_hash"),
             )
-            row = list(dynamic[0]) if dynamic else []
-            if CFG.ALERT_WITH_COPY_BUTTON:
-                row.append(Button.inline("📋 نسخ النص", f"copy_{analysis.get('msg_hash', '')}"))
-            if row:
-                buttons = [row]
+            rows = [list(r) for r in dynamic] if dynamic else []
+            if CFG.ALERT_WITH_COPY_BUTTON and rows:
+                rows[-1].append(Button.inline("📋 نسخ النص", f"copy_{(analysis or {}).get('msg_hash', '')}"))
+            elif CFG.ALERT_WITH_COPY_BUTTON:
+                rows.append([Button.inline("📋 نسخ النص", f"copy_{(analysis or {}).get('msg_hash', '')}")])
+            if rows:
+                buttons = rows
         return alert, buttons
 
 
@@ -1614,6 +1632,11 @@ class EnhancedAccountMonitor:
         sender_id = data.get("sender_id", 0); chat_id = data.get("chat_id", 0)
         if await self.db.is_blocked_sender(sender_id): return False
         if await self.db.is_blocked_chat(chat_id): return False
+        # v9.11 مكافحة السبام: المستخدم المصنف Cross-Group Spam / Mass Poster
+        # لا تُعالج رسائله مرة أخرى إطلاقاً (فحص ذاكري فوري — لا تكلفة DB).
+        if get_antispam().is_ignored(sender_id):
+            await self._inc_stat("spam_skipped")
+            return False
         text = data.get("text", "")
         if text and not (CFG.MIN_MESSAGE_LENGTH <= len(text) <= CFG.MAX_MESSAGE_LENGTH):
             await self._inc_stat("errors"); return False
@@ -1653,6 +1676,21 @@ class EnhancedAccountMonitor:
             elif has_media: analysis = {"valid": False, "reason": "media_only_no_text", "keyword": None, "decision": "ignore"}
         else:
             analysis = {"valid": False, "reason": "no_content", "keyword": None, "decision": "ignore"}
+        # ====== v9.11 مكافحة السبام: مراقبة كل رسالة جديدة (قبل أي تنبيه) ======
+        # observe لا يغير قرار الفلترة إطلاقاً — يقرر فقط: مراقبة/تجاهل دائم،
+        # والتأكيد (تجاهل دائم + تسجيل السبب) يتم ذاتياً داخل المحرك.
+        # المستخدم تحت المراقبة يستمر في تلقي التنبيهات كالمعتاد (لا تجاهل
+        # ولا حظر أثناء المراقبة)؛ تأكيد السبام فقط يوقف التنبيهات نهائياً.
+        if CFG.ANTISPAM_ENABLED:
+            try:
+                spam_action, _spam_info = await get_antispam().observe(
+                    sender_id, data.get("chat_id"), validated_text or "", ts=data.get("timestamp")
+                )
+                if spam_action == "spam":
+                    await self._inc_stat("spam_blocked")
+                    return  # إيقاف كل التنبيهات — رسائله لا تُعالج مرة أخرى
+            except Exception as e:
+                logger.debug(f"antispam observe skipped [{self.account['name']}]: {e}")
         # ====== الإصلاح الجوهري: التأكد من أن القرار النهائي هو "accept" فقط ======
         decision = analysis.get("decision", "ignore")
         is_valid = analysis.get("valid", False) and decision == "accept"
@@ -1757,9 +1795,10 @@ class EnhancedAccountMonitor:
         user_media = data.get("media_object")
         async def do_send():
             sent = False
+            sent_msg = None
             if user_media is not None:
                 try:
-                    await send_client.send_file(CFG.TARGET_GROUP_ID, file=user_media, caption=alert_text, buttons=buttons, parse_mode="html", link_preview=False)
+                    sent_msg = await send_client.send_file(CFG.TARGET_GROUP_ID, file=user_media, caption=alert_text, buttons=buttons, parse_mode="html", link_preview=False)
                     sent = True
                 except Exception as e: logger.debug(f"User media send failed: {e}")
             if not sent:
@@ -1768,12 +1807,13 @@ class EnhancedAccountMonitor:
                     try:
                         result = await send_client.get_profile_photos(chat_entity, limit=1)
                         if result and hasattr(result, 'photos') and len(result.photos) > 0:
-                            await send_client.send_file(CFG.TARGET_GROUP_ID, file=result.photos[0], caption=alert_text, parse_mode="html", link_preview=False)
+                            sent_msg = await send_client.send_file(CFG.TARGET_GROUP_ID, file=result.photos[0], caption=alert_text, buttons=buttons, parse_mode="html", link_preview=False)
                             sent = True
                     except Exception as e:
                         logger.debug(f"Chat photo fallback send failed [{account_name}]: {e}")
             if not sent:
-                await send_client.send_message(CFG.TARGET_GROUP_ID, alert_text, buttons=buttons, parse_mode="html", link_preview=False)
+                sent_msg = await send_client.send_message(CFG.TARGET_GROUP_ID, alert_text, buttons=buttons, parse_mode="html", link_preview=False)
+            return sent_msg
         def _retry_payload() -> Dict[str, Any]:
             payload = dict(data)
             payload["_dlq_kind"] = "alert_resend"
@@ -1783,9 +1823,18 @@ class EnhancedAccountMonitor:
             payload["_dlq_analysis"] = analysis
             return payload
         try:
-            await self._send_cb.call(do_send)
+            sent_msg = await self._send_cb.call(do_send)
             if _capture.enabled:
                 _capture.mark_alerted(data.get("chat_id"), data.get("message_id"))
+            # v9.11: سجّل موضع رسالة التنبيه في المجموعة الهدف لدعم مسار
+            # الرد البديل (رد بـ«تواصل» أو برقم) على الزر «تواصل مع المرسل».
+            if sent_msg is not None and self._bot_ref is not None:
+                try:
+                    note = getattr(self._bot_ref, "_note_alert_message", None)
+                    if note is not None:
+                        note(getattr(sent_msg, "id", None), msg_hash)
+                except Exception:
+                    pass
             safe_keyword = keyword
             if isinstance(safe_keyword, (tuple, list)): safe_keyword = safe_keyword[0] if safe_keyword else ""
             if not isinstance(safe_keyword, str): safe_keyword = str(safe_keyword) if safe_keyword is not None else ""

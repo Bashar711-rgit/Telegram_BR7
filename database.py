@@ -599,6 +599,21 @@ class EnhancedDatabase:
                 last_seen REAL NOT NULL,
                 hits INTEGER DEFAULT 1
             );
+            CREATE TABLE IF NOT EXISTS spam_watch (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sender_id INTEGER NOT NULL,
+                reason TEXT,
+                evidence TEXT,
+                watch_until REAL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS spam_ignore (
+                sender_id INTEGER PRIMARY KEY,
+                reason TEXT,
+                evidence TEXT,
+                classified TEXT DEFAULT 'cross_group_spam',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
         """
         for stmt in stmts.split(";"):
             s = stmt.strip()
@@ -608,6 +623,10 @@ class EnhancedDatabase:
                         s.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "BIGSERIAL PRIMARY KEY")
                         .replace("sender_id INTEGER PRIMARY KEY", "sender_id BIGINT PRIMARY KEY")
                         .replace("chat_id INTEGER PRIMARY KEY", "chat_id BIGINT PRIMARY KEY")
+                        # v9.11: عمود عاري غير مفتاحي أيضاً يجب أن يتسع لمعرفات
+                        # تيليجرام 64-بت (alert_dedup.sender_id كان يبقى int4).
+                        .replace("sender_id INTEGER,", "sender_id BIGINT,")
+                        .replace("chat_id INTEGER,", "chat_id BIGINT,")
                         .replace("INTEGER NOT NULL", "BIGINT NOT NULL")
                         .replace("access_hash INTEGER,", "access_hash BIGINT,")
                         .replace("last_chat_id INTEGER,", "last_chat_id BIGINT,")
@@ -636,6 +655,10 @@ class EnhancedDatabase:
         """
         if self.db_type != "postgresql":
             return
+        # v9.11: القائمة الشاملة لكل أعمدة معرفات تيليجرام — ALTER هو no-op
+        # رخيص إذا كان العمود BIGINT مسبقاً، لذا تُنفّذ دائماً كأحزمة أمان
+        # تشمل الجداول التي كانت تُنشأ صحيحة منذ البداية (messages/alerts)
+        # وجدول alert_dedup الذي كان يفلت من قواعد الترجمة ويبقى int4.
         stmts = [
             "ALTER TABLE sender_stats    ALTER COLUMN sender_id       TYPE BIGINT",
             "ALTER TABLE sender_contacts ALTER COLUMN sender_id       TYPE BIGINT",
@@ -644,24 +667,92 @@ class EnhancedDatabase:
             "ALTER TABLE sender_contacts ALTER COLUMN last_message_id TYPE BIGINT",
             "ALTER TABLE blocked_senders ALTER COLUMN sender_id       TYPE BIGINT",
             "ALTER TABLE blocked_chats   ALTER COLUMN chat_id         TYPE BIGINT",
+            # ── v9.11: إصلاح خطأ DataError المستمر (value out of int32 range) ──
+            "ALTER TABLE messages        ALTER COLUMN chat_id         TYPE BIGINT",
+            "ALTER TABLE messages        ALTER COLUMN sender_id       TYPE BIGINT",
+            "ALTER TABLE alerts          ALTER COLUMN chat_id         TYPE BIGINT",
+            "ALTER TABLE alerts          ALTER COLUMN sender_id       TYPE BIGINT",
+            "ALTER TABLE alert_dedup     ALTER COLUMN sender_id       TYPE BIGINT",
+            "ALTER TABLE spam_watch      ALTER COLUMN sender_id       TYPE BIGINT",
+            "ALTER TABLE spam_ignore     ALTER COLUMN sender_id       TYPE BIGINT",
         ]
         applied = 0
+        failed: list = []
         for st in stmts:
             table = st.split()[2]
             column = st.split("ALTER COLUMN ")[1].split()[0]
-            try:
-                await self._execute(st)
-                applied += 1
-            except Exception as e:
-                logger.warning(
-                    f"bigint migration: {table}.{column} skipped: "
-                    f"{type(e).__name__}: {str(e)[:120]}"
-                )
+            ok = False
+            for attempt in (1, 2):  # محاولتان — منافسة الأقفال عابرة غالباً
+                try:
+                    await self._execute(st)
+                    applied += 1
+                    ok = True
+                    break
+                except Exception as e:
+                    if attempt == 1:
+                        await asyncio.sleep(2.0)  # مهلة قصيرة قبل إعادة المحاولة
+                        continue
+                    # v9.11: الفشل لم يعد يُبتلع بصمت — سجل صارخ + اسم الجدول/العمود
+                    failed.append((table, column))
+                    logger.error(
+                        f"bigint migration FAILED: {table}.{column} stays int4 → "
+                        f"writes of Telegram 64-bit IDs will raise DataError "
+                        f"(value out of int32 range): {type(e).__name__}: {str(e)[:200]}"
+                    )
         await self._commit()
         logger.info(
-            f"Database migration v9.1: Telegram-ID columns widened to BIGINT "
-            f"({applied}/{len(stmts)} applied)"
+            f"Database migration v9.11: Telegram-ID columns widened to BIGINT "
+            f"({applied}/{len(stmts)} applied, {len(failed)} failed)"
         )
+        # تحقق فعلي من أنواع الأعمدة بعد الترحيل — يكشف أي عمود ما زال int4
+        await self._verify_bigint_columns(failed)
+
+    async def _verify_bigint_columns(self, failed: list) -> None:
+        """v9.11: تحقق من information_schema أن كل أعمدة المعرفات فعلاً BIGINT.
+
+        هذا يكشف الحالة التي كان فيها خطأ الترحيل يُبتلع بصمت (قفل من عملية
+        أخرى/مهلة 30 ثانية) فيبقى العمود int4 ويتكرر في السجلات:
+            DataError: invalid input for query argument $1 (value out of int32 range)
+        """
+        if self.db_type != "postgresql":
+            return
+        columns = [
+            ("messages", "chat_id"), ("messages", "sender_id"),
+            ("alerts", "chat_id"), ("alerts", "sender_id"),
+            ("sender_stats", "sender_id"),
+            ("sender_contacts", "sender_id"), ("sender_contacts", "access_hash"),
+            ("sender_contacts", "last_chat_id"), ("sender_contacts", "last_message_id"),
+            ("blocked_senders", "sender_id"), ("blocked_chats", "chat_id"),
+            ("alert_dedup", "sender_id"),
+            ("spam_watch", "sender_id"), ("spam_ignore", "sender_id"),
+        ]
+        try:
+            still_int4 = []
+            for table, column in columns:
+                try:
+                    row = await self._fetchone(
+                        "SELECT data_type FROM information_schema.columns "
+                        "WHERE table_name = ? AND column_name = ?",
+                        (table, column),
+                    )
+                    dtype = (row.get("data_type") if row else None) or ""
+                    if dtype and dtype.lower() in ("integer", "smallint", "int4", "int2"):
+                        still_int4.append(f"{table}.{column}({dtype})")
+                except Exception:
+                    continue  # الجدول قد لا يكون موجوداً بعد — إنشاؤه قادم
+            if still_int4:
+                logger.critical(
+                    "⚠️ INT32 OVERFLOW RISK — هذه الأعمدة ما زالت int4 وستفشل كتابة "
+                    "معرفات تيليجرام 64-بت (DataError: value out of int32 range): "
+                    + ", ".join(still_int4)
+                    + " — غالباً قفل من عملية أخرى؛ سيتكرر المحاولة عند الإقلاع القادم."
+                )
+            else:
+                logger.info(
+                    f"bigint verify OK: all {len(columns)} Telegram-ID columns are 64-bit safe"
+                )
+        except Exception as e:
+            logger.debug(f"bigint verify skipped: {e}")
 
     # ── sender-intel columns (v9.3, backward-compatible) ──────────────────
     _SENDER_INTEL_COLUMNS = [
@@ -752,6 +843,9 @@ class EnhancedDatabase:
             # v9.10 dedup: fast expiry-scan for the periodic cleanup
             "CREATE INDEX IF NOT EXISTS idx_dedup_first_seen ON alert_dedup(first_seen)",
             "CREATE INDEX IF NOT EXISTS idx_dedup_sender     ON alert_dedup(sender_id)",
+            # v9.11 antispam: فحص سريع لقائمة المراقبة/التجاهل
+            "CREATE INDEX IF NOT EXISTS idx_watch_sender_time ON spam_watch(sender_id, created_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_watch_until       ON spam_watch(watch_until)",
         ]
         for idx in indexes:
             await self._execute(idx)
@@ -1346,6 +1440,134 @@ class EnhancedDatabase:
         except Exception:
             return None
 
+    # ─── Helpers for contact button (زر «تواصل مع المرسل») ────────────────
+    async def get_alert_sender_by_hash(self, msg_hash: str) -> Optional[Dict[str, Any]]:
+        """بيانات المرسل الأصلي لتنبيه معيّن (sender_id + بيانات التواصل).
+
+        يستخدمه معالج زر «تواصل مع المرسل» لإرسال الرسالة الجاهزة المختارة
+        إلى صاحب الإعلان/الطلب مباشرة. يجمع بيانات alerts + sender_contacts.
+        """
+        try:
+            row = await self._fetchone(
+                "SELECT sender_id, chat_id, keyword FROM alerts "
+                "WHERE message_hash = ? LIMIT 1",
+                (msg_hash,),
+            )
+            if not row:
+                return None
+            # كل الأعمدة محددة في الاستعلام أعلاه — الفهرسة المفتاحية تعمل
+            # على كلا اللهجتين (aiosqlite.Row و asyncpg.Record).
+            out = {
+                "sender_id": row["sender_id"],
+                "chat_id": row["chat_id"],
+                "keyword": row["keyword"],
+            }
+            try:
+                contact = await self.get_sender_contact(int(row["sender_id"] or 0))
+            except Exception:
+                contact = None
+            if contact:
+                out["username"] = contact.get("username")
+                out["access_hash"] = contact.get("access_hash")
+                out["first_name"] = contact.get("first_name")
+            return out
+        except Exception:
+            return None
+
+    # ─── Anti-Spam: Watch List + Permanent Ignore (المرحلة الثانية) ────────
+    async def is_spam_ignored(self, sender_id: int) -> bool:
+        try:
+            row = await self._fetchone(
+                "SELECT 1 AS found FROM spam_ignore WHERE sender_id = ? LIMIT 1",
+                (int(sender_id),),
+            )
+            return bool(row)
+        except Exception:
+            return False
+
+    async def add_spam_ignore(
+        self, sender_id: int, reason: str = "", evidence: Optional[Dict] = None, classified: str = "cross_group_spam"
+    ) -> None:
+        """إضافة إلى قائمة التجاهل الدائم مع تسجيل سبب الحظر بالتفصيل."""
+        try:
+            ev = json_dumps(evidence or {})
+            await self._execute(
+                "INSERT INTO spam_ignore (sender_id, reason, evidence, classified) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(sender_id) DO UPDATE SET "
+                "reason = excluded.reason, evidence = excluded.evidence, classified = excluded.classified",
+                (int(sender_id), reason or "cross_group_spam", ev, classified),
+            )
+            await self._commit()
+        except Exception as e:
+            logger.error(f"add_spam_ignore failed for {sender_id}: {e}")
+            raise
+
+    async def remove_spam_ignore(self, sender_id: int) -> None:
+        try:
+            await self._execute("DELETE FROM spam_ignore WHERE sender_id = ?", (int(sender_id),))
+            await self._commit()
+        except Exception as e:
+            logger.error(f"remove_spam_ignore failed for {sender_id}: {e}")
+            raise
+
+    async def get_spam_ignored(self, limit: int = 50) -> List[Dict[str, Any]]:
+        try:
+            rows = await self._fetchall(
+                "SELECT sender_id, reason, classified, created_at FROM spam_ignore "
+                "ORDER BY created_at DESC LIMIT ?",
+                (int(limit),),
+            )
+            return [dict(r) for r in rows] if rows else []
+        except Exception:
+            return []
+
+    async def record_watch(
+        self, sender_id: int, reason: str = "", evidence: Optional[Dict] = None, watch_until: float = 0.0
+    ) -> None:
+        """تسجيل إدراج في قائمة المراقبة (سجل append للأسباب — للمشرف واللوحة)."""
+        try:
+            ev = json_dumps(evidence or {})
+            await self._execute(
+                "INSERT INTO spam_watch (sender_id, reason, evidence, watch_until) "
+                "VALUES (?, ?, ?, ?)",
+                (int(sender_id), reason or "", ev, float(watch_until)),
+            )
+            await self._commit()
+        except Exception as e:
+            logger.debug(f"record_watch failed for {sender_id}: {e}")
+
+    async def get_recent_watchlist(self, limit: int = 50, active_only: bool = False) -> List[Dict[str, Any]]:
+        try:
+            if active_only:
+                rows = await self._fetchall(
+                    "SELECT sender_id, reason, watch_until, created_at FROM spam_watch "
+                    "WHERE watch_until > ? ORDER BY created_at DESC LIMIT ?",
+                    (time.time(), int(limit)),
+                )
+            else:
+                rows = await self._fetchall(
+                    "SELECT sender_id, reason, watch_until, created_at FROM spam_watch "
+                    "ORDER BY created_at DESC LIMIT ?",
+                    (int(limit),),
+                )
+            return [dict(r) for r in rows] if rows else []
+        except Exception:
+            return []
+
+    async def cleanup_old_watchlist(self, days: int = 7) -> int:
+        """إزالة سجلات المراقبة الأقدم من `days` أيام (يُستدعى من التنظيف الدوري)."""
+        try:
+            cutoff = time.time() - (int(days) * 86400)
+            cursor = await self._execute(
+                "DELETE FROM spam_watch WHERE watch_until < ?", (cutoff,)
+            )
+            await self._commit()
+            return cursor.rowcount if cursor and cursor.rowcount and cursor.rowcount > 0 else 0
+        except Exception as e:
+            logger.debug(f"cleanup_old_watchlist failed: {e}")
+            return 0
+
     # ─── Alert Dedup (v9.10 — cross-account/re-send alert barrier) ───────────
     async def claim_alert_fingerprint(
         self, fingerprint: str, first_seen: float, window_hint: int = 86400
@@ -1635,6 +1857,11 @@ class EnhancedDatabase:
             total += cur.rowcount or 0
             cur = await self._execute("DELETE FROM alerts WHERE timestamp < ?", (cutoff,))
             total += cur.rowcount or 0
+            # v9.11 antispam: تنظيف سجل قائمة المراقبة القديم (سجل تشخيصي فقط)
+            try:
+                await self._execute("DELETE FROM spam_watch WHERE watch_until < ?", (cutoff,))
+            except Exception:
+                pass
             await self._commit()
             if total > 500 and self.db_type == "sqlite":
                 await self._execute("PRAGMA optimize")

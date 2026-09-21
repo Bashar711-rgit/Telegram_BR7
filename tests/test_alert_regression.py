@@ -4,22 +4,27 @@
 deploys. These tests pin the EXACT expected strings/buttons produced by
 the current code.
 
-⚠️ v9.10 (2026-09) — GOLDEN UPDATED BY EXPLICIT USER REQUEST:
-الطلب الجديد من المستخدم غيّر صف الأزرار من
-    [ 💬 مراسلة ] [ 👤 فتح الحساب ] [ 📋 نسخ النص ]
-إلى الأزرار الديناميكية (الكود المدمج حرفياً في monitors.py):
+⚠️ v9.11 (2026-09) — GOLDEN UPDATED BY EXPLICIT USER REQUEST (المرحلة الأولى):
+الأزرار تغيّرت من صف واحد
     [ 💬 مراسلة ] [ 📨 عرض الرسالة ] [ 📋 نسخ النص ]
+إلى صفّين بالتسميات المطلوبة حرفياً:
+    الصف 1: [ عرض الرسالة ] [ تواصل مع المرسل ]
+    الصف 2: [ مراسلة ] [ 📋 نسخ النص ]
 بقواعد:
-  * مراسلة: t.me/{username} عند توفره، وإلا tg://openmessage?user_id=
   * عرض الرسالة: t.me/{chat}/{msg} عامة أو t.me/c/{inner}/{msg} خاصة
-  * الزر الذي تفتقر بياناته لا يُعرض إطلاقاً
+  * تواصل مع المرسل: inline callback (cnt_{msg_hash}) → قائمة الرسائل الجاهزة
+  * مراسلة: t.me/{username} عند توفره، وإلا tg://openmessage?user_id=
+  * الزر الذي تفتقر بياناته لا يُعرض إطلاقاً (لا أزرار مكسورة)
+  * زر النسخ (ميزة قائمة من v9.10) انتقل للصف الثاني — لم يُحذف
 نص التنبيه HTML نفسه لم يتغير إطلاقاً (نفس الحقول، نفس الترتيب، نفس
-الروابط داخل النص). أزرار "👤 فتح الحساب" حُذفت لأن "💬 مراسلة" الجديد
-يغطي نفس الغرض بشكل أدق في الحالتين.
+الروابط داخل النص).
 
 If ANY of these tests fail, the alert format changed and the release
 must be considered broken. Labels, order, URLs and callback data are
 all verified.
+
+ملاحظة توافق: مساعد مواصفات الأزرار يعمل مع Telethon القديم
+(KeyboardButtonUrl/KeyboardButtonCallback) والجديد (KeyboardInlineButton).
 """
 
 import os
@@ -38,24 +43,31 @@ from monitors import EnhancedAccountMonitor  # noqa: E402
 import pytest  # noqa: E402
 
 
+def _btn_spec(b):
+    """(kind, text, url-or-data) — version-agnostic across Telethon generations."""
+    t = getattr(b, "type", None)
+    if t is not None and hasattr(t, "url") and getattr(t, "url", None):
+        return ("url", b.text, t.url)
+    if t is not None and hasattr(t, "data"):
+        d = t.data
+        return ("callback", b.text, d.decode() if isinstance(d, bytes) else d)
+    if getattr(b, "url", None):
+        return ("url", b.text, b.url)
+    d = getattr(b, "data", None)
+    if d is not None:
+        return ("callback", b.text, d.decode() if isinstance(d, bytes) else d)
+    return (type(b).__name__, getattr(b, "text", None), None)
+
+
 def _button_specs(buttons):
-    """(class, text, url, callback-data) for every button, order-preserved."""
+    """[(kind, text, url, callback-data)] for every row, order-preserved."""
     specs = []
     for row in buttons or []:
-        row_specs = []
-        for b in row:
-            data = getattr(b, "data", None)
-            row_specs.append((
-                type(b).__name__,
-                getattr(b, "text", None),
-                getattr(b, "url", None),
-                data.decode() if isinstance(data, bytes) else data,
-            ))
-        specs.append(row_specs)
+        specs.append([_btn_spec(b) for b in row])
     return specs
 
 
-# ── GOLDEN OUTPUT (v9.10 dynamic buttons — user-requested format) ────────
+# ── GOLDEN OUTPUT (v9.11 three requested buttons — two rows) ────────────
 GOLDEN = {
     "S1_username_chat": {
         "alert": (
@@ -64,13 +76,16 @@ GOLDEN = {
             '<blockquote dir="rtl"><a href="https://t.me/mygroup">مجموعة الطلاب</a>\n\n'
             '<a href="https://t.me/mygroup/123"><b>عرض الرسالة الأصلية</b></a></blockquote>'
         ),
-        # username موجود + مجموعة عامة (chat_username) → الزران + النسخ
+        # username + مجموعة عامة → الصفان الكاملان
         "buttons": [
             [
-                ("KeyboardButtonUrl", "💬 مراسلة", "https://t.me/ahmed_99", None),
-                ("KeyboardButtonUrl", "📨 عرض الرسالة", "https://t.me/mygroup/123", None),
-                ("KeyboardButtonCallback", "📋 نسخ النص", None, "copy_abc123"),
-            ]
+                ("url", "عرض الرسالة", "https://t.me/mygroup/123"),
+                ("callback", "تواصل مع المرسل", "cnt_abc123"),
+            ],
+            [
+                ("url", "مراسلة", "https://t.me/ahmed_99"),
+                ("callback", "📋 نسخ النص", "copy_abc123"),
+            ],
         ],
     },
     "S2_private_chat": {
@@ -83,10 +98,13 @@ GOLDEN = {
         # لا username → مراسلة عبر openmessage + مجموعة خاصة → t.me/c/inner/msg
         "buttons": [
             [
-                ("KeyboardButtonUrl", "💬 مراسلة", "tg://openmessage?user_id=777000222", None),
-                ("KeyboardButtonUrl", "📨 عرض الرسالة", "https://t.me/c/1234567890/456", None),
-                ("KeyboardButtonCallback", "📋 نسخ النص", None, "copy_abc123"),
-            ]
+                ("url", "عرض الرسالة", "https://t.me/c/1234567890/456"),
+                ("callback", "تواصل مع المرسل", "cnt_abc123"),
+            ],
+            [
+                ("url", "مراسلة", "tg://openmessage?user_id=777000222"),
+                ("callback", "📋 نسخ النص", "copy_abc123"),
+            ],
         ],
     },
     "S3_no_username_hash": {
@@ -95,13 +113,16 @@ GOLDEN = {
             '👤: <a href="tg://openmessage?user_id=888000333">خالد</a>\n\n'
             '<blockquote dir="rtl">الرابط غير متاح</blockquote>'
         ),
-        # بيانات ناقصة: لا username ولا chat_id/message_id → زر العرض لا
-        # يُعرض إطلاقاً (لا أزرار مكسورة) — يبقى مراسلة + النسخ فقط.
+        # بيانات ناقصة: لا chat_id/message_id → زر العرض لا يُعرض إطلاقاً
+        # (لا أزرار مكسورة) — يبقى التواصل + مراسلة + النسخ.
         "buttons": [
             [
-                ("KeyboardButtonUrl", "💬 مراسلة", "tg://openmessage?user_id=888000333", None),
-                ("KeyboardButtonCallback", "📋 نسخ النص", None, "copy_abc123"),
-            ]
+                ("callback", "تواصل مع المرسل", "cnt_abc123"),
+            ],
+            [
+                ("url", "مراسلة", "tg://openmessage?user_id=888000333"),
+                ("callback", "📋 نسخ النص", "copy_abc123"),
+            ],
         ],
     },
     "S4_unknown_title": {
@@ -111,13 +132,16 @@ GOLDEN = {
             '<blockquote dir="rtl"><a href="https://t.me/eng_group/789">'
             '<b>عرض الرسالة الأصلية</b></a></blockquote>'
         ),
-        # username موجود + مجموعة عامة → الزران + النسخ (حتى مع title="غير معروف")
+        # username + مجموعة عامة → الصفان الكاملان (حتى مع title="غير معروف")
         "buttons": [
             [
-                ("KeyboardButtonUrl", "💬 مراسلة", "https://t.me/user_x", None),
-                ("KeyboardButtonUrl", "📨 عرض الرسالة", "https://t.me/eng_group/789", None),
-                ("KeyboardButtonCallback", "📋 نسخ النص", None, "copy_abc123"),
-            ]
+                ("url", "عرض الرسالة", "https://t.me/eng_group/789"),
+                ("callback", "تواصل مع المرسل", "cnt_abc123"),
+            ],
+            [
+                ("url", "مراسلة", "https://t.me/user_x"),
+                ("callback", "📋 نسخ النص", "copy_abc123"),
+            ],
         ],
     },
 }
@@ -140,7 +164,7 @@ class TestAlertRegression:
     @pytest.mark.asyncio
     async def test_s1_username_chat(self, monitor):
         sender = {"id": 555000111, "display": "أحمد محمد", "username": "ahmed_99", "access_hash": 7234567890123}
-        # v9.10: _send_alert يضيف id/message_id/username إلى chat_info —
+        # _send_alert يضيف id/message_id/username إلى chat_info —
         # الاختبار يحاكي نفس البنية الفعلية بعد الدمج.
         chat = {
             "group_link": "https://t.me/mygroup", "title": "مجموعة الطلاب", "msg_link": "https://t.me/mygroup/123",
@@ -199,6 +223,7 @@ class TestAlertRegression:
 
     @pytest.mark.asyncio
     async def test_buttons_contract_config(self):
-        """The alert-button contract flags must be untouched by v9.10."""
+        """The alert-button contract flags must be consistent (v9.11)."""
         assert CFG.ALERT_WITH_BUTTONS is True
         assert CFG.ALERT_WITH_COPY_BUTTON is True
+        assert CFG.ALERT_WITH_CONTACT_BUTTON is True
