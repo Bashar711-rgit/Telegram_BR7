@@ -340,6 +340,8 @@ class EnhancedTelegramBot:
         self._consumer_task: Optional[asyncio.Task] = None
         self._stats_task: Optional[asyncio.Task] = None
         self._cleanup_task: Optional[asyncio.Task] = None
+        # v9.12 (audit H-08): dedicated short-cadence loop for alert_dedup.
+        self._dedup_cleanup_task: Optional[asyncio.Task] = None
         self._health_task: Optional[asyncio.Task] = None
         self._memory_task: Optional[asyncio.Task] = None
         self._health_server_task: Optional[asyncio.Task] = None
@@ -391,20 +393,46 @@ class EnhancedTelegramBot:
 
         async def producer():
             while self.is_running:
+                event_data = None
                 try:
                     event_data = await self.db.pop_from_queue()
                     if event_data:
                         await internal_queue.put(event_data)
+                        # v9.12 (audit M-07): the put succeeded — clear the
+                        # local reference so a CancelledError below does
+                        # NOT trigger a re-enqueue of an already-queued item.
+                        event_data = None
                     else:
                         await asyncio.sleep(0.1)
                 except asyncio.CancelledError:
+                    # v9.12 (audit M-07): graceful shutdown window — if we
+                    # were cancelled BETWEEN pop_from_queue (which deletes
+                    # the row from the DB) and internal_queue.put (which
+                    # hands it to a worker), the event is in our local
+                    # `event_data` and would be lost. Re-enqueue it to the
+                    # DB so the next process picks it up. Best-effort; if
+                    # the DB is also shutting down we log and drop.
+                    if event_data is not None:
+                        try:
+                            await self.db.add_to_queue(event_data, priority=9)  # v9.12 (audit M-14): high priority for DLQ/shutdown re-inserts
+                            logger.info("Producer shutdown: re-enqueued 1 in-flight event to DB (M-07 ack-after-pop)")
+                        except Exception as e:
+                            logger.error(f"Producer shutdown: failed to re-enqueue in-flight event: {e}")
                     break
                 except Exception as e:
                     logger.error(f"Producer error: {e}")
+                    # v9.12 (audit M-07): same window for non-Cancelled
+                    # exceptions — don't lose the in-flight event.
+                    if event_data is not None:
+                        try:
+                            await self.db.add_to_queue(event_data, priority=9)  # v9.12 (audit M-14): high priority for DLQ/shutdown re-inserts
+                        except Exception:
+                            pass
                     await asyncio.sleep(1)
 
         async def worker(worker_id: int):
             while self.is_running:
+                event_data = None
                 try:
                     event_data = await asyncio.wait_for(internal_queue.get(), timeout=1.0)
                     account_name = event_data.get("account_name", "")
@@ -412,17 +440,71 @@ class EnhancedTelegramBot:
                     if monitor:
                         await monitor.process_event_from_queue(event_data)
                     else:
+                        # v9.12 (audit M-08): the source-account monitor is
+                        # missing/disconnected. The old behaviour handed the
+                        # event to the FIRST connected monitor — which then
+                        # attributed the alert to that account in stats and
+                        # DB, even though the event actually arrived via a
+                        # different account. We now mark the event with the
+                        # real source account name (preserved in
+                        # event_data["account_name"]) AND set a
+                        # "_attributed_to" field so downstream stats can
+                        # distinguish "processed by X on behalf of
+                        # disconnected Y" from "processed by X originally".
+                        # The first connected monitor still does the actual
+                        # processing (it has a live Telegram client); we
+                        # just don't silently re-attribute it.
+                        event_data["_attributed_to"] = account_name or "unknown"
                         for m in self.monitors:
                             if m.is_connected:
                                 await m.process_event_from_queue(event_data)
                                 break
+                        else:
+                            # No connected monitor at all — re-enqueue for
+                            # later instead of dropping the event.
+                            logger.warning(
+                                f"No connected monitor to process event from {account_name}; re-enqueueing"
+                            )
+                            try:
+                                await self.db.add_to_queue(event_data, priority=9)
+                            except Exception:
+                                pass
                     internal_queue.task_done()
+                    # v9.12 (audit M-07 / M-05 related): clear the local
+                    # reference after successful processing so the
+                    # except-branch doesn't try to re-enqueue an item that
+                    # was actually handled (process_event_from_queue never
+                    # raises for a handled error — it routes to DLQ).
+                    event_data = None
                 except asyncio.TimeoutError:
                     continue
                 except asyncio.CancelledError:
+                    # v9.12 (audit M-07): on shutdown, if we pulled an
+                    # item from internal_queue but didn't finish processing
+                    # it, re-enqueue to DB so the next process picks it up.
+                    # The item was already popped from the persistent queue
+                    # by the producer, so without this re-enqueue it would
+                    # be lost on shutdown.
+                    if event_data is not None:
+                        try:
+                            await self.db.add_to_queue(event_data, priority=9)  # v9.12 (audit M-14): high priority for DLQ/shutdown re-inserts
+                            logger.info(f"Worker {worker_id} shutdown: re-enqueued 1 in-flight event to DB (M-07)")
+                        except Exception as e:
+                            logger.error(f"Worker {worker_id} shutdown: failed to re-enqueue in-flight event: {e}")
                     break
                 except Exception as e:
                     logger.error(f"Worker {worker_id} error: {e}")
+                    # v9.12 (audit M-07): unhandled exception after pulling
+                    # from internal_queue — the item is no longer in the
+                    # queue and was not processed. The DLQ inside
+                    # process_event_from_queue should have caught the
+                    # error; if we're here, the error was in our own
+                    # routing logic. Re-enqueue to preserve at-least-once.
+                    if event_data is not None:
+                        try:
+                            await self.db.add_to_queue(event_data, priority=9)  # v9.12 (audit M-14): high priority for DLQ/shutdown re-inserts
+                        except Exception:
+                            pass
                     await asyncio.sleep(1)
 
         producer_task = asyncio.create_task(producer(), name="producer")
@@ -753,8 +835,9 @@ class EnhancedTelegramBot:
     # ─── Keep-Alive Self-Ping (M-07: no localhost fallback) ────────────────────
     async def _keep_alive_loop(self) -> None:
         """
-        Pings /health from an EXTERNAL address every 10 minutes to prevent
-        Render free-tier services from sleeping after ~15 minutes idle.
+        Pings /health from an EXTERNAL address every KEEP_ALIVE_INTERVAL_SECONDS
+        (default 600 = 10 min) to prevent Render free-tier services from
+        sleeping after ~15 minutes idle.
 
         M-07 fix: previously fell back to http://127.0.0.1:<PORT>/health
         when RENDER_EXTERNAL_URL was unset. A request to localhost never
@@ -763,8 +846,34 @@ class EnhancedTelegramBot:
         sleep. Now: no external URL → keep-alive is explicitly disabled
         with a clear one-time warning, instead of silently doing nothing
         useful.
+
+        v9.12 (audit L-06): the interval is now configurable via
+        KEEP_ALIVE_INTERVAL_SECONDS (default 600). Render's free tier
+        sleeps after ~15 min of no inbound traffic; the default 10-min
+        cadence keeps the service awake. For PAID Render tiers (which
+        don't sleep) the keep-alive is harmless but unnecessary — set
+        KEEP_ALIVE_INTERVAL_SECONDS=0 to disable it explicitly. We also
+        skip the loop entirely when the service is on a paid plan
+        (RENDER_PLAN env var contains "starter"/"standard"/"pro"/"paid")
+        to avoid wasting outbound requests.
         """
         if not AIOHTTP_AVAILABLE:
+            return
+        # v9.12 (audit L-06): paid Render tiers don't sleep — skip keep-alive.
+        plan = (os.getenv("RENDER_PLAN") or "").lower()
+        paid_plans = ("starter", "standard", "pro", "paid", "plus")
+        if any(p in plan for p in paid_plans) and os.getenv("KEEP_ALIVE_FORCE", "").lower() not in ("1", "true", "yes"):
+            logger.info(
+                f"Keep-alive DISABLED — Render plan '{plan or 'unknown'}' does not sleep. "
+                f"Set KEEP_ALIVE_FORCE=true to enable anyway."
+            )
+            return
+        try:
+            interval = max(60, int(os.getenv("KEEP_ALIVE_INTERVAL_SECONDS", "600")))
+        except Exception:
+            interval = 600
+        if interval <= 0:
+            logger.info("Keep-alive disabled via KEEP_ALIVE_INTERVAL_SECONDS=0")
             return
         external_url = (os.getenv("RENDER_EXTERNAL_URL") or "").strip().rstrip("/")
         if not external_url:
@@ -780,7 +889,7 @@ class EnhancedTelegramBot:
             return
         url = f"{external_url}/health"
         await asyncio.sleep(60)  # let the web server come up first
-        logger.info(f"Keep-alive self-ping enabled -> {url} (every 10 min)")
+        logger.info(f"Keep-alive self-ping enabled -> {url} (every {interval}s)")
         while self.is_running:
             try:
                 timeout = ClientTimeout(total=30)
@@ -790,7 +899,7 @@ class EnhancedTelegramBot:
             except Exception as e:
                 logger.warning(f"Keep-alive ping failed: {e}")
             # Render free tier sleeps after ~15 min of no inbound traffic
-            await asyncio.sleep(600)
+            await asyncio.sleep(interval)
 
     # ─── Background Tasks ─────────────────────────────────────────────────────
     async def _stats_reporter(self) -> None:
@@ -847,6 +956,14 @@ class EnhancedTelegramBot:
         now the only place cleanup_old_data()/cleanup_dead_letters() are
         called from, eliminating the double-cleanup that previously
         existed between main.py and database.py.
+
+        v9.12 (audit H-08): the alert_dedup cleanup now runs on its own
+        short cadence (DEDUP_CLEANUP_INTERVAL_SECONDS, default 3600s = 1h)
+        via a separate _dedup_cleanup_loop task instead of being lumped
+        into the daily CLEANUP_INTERVAL pass. The dedup window is 24h,
+        so a daily cleanup allowed the table to grow to 2-3x the live
+        window under load; an hourly cleanup keeps the table size close
+        to the live window's steady state.
         """
         while self.is_running:
             try:
@@ -857,19 +974,39 @@ class EnhancedTelegramBot:
                 dl_cleaned = await self.db.cleanup_dead_letters(days=CFG.DEAD_LETTER_CLEANUP_DAYS)
                 if dl_cleaned:
                     logger.info(f"Dead letter cleanup: {dl_cleaned} records removed")
-                # v9.10: تنظيف بصمات منع التكرار المنتهية (تساوي نافذة الـ dedup الحية)
-                try:
-                    from dedup import get_deduplicator
-                    expired = await get_deduplicator().cleanup_expired()
-                    if expired:
-                        logger.info(f"Dedup cleanup: {expired} expired fingerprints removed")
-                except Exception as e:
-                    logger.debug(f"Dedup cleanup skipped: {e}")
                 gc.collect()
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"Cleanup error: {e}")
+
+    async def _dedup_cleanup_loop(self) -> None:
+        """v9.12 (audit H-08): dedicated short-cadence loop for the
+        alert_dedup table. Runs every DEDUP_CLEANUP_INTERVAL_SECONDS
+        (default 3600s = 1h) so the table stays close to the live 24h
+        window's steady state instead of growing 2-3x between daily
+        cleanups.
+        """
+        try:
+            interval = max(300, int(os.getenv("DEDUP_CLEANUP_INTERVAL_SECONDS", str(3600))))
+        except Exception:
+            interval = 3600
+        while self.is_running:
+            try:
+                await asyncio.sleep(interval)
+                from dedup import get_deduplicator
+                expired = await get_deduplicator().cleanup_expired()
+                if expired:
+                    logger.info(f"Dedup cleanup: {expired} expired fingerprints removed")
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.debug(f"Dedup cleanup skipped: {e}")
+                # Avoid a tight error loop on persistent failure.
+                try:
+                    await asyncio.sleep(60)
+                except asyncio.CancelledError:
+                    break
 
     async def _health_check_loop(self) -> None:
         while self.is_running:
@@ -1077,8 +1214,20 @@ class EnhancedTelegramBot:
         elif cmd == "dashboard":
             if CFG.DASHBOARD_ENABLED and DASHBOARD_AVAILABLE:
                 url = os.getenv("RENDER_EXTERNAL_URL") or f"http://localhost:{CFG.DASHBOARD_PORT}"
-                token = os.getenv("DASHBOARD_AUTH_TOKEN", "change-me")
-                await event.reply(f"<b>🌐 رابط لوحة التحكم</b>\nالرابط: <code>{url}</code>\n🔑 Token: <code>{token}</code>", parse_mode="html")
+                # v9.12 (audit H-09): the auth token is no longer echoed
+                # into the Telegram chat. The chat history, synced devices
+                # and chat backups would otherwise retain the token forever
+                # — anyone with read access to the admin's Telegram account
+                # would gain full dashboard control. The admin should
+                # retrieve the token from Render's environment variables
+                # panel (or wherever they stored it) instead.
+                await event.reply(
+                    f"<b>🌐 رابط لوحة التحكم</b>\n"
+                    f"الرابط: <code>{url}</code>\n"
+                    f"🔑 استخدم التوكن الموجود في إعدادات البيئة على Render "
+                    f"(DASHBOARD_AUTH_TOKEN) — لا يُرسل هنا لحماية الأمان.",
+                    parse_mode="html",
+                )
             else:
                 await event.reply("❌ لوحة التحكم غير مفعلة")
         elif cmd == "block":
@@ -1233,6 +1382,8 @@ class EnhancedTelegramBot:
         self._consumer_task = self._track_task(self._consumer_loop(), "consumer")
         self._stats_task = self._track_task(self._stats_reporter(), "stats")
         self._cleanup_task = self._track_task(self._cleanup_loop(), "cleanup")
+        # v9.12 (audit H-08): dedicated short-cadence dedup cleanup task.
+        self._dedup_cleanup_task = self._track_task(self._dedup_cleanup_loop(), "dedup_cleanup")
         self._health_task = self._track_task(self._health_check_loop(), "health")
         self._memory_task = self._track_task(self._memory_monitor_loop(), "memory")
         self._main_client_watchdog_task = self._track_task(

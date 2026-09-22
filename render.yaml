@@ -203,7 +203,7 @@ services:
         value: "true"
 
       - key: PREFILTER_MIN_WORDS
-        value: "2"
+        value: "1"
 
       - key: PREFILTER_MAX_EMOJIS
         value: "5"

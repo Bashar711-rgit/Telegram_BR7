@@ -21,18 +21,32 @@ characters before it reaches the regex engine — most catastrophic
 backtracking blowups scale with input length, so bounding the length alone
 closes off most of the attack surface even before the timeout kicks in.
 
+Audit v9.12 (C-02): the sync `safe_search`/`safe_findall` helpers blocked
+the asyncio event loop for up to `timeout_s` per call (4-8 calls per
+message => up to ~1s of frozen loop per burst). We now expose async
+equivalents (`safe_search_async`/`safe_findall_async`) that wrap the same
+thread-pool submission in `asyncio.get_running_loop().run_in_executor(...)`
+so the loop stays responsive. The legacy sync entrypoints are retained for
+backwards compatibility with any sync callers and tests, and the executor
+internals are unchanged so behaviour stays identical.
+
 Public API:
     MAX_REGEX_INPUT_LEN: Final[int]
     SafeRegexExecutor(timeout_s=0.25, max_workers=4)
         .search(pattern, text) -> Optional[re.Match]
         .findall(pattern, text) -> list
+        .search_async(pattern, text) -> Awaitable[Optional[re.Match]]
+        .findall_async(pattern, text) -> Awaitable[list]
         .shutdown() -> None
     safe_search(pattern, text) -> Optional[re.Match]
     safe_findall(pattern, text) -> list
+    safe_search_async(pattern, text) -> Awaitable[Optional[re.Match]]
+    safe_findall_async(pattern, text) -> Awaitable[list]
 """
 
 from __future__ import annotations
 
+import asyncio
 import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
@@ -77,6 +91,92 @@ class SafeRegexExecutor:
     def findall(self, pattern: _PatternLike, text: str) -> List[Any]:
         result = self._submit(pattern, text, "findall")
         return result if result is not None else []
+
+    async def search_async(self, pattern: _PatternLike, text: str) -> Optional["re.Match[str]"]:
+        """Async variant of .search() — keeps the event loop responsive.
+
+        Audit v9.12 (C-02): the sync `Future.result(timeout=...)` call blocks
+        the calling thread; when invoked from an async context that means
+        the entire event loop is frozen for up to `timeout_s`. We still
+        submit the regex work to the bounded thread pool (ReDoS guard
+        intact), but we now `await` the future through
+        `loop.run_in_executor` so the loop can interleave other coroutines
+        while the regex thread works.
+
+        A hard asyncio.wait_for wraps the executor future so we still enforce
+        the wall-clock timeout — the difference is the loop is free while we
+        wait. The abandoned thread behaviour on timeout is unchanged.
+        """
+        capped = _cap(text)
+        try:
+            compiled = pattern if isinstance(pattern, re.Pattern) else re.compile(pattern)
+        except re.error as exc:
+            logger.warning("safe_regex_compile_error | pattern={} err={}", pattern, exc)
+            return None
+
+        func = compiled.search
+
+        with self._state_lock:
+            if self._shutdown:
+                logger.debug("SafeRegexExecutor used after shutdown; skipping")
+                return None
+            try:
+                future = self._executor.submit(func, capped)
+            except RuntimeError:
+                return None
+
+        loop = asyncio.get_running_loop()
+        try:
+            return await asyncio.wait_for(
+                asyncio.wrap_future(future, loop=loop),
+                timeout=self._timeout_s,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "safe_regex_timeout_async | pattern={} text_len={} timeout_s={}",
+                getattr(compiled, "pattern", pattern), len(capped), self._timeout_s,
+            )
+            return None
+        except Exception as exc:  # noqa: BLE001 — must never propagate into the caller's hot path
+            logger.debug("safe_regex_error_async | pattern={} err={}", pattern, exc)
+            return None
+
+    async def findall_async(self, pattern: _PatternLike, text: str) -> List[Any]:
+        """Async variant of .findall() — see search_async() for the rationale."""
+        capped = _cap(text)
+        try:
+            compiled = pattern if isinstance(pattern, re.Pattern) else re.compile(pattern)
+        except re.error as exc:
+            logger.warning("safe_regex_compile_error | pattern={} err={}", pattern, exc)
+            return []
+
+        func = compiled.findall
+
+        with self._state_lock:
+            if self._shutdown:
+                logger.debug("SafeRegexExecutor used after shutdown; skipping")
+                return []
+            try:
+                future = self._executor.submit(func, capped)
+            except RuntimeError:
+                return []
+
+        loop = asyncio.get_running_loop()
+        try:
+            result = await asyncio.wait_for(
+                asyncio.wrap_future(future, loop=loop),
+                timeout=self._timeout_s,
+            )
+            return result if result is not None else []
+        except asyncio.TimeoutError:
+            logger.warning(
+                "safe_regex_timeout_async | pattern={} text_len={} timeout_s={}",
+                getattr(compiled, "pattern", pattern), len(capped), self._timeout_s,
+            )
+            return []
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("safe_regex_error_async | pattern={} err={}", pattern, exc)
+            return []
 
     def _submit(self, pattern: _PatternLike, text: str, op: str) -> Any:
         capped = _cap(text)
@@ -139,10 +239,36 @@ def _get_default_executor() -> SafeRegexExecutor:
 
 
 def safe_search(pattern: _PatternLike, text: str) -> Optional["re.Match[str]"]:
-    """Drop-in, ReDoS-guarded replacement for re.search() / pattern.search()."""
+    """Drop-in, ReDoS-guarded replacement for re.search() / pattern.search().
+
+    Note (audit C-02): this is the SYNC variant. From async code prefer
+    `safe_search_async` so the event loop is not blocked for up to
+    `timeout_s` per call.
+    """
     return _get_default_executor().search(pattern, text)
 
 
 def safe_findall(pattern: _PatternLike, text: str) -> List[Any]:
-    """Drop-in, ReDoS-guarded replacement for re.findall() / pattern.findall()."""
+    """Drop-in, ReDoS-guarded replacement for re.findall() / pattern.findall().
+
+    Note (audit C-02): this is the SYNC variant. From async code prefer
+    `safe_findall_async` so the event loop is not blocked for up to
+    `timeout_s` per call.
+    """
     return _get_default_executor().findall(pattern, text)
+
+
+async def safe_search_async(pattern: _PatternLike, text: str) -> Optional["re.Match[str]"]:
+    """Async variant of safe_search — does NOT block the event loop.
+
+    Audit v9.12 (C-02): use this from any async caller (filter pipeline,
+    prefilter, spam scorer) instead of the sync `safe_search`. The ReDoS
+    thread-pool guard and wall-clock timeout are unchanged; only the wait
+    is now cooperative.
+    """
+    return await _get_default_executor().search_async(pattern, text)
+
+
+async def safe_findall_async(pattern: _PatternLike, text: str) -> List[Any]:
+    """Async variant of safe_findall — does NOT block the event loop."""
+    return await _get_default_executor().findall_async(pattern, text)

@@ -444,6 +444,23 @@ logger.info(
     f"maxsize={_capture._maxsize} | ttl={_capture._ttl}s"
 )
 
+# v9.12 (audit M-09): module-level shared LRU for early cross-account
+# delivery dedup. When the same group is monitored by N accounts, every
+# message produces N NewMessage events (one per account client). This LRU
+# is checked synchronously in the NewMessage handler BEFORE the event is
+# serialized into the persistent queue, so only the first delivery pays
+# the queue + DB cost — the other N-1 copies are dropped here. The LRU
+# is bounded (default 8000 entries × ~80 bytes ≈ 640KB) and shared across
+# all monitors, so the dedup works cross-account.
+try:
+    _EARLY_DELIVERY_DEDUP_SIZE = max(
+        1000,
+        int(__import__("os").getenv("EARLY_DELIVERY_DEDUP_SIZE", "8000")),
+    )
+except Exception:
+    _EARLY_DELIVERY_DEDUP_SIZE = 8000
+_early_delivery_dedup: LRUCache = LRUCache(maxsize=_EARLY_DELIVERY_DEDUP_SIZE)
+
 
 def get_capture_snapshot() -> Dict[str, Any]:
     """Read-only snapshot for /health and dashboard diagnostics.
@@ -751,6 +768,21 @@ class ReconnectionManager:
         self._running = False; self._shutdown_event = asyncio.Event()
         self._last_error: Optional[str] = None; self._consecutive_failures = 0
         self._max_consecutive_failures = 10
+        # v9.12 (audit M-06): the get_me() heartbeat cadence is decoupled
+        # from the reconnect-check cadence. RECONNECT_CHECK_INTERVAL (15s)
+        # only drives the "is the monitor down? try to reconnect" loop; the
+        # heartbeat that proves the live connection is healthy now runs
+        # every HEARTBEAT_INTERVAL_SECONDS (default 90s, env-configurable)
+        # instead of every 15s. This cuts ~4 get_me() API calls per minute
+        # per account to ~0.7 — a 6x reduction in idle API traffic across
+        # all accounts, with no observable lag in detecting a dead
+        # connection (Telethon's own socket-level detection still fires
+        # immediately on real disconnects).
+        self._heartbeat_interval = max(
+            30.0,
+            float(__import__("os").getenv("HEARTBEAT_INTERVAL_SECONDS", "90")),
+        )
+        self._last_heartbeat_ts: float = 0.0
     async def start(self):
         if self._running: return
         self._running = True; self._shutdown_event.clear()
@@ -798,6 +830,16 @@ class ReconnectionManager:
                     if ok: await self.reset(); logger.info(f"Reconnected: {self._mon.account['name']}")
                     else: self._backoff = min(self._backoff * CFG.RETRY_BACKOFF, CFG.MAX_RECONNECT_BACKOFF)
                 else:
+                    # v9.12 (audit M-06): only run the get_me() heartbeat
+                    # every HEARTBEAT_INTERVAL_SECONDS (default 90s), not on
+                    # every reconnect-check tick (15s). Telethon's own
+                    # socket-level disconnect detection still fires
+                    # immediately on real disconnects; the heartbeat is just
+                    # a periodic liveness probe, not the primary detector.
+                    now_ts = time.time()
+                    if (now_ts - self._last_heartbeat_ts) < self._heartbeat_interval:
+                        continue
+                    self._last_heartbeat_ts = now_ts
                     if self._mon.client:
                         try:
                             await asyncio.wait_for(self._mon.client.get_me(), timeout=15)
@@ -835,6 +877,13 @@ class EnhancedAccountMonitor:
         }
         self._stats_lock = asyncio.Lock()
         self._entity_cache: TTLCache = TTLCache(maxsize=CFG.ENTITY_CACHE_MAX_SIZE, ttl=600)
+        # v9.12 (audit M-02): short-TTL negative cache for entity resolution
+        # failures. Prevents hammering Telegram on every alert when a chat
+        # can't be resolved, without locking the chat out for the full 600s
+        # of the positive cache.
+        self._entity_negative_cache: TTLCache = TTLCache(
+            maxsize=CFG.ENTITY_CACHE_MAX_SIZE, ttl=30,
+        )
         self._cache_lock = asyncio.Lock()
         self._processed_hashes: LRUCache = LRUCache(maxsize=CFG.PROCESSED_HASHES_MAX_SIZE)
         self._processed_lock = asyncio.Lock()
@@ -902,27 +951,47 @@ class EnhancedAccountMonitor:
     async def _chat_info(self, client: TelegramClient, chat_id: int, message_id: int, chat_access_hash: Optional[int] = None, chat_username: Optional[str] = None) -> Dict[str, Any]:
         cache_key = chat_id; entity = None
         async with self._cache_lock: entity = self._entity_cache.get(cache_key)
+        # v9.12 (audit M-02): don't cache None in the long-TTL entity cache.
+        # The old code wrote `entity_cache[key] = None` on resolution
+        # failure, which meant a transient FloodWait/network blip locked
+        # the chat out of entity resolution for the full 600s cache TTL —
+        # every alert for that chat in the next 10 minutes would build
+        # without an entity (no chat photo, no username link). We now use
+        # a separate short-TTL (30s) negative cache so we don't hammer
+        # Telegram on every alert, but the lockout is brief.
         if entity is None:
-            # Route entity resolution through the (previously unused)
-            # entity circuit breaker so a FloodWait here is gated per
-            # account instead of hammering Telegram repeatedly.
-            try:
-                entity = await self._entity_cb.call(
-                    lambda: resolve_chat_entity(
-                        client,
-                        {"chat_id": chat_id, "chat_access_hash": chat_access_hash, "username": chat_username},
+            # Check the negative cache first — if we recently failed to
+            # resolve this chat, skip the resolution attempt entirely for
+            # the next 30s.
+            neg_cached = self._entity_negative_cache.get(cache_key)
+            if neg_cached is None:
+                # Route entity resolution through the (previously unused)
+                # entity circuit breaker so a FloodWait here is gated per
+                # account instead of hammering Telegram repeatedly.
+                try:
+                    entity = await self._entity_cb.call(
+                        lambda: resolve_chat_entity(
+                            client,
+                            {"chat_id": chat_id, "chat_access_hash": chat_access_hash, "username": chat_username},
+                        )
                     )
-                )
-            except CircuitBreakerOpen as e:
-                logger.debug(f"Entity resolution circuit open [{self.account['name']}]: {e}")
-                entity = None
-            except FloodWaitError as e:
-                logger.warning(f"FloodWait resolving entity [{self.account['name']}]: {e.seconds}s")
-                entity = None
-            except Exception as e:
-                logger.debug(f"Entity resolution failed [{self.account['name']}]: {e}")
-                entity = None
-            async with self._cache_lock: self._entity_cache[cache_key] = entity
+                except CircuitBreakerOpen as e:
+                    logger.debug(f"Entity resolution circuit open [{self.account['name']}]: {e}")
+                    entity = None
+                except FloodWaitError as e:
+                    logger.warning(f"FloodWait resolving entity [{self.account['name']}]: {e.seconds}s")
+                    entity = None
+                except Exception as e:
+                    logger.debug(f"Entity resolution failed [{self.account['name']}]: {e}")
+                    entity = None
+                # Only cache successful resolutions in the long-TTL cache.
+                if entity is not None:
+                    async with self._cache_lock: self._entity_cache[cache_key] = entity
+                else:
+                    # Cache the negative result for a short window so we
+                    # don't retry on every alert, but don't lock the chat
+                    # out for the full 600s.
+                    self._entity_negative_cache[cache_key] = True
         uname = getattr(entity, "username", None) if entity else None
         links = build_telegram_links(chat_id, message_id, username=uname)
         title = None
@@ -1037,9 +1106,26 @@ class EnhancedAccountMonitor:
                 except AuthKeyDuplicatedError:
                     logger.error(f"Session duplicated for {account['name']} - another active session is using the same key")
                     if client: await client.disconnect()
+                    # v9.12 (audit L-05): quarantine the session file to a
+                    # side path (.session.duplicated-<ts>) instead of
+                    # deleting it. Deleting meant losing the session
+                    # permanently on a transient duplicate detection (e.g.
+                    # another service briefly came online with the same
+                    # session string). Quarantine preserves the file for
+                    # manual recovery while keeping it out of the active
+                    # sessions directory so the next connect attempt
+                    # re-creates a fresh one from the env SESSION_STRING.
+                    import time as _time_mod
+                    _ts = int(_time_mod.time())
                     for p in (f"{session_name}.session", str(CFG.SESSIONS_DIR / f"{session_name}.session")):
-                        try: os.remove(p)
-                        except FileNotFoundError: pass
+                        try:
+                            quarantined = f"{p}.duplicated-{_ts}"
+                            os.rename(p, quarantined)
+                            logger.warning(f"Quarantined duplicated session: {p} -> {quarantined}")
+                        except FileNotFoundError:
+                            pass
+                        except OSError as qe:
+                            logger.warning(f"Quarantine failed for {p}: {qe} (leaving in place)")
                     self._last_connect_error = "AuthKeyDuplicated"; self._stats["last_error"] = "AuthKeyDuplicated"; return False
                 except FloodWaitError as e:
                     # Honor Telegram's exact wait duration; do not burn the
@@ -1108,6 +1194,22 @@ class EnhancedAccountMonitor:
                 # await) — لا يقع أي yield بين وصول الحدث وتخزين النص.
                 if _capture.enabled:
                     self._fast_capture(event)
+                # v9.12 (audit M-09): early cross-account dedup fingerprint.
+                # When the same group is monitored by N accounts, every
+                # message produces N NewMessage events (one per account
+                # client). Without an early dedup here, all N copies get
+                # serialized into the persistent queue, popped, and only
+                # then collapsed by _store_message's msg_hash check —
+                # wasting N× queue + DB capacity. The module-level shared
+                # LRU `_early_delivery_dedup` is checked synchronously
+                # here, BEFORE the queue; the first delivery wins, the
+                # other N-1 copies return early. The LRU is bounded so it
+                # can't grow unbounded.
+                early_key = (event.chat_id, event.message.id)
+                if early_key in _early_delivery_dedup:
+                    await self._inc_stat("duplicates")
+                    return
+                _early_delivery_dedup[early_key] = True
                 event_data = await self._event_to_dict(event)
                 if event_data.get("has_media"):
                     # Media is offloaded to a tracked background task instead
@@ -1221,16 +1323,17 @@ class EnhancedAccountMonitor:
         sender = event.sender
         # v9.9: the fast capture has ALREADY protected text+sender synchronously
         # before this point, so one deduplicated resolver lookup here is safe:
-        # it only enriches AFTER the save-first guarantee. When event.sender
-        # is absent (entity not embedded in the update), a single shared
-        # in-flight-deduped resolution fills it (requirement #3/#8: prefer
-        # event.sender; get_entity only as a bounded fallback).
-        if sender is None and CFG.SENDER_INTEL_ENABLED and getattr(event, "sender_id", None):
-            try:
-                sender = await sender_intel.fetch_event_sender(event, self.client)
-            except Exception as e:
-                logger.debug(f"sender_entity_fetch [{self.account['name']}]: {type(e).__name__}")
-                sender = None
+        # it only enriches AFTER the save-first guarantee.
+        #
+        # v9.12 (audit H-03): the network-bound resolver call (`fetch_event_sender`)
+        # is NO LONGER invoked inline from the NewMessage handler. The inline
+        # path now only uses `event.sender` (already populated by Telethon for
+        # most updates) and the cheap synchronous metadata extraction. If the
+        # sender is missing we leave the enrichment fields blank; the worker
+        # side (process_event_from_queue → _enrich_sender_from_db) fills them
+        # in after the queue pop, off the capture hot path. This removes the
+        # only network call inside the NewMessage handler and keeps T1
+        # (capture latency) bounded to synchronous work.
         chat = event.chat
         text = event.message.text or ""; caption = getattr(event.message, "message", "") or ""
         full_text = (text or caption).strip()
@@ -1245,6 +1348,10 @@ class EnhancedAccountMonitor:
             "chat_access_hash": getattr(chat, "access_hash", None), "chat_username": chat_username,
             "text": full_text, "has_text": bool(full_text), "has_media": has_media, "media_type": media_type,
             "account_name": self.account["name"], "timestamp": time.time(),
+            # v9.12 (audit H-03): flag tells the worker whether the inline
+            # path skipped enrichment (sender was None); the worker then
+            # runs the resolver in the background.
+            "_sender_needs_enrichment": sender is None and bool(getattr(event, "sender_id", None)),
         }
         # v9.9 sender intelligence: ADDITIVE metadata keys only. Every key
         # above keeps its exact name and semantics (backward compatible);
@@ -1339,10 +1446,18 @@ class EnhancedAccountMonitor:
                 entry = _capture.claim_deleted(chat_id, msg_id)
                 if entry is None:
                     continue
+                # v9.12 (audit M-15): the captured message text is no
+                # longer echoed into INFO logs — it's user private content
+                # that should not end up in bot.log (which is readable via
+                # the webadmin logs reader). We log only the metadata
+                # (chat/msg ids, sender label, queued/alerted flags) plus a
+                # short length hint. The full text remains in the
+                # FastCaptureBuffer for the recovery pipeline to use.
+                text_len = len(entry.get("text", "") or "")
                 logger.info(
                     f"🗑️ deleted_captured | chat={entry['chat_id']} | msg={entry['msg_id']} | "
                     f"sender={entry['sender_name']} | queued={entry['queued']} | "
-                    f"alerted={entry['alerted']} | text={entry['text'][:80]}"
+                    f"alerted={entry['alerted']} | text_len={text_len}"
                 )
                 _capture.inc("deleted_captured")
                 if not entry["queued"] and not entry["alerted"] and not entry["recovered"]:
@@ -1439,6 +1554,61 @@ class EnhancedAccountMonitor:
                 data["sender_last_name"] = row.get("last_name")
         except Exception as e:
             logger.debug(f"sender_db_enrich error [{self.account['name']}]: {type(e).__name__}")
+
+    async def _enrich_sender_via_resolver(self, data: Dict[str, Any]) -> None:
+        """v9.12 (audit H-03): worker-side network-bound sender enrichment.
+
+        When the NewMessage handler skipped the resolver (because event.sender
+        was None and we now defer that work off the capture hot path), this
+        method is called from the worker to fetch the sender entity from
+        Telegram via the shared sender_intel resolver. The resolver has its
+        own in-flight dedup, TTL cache and bounded retries (FloodWait-aware),
+        so concurrent workers asking for the same sender_id share one
+        resolution. Failure-safe by design — never raises, just leaves the
+        fields blank and lets _enrich_sender_from_db do the DB fallback.
+        """
+        if not data.pop("_sender_needs_enrichment", False):
+            return
+        if not CFG.SENDER_INTEL_ENABLED or not self.client:
+            return
+        sender_id = data.get("sender_id")
+        if not sender_id:
+            return
+        try:
+            # The resolver expects an event-like object; we don't have one
+            # here, so we use the lower-level get_entity path via the
+            # sender_intel singleton directly. This is the same code path
+            # fetch_event_sender falls back to internally.
+            from sender_resolver import sender_intel as _si
+            entity = await _si.resolve_entity(self.client, int(sender_id))
+            if entity is None:
+                return
+            # Update identity fields following the COALESCE policy: never
+            # overwrite an existing non-null with None.
+            if not data.get("sender_username"):
+                u = getattr(entity, "username", None)
+                if u:
+                    data["sender_username"] = u
+            if data.get("sender_access_hash") is None:
+                ah = getattr(entity, "access_hash", None)
+                if ah is not None:
+                    data["sender_access_hash"] = ah
+            if not data.get("sender_first_name"):
+                fn = getattr(entity, "first_name", None)
+                if fn:
+                    data["sender_first_name"] = fn
+            if not data.get("sender_last_name"):
+                ln = getattr(entity, "last_name", None)
+                if ln:
+                    data["sender_last_name"] = ln
+            # Carry over the full metadata snapshot for sender_contacts upsert.
+            if CFG.SENDER_INTEL_ENABLED:
+                try:
+                    data.update(_sender_meta_to_contact({"sender_meta_full": _sender_extract(entity)}))
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.debug(f"sender_resolver_enrich [{self.account['name']}]: {type(e).__name__}: {e}")
 
     def _recover_captured_text(self, data: Dict[str, Any]) -> Optional[str]:
         """v9.8 fallback at alert time: if the pipeline's copy of the text
@@ -1618,6 +1788,22 @@ class EnhancedAccountMonitor:
 
 
     async def _process_event_pipeline(self, data: Dict[str, Any]):
+        # v9.12 (audit H-03): if the NewMessage handler deferred sender
+        # enrichment (because event.sender was None and we no longer do
+        # network calls in the capture hot path), run the resolver here
+        # — off the capture path, in the worker. Failure-safe; falls back
+        # to the DB row if the resolver can't resolve either.
+        if data.get("_sender_needs_enrichment"):
+            try:
+                await self._enrich_sender_via_resolver(data)
+            except Exception as e:
+                logger.debug(f"deferred sender enrich skipped [{self.account['name']}]: {e}")
+            # Always also try the DB fallback in case the resolver didn't
+            # find anything but a contact row exists from a previous run.
+            try:
+                await self._enrich_sender_from_db(data)
+            except Exception:
+                pass
         if not await self._validate_event(data): return
         msg_hash, validated_text, is_new = await self._store_message(data)
         if not is_new: await self._inc_stat("duplicates"); return
@@ -1634,7 +1820,17 @@ class EnhancedAccountMonitor:
         if await self.db.is_blocked_chat(chat_id): return False
         # v9.11 مكافحة السبام: المستخدم المصنف Cross-Group Spam / Mass Poster
         # لا تُعالج رسائله مرة أخرى إطلاقاً (فحص ذاكري فوري — لا تكلفة DB).
-        if get_antispam().is_ignored(sender_id):
+        # v9.12 (audit H-07): the sync is_ignored() only checks the LRU +
+        # negative cache; on a cold miss we call is_ignored_async() which
+        # does the DB lookup and populates the cache. The result is the
+        # same (permanently-ignored senders are skipped) but the memory
+        # footprint is now bounded.
+        aspam = get_antispam()
+        if aspam.is_ignored(sender_id):
+            await self._inc_stat("spam_skipped")
+            return False
+        # Cold miss — do the async DB check.
+        if await aspam.is_ignored_async(sender_id):
             await self._inc_stat("spam_skipped")
             return False
         text = data.get("text", "")
@@ -1762,8 +1958,6 @@ class EnhancedAccountMonitor:
         """
         if not self._bot_ref: return
         account_name = data.get("account_name", self.account["name"])
-        if not await self._bot_ref.rate_limiter.can_proceed(account_name):
-            await self._inc_stat("rate_limited"); return
         chat_id = data["chat_id"]; message_id = data["message_id"]; sender_id = data["sender_id"]
         sender_username = data.get("sender_username"); sender_first_name = data.get("sender_first_name")
         sender_last_name = data.get("sender_last_name"); sender_access_hash = data.get("sender_access_hash")
@@ -1772,7 +1966,13 @@ class EnhancedAccountMonitor:
         send_client = await self._resolve_send_client()
         if not send_client:
             logger.error(f"No available client to send alert [{account_name}]"); await self._inc_stat("send_errors"); return
-        # ── v9.10: حاجز منع تكرار التنبيهات (بعد rate-limit وقبل أي عمل مكلف) ──
+        # ── v9.10: حاجز منع تكرار التنبيهات ──
+        # v9.12 (audit M-04): moved BEFORE the rate-limit check. The old
+        # order (rate-limit → dedup) burned a token on every cross-account
+        # duplicate, then dropped the alert after the dedup check — wasting
+        # scarce per-minute send budget on no-ops. The new order ensures
+        # duplicates never reach the rate limiter; the limiter's budget is
+        # spent only on alerts that will actually be sent.
         # نفس المرسل بنفس النص عبر أي حساب من الحسابات الستة = تنبيه واحد فقط.
         # الحجز آتومي (ذاكرة + DB) — وعند فشل الإرسال يُفك لإعادة المحاولة.
         dedup_fp = content_fingerprint(sender_id, text)
@@ -1782,6 +1982,13 @@ class EnhancedAccountMonitor:
                 f"Duplicate alert blocked [{account_name}] | msg_hash={msg_hash} | "
                 f"sender={sender_id} | fp={dedup_fp[:12]} (cross-account/re-send dedup)"
             )
+            return
+        # ── Rate limit AFTER dedup — only alerts that will actually fire
+        # consume a token. If the limiter rejects us, release the dedup
+        # claim so a DLQ retry (or a later message) can re-claim.
+        if not await self._bot_ref.rate_limiter.can_proceed(account_name):
+            await self._inc_stat("rate_limited")
+            await get_deduplicator().release(dedup_fp)
             return
         chat_info = await self._chat_info(send_client, chat_id, message_id, chat_access_hash=chat_access_hash, chat_username=chat_username)
         # v9.10: بيانات الأزرار الديناميكية — _build_alert تبني [ مراسلة /
@@ -1801,7 +2008,12 @@ class EnhancedAccountMonitor:
                     sent_msg = await send_client.send_file(CFG.TARGET_GROUP_ID, file=user_media, caption=alert_text, buttons=buttons, parse_mode="html", link_preview=False)
                     sent = True
                 except Exception as e: logger.debug(f"User media send failed: {e}")
-            if not sent:
+            # v9.12 (audit H-02): the group-photo fallback is now opt-in via
+            # CFG.ATTACH_GROUP_PHOTO. The default is False — text alerts go
+            # out as a single send_message call (half the API requests, far
+            # less FloodWait exposure). Set ATTACH_GROUP_PHOTO=true to
+            # restore the legacy two-call path with the attached photo.
+            if not sent and CFG.ATTACH_GROUP_PHOTO:
                 chat_entity = chat_info.get("entity")
                 if chat_entity and getattr(chat_entity, 'id', 0) != 0:
                     try:
@@ -1822,45 +2034,103 @@ class EnhancedAccountMonitor:
             payload["_dlq_msg_hash"] = msg_hash
             payload["_dlq_analysis"] = analysis
             return payload
+
+        async def _push_alert_to_dlq(exc: Exception) -> None:
+            """v9.12 (audit M-05): unified DLQ push for the alert path.
+
+            Both the FloodWait/CircuitBreaker branch and the generic-exception
+            branch used to construct the retry payload inline and call
+            `self._dlq.push(...)` directly, with subtle differences (one
+            released the dedup claim first, the other did it inside its own
+            try/except). This helper is the single chokepoint: it always
+            releases the dedup claim, always pushes the same payload shape,
+            and always bumps send_errors. Callers just pass the exception.
+            """
+            try:
+                await get_deduplicator().release(dedup_fp)
+            except Exception as rel_err:
+                logger.debug(f"dedup release on DLQ push failed [{account_name}]: {rel_err}")
+            try:
+                await self._dlq.push(_retry_payload(), exc, retry_count=retry_count)
+            except Exception as push_err:
+                logger.error(f"DLQ push failed [{account_name}]: {push_err}")
+            await self._inc_stat("send_errors")
+
         try:
             sent_msg = await self._send_cb.call(do_send)
-            if _capture.enabled:
-                _capture.mark_alerted(data.get("chat_id"), data.get("message_id"))
-            # v9.11: سجّل موضع رسالة التنبيه في المجموعة الهدف لدعم مسار
-            # الرد البديل (رد بـ«تواصل» أو برقم) على الزر «تواصل مع المرسل».
-            if sent_msg is not None and self._bot_ref is not None:
-                try:
-                    note = getattr(self._bot_ref, "_note_alert_message", None)
-                    if note is not None:
-                        note(getattr(sent_msg, "id", None), msg_hash)
-                except Exception:
-                    pass
-            safe_keyword = keyword
-            if isinstance(safe_keyword, (tuple, list)): safe_keyword = safe_keyword[0] if safe_keyword else ""
-            if not isinstance(safe_keyword, str): safe_keyword = str(safe_keyword) if safe_keyword is not None else ""
-            await self.db.add_alert(AlertRecord(message_hash=msg_hash, chat_id=chat_id, sender_id=sender_id,
-                account_name=account_name, keyword=safe_keyword, alert_text=alert_text, timestamp=time.time()))
-            logger.info(f"Alert sent by {account_name} | kw={keyword!r} | sender={display_name}")
+            await self._record_sent_alert(
+                sent_msg, data, msg_hash, account_name, keyword, alert_text, chat_id, sender_id, display_name
+            )
         except (FloodWaitError, CircuitBreakerOpen) as e:
             logger.warning(
                 f"Alert send throttled [{account_name}] msg_hash={msg_hash}: {type(e).__name__}: {e}"
             )
-            # فشل الإرسال — فك حجز الـ dedup حتى تتمكن إعادة محاولة DLQ من الإرسال لاحقاً
-            await get_deduplicator().release(dedup_fp)
-            await self._dlq.push(_retry_payload(), e, retry_count=retry_count)
-            await self._inc_stat("send_errors"); raise
+            # v9.12 (audit M-05): unified DLQ push path.
+            await _push_alert_to_dlq(e)
+            raise
         except Exception as e:
             logger.error(f"Send alert error [{account_name}]: {e} - trying fallback")
+            fallback_sent_msg = None
             try:
-                await send_client.send_message(CFG.TARGET_GROUP_ID, alert_text, buttons=buttons, parse_mode=None, link_preview=False)
-                if _capture.enabled:
-                    _capture.mark_alerted(data.get("chat_id"), data.get("message_id"))
+                fallback_sent_msg = await send_client.send_message(CFG.TARGET_GROUP_ID, alert_text, buttons=buttons, parse_mode=None, link_preview=False)
             except Exception as fe:
                 logger.error(f"Fallback failed [{account_name}]: {fe}")
-                await self._inc_stat("send_errors")
-                # فشل نهائي — فك الحجز لإعادة محاولة DLQ لاحقاً
-                await get_deduplicator().release(dedup_fp)
-                await self._dlq.push(_retry_payload(), fe, retry_count=retry_count)
+                # v9.12 (audit M-05): unified DLQ push path — same helper
+                # as the FloodWait branch. Releases dedup, pushes the
+                # retry payload, bumps send_errors.
+                await _push_alert_to_dlq(fe)
+                return
+            # v9.12 (audit H-05): the fallback send succeeded — record the
+            # alert in DB, mark FastCapture, and note the alert message id
+            # exactly as the primary path does. Previously this branch only
+            # did mark_alerted and silently skipped add_alert + _note_alert_message,
+            # leaving the alert untracked in DB (broken copy button, broken
+            # stats, broken reply-button mapping for the fallback path).
+            await self._record_sent_alert(
+                fallback_sent_msg, data, msg_hash, account_name, keyword, alert_text,
+                chat_id, sender_id, display_name,
+            )
+
+    async def _record_sent_alert(
+        self,
+        sent_msg: Any,
+        data: Dict[str, Any],
+        msg_hash: str,
+        account_name: str,
+        keyword: Any,
+        alert_text: str,
+        chat_id: int,
+        sender_id: int,
+        display_name: str,
+    ) -> None:
+        """Unified post-send bookkeeping (audit H-05).
+
+        Called after BOTH the primary and fallback send paths succeed.
+        Records the alert in DB (for the copy button + stats), notes the
+        alert message id (for the reply-button fallback path), marks the
+        FastCapture entry as alerted, and bumps the alerts_sent counter.
+        """
+        if _capture.enabled:
+            _capture.mark_alerted(data.get("chat_id"), data.get("message_id"))
+        if sent_msg is not None and self._bot_ref is not None:
+            try:
+                note = getattr(self._bot_ref, "_note_alert_message", None)
+                if note is not None:
+                    note(getattr(sent_msg, "id", None), msg_hash)
+            except Exception:
+                pass
+        safe_keyword = keyword
+        if isinstance(safe_keyword, (tuple, list)): safe_keyword = safe_keyword[0] if safe_keyword else ""
+        if not isinstance(safe_keyword, str): safe_keyword = str(safe_keyword) if safe_keyword is not None else ""
+        await self.db.add_alert(AlertRecord(message_hash=msg_hash, chat_id=chat_id, sender_id=sender_id,
+            account_name=account_name, keyword=safe_keyword, alert_text=alert_text, timestamp=time.time()))
+        # v9.12 (audit H-01): invalidate can_send_alert cache so the next
+        # message from this sender sees the new last_alert_time immediately.
+        try:
+            self.db._invalidate_can_send_alert(sender_id)  # noqa: SLF001
+        except Exception:
+            pass
+        logger.info(f"Alert sent by {account_name} | kw={keyword!r} | sender={display_name}")
 
 
     async def disconnect(self):
@@ -1885,7 +2155,7 @@ class EnhancedAccountMonitor:
                     logger.error(f"Media task error during shutdown [{self.account['name']}]: {e}")
             async with self._media_task_lock:
                 self._media_tasks.clear()
-            self._entity_cache.clear(); self._processed_hashes.clear(); self._processing_times.clear()
+            self._entity_cache.clear(); self._entity_negative_cache.clear(); self._processed_hashes.clear(); self._processing_times.clear()
             if self.client:
                 if self._handler_func:
                     try: self.client.remove_event_handler(self._handler_func)

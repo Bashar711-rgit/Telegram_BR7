@@ -161,6 +161,25 @@ def setup_logging(
             enqueue=True,
         )
     try:
+        # v9.12 (audit M-11): diagnose=True was a major secret-leak vector
+        # — it dumps local variables (including session strings, API hashes,
+        # tokens, sender phone numbers, message text) into every traceback
+        # written to bot.log, and the webadmin logs reader exposes that
+        # file to anyone with dashboard access. We now default to
+        # diagnose=False in production (RENDER=true or ENVIRONMENT=prod)
+        # and only enable it when LOG_DIAGNOSE=true is set explicitly.
+        # Local dev keeps diagnose=True for actually useful tracebacks.
+        _is_production = (
+            os.getenv("RENDER", "").lower() in ("1", "true", "yes")
+            or os.getenv("ENVIRONMENT", "").lower() in ("prod", "production")
+        )
+        _diagnose = os.getenv("LOG_DIAGNOSE", "").lower() in ("1", "true", "yes")
+        if _diagnose:
+            diagnose_enabled = True
+        elif _is_production:
+            diagnose_enabled = False
+        else:
+            diagnose_enabled = True  # local dev default
         logger.add(
             log_file,
             level="DEBUG",
@@ -170,11 +189,11 @@ def setup_logging(
             compression="gz",
             enqueue=True,
             backtrace=True,
-            diagnose=True,
+            diagnose=diagnose_enabled,
         )
     except (ValueError, OSError) as e:
         logger.warning(f"File log sink disabled: {e}")
-    logger.info(f"Logging initialized (JSON: {JSON_AVAILABLE})")
+    logger.info(f"Logging initialized (JSON: {JSON_AVAILABLE}, diagnose: {diagnose_enabled})")
 
 # =============================================================================
 # Secret Manager (Fernet Encryption)
@@ -359,6 +378,13 @@ class _ConfigData:
     DASHBOARD_ENABLED: bool
     DASHBOARD_PORT: int
     DASHBOARD_AUTH_TOKEN: str
+
+    # ── Alert send behaviour (audit H-02) ──
+    # When True (legacy behaviour), every text alert tries to attach the
+    # group's profile photo via get_profile_photos + send_file. When False
+    # (default since v9.12), text alerts go out as plain send_message —
+    # half the API calls, half the FloodWait risk, and the same alert text.
+    ATTACH_GROUP_PHOTO: bool
 
     # ── Admin Bot ──
     ADMIN_BOT_ENABLED: bool
@@ -653,6 +679,11 @@ class Config:
             DASHBOARD_ENABLED=SecretManager.get_bool("DASHBOARD_ENABLED", False),
             DASHBOARD_PORT=SecretManager.get_int("DASHBOARD_PORT", 8080, required=False),
             DASHBOARD_AUTH_TOKEN=dash_token,
+            # ========== Alert send behaviour (audit H-02) ==========
+            # Default False: plain send_message is the fast path. Set
+            # ATTACH_GROUP_PHOTO=true to restore the legacy behaviour of
+            # attaching the group's profile photo to every text alert.
+            ATTACH_GROUP_PHOTO=SecretManager.get_bool("ATTACH_GROUP_PHOTO", False),
             # ========== Admin Bot ==========
             ADMIN_BOT_ENABLED=SecretManager.get_bool("ADMIN_BOT_ENABLED", False),
             ADMIN_BOT_TOKEN=SecretManager.get("ADMIN_BOT_TOKEN", None, required=False),
@@ -1033,6 +1064,12 @@ def async_retry(
             raise last_exception  # type: ignore[misc]
         return wrapper
     return decorator
+
+
+# v9.12 (audit L-01): the previous `# type: ignoreisc]` comment in the
+# repo was a malformed truncation of `# type: ignore[misc]` — it had no
+# effect on type checkers and was just confusing noise. The line above
+# now uses the correct `[misc]` code.
 
 # =============================================================================
 # Utility: fast_hash

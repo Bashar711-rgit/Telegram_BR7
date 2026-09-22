@@ -122,16 +122,17 @@ echo -e "${GREEN}=========================================="
 echo -e "  🚀 Starting Bot v13.0..."
 echo -e "==========================================${NC}"
 
-# تشغيل البوت مع إعادة التشغيل التلقائي في حالة الفشل (اختياري)
+# v9.12 (audit L-09): render.yaml's `startCommand: python main.py` is the
+# source of truth for Render — Render invokes that directly, NOT this
+# script. The old `render` mode below added a `while true; do ... done`
+# loop on top, which (a) duplicated Render's own process-supervisor
+# restart logic, (b) could mask real exit codes by always restarting,
+# and (c) was dead code in production anyway. We keep the `local` mode
+# for dev/termux use; `render` mode now just exec's `python main.py`
+# directly so anyone who DOES call `./start.sh render` gets the same
+# behaviour as Render's own startCommand.
 if [ "$MODE" = "render" ]; then
-    # في السحابة، نريد إعادة تشغيل تلقائي عند الفشل
-    while true; do
-        echo -e "${GREEN}🔄 Starting bot...${NC}"
-        python3 main.py
-        echo -e "${YELLOW}⚠️  Bot stopped with exit code $?${NC}"
-        echo -e "${YELLOW}🔄 Restarting in 5 seconds...${NC}"
-        sleep 5
-    done
+    exec python3 main.py
 else
     # في الوضع المحلي، شغل مرة واحدة
     python3 main.py

@@ -39,16 +39,19 @@ class TestArabicNormalization:
 
 
 class TestPrefilter:
-    def test_empty_rejected(self):
-        ok, reason, _ = Prefilter.check("", 1, 5)
+    @pytest.mark.asyncio
+    async def test_empty_rejected(self):
+        ok, reason, _ = await Prefilter.check("", 1, 5)
         assert not ok
 
-    def test_low_arabic_ratio_rejected(self):
-        ok, reason, _ = Prefilter.check("hello world this is english", 1, 5)
+    @pytest.mark.asyncio
+    async def test_low_arabic_ratio_rejected(self):
+        ok, reason, _ = await Prefilter.check("hello world this is english", 1, 5)
         assert not ok and reason == "low_arabic_ratio"
 
-    def test_normal_arabic_passes(self):
-        ok, reason, _ = Prefilter.check("ابغى حل واجب الرياضيات", 1, 5)
+    @pytest.mark.asyncio
+    async def test_normal_arabic_passes(self):
+        ok, reason, _ = await Prefilter.check("ابغى حل واجب الرياضيات", 1, 5)
         assert ok and reason == "ok"
 
 

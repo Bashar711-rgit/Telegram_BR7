@@ -29,8 +29,31 @@ class TestPublicEndpoints:
         r = await client.get("/health")
         assert r.status_code == 200
         body = r.json()
+        # v9.12 (audit L-08): /health is now the minimal liveness probe —
+        # status + database + db_healthy + time only. The detailed
+        # operational fields (uptime, monitors_up, fast_capture, etc.)
+        # moved to /health/full which requires auth.
         assert body["status"] in ("ok", "degraded")
-        assert "database" in body and "uptime" in body
+        assert "database" in body
+        assert "db_healthy" in body
+        # uptime is no longer in the public /health response.
+        assert "uptime" not in body
+
+    @pytest.mark.asyncio
+    async def test_health_full_requires_auth(self, client):
+        # /health/full must reject unauthenticated requests.
+        r = await client.get("/health/full")
+        assert r.status_code in (401, 403)
+
+    @pytest.mark.asyncio
+    async def test_health_full_authenticated(self, client):
+        # With auth, /health/full returns the full operational picture.
+        r = await client.get("/health/full", headers=AUTH)
+        assert r.status_code == 200
+        body = r.json()
+        assert body["status"] in ("ok", "degraded")
+        assert "uptime" in body
+        assert "monitors_total" in body
 
     @pytest.mark.asyncio
     async def test_login_page_served(self, client):

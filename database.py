@@ -231,10 +231,20 @@ def _pg(sql: str) -> str:
 # =============================================================================
 # Ephemeral-storage warning helper (fix #6)
 # =============================================================================
+# v9.12 (audit C-04): the warning is now escalated to a fail-fast in production.
+# Setting ALLOW_EPHEMERAL_SQLITE=1 opts back into the old permissive behaviour
+# for local dev / quick experiments — Render production must set DATABASE_URL
+# (PostgreSQL) or BACKUP_UPLOAD_URL.
 def _warn_ephemeral_storage() -> None:
     """
     Emit a prominent warning when running SQLite without a backup upload
     target — all data is ephemeral and will be lost on instance restart.
+
+    In production (RENDER=true or any non-dev environment) this is now a
+    fatal configuration error unless ALLOW_EPHEMERAL_SQLITE=1 is set
+    explicitly — silent data loss on every redeploy is not an acceptable
+    default. The check can be bypassed for local dev by setting the opt-in
+    env var.
     """
     if CFG.DB_TYPE != "sqlite":
         return
@@ -246,13 +256,33 @@ def _warn_ephemeral_storage() -> None:
             f"BACKUP_UPLOAD_URL={_BACKUP_UPLOAD_URL[:40]}…"
         )
         return
-    logger.warning(
+
+    msg = (
         "⚠️  EPHEMERAL STORAGE WARNING: DB_TYPE=sqlite with no DATABASE_URL "
         "and no BACKUP_UPLOAD_URL. All data (messages, alerts, queue, "
         "dead-letters) WILL BE LOST on Render instance restart/redeploy. "
         "Set DATABASE_URL (PostgreSQL) for persistence, or set "
         "BACKUP_UPLOAD_URL to enable external backup uploads."
     )
+
+    # Production fail-fast: Render sets RENDER=true automatically on web services.
+    is_render = os.getenv("RENDER", "").lower() in ("1", "true", "yes")
+    is_production = is_render or os.getenv("ENVIRONMENT", "").lower() in ("prod", "production")
+    allow_ephemeral = os.getenv("ALLOW_EPHEMERAL_SQLITE", "").lower() in ("1", "true", "yes")
+
+    if is_production and not allow_ephemeral:
+        logger.critical(
+            "🛑 EPHEMERAL STORAGE IN PRODUCTION: refusing to start. "
+            "Set DATABASE_URL (PostgreSQL) or BACKUP_UPLOAD_URL on Render, "
+            "or set ALLOW_EPHEMERAL_SQLITE=1 to override (NOT RECOMMENDED)."
+        )
+        raise RuntimeError(
+            "Refusing to start with ephemeral SQLite storage in production. "
+            "Set DATABASE_URL or BACKUP_UPLOAD_URL, or set "
+            "ALLOW_EPHEMERAL_SQLITE=1 to override."
+        )
+
+    logger.warning(msg)
 
 
 # =============================================================================
@@ -332,6 +362,29 @@ class EnhancedDatabase:
         # Queue access serialization (fix #9: cap enforcement under lock)
         self._queue_lock = asyncio.Lock()
 
+        # v9.12 (audit C-01): in-memory mirror of the processing_queue row
+        # count, kept in sync under _queue_lock so add_to_queue can enforce
+        # the cap WITHOUT a SELECT COUNT(*) on every insert. The mirror is
+        # reconciled against the real DB count on connect() and on
+        # purge_queue()/eviction paths so drift is impossible across
+        # restarts. Each pop decrements; each successful insert increments;
+        # each eviction decrements.
+        self._queue_size_mirror: int = 0
+        self._queue_mirror_dirty: bool = False
+
+        # v9.12 (audit H-01): short-TTL caches for the blocklist hot path.
+        # Stored as {id: (blocked_bool, expiry_epoch)}; the TTL is short
+        # (default 30s) so a freshly-blocked sender is honored within that
+        # window even without an explicit invalidate (which we also do).
+        self._blocked_senders_cache: Dict[int, Tuple[bool, float]] = {}
+        self._blocked_chats_cache: Dict[int, Tuple[bool, float]] = {}
+
+        # v9.12 (audit H-01): short-TTL cache for can_send_alert() — the
+        # cooldown decision only changes slowly (per-sender reputation and
+        # last_alert_time), so a 15s cache absorbs most of the per-message
+        # SELECT traffic without observable latency in enforcement.
+        self._can_send_alert_cache: Dict[int, Tuple[bool, float]] = {}
+
         # Stats
         self.stats: Dict[str, int] = defaultdict(int)
         self._stats_lock = asyncio.Lock()
@@ -381,6 +434,17 @@ class EnhancedDatabase:
             await self._create_indexes()
             self.is_connected = True
             await self.start_writer()
+            # v9.12 (audit C-01): prime the in-memory queue-size mirror
+            # so the first add_to_queue doesn't pay a SELECT COUNT(*).
+            try:
+                row = await self._fetchone("SELECT COUNT(*) AS cnt FROM processing_queue")
+                async with self._queue_lock:
+                    self._queue_size_mirror = int(row["cnt"]) if row else 0
+                    self._queue_mirror_dirty = False
+                logger.debug(f"queue_size_mirror primed: {self._queue_size_mirror}")
+            except Exception as e:
+                logger.debug(f"queue mirror prime failed: {e}")
+                self._queue_mirror_dirty = True
             # Note: start_cleanup() intentionally NOT called here (fix #5)
             logger.info(f"Database connected: {self.db_type.upper()} v9.3")
             return True
@@ -864,6 +928,15 @@ class EnhancedDatabase:
         When the queue is at capacity (CFG.MESSAGE_QUEUE_SIZE), the oldest
         lowest-priority row is evicted before inserting the new one, so the
         cap is enforced atomically under _queue_lock (fix #3 / #9).
+
+        v9.12 (audit C-01): the per-insert SELECT COUNT(*) is replaced by
+        an in-memory mirror (`_queue_size_mirror`) kept in sync under
+        _queue_lock. Every N inserts (QUEUE_MIRROR_RECONCILE_EVERY) we
+        reconcile against the real DB count to absorb any external drift
+        (manual DB edits, restarts mid-flight, etc.). Commits are also
+        batched: eviction + insert now share a single commit instead of
+        two. Result: 1 SELECT-then-INSERT+COMMIT per message instead of
+        SELECT COUNT + DELETE + COMMIT + INSERT + COMMIT (3 commits → 1).
         """
         if not self._db_healthy:
             # Backpressure: tell the caller the DB is unhealthy (fix #10)
@@ -872,22 +945,30 @@ class EnhancedDatabase:
 
         try:
             async with self._queue_lock:  # serialise cap check + insert (fix #9)
-                # ── Enforce capacity cap (fix #3) ─────────────────────────
-                if self.db_type == "sqlite":
-                    row = await self._fetchone(
-                        "SELECT COUNT(*) AS cnt FROM processing_queue"
-                    )
-                    current_size = int(row["cnt"]) if row else 0
+                # ── Enforce capacity cap (fix #3, audit C-01) ────────────
+                # Use the in-memory mirror; reconcile against DB every N inserts
+                # to absorb drift (manual edits, restarts, etc.).
+                reconcile_every = max(1, int(os.getenv("QUEUE_MIRROR_RECONCILE_EVERY", "64")))
+                if self._queue_mirror_dirty or (self.stats.get("queue_inserts", 0) % reconcile_every == 0):
+                    try:
+                        row = await self._fetchone("SELECT COUNT(*) AS cnt FROM processing_queue")
+                        self._queue_size_mirror = int(row["cnt"]) if row else 0
+                        self._queue_mirror_dirty = False
+                    except Exception as e:
+                        logger.debug(f"queue mirror reconcile failed: {e}")
+                current_size = self._queue_size_mirror
 
+                if self.db_type == "sqlite":
                     if current_size >= CFG.MESSAGE_QUEUE_SIZE:
                         # DROP_OLDEST: remove the single oldest lowest-priority row
+                        # v9.12 (C-01): batch the eviction + insert into one commit.
                         await self._execute(
                             "DELETE FROM processing_queue WHERE id = ("
                             "  SELECT id FROM processing_queue"
                             "  ORDER BY priority ASC, created_at ASC LIMIT 1"
                             ")"
                         )
-                        await self._commit()
+                        self._queue_size_mirror = max(0, self._queue_size_mirror - 1)
                         async with self._stats_lock:
                             self.stats["queue_evictions"] += 1
                         logger.warning(
@@ -899,17 +980,17 @@ class EnhancedDatabase:
                         "INSERT INTO processing_queue (event_data, priority) VALUES (?, ?)",
                         (json_dumps(event_data), priority),
                     )
-                    await self._commit()
+                    await self._commit()  # single commit covers eviction (if any) + insert
+                    self._queue_size_mirror += 1
+                    async with self._stats_lock:
+                        self.stats["queue_inserts"] = self.stats.get("queue_inserts", 0) + 1
                     return cursor.lastrowid
 
                 else:
                     # PostgreSQL: capacity check + insert in one transaction
+                    # v9.12 (C-01): mirror used here too for the cap check.
                     async with self._pool.acquire() as conn:
                         async with conn.transaction():
-                            row = await conn.fetchrow(
-                                "SELECT COUNT(*) AS cnt FROM processing_queue"
-                            )
-                            current_size = int(row["cnt"]) if row else 0
                             if current_size >= CFG.MESSAGE_QUEUE_SIZE:
                                 await conn.execute(
                                     "DELETE FROM processing_queue WHERE id = ("
@@ -928,16 +1009,27 @@ class EnhancedDatabase:
                                 "VALUES ($1, $2) RETURNING id",
                                 json_dumps(event_data), priority,
                             )
+                            self._queue_size_mirror += 1
+                            async with self._stats_lock:
+                                self.stats["queue_inserts"] = self.stats.get("queue_inserts", 0) + 1
                             return result["id"]
 
         except Exception as e:
             logger.error(f"add_to_queue failed: {e}")
+            # On error the mirror may be stale — flag it for reconciliation.
+            self._queue_mirror_dirty = True
             return -1
 
     async def pop_from_queue(self) -> Optional[dict]:
         try:
             if self.db_type == "sqlite":
-                async with self._hash_lock:
+                # v9.12 (audit C-01 + M-01): pop no longer takes _hash_lock.
+                # The queue is serialised by _queue_lock (cap enforcement)
+                # and the underlying aiosqlite connection is single-threaded
+                # anyway. Removing the cross-purpose _hash_lock contention
+                # lets message dedup (is_duplicate) proceed in parallel with
+                # queue pops.
+                async with self._queue_lock:
                     cursor = await self._sqlite_conn.execute(
                         "SELECT id, event_data FROM processing_queue "
                         "ORDER BY priority DESC, created_at ASC LIMIT 1"
@@ -949,6 +1041,7 @@ class EnhancedDatabase:
                         "DELETE FROM processing_queue WHERE id = ?", (row[0],)
                     )
                     await self._sqlite_conn.commit()
+                    self._queue_size_mirror = max(0, self._queue_size_mirror - 1)
                 return json_loads(row[1])
             else:
                 async with self._pool.acquire() as conn:
@@ -963,13 +1056,22 @@ class EnhancedDatabase:
                         await conn.execute(
                             "DELETE FROM processing_queue WHERE id = $1", row["id"]
                         )
+                        self._queue_size_mirror = max(0, self._queue_size_mirror - 1)
                         return json_loads(row["event_data"])
         except Exception as e:
             logger.error(f"pop_from_queue failed: {e}")
+            self._queue_mirror_dirty = True
             return None
 
     async def queue_size(self) -> int:
+        # v9.12 (audit C-01): prefer the in-memory mirror (O(1)) over a
+        # fresh COUNT(*) — the mirror is reconciled periodically inside
+        # add_to_queue and on every connect/purge.
         try:
+            async with self._queue_lock:
+                if not self._queue_mirror_dirty:
+                    return self._queue_size_mirror
+            # Fall back to a real count if the mirror is flagged dirty.
             row = await self._fetchone("SELECT COUNT(*) AS cnt FROM processing_queue")
             return int(row["cnt"]) if row else 0
         except Exception:
@@ -984,10 +1086,14 @@ class EnhancedDatabase:
                 cursor = await self._execute("DELETE FROM processing_queue")
                 deleted = cursor.rowcount or 0
                 await self._commit()
-                return deleted
             else:
                 result = await self._pool.execute("DELETE FROM processing_queue")
-                return int(result.split()[1])
+                deleted = int(result.split()[1])
+            # v9.12 (audit C-01): keep the mirror in sync after a purge.
+            async with self._queue_lock:
+                self._queue_size_mirror = 0
+                self._queue_mirror_dirty = False
+            return deleted
         except Exception as e:
             logger.error(f"purge_queue error: {e}")
             return 0
@@ -1204,6 +1310,12 @@ class EnhancedDatabase:
                     )
                 await self._commit()
             else:
+                # v9.12 (audit L-04): the old `result == "INSERT 0 1"` string
+                # comparison is asyncpg-specific and fragile (any asyncpg
+                # version change to the status string would silently break
+                # dedup). Use the portable cursor.rowcount check instead —
+                # 1 = inserted, 0 = conflict (DO NOTHING). This matches the
+                # SQLite branch's `cursor.rowcount or 0` pattern.
                 result = await self._pool.execute(
                     "INSERT INTO messages "
                     "(message_hash, chat_id, sender_id, message_text, keyword_found, score, spam_score, timestamp) "
@@ -1213,7 +1325,14 @@ class EnhancedDatabase:
                     rec.message_text[:500], rec.keyword_found,
                     rec.score, rec.spam_score, rec.timestamp,
                 )
-                changed = 1 if result == "INSERT 0 1" else 0
+                # asyncpg's execute() returns a status string like
+                # "INSERT 0 1" or "INSERT 0 0"; parse the tuples-affected
+                # count portably instead of an exact string match.
+                try:
+                    parts = str(result).split()
+                    changed = int(parts[-1]) if parts and parts[-1].isdigit() else 0
+                except Exception:
+                    changed = 0
                 if changed:
                     await self._pool.execute(
                         "INSERT INTO sender_stats (sender_id, total_messages, first_seen) "
@@ -1485,6 +1604,18 @@ class EnhancedDatabase:
         except Exception:
             return False
 
+    async def get_spam_ignored_entry(self, sender_id: int) -> Optional[Dict[str, Any]]:
+        """v9.12 (audit H-07): single-row lookup used by AntiSpam's LRU
+        fallback. Returns the row (with reason + classified) or None."""
+        try:
+            return await self._fetchone(
+                "SELECT sender_id, reason, classified, created_at "
+                "FROM spam_ignore WHERE sender_id = ? LIMIT 1",
+                (int(sender_id),),
+            )
+        except Exception:
+            return None
+
     async def add_spam_ignore(
         self, sender_id: int, reason: str = "", evidence: Optional[Dict] = None, classified: str = "cross_group_spam"
     ) -> None:
@@ -1695,18 +1826,51 @@ class EnhancedDatabase:
 
     # ─── Blocklists ───────────────────────────────────────────────────────────
     async def is_blocked_sender(self, sender_id: int) -> bool:
-        row = await self._fetchone(
-            "SELECT 1 AS hit FROM blocked_senders WHERE sender_id = ? LIMIT 1",
-            (sender_id,),
-        )
-        return row is not None
+        # v9.12 (audit H-01): short TTL cache for the hot-path blocklist
+        # check. Blocklists rarely change; the cache absorbs the per-message
+        # SELECT. block_sender()/unblock_sender() invalidate the entry.
+        try:
+            now = time.time()
+            cached = self._blocked_senders_cache.get(sender_id)
+            if cached is not None and now < cached[1]:
+                return cached[0]
+            row = await self._fetchone(
+                "SELECT 1 AS hit FROM blocked_senders WHERE sender_id = ? LIMIT 1",
+                (sender_id,),
+            )
+            blocked = row is not None
+            ttl = max(5.0, float(os.getenv("BLOCKLIST_CACHE_TTL", "30")))
+            self._blocked_senders_cache[sender_id] = (blocked, now + ttl)
+            return blocked
+        except Exception:
+            # On any error fall back to direct DB check.
+            row = await self._fetchone(
+                "SELECT 1 AS hit FROM blocked_senders WHERE sender_id = ? LIMIT 1",
+                (sender_id,),
+            )
+            return row is not None
 
     async def is_blocked_chat(self, chat_id: int) -> bool:
-        row = await self._fetchone(
-            "SELECT 1 AS hit FROM blocked_chats WHERE chat_id = ? LIMIT 1",
-            (chat_id,),
-        )
-        return row is not None
+        # v9.12 (audit H-01): same TTL cache strategy as is_blocked_sender.
+        try:
+            now = time.time()
+            cached = self._blocked_chats_cache.get(chat_id)
+            if cached is not None and now < cached[1]:
+                return cached[0]
+            row = await self._fetchone(
+                "SELECT 1 AS hit FROM blocked_chats WHERE chat_id = ? LIMIT 1",
+                (chat_id,),
+            )
+            blocked = row is not None
+            ttl = max(5.0, float(os.getenv("BLOCKLIST_CACHE_TTL", "30")))
+            self._blocked_chats_cache[chat_id] = (blocked, now + ttl)
+            return blocked
+        except Exception:
+            row = await self._fetchone(
+                "SELECT 1 AS hit FROM blocked_chats WHERE chat_id = ? LIMIT 1",
+                (chat_id,),
+            )
+            return row is not None
 
     async def block_sender(self, sender_id: int, reason: str = "", by: str = "system") -> None:
         try:
@@ -1715,6 +1879,9 @@ class EnhancedDatabase:
                 (sender_id, reason, by),
             )
             await self._commit()
+            # v9.12 (audit H-01): invalidate the cache so the next check
+            # sees the new state immediately.
+            self._blocked_senders_cache.pop(sender_id, None)
             logger.info(f"Sender {sender_id} blocked: {reason}")
         except Exception as e:
             logger.error(f"block_sender error: {e}")
@@ -1722,6 +1889,7 @@ class EnhancedDatabase:
     async def unblock_sender(self, sender_id: int) -> None:
         await self._execute("DELETE FROM blocked_senders WHERE sender_id = ?", (sender_id,))
         await self._commit()
+        self._blocked_senders_cache.pop(sender_id, None)
 
     async def block_chat(self, chat_id: int, reason: str = "", by: str = "system") -> None:
         try:
@@ -1730,6 +1898,7 @@ class EnhancedDatabase:
                 (chat_id, reason, by),
             )
             await self._commit()
+            self._blocked_chats_cache.pop(chat_id, None)
             logger.info(f"Chat {chat_id} blocked: {reason}")
         except Exception as e:
             logger.error(f"block_chat error: {e}")
@@ -1737,6 +1906,7 @@ class EnhancedDatabase:
     async def unblock_chat(self, chat_id: int) -> None:
         await self._execute("DELETE FROM blocked_chats WHERE chat_id = ?", (chat_id,))
         await self._commit()
+        self._blocked_chats_cache.pop(chat_id, None)
 
     # ─── Alerts ───────────────────────────────────────────────────────────────
     async def add_alert(self, rec: AlertRecord) -> bool:
@@ -1773,16 +1943,44 @@ class EnhancedDatabase:
         return True
 
     async def can_send_alert(self, sender_id: int) -> bool:
-        row = await self._fetchone(
-            "SELECT last_alert_time, reputation_score FROM sender_stats WHERE sender_id = ?",
-            (sender_id,),
-        )
-        if row and row.get("last_alert_time"):
-            elapsed = time.time() - float(row["last_alert_time"])
-            rep = float(row.get("reputation_score") or 50.0)
-            cooldown = max(30, CFG.ALERT_COOLDOWN * (1.0 - rep / 200.0))
-            return elapsed >= cooldown
-        return True
+        # v9.12 (audit H-01): short-TTL cache for the per-message cooldown
+        # check. The decision only changes when (a) an alert was just sent
+        # (which invalidates this entry via _invalidate_can_send_alert) or
+        # (b) the reputation changes (rare, also handled). 15s default TTL
+        # keeps the cooldown enforcement within one cooldown tick of
+        # reality while collapsing most of the per-message SELECT traffic.
+        try:
+            now = time.time()
+            cached = self._can_send_alert_cache.get(sender_id)
+            if cached is not None and now < cached[1]:
+                return cached[0]
+            row = await self._fetchone(
+                "SELECT last_alert_time, reputation_score FROM sender_stats WHERE sender_id = ?",
+                (sender_id,),
+            )
+            if row and row.get("last_alert_time"):
+                elapsed = now - float(row["last_alert_time"])
+                rep = float(row.get("reputation_score") or 50.0)
+                cooldown = max(30, CFG.ALERT_COOLDOWN * (1.0 - rep / 200.0))
+                allowed = elapsed >= cooldown
+            else:
+                allowed = True
+            ttl = max(2.0, float(os.getenv("CAN_SEND_ALERT_CACHE_TTL", "15")))
+            # If the sender is on cooldown, cache only for a short window so
+            # we re-check close to the cooldown expiry.
+            if not allowed:
+                ttl = min(ttl, 5.0)
+            self._can_send_alert_cache[sender_id] = (allowed, now + ttl)
+            return allowed
+        except Exception:
+            # Conservative fallback: allow the alert (the rate limiter in
+            # main.py still caps total throughput per account).
+            return True
+
+    def _invalidate_can_send_alert(self, sender_id: int) -> None:
+        """Call after recording an alert send for a sender so the next
+        can_send_alert() check picks up the new last_alert_time."""
+        self._can_send_alert_cache.pop(sender_id, None)
 
     async def is_duplicate(self, h: str) -> bool:
         async with self._hash_lock:
@@ -1988,12 +2186,33 @@ class EnhancedDatabase:
                     f"VALUES {','.join(values)} ON CONFLICT (message_hash) DO NOTHING"
                 )
                 await self._pool.execute(sql, *params)
+                # v9.12 (audit M-03): collapse the per-alert UPDATE sender_stats
+                # loop into a single executemany() so a batch of N alerts costs
+                # 1 INSERT + 1 executemany instead of 1 INSERT + N UPDATEs.
+                # We pick the latest timestamp per sender (max) so the
+                # last_alert_time reflects the most recent alert in the batch.
+                # Group by sender_id: for each sender, find max(timestamp).
+                sender_to_latest_ts: Dict[int, float] = {}
+                sender_counts: Dict[int, int] = {}
                 for data in alerts_data:
-                    await self._pool.execute(
-                        "UPDATE sender_stats SET alerts_sent = alerts_sent + 1, last_alert_time = $1 "
-                        "WHERE sender_id = $2",
-                        data[6], data[2],
+                    sid = int(data[2])
+                    ts = float(data[6])
+                    sender_to_latest_ts[sid] = max(sender_to_latest_ts.get(sid, 0.0), ts)
+                    sender_counts[sid] = sender_counts.get(sid, 0) + 1
+                # Build the per-sender UPDATE batch.
+                update_params = [
+                    (sender_to_latest_ts[sid], sender_counts[sid], sid)
+                    for sid in sender_to_latest_ts
+                ]
+                if update_params:
+                    await self._pool.executemany(
+                        "UPDATE sender_stats "
+                        "SET alerts_sent = alerts_sent + $2, last_alert_time = $1 "
+                        "WHERE sender_id = $3",
+                        update_params,
                     )
+                for sid in sender_to_latest_ts:
+                    self._invalidate_can_send_alert(sid)
             else:
                 sql = (
                     "INSERT OR IGNORE INTO alerts "
@@ -2003,12 +2222,28 @@ class EnhancedDatabase:
                 )
                 params_list = [tuple(data) for data in alerts_data]
                 await self._executemany(sql, params_list)
+                # v9.12 (audit M-03): same N+1 collapse for SQLite — one
+                # executemany for the per-sender UPDATEs instead of N round-trips.
+                sender_to_latest_ts: Dict[int, float] = {}
+                sender_counts: Dict[int, int] = {}
                 for data in alerts_data:
-                    await self._execute(
-                        "UPDATE sender_stats SET alerts_sent = alerts_sent + 1, last_alert_time = ? "
+                    sid = int(data[2])
+                    ts = float(data[6])
+                    sender_to_latest_ts[sid] = max(sender_to_latest_ts.get(sid, 0.0), ts)
+                    sender_counts[sid] = sender_counts.get(sid, 0) + 1
+                update_params = [
+                    (sender_to_latest_ts[sid], sender_counts[sid], sid)
+                    for sid in sender_to_latest_ts
+                ]
+                if update_params:
+                    await self._executemany(
+                        "UPDATE sender_stats "
+                        "SET alerts_sent = alerts_sent + ?, last_alert_time = ? "
                         "WHERE sender_id = ?",
-                        (data[6], data[2]),
+                        update_params,
                     )
+                for sid in sender_to_latest_ts:
+                    self._invalidate_can_send_alert(sid)
                 await self._commit()
 
             # Success — reset failure tracking (fix #10)

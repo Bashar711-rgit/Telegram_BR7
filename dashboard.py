@@ -452,8 +452,19 @@ async def _update_stats_loop(app: FastAPI):
     refreshes app.state.stats_cache every 5th cycle (10 s) instead of running
     ~7 COUNT/aggregate queries against the DB every 2 s 24/7. The full-rate
     push resumes automatically as soon as a client connects.
+
+    v9.12 (audit M-10): the no-client cadence is widened to every 15th cycle
+    (~30 s) — COUNT/DISTINCT aggregates over messages/sender_stats are the
+    most expensive queries in the system and the dashboard isn't even
+    visible to anyone when no WS client is connected. With clients the rate
+    stays at 2s so the UX is unchanged. We also cache the heavy
+    db.get_stats() result on app.state for 5s so concurrent /api/stats HTTP
+    pulls don't each issue the 7 aggregates.
     """
     cycle = 0
+    last_db_stats_ts: float = 0.0
+    last_db_stats: Optional[Dict[str, Any]] = None
+    DB_STATS_TTL = 5.0  # seconds — coalesce concurrent pulls
     while True:
         try:
             await asyncio.sleep(2)
@@ -463,12 +474,21 @@ async def _update_stats_loop(app: FastAPI):
             if not db.is_connected:
                 continue
             has_clients = bool(manager.active_connections)
-            if not has_clients and (cycle % 5) != 1:
-                # No WS clients: keep the /api/stats cache fresh-ish at a
-                # ~10 s cadence instead of hammering the DB every 2 s.
+            if not has_clients and (cycle % 15) != 1:
+                # No WS clients: refresh the /api/stats cache at a ~30 s
+                # cadence instead of hammering the DB every 2 s 24/7. The
+                # full 2 s rate resumes as soon as a client connects.
                 continue
 
-            db_stats = await db.get_stats()
+            # v9.12 (M-10): coalesce the heavy db.get_stats() call across
+            # concurrent HTTP pulls via a 5s in-memory cache.
+            now = time.time()
+            if last_db_stats is None or (now - last_db_stats_ts) > DB_STATS_TTL:
+                db_stats = await db.get_stats()
+                last_db_stats = db_stats
+                last_db_stats_ts = now
+            else:
+                db_stats = last_db_stats
             filter_tele = await bot.filter.get_telemetry() if bot else {}
             queue_size = await db.queue_size()
 
@@ -663,13 +683,29 @@ async def _reload_filter_keywords(app: FastAPI) -> Dict[str, Any]:
 # API Endpoints
 # =============================================================================
 
+# v9.12 (audit L-02): read the dashboard template ONCE at import time
+# instead of on every "/" request. The old `open(...)` inside the request
+# handler was a blocking sync I/O call on the event loop for every page
+# load. The template is static — caching it as a module-level string is
+# safe.
+_DASHBOARD_TEMPLATE_PATH = os.path.join(os.path.dirname(__file__), "templates", "dashboard.html")
+_DASHBOARD_TEMPLATE_CONTENT: Optional[str] = None
+try:
+    if os.path.exists(_DASHBOARD_TEMPLATE_PATH):
+        with open(_DASHBOARD_TEMPLATE_PATH, "r", encoding="utf-8") as _f:
+            _DASHBOARD_TEMPLATE_CONTENT = _f.read()
+    else:
+        logger.warning(f"dashboard template not found at {_DASHBOARD_TEMPLATE_PATH}")
+except Exception as _tpl_err:  # noqa: BLE001
+    logger.error(f"failed to pre-load dashboard template: {_tpl_err}")
+    _DASHBOARD_TEMPLATE_CONTENT = None
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    html_path = os.path.join(os.path.dirname(__file__), "templates", "dashboard.html")
-    if os.path.exists(html_path):
-        with open(html_path, "r", encoding="utf-8") as f:
-            return HTMLResponse(f.read())
-    return HTMLResponse("<h1>Dashboard not found</h1>")
+    if _DASHBOARD_TEMPLATE_CONTENT is None:
+        return HTMLResponse("<h1>Dashboard not found</h1>", status_code=503)
+    return HTMLResponse(_DASHBOARD_TEMPLATE_CONTENT)
 
 
 @app.get("/login", response_class=HTMLResponse)
@@ -681,7 +717,35 @@ async def login_page():
 @app.get("/health")
 async def health(request: Request):
     """Render health check + keep-alive endpoint (no auth — main.py's
-    _keep_alive_loop and Render's own health checks hit this unauthenticated)."""
+    _keep_alive_loop and Render's own health checks hit this unauthenticated).
+
+    v9.12 (audit L-08): this endpoint now returns ONLY the minimal status
+    needed for liveness probing (HTTP 200 + a single "ok"/"degraded" flag
+    + db_ok). The detailed operational data (monitor counts, fast_capture
+    snapshot, sender_intel, dedup, antispam, uptime) was moved to
+    /health/full which requires dashboard auth — exposing counts, queue
+    depths and engine internals to anyone who could reach the service
+    was an information-disclosure surface."""
+    db = getattr(request.app.state, "db", None)
+    db_ok = bool(db and getattr(db, "is_connected", False))
+    db_healthy = bool(db and getattr(db, "db_healthy", True))
+    return JSONResponse({
+        "status": "ok" if (db_ok and db_healthy) else "degraded",
+        "database": "ok" if db_ok else "down",
+        "db_healthy": db_healthy,
+        "time": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    })
+
+
+@app.get("/health/full", dependencies=[Depends(verify_token)])
+async def health_full(request: Request):
+    """Detailed health snapshot (audit L-08: requires auth).
+
+    Returns the full operational picture that /health used to expose
+    unauthenticated: monitor counts, main client state, fast_capture,
+    sender_intel, dedup, antispam, uptime. Use this from the dashboard
+    or for admin-driven diagnostics; Render's liveness probe and the
+    keep-alive loop use the bare /health endpoint above."""
     db = getattr(request.app.state, "db", None)
     db_ok = bool(db and getattr(db, "is_connected", False))
     db_healthy = bool(db and getattr(db, "db_healthy", True))

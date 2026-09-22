@@ -156,7 +156,7 @@ class TestPrefilterLanguage:
 
     async def test_neutral_emojis_exempt_from_cap(self, flt):
         text = "ابي احد يساعدني ضروري 😭🙏😅🥺😢 اسلم الواجب بكرة"
-        ok, reason, _ = Prefilter.check(
+        ok, reason, _ = await Prefilter.check(
             flt._clean(text)[0], 1, 5, emoji_exempt=flt._neutral_emoji
         )
         assert ok, reason

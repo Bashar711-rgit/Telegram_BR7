@@ -181,11 +181,26 @@ async def auth_csrf(session: Dict[str, Any] = Protected):
 # started from any directory other than the repo root.
 _ADMIN_TEMPLATE = Path(__file__).resolve().parent.parent / "templates" / "admin.html"
 
+# v9.12 (audit L-02): read the template ONCE at import time instead of on
+# every /admin request. The old `open(...)` inside the request handler was
+# a blocking sync I/O call on the event loop for every page load. The
+# template is static — caching it as a module-level string is safe.
+_ADMIN_TEMPLATE_CONTENT: Optional[str] = None
+try:
+    if _ADMIN_TEMPLATE.exists():
+        _ADMIN_TEMPLATE_CONTENT = _ADMIN_TEMPLATE.read_text(encoding="utf-8")
+    else:
+        logger.warning(f"admin template not found at {_ADMIN_TEMPLATE}")
+except Exception as _tpl_err:  # noqa: BLE001 — module-load-time, must not crash
+    logger.error(f"failed to pre-load admin template: {_tpl_err}")
+    _ADMIN_TEMPLATE_CONTENT = None
+
 
 @router.get("/admin", response_class=HTMLResponse)
 async def admin_spa():
-    with open(_ADMIN_TEMPLATE, "r", encoding="utf-8") as f:
-        return HTMLResponse(f.read())
+    if _ADMIN_TEMPLATE_CONTENT is None:
+        return HTMLResponse("<h1>admin template unavailable</h1>", status_code=503)
+    return HTMLResponse(_ADMIN_TEMPLATE_CONTENT)
 
 
 # ===========================================================================
@@ -613,22 +628,30 @@ async def bot_restart(request: Request, _: Any = CsrfProtected):
     if result.get("restarted"):
         return {"success": True, "mode": "render", "message": "طُلبت إعادة التشغيل من Render"}
 
-    # Fallback: graceful local shutdown - Render restarts the exited process
-    async def _graceful_exit() -> None:
+    # Fallback: graceful local shutdown - Render restarts the exited process.
+    # v9.12 (audit H-06): the old code called os._exit(0) after bot.stop() —
+    # a hard process kill that bypassed the asyncio cleanup bot.stop()
+    # just scheduled (DB flush, task cancellation, session encryption).
+    # The net effect was that bot.stop() barely ran before the process
+    # died, so pending alert batches, in-flight DLQ retries and unencrypted
+    # session files were lost on every restart. We now just call bot.stop()
+    # and let it return naturally; Render's process supervisor restarts
+    # the exited process. The 1s sleep gives the HTTP response time to
+    # flush back to the admin's browser before the shutdown begins.
+    async def _graceful_stop() -> None:
         bot = getattr(request.app.state, "bot_ref", None)
         await asyncio.sleep(1)
         try:
             if bot is not None:
                 await bot.stop()
-        except Exception:
-            pass
-        os._exit(0)
+        except Exception as e:
+            logger.error(f"bot.stop() during restart failed: {e}")
 
-    asyncio.create_task(_graceful_exit())
+    asyncio.create_task(_graceful_stop())
     return {
         "success": True,
-        "mode": "local-exit",
-        "message": f"إعادة تشغيل ذاتية (Render API: {result.get('reason')})",
+        "mode": "local-stop",
+        "message": f"إعادة تشغيل رشيق (Render API: {result.get('reason')})",
     }
 
 

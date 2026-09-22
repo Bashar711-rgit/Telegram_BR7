@@ -63,7 +63,6 @@ import hashlib
 import math
 import re
 import time
-from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Dict, Final, List, Optional, Set, Tuple
 
@@ -81,7 +80,14 @@ from config import (
     WS_PATTERN,
 )
 
-from security import safe_search, safe_findall, SafeRegexExecutor, MAX_REGEX_INPUT_LEN
+from security import (
+    safe_search,
+    safe_findall,
+    safe_search_async,
+    safe_findall_async,
+    SafeRegexExecutor,
+    MAX_REGEX_INPUT_LEN,
+)
 from metrics import BoundedMetrics
 from adaptive import AdaptiveWeights
 
@@ -93,7 +99,14 @@ except ImportError:
     logger.warning("rapidfuzz not installed – fuzzy matching disabled")
 
 try:
-    from langdetect import detect
+    from langdetect import detect, DetectorFactory
+    # v9.12 (audit L-03): langdetect uses a non-deterministic random seed
+    # by default, so the same text could be classified differently on
+    # consecutive calls. For our use case (Arabic ratio gating) the
+    # non-determinism is a real correctness risk — a borderline text
+    # could pass prefilter on one call and fail on the next. Pin the
+    # seed so the same text always yields the same language verdict.
+    DetectorFactory.seed = 0
     LANGDETECT_AVAILABLE = True
 except ImportError:
     LANGDETECT_AVAILABLE = False
@@ -307,10 +320,15 @@ class Prefilter:
     punctuation no longer dilute it — "حل homework 2" is a valid Arabic
     request), and the emoji cap can exempt neutral emojis (students are
     expressive; ad-style emoji spam is not).
+
+    v9.12 (audit C-02): `check()` is now a coroutine so it can use the
+    non-blocking `safe_findall_async` / `safe_search_async` helpers. All
+    callers already awaited it (or called it from another coroutine that
+    we now mark `await`); no behaviour change otherwise.
     """
 
     @staticmethod
-    def check(
+    async def check(
         text: str,
         min_words: int = 1,
         max_emojis: int = 5,
@@ -335,7 +353,10 @@ class Prefilter:
             return False, f"too_few_words_{word_count}", metadata
 
         exempt = emoji_exempt or set()
-        emojis = [e for e in safe_findall(EMOJI_PATTERN, text) if e not in exempt]
+        # v9.12 (C-02): non-blocking async regex — was the #1 event-loop
+        # freezer in the prefilter hot path.
+        emojis_raw = await safe_findall_async(EMOJI_PATTERN, text)
+        emojis = [e for e in emojis_raw if e not in exempt]
         emoji_count = len(emojis)
         metadata["emoji_count"] = emoji_count
 
@@ -350,8 +371,13 @@ class Prefilter:
         if arabic_ratio < 0.1:
             return False, "low_arabic_ratio", metadata
 
-        metadata["has_url"] = bool(safe_search(URL_PATTERN, text))
-        metadata["has_phone"] = bool(safe_search(PHONE_PATTERN, text))
+        # Run the two URL/phone checks concurrently — both are non-blocking.
+        has_url_match, has_phone_match = await asyncio.gather(
+            safe_search_async(URL_PATTERN, text),
+            safe_search_async(PHONE_PATTERN, text),
+        )
+        metadata["has_url"] = bool(has_url_match)
+        metadata["has_phone"] = bool(has_phone_match)
 
         return True, "ok", metadata
 
@@ -413,40 +439,10 @@ class OptimizedBloomFilter:
             self._added_count = 0
 
 
-class ShardedLRUCache:
-    """Kept for backward compatibility; not used in main analysis path."""
-
-    def __init__(self, max_size: int = 10_000, ttl: int = 300, shards: int = 16) -> None:
-        self._shards: List[OrderedDict] = [OrderedDict() for _ in range(shards)]
-        self._max_per_shard = max(1, max_size // shards)
-        self._ttl = ttl
-        self._shard_locks = [asyncio.Lock() for _ in range(shards)]
-
-    def _idx(self, key: str) -> int:
-        return hash(key) % len(self._shards)
-
-    async def get(self, key: str) -> Optional[Dict]:
-        idx = self._idx(key)
-        async with self._shard_locks[idx]:
-            entry = self._shards[idx].get(key)
-            if entry:
-                val, ts = entry
-                if time.time() - ts < self._ttl:
-                    self._shards[idx].move_to_end(key)
-                    return val
-                del self._shards[idx][key]
-        return None
-
-    async def set(self, key: str, value: Dict) -> None:
-        idx = self._idx(key)
-        async with self._shard_locks[idx]:
-            cache = self._shards[idx]
-            if key in cache:
-                cache.move_to_end(key)
-            else:
-                while len(cache) >= self._max_per_shard:
-                    cache.popitem(last=False)
-            cache[key] = (value, time.time())
+# v9.12 (audit L-10): ShardedLRUCache was removed — it was constructed in
+# EnhancedFilter.__init__ as `self._cache = ShardedLRUCache(...)` but never
+# read or written by any code path (only `_text_cache` is used). The dead
+# class definition and the dead `self._cache` attribute are both gone.
 
 
 class TrieNode:
@@ -583,13 +579,24 @@ class EnhancedFilter:
         self._build_tries()
 
         self._bloom = OptimizedBloomFilter(CFG.BLOOM_FILTER_SIZE, CFG.BLOOM_FILTER_FP)
-        self._cache = ShardedLRUCache(CFG.MAX_CACHE_SIZE, CFG.CACHE_TTL)
+        # v9.12 (audit L-10): removed dead `self._cache = ShardedLRUCache(...)`
+        # — was constructed but never read or written. Only `_text_cache`
+        # below is used by the analysis path.
         self._text_cache = TTLCache(maxsize=CFG.TEXT_CACHE_SIZE, ttl=CFG.TEXT_CACHE_TTL)
         self._cache_lock = asyncio.Lock()
 
         self._regex_guard = SafeRegexExecutor(
             timeout_s=_cfg("REGEX_TIMEOUT_S", 0.25),
             max_workers=_cfg("REGEX_GUARD_WORKERS", 4),
+        )
+        # v9.12 (audit C-03): dedicated bounded executor for the CPU-bound
+        # filter pipeline. Capped at FILTER_EXECUTOR_WORKERS so under load
+        # we don't fan out unbounded threads; the ModerationService
+        # Semaphore already throttles concurrent analyze() calls.
+        from concurrent.futures import ThreadPoolExecutor  # local import keeps top-level clean
+        self._filter_executor = ThreadPoolExecutor(
+            max_workers=max(1, _cfg("FILTER_EXECUTOR_WORKERS", 4)),
+            thread_name_prefix="filter-core",
         )
         self._metrics = BoundedMetrics(
             window=_cfg("METRICS_WINDOW", 2000),
@@ -1270,17 +1277,30 @@ class EnhancedFilter:
 
     _REPEAT_CHARS_PATTERN: Final = re.compile(r"(.)\1{4,}")
 
-    def _spam_score(self, text: str) -> float:
+    async def _spam_score(self, text: str) -> float:
+        """v9.12 (C-02): converted to a coroutine so the 4 regex calls
+        inside the hot path no longer freeze the event loop. All four
+        patterns are dispatched concurrently via asyncio.gather so the
+        wall-clock cost is roughly max(...) instead of sum(...)."""
         score = 0.0
-        if safe_search(PHONE_PATTERN, text):
+        if not text:
+            return score
+        # Dispatch the four ReDoS-guarded checks in parallel.
+        phone_m, urls, emojis, repeat_m = await asyncio.gather(
+            safe_search_async(PHONE_PATTERN, text),
+            safe_findall_async(URL_PATTERN, text),
+            safe_findall_async(EMOJI_PATTERN, text),
+            safe_search_async(self._REPEAT_CHARS_PATTERN, text),
+        )
+        if phone_m:
             score += 0.3
-        url_count = len(safe_findall(URL_PATTERN, text))
+        url_count = len(urls)
         score += min(0.4, url_count * 0.2)
-        emoji_count = len(safe_findall(EMOJI_PATTERN, text))
+        emoji_count = len(emojis)
         score += min(0.2, emoji_count * 0.04)
         # v14.5 perf: النمط كان يُترجم (re.compile) عند كل استدعاء — الآن
         # ثابت صنفي مُجمّع مرة واحدة (نفس النمط، نفس النتيجة).
-        if safe_search(self._REPEAT_CHARS_PATTERN, text):
+        if repeat_m:
             score += 0.15
         return min(score, 1.0)
 
@@ -1530,7 +1550,7 @@ class EnhancedFilter:
             cache_key = hashlib.blake2b(cleaned.encode(), digest_size=16).hexdigest()[:32]
 
             if CFG.PREFILTER_ENABLED:
-                ok, reason, metadata = Prefilter.check(
+                ok, reason, metadata = await Prefilter.check(
                     cleaned, _cfg("PREFILTER_MIN_WORDS", 1), CFG.PREFILTER_MAX_EMOJIS,
                     emoji_exempt=getattr(self, "_neutral_emoji", set()),
                 )
@@ -1578,344 +1598,430 @@ class EnhancedFilter:
             if CFG.LANGUAGE_FILTER and not is_arabic:
                 return self._result("ignore", 0.0, ["non_arabic"], original_text=original_text)
 
-            spam_score = self._spam_score(cleaned)
+            spam_score = await self._spam_score(cleaned)
             if spam_score > CFG.SPAM_SCORE_THRESHOLD:
                 async with self._stats_lock:
                     self._stats["spam"] += 1
                 return self._result("ignore", 0.0, ["spam_detected"], original_text=original_text)
 
-            # v14.4: boundary-valid short-circuits — the affirmation "لا"
-            # must not match inside "علاج/الاكسل/الاختبار" and kill real
-            # requests via the ignore/spam tries.
-            if self._search_first_valid(self._spam_trie, cleaned):
-                async with self._stats_lock:
-                    self._stats["spam"] += 1
-                return self._result("ignore", 0.0, ["spam_pattern"], original_text=original_text)
-
-            # v14.4: boundary-valid + STRONG-ONLY early ignore — weak social
-            # signals (greetings/thanks/affirmations) are evaluated later and
-            # never suppress messages that carry a request keyword.
-            if self._search_first_valid(self._ignore_strong_trie, cleaned):
-                return self._result("ignore", 0.0, ["ignore_pattern"], original_text=original_text)
-
-            if self._search_first_valid(self._ad_blocker_trie, cleaned):
-                return self._result("ignore", 0.0, ["ad_blocker"], original_text=original_text)
-
-            # v14.4: boundary-aware, best-weight matching everywhere.
-            intent_match = self._search_best(
-                self._request_trie,
+            # ── v9.12 (audit C-03): the entire CPU-bound core (trie scans,
+            # fuzzy fallback, negation, advertisement detection, scoring)
+            # now runs off the event loop via run_in_executor. The event
+            # loop is free to interleave Telegram captures, queue pops and
+            # alert sends while a single message is being analyzed. The
+            # default ThreadPoolExecutor is bounded by asyncio, so under
+            # load the semaphore in ModerationService naturally throttles
+            # concurrent analyses. The sync helper returns the final
+            # result_dict plus a small stats-bucket we apply under the
+            # asyncio lock back on the loop.
+            loop = asyncio.get_running_loop()
+            core_result = await loop.run_in_executor(
+                self._filter_executor,
+                self._analyze_core_sync,
                 cleaned,
-                lambda t: self._adaptive_intent.get(t, self._intent_weights.get(t, 0.7)),
+                original,
+                original_text,
+                is_arabic,
+                arabic_ratio,
+                start,
             )
-            fuzzy_used = False
-            if intent_match is None:
-                fuzzy = self._fuzzy_intent_fallback(cleaned)
-                if fuzzy is not None:
-                    intent_match = fuzzy
-                    fuzzy_used = True
-                    async with self._stats_lock:
-                        self._stats["fuzzy_path"] += 1
+            # core_result is a tuple: (result_dict, stats_to_inc, elapsed_ms_or_None, anomaly_value_or_None)
+            result_dict, stats_to_inc, elapsed_ms, anomaly_value = core_result
 
-            indirect_match = self._search_first_valid(self._indirect_trie, cleaned)
-            implicit_match = self._search_first_valid(self._implicit_trie, cleaned)
+            if anomaly_value is not None:
+                anomaly_report = await self._metrics.record(anomaly_value)
+                if anomaly_report and anomaly_report.is_anomaly:
+                    result_dict["anomaly"] = True
+                    logger.warning(
+                        "analyze_latency_anomaly | value_ms={} mean_ms={} z={} n={}",
+                        anomaly_report.value, round(anomaly_report.mean, 2),
+                        round(anomaly_report.z_score, 2), anomaly_report.sample_size,
+                    )
+                    stats_to_inc["anomalies_detected"] = stats_to_inc.get("anomalies_detected", 0) + 1
 
-            intent_word = intent_match[0] if intent_match else None
-            intent_pos = intent_match[2] if intent_match else None
-            intent_weight = (
-                self._adaptive_intent.get(intent_word, 0.7) if intent_word and not fuzzy_used
-                else (intent_match[1] if fuzzy_used and intent_match else 0.0)
-            )
-
-            is_implicit = implicit_match is not None
-
-            # v14.4: implicit availability/problem requests anchor the intent
-            # when no explicit intent verb exists ("مين يساعد", "عندي واجب") —
-            # anchored BEFORE negation/distance so their scope is correct.
-            if is_implicit and not intent_word:
-                intent_weight = 0.7
-                intent_pos = implicit_match[2]
-
-            # ── v14.5 EARLY EXIT («Fail Fast / Early Exit») ─────────────
-            # لا نية صريحة ولا طلب غير مباشر ولا ضمني ⇒ الرسالة بلا كلمة
-            # مفتاحية قطعاً. فحوص urgency/boost/help/context/negation/ads
-            # لا تغيّر قرار هذا المسار إطلاقاً (النتيجة "no_keyword" أو
-            # "ignore_pattern" في كل الأحوال) — تُتخطى كلها فوراً بدلاً
-            # من تنفيذها على رسائل خارج النطاق (أكبر مكسب أداء للمسار
-            # الراكد: معظم رسائل المجموعات ليست طلبات).
-            keyword = intent_word or (
-                indirect_match[0] if indirect_match else None
-            ) or (
-                implicit_match[0] if implicit_match else None
-            )
-            if not keyword:
-                result = FilterResult()
-                result.original_text = original
-                # v14.4: weak ignore signals (greetings/thanks/...) apply only
-                # when the message carries no request keyword at all.
-                if self._search_first_valid(self._ignore_trie, cleaned):
-                    result.valid = False
-                    result.reason = "ignore_pattern"
-                    return self._convert_result(result, is_arabic, arabic_ratio, 0.0, start)
-                result.valid = False
-                result.reason = "no_keyword"
-                return self._convert_result(result, is_arabic, arabic_ratio, 0.0, start)
-            # ── كلمة مفتاحية موجودة — المتابعة بالمسار الكامل كما هو ──
-            urgency_match = self._search_first_valid(self._urgency_trie, cleaned)
-            boost_match = self._search_first_valid(self._boost_trie, cleaned)
-            help_match = self._search_first_valid(self._help_trie, cleaned)
-
-            urgency_marker = urgency_match[0] if urgency_match else None
-            urgent = urgency_match is not None
-
-            # v14.4: strongest academic object (tier weight, then proximity
-            # to the intent anchor) instead of "first positional match".
-            academic_match, context_matches = self._search_best_context(cleaned, intent_pos)
-            academic_word = academic_match[0] if academic_match else None
-            academic_pos = academic_match[2] if academic_match else None
-            academic_weight = self._adaptive_academic.get(academic_word, 0.7) if academic_word else 0.0
-
-            is_negated, neg_score, neg_reasons = self._detect_negation(cleaned, intent_pos)
-            if is_negated and neg_score > 0.7:
-                return self._result(
-                    "ignore",
-                    1.0 - neg_score,
-                    neg_reasons,
-                    original_text=original_text
-                )
-
-            ad_score, ad_reasons = self._detect_advertisement(cleaned)
-            if ad_score > 0.6:
-                return self._result("ignore", 1.0 - ad_score, ad_reasons, original_text=original_text)
-
-            result = FilterResult()
-            result.original_text = original
-
-            if self._is_blocked(cleaned, result, ad_score):
-                return self._convert_result(result, is_arabic, arabic_ratio, ad_score, start)
-
-            score = CFG.SCORE_DIRECT_MATCH if intent_word else 0
-            context_boost = min(len(context_matches) * 5, CFG.SCORE_CONTEXT_MAX)
-            score += context_boost
-
-            if urgent:
-                score += CFG.SCORE_URGENCY
-
-            if (indirect_match or is_implicit) and not intent_word:
-                score += CFG.SCORE_INDIRECT
-                result.indirect = True
-
-            result.valid = score >= CFG.SCORE_MIN_VALID
-            result.keyword = keyword
-            result.score = score
-            result.context_boost = context_boost
-            result.urgent = urgent
-            result.fuzzy_matched = fuzzy_used
-            result.reason = (
-                "keyword_found" if intent_word
-                else ("indirect_request" if indirect_match
-                      else ("implicit_request" if is_implicit else "no_keyword"))
-            )
-            result.context_type = (
-                "academic_request" if context_matches
-                else ("urgent_request" if urgent else "direct_request")
-            )
-            result.context_confidence = 0.90 if context_matches else (0.85 if urgent else 0.75)
-
-            legacy_confidence = score / 100.0
-
-            weighted_confidence: Optional[float] = None
-            distance_score = 0.0
-            grammar_score = 0.0
-            if CFG.DISTANCE_SCORING_ENABLED:
-                grammar_match = (
-                    self._search_first_valid(self._subject_markers_trie, cleaned)
-                    or self._search_first_valid(self._action_verbs_trie, cleaned)
-                    or help_match
-                )
-                grammar_score = 1.0 if grammar_match else 0.0
-
-                if intent_pos is not None and academic_pos is not None:
-                    distance_score = self._calculate_distance_score(intent_pos, academic_pos, len(cleaned))
-                elif intent_word:
-                    distance_score = 0.5
-
-                context_component = min(len(context_matches) / 3.0, 1.0)
-                urgency_component = 1.0 if urgent else 0.0
-
-                weight_sum = (
-                    CFG.SCORE_WEIGHT_INTENT + CFG.SCORE_WEIGHT_ACADEMIC + CFG.SCORE_WEIGHT_GRAMMAR
-                    + CFG.SCORE_WEIGHT_DISTANCE + CFG.SCORE_WEIGHT_URGENCY + CFG.SCORE_WEIGHT_CONTEXT
-                ) or 1.0
-
-                weighted_confidence = (
-                    intent_weight * CFG.SCORE_WEIGHT_INTENT
-                    + academic_weight * CFG.SCORE_WEIGHT_ACADEMIC
-                    + grammar_score * CFG.SCORE_WEIGHT_GRAMMAR
-                    + distance_score * CFG.SCORE_WEIGHT_DISTANCE
-                    + urgency_component * CFG.SCORE_WEIGHT_URGENCY
-                    + context_component * CFG.SCORE_WEIGHT_CONTEXT
-                ) / weight_sum
-                weighted_confidence = max(0.0, min(1.0, weighted_confidence))
-
-            # v14.4: implicit-only requests are scored on the weighted
-            # pipeline alone — the legacy additive score is intent-centric
-            # and systematically under-rates them.
-            if weighted_confidence is not None and not intent_word and is_implicit:
-                result.confidence = weighted_confidence
-            else:
-                result.confidence = (
-                    (legacy_confidence + weighted_confidence) / 2.0
-                    if weighted_confidence is not None else legacy_confidence
-                )
-
-            result.intent_verb = intent_word
-            result.academic_object = academic_word
-            result.urgency_marker = urgency_marker
-            result.negation_detected = is_negated
-            result.advert_score = ad_score
-            result.reasons = []
-            key_phrases: List[str] = []
-            if intent_word:
-                result.reasons.append(f"intent_verb: {intent_word}")
-                key_phrases.append(intent_word)
-            if academic_word:
-                result.reasons.append(f"academic_object: {academic_word}")
-                key_phrases.append(academic_word)
-            if urgency_marker:
-                result.reasons.append(f"urgency: {urgency_marker}")
-            if is_implicit:
-                result.reasons.append("implicit_request")
-            if help_match:
-                result.reasons.append(f"help_expression: {help_match[0]}")
-            if is_negated:
-                result.reasons.extend(neg_reasons)
-            if ad_score > 0.3:
-                result.reasons.extend(ad_reasons)
-            if boost_match:
-                result.reasons.append(f"template_boost: {boost_match[0]}")
-                key_phrases.append(boost_match[0])
-            result.key_phrases = key_phrases
-
-            token_count = len(cleaned.split())
-            length_modifier = self._get_length_modifier(token_count)
-            # v14.4: a specific academic object carries its own context —
-            # relax the short-message discount proportionally.
-            if academic_word:
-                relief = max(0.0, min(1.0, (academic_weight - 0.5) / 0.5))
-                length_modifier = length_modifier + (1.0 - length_modifier) * relief
-            result.confidence *= length_modifier
-
-            if is_negated:
-                result.confidence *= (1 - neg_score * 0.7)
-            result.confidence *= (1 - ad_score * 0.9)
-
-            # v14.4: template boost is gated — ad-like texts get nothing, and
-            # patterns over generic/expert context only give a weak bump.
-            boost = 0.0
-            if boost_match and ad_score <= 0.3:
-                specific = (
-                    self._academic_weights.get(academic_word, 0.0) >= 0.75
-                    if academic_word else False
-                )
-                boost = 0.25 if specific else 0.10
-                result.confidence += boost
-
-            result.confidence = max(0.0, min(1.0, result.confidence))
-
-            result.score_details = {
-                "legacy_score": round(legacy_confidence, 4),
-                "weighted_score": round(weighted_confidence, 4) if weighted_confidence is not None else 0.0,
-                "intent_weight": round(intent_weight, 4),
-                "academic_weight": round(academic_weight, 4),
-                "grammar_score": round(grammar_score, 4),
-                "distance_score": round(distance_score, 4),
-                "length_modifier": round(length_modifier, 4),
-                "boost": round(boost, 3),
-                "negation_score": round(neg_score, 3),
-                "ad_score": round(ad_score, 3),
-            }
-
-            if result.confidence >= CFG.CONFIDENCE_ACCEPT_THRESHOLD:
-                result.decision = "accept"
-            elif result.confidence >= CFG.CONFIDENCE_REVIEW_THRESHOLD:
-                result.decision = "review"
-            else:
-                result.decision = "ignore"
-
-            # ── v14.4 calibration caps ────────────────────────────────────
-            # 1) bare intents ("ابي", "محتاج", "مين يساعد") bottom out at
-            #    review: never silently ignored, never auto-accepted.
-            if (
-                result.decision != "accept"
-                and not academic_word and not help_match
-                and token_count <= 2
-            ):
-                result.confidence = max(result.confidence, _cfg("CONFIDENCE_REVIEW_THRESHOLD", 0.40) + 0.05)
-                result.decision = "review"
-            # 2) expert-only context ("احتاج دكتور") stays review until a
-            #    specific academic object disambiguates it.
-            if (
-                result.decision == "accept"
-                and academic_word in getattr(self, "_expert_words", set())
-                and not (self._academic_weights.get(academic_word, 0.0) >= 0.75)
-            ):
-                result.decision = "review"
-                result.reasons.append("capped: expert_only_context")
-            # 3) resolution + new request in one message → at most review
-            #    (documented engine limitation in keywords.json test_cases).
-            if result.decision == "accept" and any(
-                r.startswith(("resolution_phrase_with_new_request", "post_clause_with_new_request"))
-                for r in result.reasons
-            ):
-                result.decision = "review"
-                result.reasons.append("capped: resolution_with_new_request")
-
-            # ===== الإصلاح الحاسم: مزامنة valid مع القرار النهائي =====
-            result.valid = (result.decision == "accept")
-            # =====================================================
-
-            elapsed_ms = round((time.perf_counter() - start) * 1000, 2)
-            anomaly_report = await self._metrics.record(elapsed_ms)
-            if anomaly_report and anomaly_report.is_anomaly:
-                result.anomaly = True
-                logger.warning(
-                    "analyze_latency_anomaly | value_ms={} mean_ms={} z={} n={}",
-                    anomaly_report.value, round(anomaly_report.mean, 2),
-                    round(anomaly_report.z_score, 2), anomaly_report.sample_size,
-                )
+            if elapsed_ms is not None:
+                result_dict["analysis_time_ms"] = elapsed_ms
 
             async with self._stats_lock:
-                if result.valid:
-                    self._stats["valid"] += 1
-                    self._stats["accepted"] += 1
-                else:
-                    self._stats["rejected"] += 1
-                    if result.decision == "review":
-                        self._stats["review"] += 1
-                    else:
-                        self._stats["ignored"] += 1
+                for k, v in stats_to_inc.items():
+                    self._stats[k] = self._stats.get(k, 0) + v
+                if elapsed_ms is not None:
+                    self._stats["fast_path"] += 1
+                    self._stats["total_time_ms"] += elapsed_ms
+                    self._stats["avg_time_ms"] = self._stats["total_time_ms"] / max(self._stats["processed"], 1)
+                    self._stats["max_time_ms"] = max(self._stats["max_time_ms"], elapsed_ms)
+                    self._stats["min_time_ms"] = min(self._stats["min_time_ms"], elapsed_ms)
 
-                self._stats["fast_path"] += 1
-                self._stats["total_time_ms"] += elapsed_ms
-                self._stats["avg_time_ms"] = self._stats["total_time_ms"] / max(self._stats["processed"], 1)
-                self._stats["max_time_ms"] = max(self._stats["max_time_ms"], elapsed_ms)
-                self._stats["min_time_ms"] = min(self._stats["min_time_ms"], elapsed_ms)
-                if result.anomaly:
-                    self._stats["anomalies_detected"] += 1
-
-            result.analysis_time_ms = elapsed_ms
-
-            result_dict = result.to_dict()
-            result_dict["valid"] = result.valid
-
-            async with self._cache_lock:
-                self._text_cache[cache_key] = result_dict
+            if elapsed_ms is not None:
+                # Only cache the full-analysis result, not early-exit dicts.
+                async with self._cache_lock:
+                    self._text_cache[cache_key] = result_dict
 
             return result_dict
 
         except Exception as e:
             logger.exception("Filter.analyze error")
             return self._result("ignore", 0.0, [f"internal_error: {str(e)[:50]}"], original_text=original_text)
+
+    # ── v9.12 (audit C-03): the CPU-bound core ──────────────────────────
+    # Runs inside run_in_executor — no awaits, no asyncio.Lock acquisition.
+    # Returns a tuple (result_dict, stats_to_inc, elapsed_ms_or_None,
+    # anomaly_value_or_None). When elapsed_ms is None the caller treats
+    # the result as an early-exit and skips anomaly/cache handling.
+    def _analyze_core_sync(
+        self,
+        cleaned: str,
+        original: str,
+        original_text: str,
+        is_arabic: bool,
+        arabic_ratio: float,
+        start: float,
+    ) -> Tuple[Dict[str, Any], Dict[str, int], Optional[float], Optional[float]]:
+        # v14.4: boundary-valid short-circuits — the affirmation "لا"
+        # must not match inside "علاج/الاكسل/الاختبار" and kill real
+        # requests via the ignore/spam tries.
+        if self._search_first_valid(self._spam_trie, cleaned):
+            return (
+                self._result("ignore", 0.0, ["spam_pattern"], original_text=original_text),
+                {"spam": 1},
+                None,
+                None,
+            )
+
+        # v14.4: boundary-valid + STRONG-ONLY early ignore — weak social
+        # signals (greetings/thanks/affirmations) are evaluated later and
+        # never suppress messages that carry a request keyword.
+        if self._search_first_valid(self._ignore_strong_trie, cleaned):
+            return (
+                self._result("ignore", 0.0, ["ignore_pattern"], original_text=original_text),
+                {},
+                None,
+                None,
+            )
+
+        if self._search_first_valid(self._ad_blocker_trie, cleaned):
+            return (
+                self._result("ignore", 0.0, ["ad_blocker"], original_text=original_text),
+                {},
+                None,
+                None,
+            )
+
+        # v14.4: boundary-aware, best-weight matching everywhere.
+        intent_match = self._search_best(
+            self._request_trie,
+            cleaned,
+            lambda t: self._adaptive_intent.get(t, self._intent_weights.get(t, 0.7)),
+        )
+        fuzzy_used = False
+        stats_inc: Dict[str, int] = {}
+        if intent_match is None:
+            fuzzy = self._fuzzy_intent_fallback(cleaned)
+            if fuzzy is not None:
+                intent_match = fuzzy
+                fuzzy_used = True
+                stats_inc["fuzzy_path"] = 1
+
+        indirect_match = self._search_first_valid(self._indirect_trie, cleaned)
+        implicit_match = self._search_first_valid(self._implicit_trie, cleaned)
+
+        intent_word = intent_match[0] if intent_match else None
+        intent_pos = intent_match[2] if intent_match else None
+        intent_weight = (
+            self._adaptive_intent.get(intent_word, 0.7) if intent_word and not fuzzy_used
+            else (intent_match[1] if fuzzy_used and intent_match else 0.0)
+        )
+
+        is_implicit = implicit_match is not None
+
+        # v14.4: implicit availability/problem requests anchor the intent
+        # when no explicit intent verb exists ("مين يساعد", "عندي واجب") —
+        # anchored BEFORE negation/distance so their scope is correct.
+        if is_implicit and not intent_word:
+            intent_weight = 0.7
+            intent_pos = implicit_match[2]
+
+        # ── v14.5 EARLY EXIT («Fail Fast / Early Exit») ─────────────
+        # لا نية صريحة ولا طلب غير مباشر ولا ضمني ⇒ الرسالة بلا كلمة
+        # مفتاحية قطعاً. فحوص urgency/boost/help/context/negation/ads
+        # لا تغيّر قرار هذا المسار إطلاقاً (النتيجة "no_keyword" أو
+        # "ignore_pattern" في كل الأحوال) — تُتخطى كلها فوراً بدلاً
+        # من تنفيذها على رسائل خارج النطاق (أكبر مكسب أداء للمسار
+        # الراكد: معظم رسائل المجموعات ليست طلبات).
+        keyword = intent_word or (
+            indirect_match[0] if indirect_match else None
+        ) or (
+            implicit_match[0] if implicit_match else None
+        )
+        if not keyword:
+            result = FilterResult()
+            result.original_text = original
+            # v14.4: weak ignore signals (greetings/thanks/...) apply only
+            # when the message carries no request keyword at all.
+            if self._search_first_valid(self._ignore_trie, cleaned):
+                result.valid = False
+                result.reason = "ignore_pattern"
+                return (
+                    self._convert_result(result, is_arabic, arabic_ratio, 0.0, start),
+                    stats_inc,
+                    None,
+                    None,
+                )
+            result.valid = False
+            result.reason = "no_keyword"
+            return (
+                self._convert_result(result, is_arabic, arabic_ratio, 0.0, start),
+                stats_inc,
+                None,
+                None,
+            )
+        # ── كلمة مفتاحية موجودة — المتابعة بالمسار الكامل كما هو ──
+        urgency_match = self._search_first_valid(self._urgency_trie, cleaned)
+        boost_match = self._search_first_valid(self._boost_trie, cleaned)
+        help_match = self._search_first_valid(self._help_trie, cleaned)
+
+        urgency_marker = urgency_match[0] if urgency_match else None
+        urgent = urgency_match is not None
+
+        # v14.4: strongest academic object (tier weight, then proximity
+        # to the intent anchor) instead of "first positional match".
+        academic_match, context_matches = self._search_best_context(cleaned, intent_pos)
+        academic_word = academic_match[0] if academic_match else None
+        academic_pos = academic_match[2] if academic_match else None
+        academic_weight = self._adaptive_academic.get(academic_word, 0.7) if academic_word else 0.0
+
+        is_negated, neg_score, neg_reasons = self._detect_negation(cleaned, intent_pos)
+        if is_negated and neg_score > 0.7:
+            return (
+                self._result(
+                    "ignore",
+                    1.0 - neg_score,
+                    neg_reasons,
+                    original_text=original_text,
+                ),
+                stats_inc,
+                None,
+                None,
+            )
+
+        ad_score, ad_reasons = self._detect_advertisement(cleaned)
+        if ad_score > 0.6:
+            return (
+                self._result("ignore", 1.0 - ad_score, ad_reasons, original_text=original_text),
+                stats_inc,
+                None,
+                None,
+            )
+
+        result = FilterResult()
+        result.original_text = original
+
+        if self._is_blocked(cleaned, result, ad_score):
+            return (
+                self._convert_result(result, is_arabic, arabic_ratio, ad_score, start),
+                stats_inc,
+                None,
+                None,
+            )
+
+        score = CFG.SCORE_DIRECT_MATCH if intent_word else 0
+        context_boost = min(len(context_matches) * 5, CFG.SCORE_CONTEXT_MAX)
+        score += context_boost
+
+        if urgent:
+            score += CFG.SCORE_URGENCY
+
+        if (indirect_match or is_implicit) and not intent_word:
+            score += CFG.SCORE_INDIRECT
+            result.indirect = True
+
+        result.valid = score >= CFG.SCORE_MIN_VALID
+        result.keyword = keyword
+        result.score = score
+        result.context_boost = context_boost
+        result.urgent = urgent
+        result.fuzzy_matched = fuzzy_used
+        result.reason = (
+            "keyword_found" if intent_word
+            else ("indirect_request" if indirect_match
+                  else ("implicit_request" if is_implicit else "no_keyword"))
+        )
+        result.context_type = (
+            "academic_request" if context_matches
+            else ("urgent_request" if urgent else "direct_request")
+        )
+        result.context_confidence = 0.90 if context_matches else (0.85 if urgent else 0.75)
+
+        legacy_confidence = score / 100.0
+
+        weighted_confidence: Optional[float] = None
+        distance_score = 0.0
+        grammar_score = 0.0
+        if CFG.DISTANCE_SCORING_ENABLED:
+            grammar_match = (
+                self._search_first_valid(self._subject_markers_trie, cleaned)
+                or self._search_first_valid(self._action_verbs_trie, cleaned)
+                or help_match
+            )
+            grammar_score = 1.0 if grammar_match else 0.0
+
+            if intent_pos is not None and academic_pos is not None:
+                distance_score = self._calculate_distance_score(intent_pos, academic_pos, len(cleaned))
+            elif intent_word:
+                distance_score = 0.5
+
+            context_component = min(len(context_matches) / 3.0, 1.0)
+            urgency_component = 1.0 if urgent else 0.0
+
+            weight_sum = (
+                CFG.SCORE_WEIGHT_INTENT + CFG.SCORE_WEIGHT_ACADEMIC + CFG.SCORE_WEIGHT_GRAMMAR
+                + CFG.SCORE_WEIGHT_DISTANCE + CFG.SCORE_WEIGHT_URGENCY + CFG.SCORE_WEIGHT_CONTEXT
+            ) or 1.0
+
+            weighted_confidence = (
+                intent_weight * CFG.SCORE_WEIGHT_INTENT
+                + academic_weight * CFG.SCORE_WEIGHT_ACADEMIC
+                + grammar_score * CFG.SCORE_WEIGHT_GRAMMAR
+                + distance_score * CFG.SCORE_WEIGHT_DISTANCE
+                + urgency_component * CFG.SCORE_WEIGHT_URGENCY
+                + context_component * CFG.SCORE_WEIGHT_CONTEXT
+            ) / weight_sum
+            weighted_confidence = max(0.0, min(1.0, weighted_confidence))
+
+        # v14.4: implicit-only requests are scored on the weighted
+        # pipeline alone — the legacy additive score is intent-centric
+        # and systematically under-rates them.
+        if weighted_confidence is not None and not intent_word and is_implicit:
+            result.confidence = weighted_confidence
+        else:
+            result.confidence = (
+                (legacy_confidence + weighted_confidence) / 2.0
+                if weighted_confidence is not None else legacy_confidence
+            )
+
+        result.intent_verb = intent_word
+        result.academic_object = academic_word
+        result.urgency_marker = urgency_marker
+        result.negation_detected = is_negated
+        result.advert_score = ad_score
+        result.reasons = []
+        key_phrases: List[str] = []
+        if intent_word:
+            result.reasons.append(f"intent_verb: {intent_word}")
+            key_phrases.append(intent_word)
+        if academic_word:
+            result.reasons.append(f"academic_object: {academic_word}")
+            key_phrases.append(academic_word)
+        if urgency_marker:
+            result.reasons.append(f"urgency: {urgency_marker}")
+        if is_implicit:
+            result.reasons.append("implicit_request")
+        if help_match:
+            result.reasons.append(f"help_expression: {help_match[0]}")
+        if is_negated:
+            result.reasons.extend(neg_reasons)
+        if ad_score > 0.3:
+            result.reasons.extend(ad_reasons)
+        if boost_match:
+            result.reasons.append(f"template_boost: {boost_match[0]}")
+            key_phrases.append(boost_match[0])
+        result.key_phrases = key_phrases
+
+        token_count = len(cleaned.split())
+        length_modifier = self._get_length_modifier(token_count)
+        # v14.4: a specific academic object carries its own context —
+        # relax the short-message discount proportionally.
+        if academic_word:
+            relief = max(0.0, min(1.0, (academic_weight - 0.5) / 0.5))
+            length_modifier = length_modifier + (1.0 - length_modifier) * relief
+        result.confidence *= length_modifier
+
+        if is_negated:
+            result.confidence *= (1 - neg_score * 0.7)
+        result.confidence *= (1 - ad_score * 0.9)
+
+        # v14.4: template boost is gated — ad-like texts get nothing, and
+        # patterns over generic/expert context only give a weak bump.
+        boost = 0.0
+        if boost_match and ad_score <= 0.3:
+            specific = (
+                self._academic_weights.get(academic_word, 0.0) >= 0.75
+                if academic_word else False
+            )
+            boost = 0.25 if specific else 0.10
+            result.confidence += boost
+
+        result.confidence = max(0.0, min(1.0, result.confidence))
+
+        result.score_details = {
+            "legacy_score": round(legacy_confidence, 4),
+            "weighted_score": round(weighted_confidence, 4) if weighted_confidence is not None else 0.0,
+            "intent_weight": round(intent_weight, 4),
+            "academic_weight": round(academic_weight, 4),
+            "grammar_score": round(grammar_score, 4),
+            "distance_score": round(distance_score, 4),
+            "length_modifier": round(length_modifier, 4),
+            "boost": round(boost, 3),
+            "negation_score": round(neg_score, 3),
+            "ad_score": round(ad_score, 3),
+        }
+
+        if result.confidence >= CFG.CONFIDENCE_ACCEPT_THRESHOLD:
+            result.decision = "accept"
+        elif result.confidence >= CFG.CONFIDENCE_REVIEW_THRESHOLD:
+            result.decision = "review"
+        else:
+            result.decision = "ignore"
+
+        # ── v14.4 calibration caps ────────────────────────────────────
+        # 1) bare intents ("ابي", "محتاج", "مين يساعد") bottom out at
+        #    review: never silently ignored, never auto-accepted.
+        if (
+            result.decision != "accept"
+            and not academic_word and not help_match
+            and token_count <= 2
+        ):
+            result.confidence = max(result.confidence, _cfg("CONFIDENCE_REVIEW_THRESHOLD", 0.40) + 0.05)
+            result.decision = "review"
+        # 2) expert-only context ("احتاج دكتور") stays review until a
+        #    specific academic object disambiguates it.
+        if (
+            result.decision == "accept"
+            and academic_word in getattr(self, "_expert_words", set())
+            and not (self._academic_weights.get(academic_word, 0.0) >= 0.75)
+        ):
+            result.decision = "review"
+            result.reasons.append("capped: expert_only_context")
+        # 3) resolution + new request in one message → at most review
+        #    (documented engine limitation in keywords.json test_cases).
+        if result.decision == "accept" and any(
+            r.startswith(("resolution_phrase_with_new_request", "post_clause_with_new_request"))
+            for r in result.reasons
+        ):
+            result.decision = "review"
+            result.reasons.append("capped: resolution_with_new_request")
+
+        # ===== الإصلاح الحاسم: مزامنة valid مع القرار النهائي =====
+        result.valid = (result.decision == "accept")
+        # =====================================================
+
+        elapsed_ms = round((time.perf_counter() - start) * 1000, 2)
+        result.analysis_time_ms = elapsed_ms
+
+        # Apply post-result stats counters that the async caller will merge.
+        if result.valid:
+            stats_inc["valid"] = stats_inc.get("valid", 0) + 1
+            stats_inc["accepted"] = stats_inc.get("accepted", 0) + 1
+        else:
+            stats_inc["rejected"] = stats_inc.get("rejected", 0) + 1
+            if result.decision == "review":
+                stats_inc["review"] = stats_inc.get("review", 0) + 1
+            else:
+                stats_inc["ignored"] = stats_inc.get("ignored", 0) + 1
+
+        result_dict = result.to_dict()
+        result_dict["valid"] = result.valid
+        return result_dict, stats_inc, elapsed_ms, elapsed_ms
 
     async def record_feedback(self, term: str, term_kind: str, was_correct: bool) -> float:
         if term_kind == "intent":
@@ -2004,6 +2110,11 @@ class EnhancedFilter:
 
     def shutdown(self) -> None:
         self._regex_guard.shutdown()
+        # v9.12 (audit C-03): release the filter CPU executor too.
+        try:
+            self._filter_executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:  # noqa: BLE001 — shutdown is best-effort
+            pass
 
 
 class ModerationService:

@@ -7,6 +7,8 @@ accounts.env
 *.session
 *.session-journal
 sessions/
+# v9.12 (audit L-05): quarantined session files (renamed on AuthKeyDuplicated)
+*.session.duplicated-*
 
 # ========== Databases ==========
 *.db

@@ -12,11 +12,12 @@ webadmin/auth.py – Production-grade session authentication for the admin SPA.
 from __future__ import annotations
 
 import hmac
+import ipaddress
 import os
 import secrets
 import threading
 import time
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import HTTPException, Request, Response
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
@@ -57,6 +58,49 @@ def _credentials() -> Tuple[Optional[str], Optional[str]]:
     return user, password
 
 
+# v9.12 (audit M-12): trusted-proxy parsing for the login-guard ban key.
+# TRUSTED_PROXIES is a comma-separated list of CIDRs (e.g.
+# "10.0.0.0/8,173.245.48.0/20"). When set, X-Forwarded-For entries
+# inside these CIDRs are treated as trusted hops; the rightmost
+# non-trusted entry is the real client IP used for ban-keying. When
+# unset, the guard uses only the direct connection IP (safest).
+_TRUSTED_PROXIES_CACHE: Tuple[float, List[ipaddress._BaseNetwork]] = (0.0, [])
+_TRUSTED_PROXIES_TTL = 60.0  # seconds
+
+
+def _trusted_proxies() -> List[ipaddress._BaseNetwork]:
+    """Return the parsed list of trusted-proxy CIDRs (cached for 60s)."""
+    global _TRUSTED_PROXIES_CACHE
+    now = time.time()
+    cached_ts, cached = _TRUSTED_PROXIES_CACHE
+    if (now - cached_ts) < _TRUSTED_PROXIES_TTL and cached_ts > 0:
+        return cached
+    raw = os.getenv("TRUSTED_PROXIES", "").strip()
+    nets: List[ipaddress._BaseNetwork] = []
+    if raw:
+        for piece in raw.split(","):
+            piece = piece.strip()
+            if not piece:
+                continue
+            try:
+                nets.append(ipaddress.ip_network(piece, strict=False))
+            except ValueError:
+                logger.warning(f"TRUSTED_PROXIES: invalid CIDR skipped: {piece!r}")
+    _TRUSTED_PROXIES_CACHE = (now, nets)
+    return nets
+
+
+def _ip_in_any_cidr(ip: str, cidrs: List[ipaddress._BaseNetwork]) -> bool:
+    """True if `ip` is contained in any of the provided CIDRs."""
+    if not ip or not cidrs:
+        return False
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return any(addr in net for net in cidrs)
+
+
 def auth_is_configured() -> bool:
     user, password = _credentials()
     return bool(user and password)
@@ -71,9 +115,34 @@ class _LoginGuard:
         self._lock = threading.Lock()
 
     def _key(self, request: Request) -> str:
+        # v9.12 (audit M-12): the ban key no longer trusts the FIRST
+        # X-Forwarded-For entry, which is attacker-controlled when the
+        # service sits behind a proxy that doesn't overwrite the header.
+        # An attacker could rotate the first XFF value on every request
+        # and never hit the lockout threshold. We now prefer a list of
+        # trusted-proxy-resolved IPs configured via TRUSTED_PROXIES env
+        # (comma-separated CIDRs); if the request's direct client IP is
+        # inside a trusted CIDR, we walk the XFF chain from RIGHT to LEFT
+        # and pick the first IP that is NOT in a trusted CIDR (the
+        # "real" client). If no trusted proxies are configured, we fall
+        # back to the direct client IP (request.client.host) which is
+        # always set by the actual TCP connection and not forgeable.
+        direct = request.client.host if request.client else "?"
         fwd = request.headers.get("x-forwarded-for", "")
-        ip = fwd.split(",")[0].strip() if fwd else (request.client.host if request.client else "?")
-        return ip
+        trusted_proxies = _trusted_proxies()
+        if not trusted_proxies:
+            # No trusted proxies configured — use the direct connection
+            # IP only (safest: cannot be forged by the client).
+            return direct
+        # Walk the XFF chain right-to-left, skipping trusted-proxy IPs.
+        if fwd:
+            parts = [p.strip() for p in fwd.split(",") if p.strip()]
+            for ip in reversed(parts):
+                if not _ip_in_any_cidr(ip, trusted_proxies):
+                    return ip
+        # All XFF entries were trusted proxies (or XFF empty) — fall back
+        # to the direct connection IP.
+        return direct
 
     def check_allowed(self, request: Request) -> None:
         key = self._key(request)

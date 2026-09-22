@@ -57,7 +57,7 @@ try:
 except Exception:  # pragma: no cover — rapidfuzz is a hard dep, fallback anyway
     _FUZZ_AVAILABLE = False
 
-from cachetools import TTLCache
+from cachetools import LRUCache, TTLCache
 
 from config import CFG
 from dedup import normalize_for_fingerprint
@@ -142,7 +142,27 @@ class AntiSpamEngine:
         # sender_id → _Activity (TTL 30 دقيقة بلا نشاط، سقف ANTISPAM_MAX_TRACKED_USERS)
         self._activities: TTLCache = TTLCache(maxsize=CFG.ANTISPAM_MAX_TRACKED_USERS, ttl=1800)
         self._watch: Dict[int, _WatchEntry] = {}
-        self._ignored: Set[int] = set()
+        # v9.12 (audit H-07): the permanent-ignore list is now a bounded
+        # LRU cache instead of an unbounded Set. Old behaviour loaded up
+        # to 100k rows at startup and grew forever — at ~80 bytes per int
+        # entry in a Python set that's ~8MB just for the set, plus the
+        # load cost. The new LRU keeps the most-recently-checked 50k
+        # senders in memory (default; env ANTISPAM_IGNORE_LRU_SIZE); on a
+        # cache miss we fall back to a DB lookup (spam_ignore table). The
+        # DB is the source of truth and survives restarts; the LRU is just
+        # a hot-path accelerator. `is_ignored` is called for every message
+        # so the cache must be fast and bounded.
+        _ignore_lru_size = max(
+            1000,
+            int(__import__("os").getenv("ANTISPAM_IGNORE_LRU_SIZE", "50000")),
+        )
+        self._ignored: LRUCache = LRUCache(maxsize=_ignore_lru_size)
+        # Track senders we KNOW are not in the DB (negative cache, short
+        # TTL) so we don't re-query the DB for the same unignored sender
+        # on every message.
+        self._ignored_negative_cache: TTLCache = TTLCache(
+            maxsize=_ignore_lru_size, ttl=300,
+        )
         self._sweeps: int = 0
         # عدادات للوحة/الصحة
         self.stats: Dict[str, int] = {
@@ -151,24 +171,34 @@ class AntiSpamEngine:
             "spam_confirmed": 0,
             "direct_spam": 0,
             "ignored_skipped": 0,
+            "ignored_db_misses": 0,
             "errors": 0,
         }
 
     # ── التهيئة ─────────────────────────────────────────────────────────────
     async def setup(self, db: Any) -> None:
-        """اربط قاعدة البيانات وحمّل قائمة التجاهل الدائم (تنجو من إعادة التشغيل)."""
+        """اربط قاعدة البيانات وحمّل قائمة التجاهل الدائم (تنجو من إعادة التشغيل).
+
+        v9.12 (audit H-07): we no longer load up to 100k rows eagerly. The
+        LRU is primed with the most recent N rows (N = LRU size) ordered
+        by id DESC, so the hot senders are in memory from the start. The
+        rest are fetched on demand via is_ignored()'s DB fallback.
+        """
         self._db = db
         try:
-            rows = await db.get_spam_ignored(limit=100000) if db else []
-            if rows:
-                for r in rows:
-                    try:
-                        self._ignored.add(int(r.get("sender_id") or r["sender_id"]))
-                    except Exception:
-                        continue
+            if db:
+                # Prime the LRU with the most-recently-added ignored senders.
+                rows = await db.get_spam_ignored(limit=50000)
+                if rows:
+                    for r in rows:
+                        try:
+                            self._ignored[int(r.get("sender_id") or r["sender_id"])] = True
+                        except Exception:
+                            continue
             logger.info(
                 f"AntiSpam engine ready: {len(self._ignored)} permanently-ignored "
-                f"sender(s) loaded from DB | enabled={CFG.ANTISPAM_ENABLED}"
+                f"sender(s) loaded into LRU | enabled={CFG.ANTISPAM_ENABLED} | "
+                f"lru_size={self._ignored.maxsize}"
             )
         except Exception as e:
             # جدول spam_ignore قد لا يكون موجوداً بعد (أول تشغيل قبل إنشائه)
@@ -176,15 +206,78 @@ class AntiSpamEngine:
 
     # ── التجاهل الدائم (فحص متزامن سريع — يُستدعى لكل رسالة واردة) ─────────
     def is_ignored(self, sender_id: Any) -> bool:
+        """Fast hot-path ignore check (called for every incoming message).
+
+        v9.12 (audit H-07): bounded LRU cache + DB fallback on miss.
+        Returns True if the sender is in the LRU; otherwise checks a
+        short-TTL negative cache (senders we recently confirmed are NOT
+        in the DB) and returns False without a DB round-trip. Only on a
+        real cold miss do we need an async DB lookup — but is_ignored is
+        sync, so the caller (_validate_event) does the async DB check
+        when needed via is_ignored_async().
+        """
         try:
-            return int(sender_id or 0) in self._ignored
+            sid = int(sender_id or 0)
+            if not sid:
+                return False
+            if sid in self._ignored:
+                return True
+            # Negative cache: we recently confirmed this sender is NOT
+            # in the DB. Avoids re-querying for the same unignored sender.
+            if sid in self._ignored_negative_cache:
+                return False
+            # Cold miss — caller must do the async DB check.
+            return False
+        except Exception:
+            return False
+
+    async def is_ignored_async(self, sender_id: Any) -> bool:
+        """Async variant that does the DB fallback on a cold miss.
+
+        v9.12 (audit H-07): the sync is_ignored() is the fast hot path
+        that only checks the LRU + negative cache. This async variant is
+        called by the worker when is_ignored() returns False AND the
+        sender is not in the negative cache — it queries the DB, then
+        populates either the LRU (if ignored) or the negative cache (if
+        not), so subsequent messages from the same sender are O(1).
+        """
+        try:
+            sid = int(sender_id or 0)
+            if not sid:
+                return False
+            if sid in self._ignored:
+                return True
+            if sid in self._ignored_negative_cache:
+                return False
+            # DB fallback.
+            if self._db is None:
+                return False
+            try:
+                row = await self._db.get_spam_ignored_entry(sid)
+            except AttributeError:
+                # Older DB layer without the new single-row method — fall
+                # back to the list method with limit=1.
+                rows = await self._db.get_spam_ignored(limit=1)
+                row = rows[0] if rows else None
+            except Exception as e:
+                logger.debug(f"AntiSpam is_ignored_async DB lookup error: {e}")
+                row = None
+            if row:
+                self._ignored[sid] = True
+                return True
+            self._ignored_negative_cache[sid] = True
+            self.stats["ignored_db_misses"] += 1
+            return False
         except Exception:
             return False
 
     async def confirm_spam(self, sender_id: Any, reasons: List[str], evidence: Optional[Dict] = None) -> None:
         """نفّذ الإجراء النهائي: تصنيف + تجاهل دائم + تسجيل السبب بالتفصيل."""
         sid = int(sender_id or 0)
-        self._ignored.add(sid)
+        self._ignored[sid] = True
+        # Remove from the negative cache in case we previously cached a
+        # "not ignored" decision for this sender.
+        self._ignored_negative_cache.pop(sid, None)
         self._watch.pop(sid, None)
         self._activities.pop(sid, None)
         reason_text = "؛ ".join(reasons) if reasons else "cross_group_spam"
@@ -209,7 +302,8 @@ class AntiSpamEngine:
     async def unignore(self, sender_id: Any) -> bool:
         """إزالة من قائمة التجاهل الدائم (أمر المشرف /unspam)."""
         sid = int(sender_id or 0)
-        self._ignored.discard(sid)
+        self._ignored.pop(sid, None)
+        self._ignored_negative_cache.pop(sid, None)
         if self._db is not None:
             try:
                 await self._db.remove_spam_ignore(sid)
@@ -434,8 +528,33 @@ class AntiSpamEngine:
                 reasons.append(f"طلب معاد الصياغة أثناء المراقبة (تشابه {round(sim * 100)}%)")
 
         # (ب) رسالة إضافية أو أكثر خلال 5 دقائق
+        # v9.12 (audit M-13): condition (ب) now ALSO requires a spam
+        # indicator on the new message — same/ similar content as a
+        # previous one, OR a request category. The old logic fired on
+        # ANY 2 messages within 5 minutes during watch, which meant a
+        # user under watch who said "شكراً" then "تمام" was permanently
+        # classified as Cross-Group Spam. We now require the additional
+        # message to look like spam (similar to a prior one or carrying
+        # a request category), not just be any second message.
         if len(recent_5m) >= 2:
-            reasons.append(f"{len(recent_5m)} رسائل خلال {CFG.ANTISPAM_CONFIRM_WINDOW_SECONDS // 60} دقائق أثناء المراقبة")
+            # Look at the most recent prior record (the new one is
+            # already appended to act.records). For the message to count
+            # as a spam indicator, it must share content with a prior
+            # record OR carry a request category.
+            spam_indicator = False
+            if cats:
+                # New message carries a request category → spam indicator.
+                spam_indicator = True
+            elif norm:
+                # New message is similar to any prior record in the window.
+                for r in recent_5m[:-1]:
+                    if r[2] and (r[2] == norm or self._ratio(norm, r[2]) >= CFG.ANTISPAM_SIMILARITY_THRESHOLD):
+                        spam_indicator = True
+                        break
+            if spam_indicator:
+                reasons.append(
+                    f"{len(recent_5m)} رسائل خلال {CFG.ANTISPAM_CONFIRM_WINDOW_SECONDS // 60} دقائق أثناء المراقبة (مع مؤشر سبام)"
+                )
 
         # (ج) الانتقال إلى مجموعات أخرى بنفس الغرض (مجموعة جديدة + تشابه/فئة)
         prior_chats = {r[1] for r in act.records if r[0] < now and now - r[0] <= CFG.ANTISPAM_SIMILARITY_WINDOW_SECONDS}
