@@ -61,6 +61,12 @@ tailwind.config = {
 
   .tbl tbody tr { transition: background .12s; }
   .tbl tbody tr:hover td { background: rgba(14,165,233,.05); }
+  .tbl tbody tr:nth-child(even) td { background: rgba(148,163,184,.04); }
+  .tbl tbody tr:nth-child(even):hover td { background: rgba(14,165,233,.07); }
+
+  /* v9.16: skeleton shimmer for table loading */
+  .skel-cell { height: 12px; border-radius: 6px; background: linear-gradient(90deg, rgba(148,163,184,.15) 25%, rgba(148,163,184,.30) 50%, rgba(148,163,184,.15) 75%); background-size: 200% 100%; animation: skelShimmer 1.3s ease-in-out infinite; }
+  @keyframes skelShimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
 
   button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible { outline: 2px solid #0ea5e9; outline-offset: 2px; }
 
@@ -630,7 +636,7 @@ function renderAlerts(){
   </div>
   <div class="card overflow-x-auto"><table class="tbl min-w-[1000px]"><thead><tr>
     <th>الوقت</th><th>المرسل</th><th>الحساب</th><th>الكلمة المطابقة</th><th>القرار</th><th>الثقة</th><th>معاينة الرسالة</th><th>روابط</th>
-  </tr></thead><tbody id="alerts-body"><tr><td colspan="8" class="text-center muted2 py-8">جارِ التحميل…</td></tr></tbody></table></div>
+  </tr></thead><tbody id="alerts-body"><tr><td colspan="8" class="py-8"><div class="space-y-2.5"><div class="skel-cell w-2/3"></div><div class="skel-cell w-1/2"></div><div class="skel-cell w-3/4"></div><div class="skel-cell w-2/5"></div></div></td></tr></tbody></table></div>
   <div class="flex items-center justify-between mt-3 text-xs muted2"><span id="alerts-count"></span>
     <span class="flex items-center gap-3"><span id="al-updated"></span>
     <button id="al-more" class="px-3 py-1.5 rounded-lg" style="border:1px solid var(--border)">عرض المزيد +100</button></span></div>`;
@@ -700,6 +706,8 @@ async function loadAlerts(){
     const d=await api('/alerts?'+alertsQuery());
     const tb=document.getElementById('alerts-body');
     if(!tb)return;
+    const _skelRow='<tr><td colspan="8" class="py-4"><div class="space-y-2.5"><div class="skel-cell w-2/3"></div><div class="skel-cell w-1/2"></div><div class="skel-cell w-3/4"></div><div class="skel-cell w-2/5"></div></div></td></tr>';
+    tb.innerHTML=_skelRow;
     if(!d.alerts.length){tb.innerHTML='<tr><td colspan="8" class="text-center muted2 py-8">لا توجد نتائج</td></tr>';}
     else tb.innerHTML=d.alerts.map(a=>{
       const dec=a.decision==='accept'?['مقبول','ok']:a.decision==='review'?['مراجعة','warn']:a.decision==='reject'?['مرفوض','bad']:[a.decision||'—','info'];

@@ -592,6 +592,68 @@ body { font-family: var(--sans); background: var(--bg); color: var(--text); font
 }
 .search-input:focus { outline: none; border-color: var(--accent); }
 
+/* ── v9.16 ───────────────────────────────────────────────────── */
+/* skeleton shimmer loaders — تُظهر أثناء تحميل القوائم بدل النص الثابت */
+.skel {
+  display: flex; flex-direction: column; gap: 7px;
+  padding: 12px 16px; border-bottom: 1px solid var(--border);
+}
+.skel:last-child { border-bottom: none; }
+.skel .ln {
+  height: 10px; border-radius: 5px;
+  background: linear-gradient(90deg, var(--bg3) 25%, var(--bg2) 50%, var(--bg3) 75%);
+  background-size: 200% 100%;
+  animation: skelShimmer 1.3s ease-in-out infinite;
+}
+.skel .ln.w60 { width: 60%; } .skel .ln.w40 { width: 40%; } .skel .ln.w85 { width: 85%; }
+@keyframes skelShimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
+
+/* richer empty states */
+.empty2 {
+  text-align: center; padding: 30px 16px; color: var(--text3);
+  display: flex; flex-direction: column; align-items: center; gap: 8px;
+}
+.empty2 .ico {
+  font-size: 30px; opacity: 0.5; line-height: 1;
+  filter: grayscale(0.3);
+}
+.empty2 .t1 { font-size: 12.5px; color: var(--text2); font-weight: 600; }
+.empty2 .t2 { font-size: 11px; color: var(--text3); }
+
+/* KPI hover micro-interaction */
+.kpi { transition: transform .15s ease, box-shadow .15s ease; }
+.kpi:hover { transform: translateY(-2px); box-shadow: 0 6px 18px rgba(0,0,0,.25); }
+.kpi .kpi-icon { transition: transform .2s ease, opacity .2s ease; }
+.kpi:hover .kpi-icon { transform: scale(1.25); opacity: 0.14; }
+
+/* blocked rows — source/time chips (v9.16) */
+.blk-chip {
+  font-size: 10px; padding: 2px 8px; border-radius: 10px;
+  background: var(--bg3); color: var(--text3); white-space: nowrap;
+  display: inline-flex; align-items: center; gap: 4px;
+}
+.blk-chip.src { background: var(--bg2); color: var(--text2); border: 1px solid var(--border2); }
+.blk-chip.reason { color: var(--yellow); background: var(--yellow2); max-width: 260px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: inline-block; }
+
+/* system info card (settings) */
+.sysinfo-grid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 10px; padding: 14px 16px;
+}
+.sysinfo-cell {
+  background: var(--bg2); border: 1px solid var(--border);
+  border-radius: var(--r); padding: 10px 12px;
+  display: flex; flex-direction: column; gap: 4px;
+}
+.sysinfo-cell .k { font-size: 10px; color: var(--text3); }
+.sysinfo-cell .v { font-size: 13px; font-family: var(--mono); color: var(--text); }
+
+/* broader keyboard focus visibility */
+.kw-input:focus-visible, .al-btn:focus-visible, .empty2:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: 2px;
+}
+
 ::-webkit-scrollbar { width: 4px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--bg3); border-radius: 2px; }
@@ -627,7 +689,7 @@ body { font-family: var(--sans); background: var(--bg); color: var(--text); font
     <div class="brand-icon">🤖</div>
     <div>
       <div class="brand-name">BotPanel</div>
-      <div class="brand-ver" id="brandVer">BR7 · v9.15</div>
+      <div class="brand-ver" id="brandVer">BR7 · v9.16</div>
     </div>
   </div>
 
@@ -701,7 +763,7 @@ body { font-family: var(--sans); background: var(--bg); color: var(--text); font
 
   <!-- v9.15: in-tab new-alert banner — lives outside #mainContent so it survives tab switches -->
   <div id="newAlertBanner" class="hidden" onclick="bannerOpenAlert()">
-    <span class="nb-title">🚨 تنبيه جديد</span>
+    <span class="nb-title" id="nbTitle">🚨 تنبيه جديد</span>
     <span class="nb-text" id="nbText">—</span>
     <button class="nb-close" title="إخفاء" onclick="event.stopPropagation();hideNewAlertBanner()">✕</button>
   </div>
@@ -790,6 +852,23 @@ function fmtRel(v) {
     if (diff < 86400) return `قبل ${Math.round(diff / 3600)} س`;
     if (diff < 7 * 86400) return `قبل ${Math.round(diff / 86400)} يوم`;
     return fmtTime(v);
+}
+
+// v9.16: skeleton shimmer rows — تُظهر أثناء تحميل القوائم بدل النص الثابت
+function skeletonRows(n) {
+    return Array.from({ length: n || 4 }, () => `
+        <div class="skel" aria-hidden="true">
+            <div class="ln w85"></div><div class="ln w60"></div><div class="ln w40"></div>
+        </div>`).join('');
+}
+
+// v9.16: حالة فراغ أغنى (أيقونة + عنوان + وصف)
+function emptyBox(icon, title, sub) {
+    return `<div class="empty2">
+        <div class="ico">${icon}</div>
+        <div class="t1">${title}</div>
+        ${sub ? `<div class="t2">${sub}</div>` : ''}
+    </div>`;
 }
 
 function logEvent(lvl, msg) {
@@ -914,6 +993,7 @@ setInterval(() => {
 // APPLY WS STATS → KPIs + sidebar badges + live page data
 // ================================================================
 function applyStats(d) {
+    window.__LAST_STATS__ = d;   // v9.16: cached for pages that need grand totals
     // Sidebar badges
     const ab = document.getElementById('navAlertsBadge');
     if (ab) ab.textContent = d.alerts_last_hour || 0;
@@ -1265,6 +1345,7 @@ const PAGES = {
                 <div class="kw-controls">
                     <div class="search-row" style="flex:1">
                         <input type="text" id="msg-search" class="search-input" placeholder="🔍 بحث في الرسائل...">
+                        <button class="tb-btn ${MSG_EXACT ? 'notify-on' : ''}" id="msgExactBtn" onclick="toggleMsgExact()" title="مطابقة الكلمة كاملة بدل جزء منها (يدعم العربية واللاتينية)">🔤 كلمة كاملة</button>
                         <button class="tb-btn" onclick="loadMessages()">بحث</button>
                         <button class="tb-btn" onclick="document.getElementById('msg-search').value='';loadMessages()">مسح</button>
                     </div>
@@ -1304,26 +1385,36 @@ const PAGES = {
                 <div class="panel">
                     <div class="panel-head">
                         <div class="panel-title"><span class="ico">👤</span> المستخدمون المحظورون</div>
-                        <div class="panel-actions"><span class="pill red" id="blockedSendersCount">0</span></div>
+                        <div class="panel-actions"><span class="pill red" id="blockedSendersCount" title="الإجمالي الفعلي من الإحصاءات الحية">0</span></div>
                     </div>
                     <div class="alert-feed" id="blocked-senders-list"><div class="empty">جاري التحميل...</div></div>
                     <div class="kw-controls" style="border-bottom:none;border-top:1px solid var(--border)">
                         <input type="number" id="block-user-id" class="kw-input" placeholder="معرف المستخدم" style="direction:ltr">
-                        <input type="text" id="block-user-reason" class="kw-input" placeholder="السبب">
+                        <input type="text" id="block-user-reason" class="kw-input" placeholder="السبب (اختياري)">
                         <button class="tb-btn danger" onclick="blockSender()">حظر</button>
                     </div>
                 </div>
                 <div class="panel">
                     <div class="panel-head">
                         <div class="panel-title"><span class="ico">👥</span> المجموعات المحظورة</div>
-                        <div class="panel-actions"><span class="pill red" id="blockedChatsCount">0</span></div>
+                        <div class="panel-actions"><span class="pill red" id="blockedChatsCount" title="الإجمالي الفعلي من الإحصاءات الحية">0</span></div>
                     </div>
                     <div class="alert-feed" id="blocked-chats-list"><div class="empty">جاري التحميل...</div></div>
                     <div class="kw-controls" style="border-bottom:none;border-top:1px solid var(--border)">
                         <input type="number" id="block-chat-id" class="kw-input" placeholder="معرف المجموعة" style="direction:ltr">
-                        <input type="text" id="block-chat-reason" class="kw-input" placeholder="السبب">
+                        <input type="text" id="block-chat-reason" class="kw-input" placeholder="السبب (اختياري)">
                         <button class="tb-btn danger" onclick="blockChat()">حظر</button>
                     </div>
+                </div>
+            </div>
+            <div class="panel" style="margin-top:12px;max-width:860px">
+                <div class="panel-head">
+                    <div class="panel-title"><span class="ico">📖</span> كيف يعمل الحظر؟</div>
+                </div>
+                <div style="padding:12px 16px;font-size:12px;color:var(--text2);line-height:1.9">
+                    الرسائل الواردة من <b>مستخدم محظور</b> أو من <b>مجموعة محظورة</b> تُتجاهل فوراً قبل الفلترة —
+                    لا تُحفظ ولا تُرسل تنبيهات منها. يمكن حظر المُرسل مباشرة من مودال أي تنبيه أيضاً،
+                    ويُسجّل مصدر الحظر (لوحة التحكم / من التنبيه / النظام) ووقته في القوائم أعلاه.
                 </div>
             </div>`;
         },
@@ -1334,6 +1425,16 @@ const PAGES = {
         render() {
             return `
             <div class="panel" style="max-width:860px">
+                <div class="panel-head">
+                    <div class="panel-title"><span class="ico">🖥️</span> معلومات النظام</div>
+                    <div class="panel-actions"><button class="tb-btn" onclick="renderSysInfo(true)" title="تحديث من الخادم">⟳</button></div>
+                </div>
+                <div class="sysinfo-grid" id="sysinfo-grid">
+                    <div class="sysinfo-cell"><span class="k">الإصدار</span><span class="v">v9.16</span></div>
+                    <div class="sysinfo-cell"><span class="k">جاري التحميل…</span><span class="v">—</span></div>
+                </div>
+            </div>
+            <div class="panel" style="max-width:860px;margin-top:12px">
                 <div class="panel-head">
                     <div class="panel-title"><span class="ico">⚙️</span> إعدادات البوت</div>
                     <div class="panel-actions"><span class="pill green" id="settingsDbPill">—</span></div>
@@ -1348,7 +1449,7 @@ const PAGES = {
                 </div>
             </div>`;
         },
-        load() { loadSettings(); }
+        load() { loadSettings(); renderSysInfo(true); }
     },
 
     logs: {
@@ -1547,18 +1648,32 @@ async function loadAccounts() {
 }
 
 // ── MESSAGES ──
+// v9.16: حالة البحث بكلمة كاملة (تُحفظ في localStorage)
+let MSG_EXACT = localStorage.getItem('msg_exact') === '1';
+
+function toggleMsgExact() {
+    MSG_EXACT = !MSG_EXACT;
+    localStorage.setItem('msg_exact', MSG_EXACT ? '1' : '0');
+    const btn = document.getElementById('msgExactBtn');
+    if (btn) { btn.classList.toggle('notify-on', MSG_EXACT); }
+    logEvent('inf', `messages exact-word search ${MSG_EXACT ? 'enabled' : 'disabled'}`);
+    loadMessages();
+}
+
 async function loadMessages() {
     const container = document.getElementById('messages-list');
     if (!container) return;
     const q = (document.getElementById('msg-search')?.value || '').trim();
-    container.innerHTML = '<div class="empty">جاري التحميل...</div>';
+    container.innerHTML = skeletonRows(5);
     try {
-        const url = q ? `/api/messages?keyword=${encodeURIComponent(q)}&limit=100` : '/api/messages?limit=50';
-        const data = await apiFetch(url);
+        const params = new URLSearchParams({ limit: q ? '100' : '50' });
+        if (q) { params.set('keyword', q); if (MSG_EXACT) params.set('exact', '1'); }
+        const data = await apiFetch(`/api/messages?${params}`);
         const cnt = document.getElementById('messagesCount');
         if (cnt) cnt.textContent = data.total || 0;
         if (!data.messages || data.messages.length === 0) {
-            container.innerHTML = '<div class="empty">لا توجد رسائل</div>';
+            container.innerHTML = emptyBox('✉️', q ? 'لا نتائج مطابقة' : 'لا توجد رسائل بعد',
+                q ? (MSG_EXACT ? 'جرّب تعطيل "كلمة كاملة" أو كلمات أقصر' : 'جرّب كلمات أخرى أو أقصر') : 'ستظهر هنا آخر الرسائل المعالجة');
             return;
         }
         container.innerHTML = data.messages.map(m => `
@@ -1591,7 +1706,7 @@ async function loadAlerts(append) {
     const dec = document.getElementById('alert-decision')?.value || '';
     if (!append) {
         ALERTS_OFFSET = 0;
-        container.innerHTML = '<div class="empty">جاري التحميل...</div>';
+        container.innerHTML = skeletonRows(5);
     }
     try {
         const PAGE = 50;
@@ -1605,7 +1720,8 @@ async function loadAlerts(append) {
         if (cnt) cnt.textContent = data.total || 0;
         const rows = data.alerts || [];
         if (rows.length === 0 && !append) {
-            container.innerHTML = '<div class="empty">لا توجد تنبيهات</div>';
+            container.innerHTML = emptyBox('🔔', 'لا توجد تنبيهات',
+                'ستظهر هنا التنبيهات المرسلة فور رصد أي رسالة مطابقة — أو عدّل الفلاتر');
             ALERTS_HAS_MORE = false;
             return;
         }
@@ -1851,33 +1967,63 @@ function detectNewAlerts(list) {
     LAST_SEEN_ALERT_ID = maxId;
     const badge = document.getElementById('navAlertsBadge');
     if (badge) { badge.classList.remove('pulse'); void badge.offsetWidth; badge.classList.add('pulse'); }
-    // v9.15: بانر داخل الصفحة دائماً — لا يعتمد على إذن إشعارات المتصفح
-    showNewAlertBanner(fresh[0]);
+    // v9.16: تجميع التنبيهات المتتالية (coalescing) — إشعار/صوت واحد لكل دفعة
+    enqueueAlertBatch(fresh);
+    logEvent('ok', `🔔 ${fresh.length} تنبيه جديد وصل`);
+}
+
+// ── v9.16: ALERT BATCHING / COALESCING ──
+// التنبيهات التي تصل خلال نافذة BATCH_WINDOW_MS تُجمّع في إشعار واحد:
+// بانر واحد يعرض العدد، نغمة واحدة (بحد أدنى للفاصل)، وإشعار سطح مكتب واحد.
+const BATCH_WINDOW_MS = 3500;
+const CHIME_MIN_GAP_MS = 8000;
+let ALERT_BATCH = [];          // تنبيهات الدفعة الحالية (الأقدم أولاً)
+let ALERT_BATCH_TIMER = null;
+let LAST_CHIME_TS = 0;
+
+function enqueueAlertBatch(fresh) {
+    ALERT_BATCH.push(...fresh);
+    if (ALERT_BATCH_TIMER) clearTimeout(ALERT_BATCH_TIMER);
+    ALERT_BATCH_TIMER = setTimeout(flushAlertBatch, BATCH_WINDOW_MS);
+}
+
+function flushAlertBatch() {
+    ALERT_BATCH_TIMER = null;
+    const batch = ALERT_BATCH;
+    ALERT_BATCH = [];
+    if (!batch.length) return;
+    const count = batch.length;
+    const rep = batch[0];   // أقدم تنبيه ممثل للدفعة
+    showNewAlertBanner(rep, count);
     if (!notifyEnabled()) return;
-    playChime();
+    const now = Date.now();
+    if (now - LAST_CHIME_TS >= CHIME_MIN_GAP_MS) { LAST_CHIME_TS = now; playChime(); }
     if ('Notification' in window && Notification.permission === 'granted' && document.visibilityState !== 'visible') {
-        const a = fresh[0];
         try {
-            new Notification('🚨 تنبيه جديد — BotPanel BR7', {
-                body: `${a.keyword ? '🏷 ' + a.keyword + ' — ' : ''}${(a.alert_text || '').slice(0, 110)}`,
+            new Notification(count > 1 ? `🚨 ${count} تنبيهات جديدة — BotPanel BR7` : '🚨 تنبيه جديد — BotPanel BR7', {
+                body: count > 1
+                    ? `${rep.keyword ? '🏷 ' + rep.keyword + ' — ' : ''}${(rep.alert_text || '').slice(0, 90)}${count > 2 ? ' …وغيرها' : ''}`
+                    : `${rep.keyword ? '🏷 ' + rep.keyword + ' — ' : ''}${(rep.alert_text || '').slice(0, 110)}`,
                 tag: 'br7-alert',
             });
         } catch (e) {}
     }
-    logEvent('ok', `🔔 ${fresh.length} تنبيه جديد وصل`);
 }
 
-// ── IN-TAB NEW-ALERT BANNER (v9.15) ──
+// ── IN-TAB NEW-ALERT BANNER (v9.15, count-aware v9.16) ──
 let BANNER_ALERT_ID = null;
 let BANNER_TIMER = null;
 
-function showNewAlertBanner(a) {
+function showNewAlertBanner(a, count) {
     if (!a) return;
     BANNER_ALERT_ID = a.id;
     cacheAlerts([a]);
     const box = document.getElementById('newAlertBanner');
+    const title = document.getElementById('nbTitle');
     const txt = document.getElementById('nbText');
     if (!box || !txt) return;
+    const n = Number(count) || 1;
+    if (title) title.textContent = n > 1 ? `🚨 ${n} تنبيهات جديدة` : '🚨 تنبيه جديد';
     txt.textContent = `${a.keyword ? '🏷 ' + a.keyword + ' — ' : ''}${(a.alert_text || '').slice(0, 90)}`;
     box.classList.remove('hidden');
     box.style.animation = 'none'; void box.offsetWidth; box.style.animation = '';  // re-trigger drop
@@ -2026,7 +2172,31 @@ async function deleteKeyword(category, keyword) {
 // ================================================================
 // BLOCKED
 // ================================================================
+// v9.16: تسميات مصدر الحظر (blocked_by)
+function blockSourceLabel(src) {
+    const s = String(src || '').toLowerCase();
+    if (s === 'dashboard') return { icon: '🖥', label: 'لوحة التحكم' };
+    if (s === 'alert')     return { icon: '🚨', label: 'من تنبيه' };
+    if (s === 'system' || s === '') return { icon: '⚙️', label: 'النظام' };
+    return { icon: '•', label: String(src) };
+}
+
+// v9.16: blocked_at قد يكون DATETIME نصي من SQLite — حوّله لطابع زمني للعرض النسبي
+function fmtBlockedAt(v) {
+    if (!v) return '';
+    const n = Number(v);
+    if (!isNaN(n) && n > 1000000000) return fmtRel(n);
+    const t = Date.parse(String(v).replace(' ', 'T') + (String(v).includes('Z') ? '' : 'Z'));
+    if (!isNaN(t)) return fmtRel(t / 1000);
+    return esc(String(v));
+}
+
 async function loadBlocked() {
+    const sendersContainer = document.getElementById('blocked-senders-list');
+    const chatsContainer = document.getElementById('blocked-chats-list');
+    if (!sendersContainer && !chatsContainer) return;
+    if (sendersContainer) sendersContainer.innerHTML = skeletonRows(3);
+    if (chatsContainer) chatsContainer.innerHTML = skeletonRows(3);
     try {
         const [senders, chats] = await Promise.all([
             apiFetch('/api/blocked/senders'),
@@ -2034,39 +2204,52 @@ async function loadBlocked() {
         ]);
         const sCnt = document.getElementById('blockedSendersCount');
         const cCnt = document.getElementById('blockedChatsCount');
-        const sendersContainer = document.getElementById('blocked-senders-list');
-        if (senders.senders && senders.senders.length > 0) {
-            if (sCnt) sCnt.textContent = senders.senders.length;
-            sendersContainer.innerHTML = senders.senders.map(s => `
+        // v9.16: العدّاد يعرض الإجمالي الفعلي من الإحصاءات الحية (API مقصوص بـ LIMIT 100)
+        const realSenders = (window.__LAST_STATS__ || {}).blocked_senders;
+        const realChats = (window.__LAST_STATS__ || {}).blocked_chats;
+        if (sCnt) sCnt.textContent = String(realSenders !== undefined ? realSenders : ((senders.senders || []).length));
+        if (cCnt) cCnt.textContent = String(realChats !== undefined ? realChats : ((chats.chats || []).length));
+        const sList = senders.senders || [];
+        if (sList.length > 0) {
+            sendersContainer.innerHTML = sList.map(s => {
+                const src = blockSourceLabel(s.blocked_by);
+                return `
                 <div class="alert-item" style="flex-direction:row;align-items:center;gap:8px;flex-wrap:wrap">
                     <span class="al-conf lo">👤</span>
                     <span class="al-text" style="min-width:auto;font-family:var(--mono);font-size:12px">${esc(s.sender_id)}</span>
-                    <span style="font-size:11px;color:var(--text3)">${esc(s.reason || 'لا يوجد سبب')}</span>
+                    ${s.reason ? `<span class="blk-chip reason" title="السبب: ${esc(s.reason)}">🏷 ${esc(s.reason)}</span>` : `<span class="blk-chip">بدون سبب</span>`}
+                    <span class="blk-chip src" title="مصدر الحظر">${src.icon} ${esc(src.label)}</span>
+                    <span class="blk-chip" title="وقت الحظر">🕐 ${fmtBlockedAt(s.blocked_at)}</span>
                     <button class="al-btn" style="margin-right:auto" data-unblock-sender="${parseInt(s.sender_id, 10) || 0}">↺ رفع الحظر</button>
-                </div>`).join('');
+                </div>`;
+            }).join('');
             sendersContainer.querySelectorAll('[data-unblock-sender]').forEach(btn =>
                 btn.addEventListener('click', () => unblockSender(parseInt(btn.dataset.unblockSender, 10))));
         } else {
-            if (sCnt) sCnt.textContent = '0';
-            sendersContainer.innerHTML = '<div class="empty">لا يوجد مستخدمون محظورون</div>';
+            sendersContainer.innerHTML = emptyBox('✅', 'لا يوجد مستخدمون محظورون', 'ستظهر هنا أي قوائم تضيفها من النموذج أدناه أو من مودال التنبيه');
         }
-        const chatsContainer = document.getElementById('blocked-chats-list');
-        if (chats.chats && chats.chats.length > 0) {
-            if (cCnt) cCnt.textContent = chats.chats.length;
-            chatsContainer.innerHTML = chats.chats.map(c => `
+        const cList = chats.chats || [];
+        if (cList.length > 0) {
+            chatsContainer.innerHTML = cList.map(c => {
+                const src = blockSourceLabel(c.blocked_by);
+                return `
                 <div class="alert-item" style="flex-direction:row;align-items:center;gap:8px;flex-wrap:wrap">
                     <span class="al-conf lo">💬</span>
                     <span class="al-text" style="min-width:auto;font-family:var(--mono);font-size:12px">${esc(c.chat_id)}</span>
-                    <span style="font-size:11px;color:var(--text3)">${esc(c.reason || 'لا يوجد سبب')}</span>
+                    ${c.reason ? `<span class="blk-chip reason" title="السبب: ${esc(c.reason)}">🏷 ${esc(c.reason)}</span>` : `<span class="blk-chip">بدون سبب</span>`}
+                    <span class="blk-chip src" title="مصدر الحظر">${src.icon} ${esc(src.label)}</span>
+                    <span class="blk-chip" title="وقت الحظر">🕐 ${fmtBlockedAt(c.blocked_at)}</span>
                     <button class="al-btn" style="margin-right:auto" data-unblock-chat="${parseInt(c.chat_id, 10) || 0}">↺ رفع الحظر</button>
-                </div>`).join('');
+                </div>`;
+            }).join('');
             chatsContainer.querySelectorAll('[data-unblock-chat]').forEach(btn =>
                 btn.addEventListener('click', () => unblockChat(parseInt(btn.dataset.unblockChat, 10))));
         } else {
-            if (cCnt) cCnt.textContent = '0';
-            chatsContainer.innerHTML = '<div class="empty">لا توجد مجموعات محظورة</div>';
+            chatsContainer.innerHTML = emptyBox('✅', 'لا توجد مجموعات محظورة', 'ستظهر هنا أي مجموعات تضيفها من النموذج أدناه');
         }
     } catch (e) {
+        if (sendersContainer) sendersContainer.innerHTML = `<div class="empty" style="color:var(--red)">خطأ: ${esc(e.message)}</div>`;
+        if (chatsContainer) chatsContainer.innerHTML = `<div class="empty" style="color:var(--red)">خطأ: ${esc(e.message)}</div>`;
         logEvent('err', `blocked lists load failed: ${e.message}`);
     }
 }
@@ -2087,12 +2270,12 @@ async function blockSender() {
 }
 
 async function unblockSender(user_id) {
-    if (!confirm(`رفع الحظر عن المستخدم ${user_id}؟`)) return;
+    if (!confirm(`رفع الحظر عن المستخدم ${user_id}؟\nسيستأنف البوت معالجة رسائله وتصفيتها كالمعتاد.`)) return;
     try {
         const result = await apiFetch(`/api/blocked/senders/${user_id}`, { method: 'DELETE' });
-        if (result.success) { logEvent('ok', `sender unblocked: ${user_id}`); loadBlocked(); }
-        else alert('❌ فشل رفع الحظر');
-    } catch (e) { alert('❌ خطأ: ' + e.message); }
+        if (result.success) { showToast(`✅ رُفع الحظر عن ${user_id}`, 'ok'); logEvent('ok', `sender unblocked: ${user_id}`); loadBlocked(); }
+        else showToast('❌ فشل رفع الحظر', 'err');
+    } catch (e) { showToast('❌ خطأ: ' + e.message, 'err'); }
 }
 
 async function blockChat() {
@@ -2111,12 +2294,12 @@ async function blockChat() {
 }
 
 async function unblockChat(chat_id) {
-    if (!confirm(`رفع الحظر عن المجموعة ${chat_id}؟`)) return;
+    if (!confirm(`رفع الحظر عن المجموعة ${chat_id}؟\nسيستأنف البوت معالجة رسائلها وتصفيتها كالمعتاد.`)) return;
     try {
         const result = await apiFetch(`/api/blocked/chats/${chat_id}`, { method: 'DELETE' });
-        if (result.success) { logEvent('ok', `chat unblocked: ${chat_id}`); loadBlocked(); }
-        else alert('❌ فشل رفع الحظر');
-    } catch (e) { alert('❌ خطأ: ' + e.message); }
+        if (result.success) { showToast(`✅ رُفع الحظر عن ${chat_id}`, 'ok'); logEvent('ok', `chat unblocked: ${chat_id}`); loadBlocked(); }
+        else showToast('❌ فشل رفع الحظر', 'err');
+    } catch (e) { showToast('❌ خطأ: ' + e.message, 'err'); }
 }
 
 // ================================================================
@@ -2124,6 +2307,45 @@ async function unblockChat(chat_id) {
 // ================================================================
 function settingLabel(key) {
     return (SETTINGS_SCHEMA[key] && SETTINGS_SCHEMA[key].label) || key;
+}
+
+// v9.16: بطاقة معلومات النظام — من /api/stats مباشرة أو من الكاش
+function fmtUptime(sec) {
+    const s = Math.max(0, Math.floor(Number(sec) || 0));
+    const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60);
+    if (d > 0) return `${d}ي ${h}س`;
+    if (h > 0) return `${h}س ${m}د`;
+    return `${m}د ${s % 60}ث`;
+}
+
+async function renderSysInfo(refresh) {
+    const grid = document.getElementById('sysinfo-grid');
+    if (!grid) return;
+    let d = refresh ? null : window.__LAST_STATS__;
+    if (!d) {
+        try { d = await apiFetch('/api/stats'); window.__LAST_STATS__ = d; }
+        catch (e) {
+            grid.innerHTML = `<div class=\"empty\" style=\"grid-column:1/-1;color:var(--red)\">تعذر جلب معلومات النظام: ${esc(e.message)}</div>`;
+            return;
+        }
+    }
+    const dbOk = d.db_healthy !== false;
+    const cells = [
+        ['الإصدار', 'v9.16'],
+        ['مدة التشغيل', fmtUptime(d.uptime || 0)],
+        ['الذاكرة', `${d.memory_used_mb || 0}MB`],
+        ['المعالج', `${(d.cpu_percent || 0).toFixed ? (d.cpu_percent || 0).toFixed(1) : (d.cpu_percent || 0)}%`],
+        ['حجم الطابور', String(d.queue_size ?? 0)],
+        ['قاعدة البيانات', dbOk ? '✅ سليمة' : '⚠️ مشكلة'],
+        ['الحسابات', `${d.connected_accounts || 0}/${d.total_accounts || 0} متصل`],
+        ['رسائل/ساعة', String(d.messages_last_hour || 0)],
+        ['تنبيهات/ساعة', String(d.alerts_last_hour || 0)],
+        ['محظورون', String(d.blocked_senders || 0)],
+        ['مستخدمون فريدون', String(d.unique_senders || 0)],
+        ['تسرب ذاكرة', d.leak_suspected ? '⚠️ مشتبه' : 'لا'],
+    ];
+    grid.innerHTML = cells.map(([k, v]) =>
+        `<div class=\"sysinfo-cell\"><span class=\"k\">${k}</span><span class=\"v\">${v}</span></div>`).join('');
 }
 
 async function loadSettings() {

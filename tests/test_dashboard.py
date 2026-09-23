@@ -156,3 +156,68 @@ class TestWebSocketAuth:
                         pong = msg
                         break
                 assert pong is not None, "did not receive pong from authenticated WS"
+
+
+class TestMessagesExactSearch:
+    """v9.16: /api/messages?exact=1 — word-boundary search (Arabic + Latin),
+    plus blocked_chats grand total in /api/stats."""
+
+    @pytest.mark.asyncio
+    async def _seed(self, client):
+        import time as _t
+        db = app.state.db
+        await db._execute("DELETE FROM messages WHERE message_hash LIKE 't916_%'", ())
+        rows = [
+            ('t916_1', 'محتاج تقرير عن الفيزياء'),      # كلمة مستقلة ✓
+            ('t916_2', 'لا أحتاج شيئاً الآن'),            # أحتاج ⊂ داخل كلمة ✗
+            ('t916_3', 'I need the reports now, Reporting'),  # need ✓ / report جزئي ✗
+        ]
+        for h, txt in rows:
+            await db._execute(
+                "INSERT OR IGNORE INTO messages (message_hash, chat_id, sender_id, message_text, timestamp) VALUES (?,?,?,?,?)",
+                (h, -1001234, 987654321, txt, _t.time()),
+            )
+
+    @pytest.mark.asyncio
+    async def test_partial_search_default(self, client):
+        await self._seed(client)
+        r = await client.get("/api/messages", headers=AUTH, params={"keyword": "محتاج", "limit": 100})
+        assert r.status_code == 200
+        texts = [m["message_text"] for m in r.json()["messages"]]
+        assert any("محتاج تقرير" in t for t in texts)
+
+    @pytest.mark.asyncio
+    async def test_exact_word_arabic(self, client):
+        await self._seed(client)
+        # "احتاج" يوجد فقط داخل "أحتاج" — البحث الكامل يجب ألا يطابقها كـ"احتاج"
+        r = await client.get("/api/messages", headers=AUTH, params={"keyword": "محتاج", "exact": "true", "limit": 100})
+        assert r.status_code == 200
+        texts = [m["message_text"] for m in r.json()["messages"]]
+        assert any(t for t in texts if "محتاج" in t)
+        assert not any("أحتاج" in t for t in texts)
+
+    @pytest.mark.asyncio
+    async def test_exact_word_latin_case_insensitive(self, client):
+        await self._seed(client)
+        r = await client.get("/api/messages", headers=AUTH, params={"keyword": "need", "exact": "1", "limit": 100})
+        assert r.status_code == 200
+        texts = [m["message_text"] for m in r.json()["messages"]]
+        assert any("I need the reports" in t for t in texts)
+
+    @pytest.mark.asyncio
+    async def test_stats_includes_blocked_chats(self, client):
+        # stats_cache يُملأ من حلقة البث غير المتزامنة — انتظر حتى أول دفعة
+        import asyncio
+        import time as _t
+        deadline = _t.time() + 10
+        body: dict = {}
+        while _t.time() < deadline:
+            r = await client.get("/api/stats", headers=AUTH)
+            assert r.status_code == 200
+            body = r.json()
+            if body:
+                break
+            await asyncio.sleep(0.3)
+        assert body, "stats_cache was never populated"
+        assert "blocked_chats" in body
+        assert isinstance(body["blocked_chats"], int)

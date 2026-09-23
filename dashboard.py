@@ -588,6 +588,7 @@ async def _update_stats_loop(app: FastAPI):
                 "alerts_last_hour": db_stats.get("alerts_last_hour", 0),
                 "messages_last_hour": db_stats.get("messages_last_hour", 0),
                 "blocked_senders": db_stats.get("blocked_senders", 0),
+                "blocked_chats": db_stats.get("blocked_chats", 0),   # v9.16
                 "avg_reputation": db_stats.get("avg_reputation", 0),
                 "filter_accepted": filter_tele.get("accepted", 0),
                 "filter_review": filter_tele.get("review", 0),
@@ -940,11 +941,23 @@ async def get_messages(
     limit: int = 50,
     offset: int = 0,
     keyword: Optional[str] = None,
+    exact: bool = False,
 ):
-    """جلب الرسائل مع تصفية اختيارية."""
+    """جلب الرسائل مع تصفية اختيارية.
+
+    v9.16: exact=True تفعّل البحث بكلمة كاملة (word-boundary) بدل
+    LIKE الجزئي — يدعم العربية (نطاق ‎\\u0600-\\u06FF) وغير حساس لحالة
+    الأحرف اللاتينية. يُطبّق كتصفية لاحقة على نتائج LIKE لتقليل عبء SQL.
+    """
     db = request.app.state.db
     try:
         rows = await db.get_messages_with_filters(limit=limit, offset=offset, keyword=keyword)
+        if exact and keyword:
+            pat = re.compile(
+                rf"(?<![\w\u0600-\u06FF]){re.escape(keyword)}(?![\w\u0600-\u06FF])",
+                re.IGNORECASE,
+            )
+            rows = [r for r in rows if r.get("message_text") and pat.search(str(r["message_text"]))]
         return JSONResponse({"messages": rows, "total": len(rows)})
     except Exception as e:
         logger.error(f"Error fetching messages: {e}")

@@ -2027,6 +2027,10 @@ class EnhancedDatabase:
             row = await self._fetchone("SELECT COUNT(*) AS cnt FROM blocked_senders")
             out["blocked_senders"] = int(row["cnt"]) if row else 0
 
+            # v9.16: blocked-chats grand total for the BotPanel blocked page
+            row = await self._fetchone("SELECT COUNT(*) AS cnt FROM blocked_chats")
+            out["blocked_chats"] = int(row["cnt"]) if row else 0
+
             cutoff = time.time() - 3600
             row = await self._fetchone(
                 "SELECT COUNT(*) AS cnt FROM messages WHERE timestamp > ?", (cutoff,)
