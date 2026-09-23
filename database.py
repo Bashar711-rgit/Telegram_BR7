@@ -231,20 +231,33 @@ def _pg(sql: str) -> str:
 # =============================================================================
 # Ephemeral-storage warning helper (fix #6)
 # =============================================================================
-# v9.12 (audit C-04): the warning is now escalated to a fail-fast in production.
-# Setting ALLOW_EPHEMERAL_SQLITE=1 opts back into the old permissive behaviour
-# for local dev / quick experiments — Render production must set DATABASE_URL
-# (PostgreSQL) or BACKUP_UPLOAD_URL.
+# v9.12 (audit C-04), corrected v9.13: the audit recommended escalating this
+# warning to a fail-fast in production. An earlier pass on this branch made
+# fail-fast the *default* the moment RENDER=true — but RENDER=true is set on
+# EVERY Render service unconditionally, including this project's own free-tier
+# deployment which currently has neither DATABASE_URL nor BACKUP_UPLOAD_URL
+# configured. That made the bot refuse to boot on its own production service
+# (verified by reproducing the exact guard call with Render's real env vars).
+# That is a self-inflicted outage, not a safety improvement.
+#
+# Fix: fail-fast is now opt-IN via REQUIRE_PERSISTENT_STORAGE=1 (set this once
+# DATABASE_URL/BACKUP_UPLOAD_URL is actually configured, to guarantee any
+# future accidental removal is caught immediately). Without it, the loud
+# CRITICAL-level warning below still fires on every boot — visible in logs and
+# on /health — but the process starts, preserving current behaviour exactly.
+# ALLOW_EPHEMERAL_SQLITE=1 remains accepted as an explicit override even when
+# REQUIRE_PERSISTENT_STORAGE=1 is set, for a supervised emergency restart.
 def _warn_ephemeral_storage() -> None:
     """
     Emit a prominent warning when running SQLite without a backup upload
     target — all data is ephemeral and will be lost on instance restart.
 
-    In production (RENDER=true or any non-dev environment) this is now a
-    fatal configuration error unless ALLOW_EPHEMERAL_SQLITE=1 is set
-    explicitly — silent data loss on every redeploy is not an acceptable
-    default. The check can be bypassed for local dev by setting the opt-in
-    env var.
+    Fails fast only when the operator explicitly opts in via
+    REQUIRE_PERSISTENT_STORAGE=1 (meant to be set only after DATABASE_URL or
+    BACKUP_UPLOAD_URL is actually configured, as a tripwire against future
+    misconfiguration). Otherwise this only warns — it must never silently
+    block startup, since RENDER=true is present on every Render deploy
+    regardless of plan or persistence setup.
     """
     if CFG.DB_TYPE != "sqlite":
         return
@@ -265,24 +278,22 @@ def _warn_ephemeral_storage() -> None:
         "BACKUP_UPLOAD_URL to enable external backup uploads."
     )
 
-    # Production fail-fast: Render sets RENDER=true automatically on web services.
-    is_render = os.getenv("RENDER", "").lower() in ("1", "true", "yes")
-    is_production = is_render or os.getenv("ENVIRONMENT", "").lower() in ("prod", "production")
+    require_persistent = os.getenv("REQUIRE_PERSISTENT_STORAGE", "").lower() in ("1", "true", "yes")
     allow_ephemeral = os.getenv("ALLOW_EPHEMERAL_SQLITE", "").lower() in ("1", "true", "yes")
 
-    if is_production and not allow_ephemeral:
+    if require_persistent and not allow_ephemeral:
         logger.critical(
-            "🛑 EPHEMERAL STORAGE IN PRODUCTION: refusing to start. "
-            "Set DATABASE_URL (PostgreSQL) or BACKUP_UPLOAD_URL on Render, "
-            "or set ALLOW_EPHEMERAL_SQLITE=1 to override (NOT RECOMMENDED)."
+            "🛑 EPHEMERAL STORAGE: REQUIRE_PERSISTENT_STORAGE=1 is set but no "
+            "DATABASE_URL/BACKUP_UPLOAD_URL is configured — refusing to start. "
+            "Set DATABASE_URL (PostgreSQL) or BACKUP_UPLOAD_URL, or unset "
+            "REQUIRE_PERSISTENT_STORAGE / set ALLOW_EPHEMERAL_SQLITE=1 to override."
         )
         raise RuntimeError(
-            "Refusing to start with ephemeral SQLite storage in production. "
-            "Set DATABASE_URL or BACKUP_UPLOAD_URL, or set "
-            "ALLOW_EPHEMERAL_SQLITE=1 to override."
+            "Refusing to start: REQUIRE_PERSISTENT_STORAGE=1 with ephemeral "
+            "SQLite storage and no backup target configured."
         )
 
-    logger.warning(msg)
+    logger.critical(msg)
 
 
 # =============================================================================
