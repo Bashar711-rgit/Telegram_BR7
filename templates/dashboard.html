@@ -529,6 +529,53 @@ body { font-family: var(--sans); background: var(--bg); color: var(--text); font
 @keyframes toastIn  { from { transform: translateY(8px); opacity: 0; } to { transform: none; opacity: 1; } }
 @keyframes toastOut { to   { transform: translateY(8px); opacity: 0; } }
 
+/* ── v9.15 ───────────────────────────────────────────────────── */
+/* in-tab new-alert banner (fallback when desktop notifications are
+   unavailable/denied — works inside the page always) */
+#newAlertBanner {
+  position: relative; z-index: 420; flex-shrink: 0;
+  display: flex; align-items: center; gap: 12px;
+  padding: 10px 16px; margin: 12px 24px 0;
+  background: linear-gradient(90deg, rgba(59,26,26,.92), rgba(30,30,34,.94));
+  border: 1px solid rgba(248,113,113,.35);
+  border-radius: var(--r2);
+  cursor: pointer; overflow: hidden;
+  animation: bannerDrop .3s ease-out;
+  box-shadow: 0 8px 28px rgba(0,0,0,.45);
+}
+#newAlertBanner.hidden { display: none; }
+#newAlertBanner .nb-title { font-weight: 700; font-size: 13px; color: var(--red); white-space: nowrap; }
+#newAlertBanner .nb-text {
+  flex: 1; min-width: 0; font-size: 12.5px; color: var(--text);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+#newAlertBanner .nb-close {
+  border: none; background: none; color: var(--text3); cursor: pointer;
+  font-size: 14px; padding: 2px 6px; border-radius: 6px;
+}
+#newAlertBanner .nb-close:hover { color: var(--text); background: var(--bg3); }
+#newAlertBanner::after {
+  content: ''; position: absolute; bottom: 0; right: 0; height: 2px;
+  background: var(--red); animation: bannerTimer 10s linear forwards;
+}
+@keyframes bannerDrop { from { transform: translateY(-12px); opacity: 0; } to { transform: none; opacity: 1; } }
+@keyframes bannerTimer { from { width: 100%; } to { width: 0; } }
+
+/* page-switch fade */
+#mainContent > * { animation: pageFade .25s ease-out; }
+@keyframes pageFade { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+
+/* active nav glow */
+.nav-item.active {
+  box-shadow: inset 0 0 0 1px rgba(56,132,255,.25), 0 0 18px rgba(56,132,255,.08);
+}
+
+/* per-account contribution meters (analytics) */
+.acc-share .m-fill { transition: width .5s ease; }
+
+/* relative time chip */
+.rel-ts { color: var(--text3); font-size: 10.5px; }
+
 /* keyboard focus visibility (a11y) */
 .tb-btn:focus-visible, .kw-select:focus-visible, .search-input:focus-visible,
 .nav-item:focus-visible, .logout-btn:focus-visible {
@@ -580,7 +627,7 @@ body { font-family: var(--sans); background: var(--bg); color: var(--text); font
     <div class="brand-icon">🤖</div>
     <div>
       <div class="brand-name">BotPanel</div>
-      <div class="brand-ver" id="brandVer">BR7 · v9.14</div>
+      <div class="brand-ver" id="brandVer">BR7 · v9.15</div>
     </div>
   </div>
 
@@ -652,6 +699,12 @@ body { font-family: var(--sans); background: var(--bg); color: var(--text); font
     </div>
   </div>
 
+  <!-- v9.15: in-tab new-alert banner — lives outside #mainContent so it survives tab switches -->
+  <div id="newAlertBanner" class="hidden" onclick="bannerOpenAlert()">
+    <span class="nb-title">🚨 تنبيه جديد</span>
+    <span class="nb-text" id="nbText">—</span>
+    <button class="nb-close" title="إخفاء" onclick="event.stopPropagation();hideNewAlertBanner()">✕</button>
+  </div>
   <div class="content" id="mainContent"></div>
 </main>
 
@@ -661,6 +714,7 @@ body { font-family: var(--sans); background: var(--bg); color: var(--text); font
     <h2>🚨 تفاصيل التنبيه <button class="logout-btn" style="margin-inline-start:auto" title="إغلاق" onclick="closeModal('alertDetailModal')">✕</button></h2>
     <div id="alertDetailBody"></div>
     <div class="modal-actions">
+      <button class="tb-btn danger" onclick="blockSenderFromAlert()" title="حظر هذا المُرسل نهائياً">🚫 حظر المُرسل</button>
       <button class="tb-btn" onclick="copyAlertText()">📋 نسخ النص</button>
       <button class="tb-btn primary" onclick="closeModal('alertDetailModal')">إغلاق</button>
     </div>
@@ -704,6 +758,9 @@ let ALERTS_CACHE = {};         // id → alert row (feeds the detail modal)
 let ALERTS_AUTOREFRESH = null; // interval handle for the alerts page
 let LAST_SEEN_ALERT_ID = 0;    // for desktop notifications
 const NOTIFY_KEY = 'br7_notify'; // persisted notification preference
+let ALERTS_OFFSET = 0;         // v9.15: pagination cursor for the alerts page
+let ALERTS_HAS_MORE = false;   // v9.15: whether a load-more button should show
+let ALERTS_TOTAL_KNOWN = 0;    // v9.15: last reported grand total
 
 // ================================================================
 // XSS GUARD (audit H-3): every dynamic value interpolated into HTML
@@ -721,6 +778,18 @@ function fmtTime(v) {
         try { return new Date(n * 1000).toLocaleString('ar', { hour12: false }); } catch (e) {}
     }
     return String(v);
+}
+
+// v9.15: عربي نسبي — "قبل ٥ د" للمدون قصيرة، وإلا الوقت الكامل.
+function fmtRel(v) {
+    const n = Number(v);
+    if (v === null || v === undefined || v === '' || isNaN(n) || n < 1000000000) return fmtTime(v);
+    const diff = Math.max(0, Date.now() / 1000 - n);
+    if (diff < 45) return 'الآن';
+    if (diff < 3600) return `قبل ${Math.round(diff / 60)} د`;
+    if (diff < 86400) return `قبل ${Math.round(diff / 3600)} س`;
+    if (diff < 7 * 86400) return `قبل ${Math.round(diff / 86400)} يوم`;
+    return fmtTime(v);
 }
 
 function logEvent(lvl, msg) {
@@ -896,6 +965,37 @@ function applyStats(d) {
     // Live pages re-render
     if (currentTab === 'dashboard' && d.recent_alerts) renderRecentAlertsFeed(d.recent_alerts);
     if (currentTab === 'accounts' && d.accounts) renderAccountsList(d.accounts);
+    if (currentTab === 'analytics' && d.accounts) renderAccountShare(d.accounts);   // v9.15
+}
+
+// v9.15: per-account share of processed messages (horizontal meters, live via WS)
+const ACC_BAR_COLORS = ['#3b82f6', '#34d399', '#fbbf24', '#f87171', '#a78bfa', '#22d3ee', '#fb923c'];
+function renderAccountShare(accounts) {
+    const box = document.getElementById('accShare');
+    if (!box) return;
+    const accs = (accounts || (statsData && statsData.accounts) || []).filter(a => a && a.name);
+    const total = accs.reduce((s, a) => s + (a.messages_processed || 0), 0);
+    const tot = document.getElementById('accShareTotal');
+    if (tot) tot.textContent = `${total.toLocaleString('en-US')} رسالة`;
+    if (accs.length === 0) {
+        box.innerHTML = '<div class="empty">لا توجد بيانات حسابات بعد</div>';
+        return;
+    }
+    const sorted = [...accs].sort((a, b) => (b.messages_processed || 0) - (a.messages_processed || 0));
+    box.innerHTML = sorted.map((a, i) => {
+        const n = a.messages_processed || 0;
+        const pct = total ? Math.max(2, n / total * 100) : 2;
+        const color = a.connected ? ACC_BAR_COLORS[i % ACC_BAR_COLORS.length] : 'var(--text3)';
+        const err = a.errors ? `<span class="al-conf lo" title="أخطاء">⚠️ ${a.errors}</span>` : '';
+        return `
+        <div class="m-item">
+            <div class="m-label">
+                <span class="m-name" style="color:var(--text)">${a.connected ? '🟢' : '🔴'} ${esc(a.name)}${a.is_main ? ' 👑' : ''}</span>
+                <span style="display:flex;gap:6px;align-items:center">${err}<span class="m-val">${n.toLocaleString('en-US')} (${total ? Math.round(n / total * 100) : 0}%)</span></span>
+            </div>
+            <div class="m-track"><div class="m-fill" style="width:${pct}%;background:${color}"></div></div>
+        </div>`;
+    }).join('');
 }
 
 // ================================================================
@@ -963,7 +1063,7 @@ function renderRecentAlertsFeed(alerts) {
                 <span>🏷 <span class="al-kw">${esc(a.keyword || 'غير معروف')}</span></span>
                 <span>👤 ${esc(a.first_name || a.username || a.sender_id || 'غير معروف')}</span>
                 <span>📱 ${esc(a.account_name || '')}</span>
-                <span class="al-time">🕐 ${esc(fmtTime(a.timestamp || a.created_at))}</span>
+                <span class="al-time">🕐 <span class="rel-ts">${esc(fmtRel(a.timestamp || a.created_at))}</span></span>
             </div>
         </div>`).join('');
 }
@@ -1080,6 +1180,7 @@ const PAGES = {
                     </div>
                 </div>
                 <div class="alert-feed" id="alerts-list"><div class="empty">جاري التحميل...</div></div>
+                <div id="alertsMoreWrap" style="padding:0 16px 14px"></div>
             </div>`;
         },
         load() { loadAlerts(); }
@@ -1113,6 +1214,13 @@ const PAGES = {
                     <div class="meter-row" id="topSenders"><div class="empty">جاري التحميل...</div></div>
                 </div>
             </div>
+            <div class="panel" style="margin-top:14px">
+                <div class="panel-head">
+                    <div class="panel-title"><span class="ico">📱</span> مشاركة الحسابات في المعالجة (مباشر)</div>
+                    <div class="panel-actions"><span class="pill purple" id="accShareTotal">0 رسالة</span></div>
+                </div>
+                <div class="meter-row acc-share" id="accShare"><div class="empty">بانتظار بيانات الحسابات...</div></div>
+            </div>
             <div class="panel">
                 <div class="panel-head">
                     <div class="panel-title"><span class="ico">💀</span> الرسائل الميتة (Dead Letters)</div>
@@ -1121,7 +1229,7 @@ const PAGES = {
                 <div class="alert-feed" id="deadLetters"><div class="empty">جاري التحميل...</div></div>
             </div>`;
         },
-        load() { loadAnalytics(true); loadDeadLetters(); }
+        load() { loadAnalytics(true); loadDeadLetters(); renderAccountShare(); }
     },
 
     accounts: {
@@ -1476,26 +1584,33 @@ function cacheAlerts(list) {
     (list || []).forEach(a => { if (a && a.id != null) ALERTS_CACHE[a.id] = a; });
 }
 
-async function loadAlerts() {
+async function loadAlerts(append) {
     const container = document.getElementById('alerts-list');
     if (!container) return;
     const q = (document.getElementById('alert-search')?.value || '').trim();
     const dec = document.getElementById('alert-decision')?.value || '';
-    container.innerHTML = '<div class="empty">جاري التحميل...</div>';
+    if (!append) {
+        ALERTS_OFFSET = 0;
+        container.innerHTML = '<div class="empty">جاري التحميل...</div>';
+    }
     try {
-        const params = new URLSearchParams({ limit: '50' });
+        const PAGE = 50;
+        const params = new URLSearchParams({ limit: String(PAGE), offset: String(ALERTS_OFFSET) });
         if (q) params.set('keyword', q);
         if (dec) params.set('decision', dec);
         const data = await apiFetch(`/api/alerts?${params}`);
         cacheAlerts(data.alerts);
+        ALERTS_TOTAL_KNOWN = data.total || 0;
         const cnt = document.getElementById('alertsCount');
         if (cnt) cnt.textContent = data.total || 0;
-        if (!data.alerts || data.alerts.length === 0) {
+        const rows = data.alerts || [];
+        if (rows.length === 0 && !append) {
             container.innerHTML = '<div class="empty">لا توجد تنبيهات</div>';
+            ALERTS_HAS_MORE = false;
             return;
         }
         const DEC_LABEL = { accept: ['مقبول', 'green'], review: ['مراجعة', 'yellow'], ignore: ['متجاهل', 'red'] };
-        container.innerHTML = data.alerts.map(a => {
+        const html = rows.map(a => {
             const d = DEC_LABEL[a.decision] || ['—', 'blue'];
             const sender = a.first_name || a.username || a.sender_id || 'غير معروف';
             return `
@@ -1509,12 +1624,33 @@ async function loadAlerts() {
                     <span>🏷 <span class="al-kw">${esc(a.keyword || 'غير معروف')}</span></span>
                     <span>👤 ${esc(sender)}${a.username ? ` <span class="al-conf na">@${esc(a.username)}</span>` : ''}</span>
                     <span>📱 ${esc(a.account_name || '')}</span>
-                    <span class="al-time">🕐 ${esc(fmtTime(a.timestamp || a.created_at))}</span>
+                    <span class="al-time">🕐 <span class="rel-ts">${esc(fmtRel(a.timestamp || a.created_at))}</span></span>
                 </div>
             </div>`;
         }).join('');
+        if (append) {
+            container.insertAdjacentHTML('beforeend', html);
+        } else {
+            container.innerHTML = html;
+        }
+        ALERTS_OFFSET += rows.length;
+        ALERTS_HAS_MORE = (data.total || 0) > ALERTS_OFFSET && rows.length >= PAGE;
+        renderAlertsMoreBtn();
     } catch (e) {
-        container.innerHTML = `<div class="empty" style="color:var(--red)">خطأ: ${esc(e.message)}</div>`;
+        if (!append) container.innerHTML = `<div class="empty" style="color:var(--red)">خطأ: ${esc(e.message)}</div>`;
+        else showToast('فشل تحميل المزيد: ' + e.message, 'err');
+    }
+}
+
+function renderAlertsMoreBtn() {
+    const wrap = document.getElementById('alertsMoreWrap');
+    if (!wrap) return;
+    if (ALERTS_HAS_MORE) {
+        wrap.innerHTML = `<button class="tb-btn" style="width:100%;justify-content:center;margin-top:10px" onclick="loadAlerts(true)">⬇️ تحميل المزيد — معروض ${ALERTS_OFFSET} من ${ALERTS_TOTAL_KNOWN || '…'}</button>`;
+        wrap.style.display = '';
+    } else {
+        wrap.innerHTML = '';
+        wrap.style.display = 'none';
     }
 }
 
@@ -1565,11 +1701,13 @@ function exportAlertsCsv() {
 
 // ── ALERT DETAIL MODAL (v9.14) ──
 let CURRENT_ALERT_TEXT = '';
+let CURRENT_ALERT_SENDER = null;
 
 function showAlertModal(id) {
     const a = ALERTS_CACHE[id];
     if (!a) return;
     CURRENT_ALERT_TEXT = a.alert_text || a.keyword || '';
+    CURRENT_ALERT_SENDER = a.sender_id;
     const pct = Math.round((a.confidence || 0) * 100);
     const confColor = a.confidence >= 0.75 ? 'var(--green)' : a.confidence >= 0.5 ? 'var(--yellow)' : 'var(--red)';
     const senderName = [a.first_name, a.last_name].filter(Boolean).join(' ') || a.username || '—';
@@ -1592,6 +1730,24 @@ function showAlertModal(id) {
         </div>`;
     document.getElementById('alertDetailModal').classList.remove('hidden');
     logEvent('inf', `alert detail opened #${id}`);
+}
+
+// v9.15: حظر المُرسل مباشرة من مودال التنبيه (يستخدم /api/blocked/senders)
+async function blockSenderFromAlert() {
+    if (!CURRENT_ALERT_SENDER) { showToast('لا يوجد معرّف مُرسل لهذا التنبيه', 'wrn'); return; }
+    if (!confirm(`حظر المُرسل ${CURRENT_ALERT_SENDER}؟ لن تُعالج رسائله بعد الآن.`)) return;
+    try {
+        const r = await apiFetch('/api/blocked/senders', {
+            method: 'POST',
+            body: JSON.stringify({ user_id: Number(CURRENT_ALERT_SENDER), reason: 'محظور من مودال التنبيه — BotPanel' }),
+        });
+        showToast('✓ تم حظر المُرسل', 'ok');
+        logEvent('ok', `sender ${CURRENT_ALERT_SENDER} blocked via alert modal`);
+        if (currentTab === 'blocked') refreshCurrent();
+    } catch (e) {
+        showToast('فشل الحظر: ' + e.message, 'err');
+        logEvent('err', `block sender failed: ${e.message}`);
+    }
 }
 
 function copyAlertText() {
@@ -1695,6 +1851,8 @@ function detectNewAlerts(list) {
     LAST_SEEN_ALERT_ID = maxId;
     const badge = document.getElementById('navAlertsBadge');
     if (badge) { badge.classList.remove('pulse'); void badge.offsetWidth; badge.classList.add('pulse'); }
+    // v9.15: بانر داخل الصفحة دائماً — لا يعتمد على إذن إشعارات المتصفح
+    showNewAlertBanner(fresh[0]);
     if (!notifyEnabled()) return;
     playChime();
     if ('Notification' in window && Notification.permission === 'granted' && document.visibilityState !== 'visible') {
@@ -1707,6 +1865,35 @@ function detectNewAlerts(list) {
         } catch (e) {}
     }
     logEvent('ok', `🔔 ${fresh.length} تنبيه جديد وصل`);
+}
+
+// ── IN-TAB NEW-ALERT BANNER (v9.15) ──
+let BANNER_ALERT_ID = null;
+let BANNER_TIMER = null;
+
+function showNewAlertBanner(a) {
+    if (!a) return;
+    BANNER_ALERT_ID = a.id;
+    cacheAlerts([a]);
+    const box = document.getElementById('newAlertBanner');
+    const txt = document.getElementById('nbText');
+    if (!box || !txt) return;
+    txt.textContent = `${a.keyword ? '🏷 ' + a.keyword + ' — ' : ''}${(a.alert_text || '').slice(0, 90)}`;
+    box.classList.remove('hidden');
+    box.style.animation = 'none'; void box.offsetWidth; box.style.animation = '';  // re-trigger drop
+    if (BANNER_TIMER) clearTimeout(BANNER_TIMER);
+    BANNER_TIMER = setTimeout(hideNewAlertBanner, 10000);
+}
+
+function hideNewAlertBanner() {
+    const box = document.getElementById('newAlertBanner');
+    if (box) box.classList.add('hidden');
+    if (BANNER_TIMER) { clearTimeout(BANNER_TIMER); BANNER_TIMER = null; }
+}
+
+function bannerOpenAlert() {
+    hideNewAlertBanner();
+    if (BANNER_ALERT_ID != null) showAlertModal(BANNER_ALERT_ID);
 }
 
 // ================================================================
