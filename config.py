@@ -976,6 +976,25 @@ KEYWORDS: Final[Dict[str, Any]] = load_keywords()
 def load_accounts() -> List[Dict[str, Any]]:
     accounts: List[Dict[str, Any]] = []
 
+    def _diagnose_partial(prefix: str) -> None:
+        # v9.13.1 diagnostic: when an account is skipped because {prefix}_API_ID
+        # is missing, check whether OTHER account vars exist for this prefix.
+        # If they do, the operator clearly INTENDED this account to run and it
+        # is now silently dead — surface a loud, actionable warning instead
+        # (this exact scenario left production running with 0 accounts while
+        # *_SESSION_STRING vars were fully configured).
+        present: List[str] = []
+        for suffix in ("API_HASH", "PHONE", "SESSION_NAME", "SESSION_STRING", "PRIORITY"):
+            if SecretManager.get(f"{prefix}_{suffix}", None, required=False):
+                present.append(f"{prefix}_{suffix}")
+        if present:
+            logger.warning(
+                f"Account {prefix} SKIPPED: {prefix}_API_ID is missing, but "
+                f"{len(present)} other var(s) are set ({', '.join(present)}). "
+                f"Set {prefix}_API_ID (and {prefix}_API_HASH / {prefix}_PHONE "
+                f"if missing) to activate this account."
+            )
+
     def _try_load(prefix: str, is_main: bool, default_priority: int) -> None:
         enabled_key = f"{prefix}_ENABLED"
         raw_enabled = SecretManager.get(enabled_key, "true", required=False) or "true"
@@ -984,6 +1003,7 @@ def load_accounts() -> List[Dict[str, Any]]:
             return
         api_id_str = SecretManager.get(f"{prefix}_API_ID", None, required=False)
         if not api_id_str:
+            _diagnose_partial(prefix)
             return
         try:
             acc: Dict[str, Any] = {
@@ -1021,6 +1041,20 @@ def load_accounts() -> List[Dict[str, Any]]:
         prefix = f"ACCOUNT_{i}"
         api_id = SecretManager.get(f"{prefix}_API_ID", None, required=False)
         if api_id is None:
+            # v9.13.1 diagnostic: discovery stops at the first gap. If a LATER
+            # ACCOUNT_k still carries an API_ID, that account can never load —
+            # warn the operator instead of dying silently.
+            later: List[str] = []
+            for j in range(i + 1, 21):
+                if SecretManager.get(f"ACCOUNT_{j}_API_ID", None, required=False):
+                    later.append(f"ACCOUNT_{j}")
+            if later:
+                logger.warning(
+                    f"Account discovery stopped at {prefix} (missing "
+                    f"{prefix}_API_ID) but later accounts are configured: "
+                    f"{', '.join(later)}. ACCOUNT_N keys must be contiguous — "
+                    f"renumber them so discovery reaches all of them."
+                )
             break
         _try_load(prefix, is_main=False, default_priority=10 - i)
 
