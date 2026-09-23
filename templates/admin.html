@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <meta name="referrer" content="no-referrer">
 <title>لوحة إدارة البوت</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%20100%20100'%3E%3Crect%20width='100'%20height='100'%20rx='22'%20fill='%230ea5e9'/%3E%3Ctext%20x='50'%20y='54'%20font-size='52'%20text-anchor='middle'%3E%F0%9F%A4%96%3C/text%3E%3C/svg%3E">
 <script src="https://cdn.tailwindcss.com"></script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 <script>
@@ -51,11 +52,21 @@ tailwind.config = {
   .tbl td { @apply py-2.5 px-1 align-top; border-bottom: 1px solid var(--border); }
   .tbl tr:last-child td { border-bottom: none; }
 
-  .log-line { white-space: pre-wrap; word-break: break-word; padding: 2px 0; border-bottom: 1px dashed rgba(148,163,184,.15); }
+  .log-line { white-space: pre-wrap; word-break: break-word; padding: 3px 8px; margin: 0 2px; border-bottom: 1px dashed rgba(148,163,184,.15); border-radius: 6px; direction: ltr; text-align: left; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; transition: background .12s; }
+  .log-line:hover { background: rgba(148,163,184,.10); }
   .log-err { color: #f87171; }
   .log-warn { color: #fbbf24; }
   .log-info { color: #34d399; }
   .log-debug { color: #94a3b8; }
+
+  .tbl tbody tr { transition: background .12s; }
+  .tbl tbody tr:hover td { background: rgba(14,165,233,.05); }
+
+  button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible { outline: 2px solid #0ea5e9; outline-offset: 2px; }
+
+  .stat-card { position: relative; overflow: hidden; transition: transform .18s ease, box-shadow .18s ease; }
+  .stat-card::before { content: ''; position: absolute; top: 0; left: 0; right: 0; height: 3px; background: var(--accent, #0ea5e9); opacity: .85; }
+  .stat-card:hover { transform: translateY(-2px); box-shadow: 0 10px 22px -8px rgba(15,23,42,.30); }
 </style>
 </head>
 <body class="h-full bg-slate-100 text-slate-800 dark:bg-slate-900 dark:text-slate-100 transition-colors">
@@ -370,15 +381,15 @@ async function refreshDashboard() {
   try { d = await api('/stats'); } catch (e) { return; }
   const db = d.db || {}, flt = d.filter || {}, sum = d.summary || {};
   const cards = [
-    { label: 'الرسائل المعالجة', value: fmtNum(db.total_messages ?? flt.processed), icon: '📨', color: 'text-blue-600' },
-    { label: 'التنبيهات المرسلة', value: fmtNum(db.alerts_sent ?? flt.accepted), icon: '🚨', color: 'text-emerald-600' },
-    { label: 'الرسائل المتجاهلة', value: fmtNum(flt.ignored ?? flt.rejected), icon: '🚫', color: 'text-slate-500' },
-    { label: 'الأخطاء / السبام', value: fmtNum((flt.rejected ?? 0) + (flt.spam ?? 0)), icon: '⚠️', color: 'text-red-600' },
-    { label: 'مدة التشغيل', value: fmtUptime(d.uptime), icon: '⏱️', color: 'text-violet-600' },
-    { label: 'الطابور', value: fmtNum(d.queue_size), icon: '🗂️', color: 'text-amber-600' },
+    { label: 'الرسائل المعالجة', value: fmtNum(db.total_messages ?? flt.processed), icon: '📨', color: 'text-blue-600', accent: '#2563eb' },
+    { label: 'التنبيهات المرسلة', value: fmtNum(db.alerts_sent ?? flt.accepted), icon: '🚨', color: 'text-emerald-600', accent: '#059669' },
+    { label: 'الرسائل المتجاهلة', value: fmtNum(flt.ignored ?? flt.rejected), icon: '🚫', color: 'text-slate-500', accent: '#64748b' },
+    { label: 'الأخطاء / السبام', value: fmtNum((flt.rejected ?? 0) + (flt.spam ?? 0)), icon: '⚠️', color: 'text-red-600', accent: '#e11d48' },
+    { label: 'مدة التشغيل', value: fmtUptime(d.uptime), icon: '⏱️', color: 'text-violet-600', accent: '#7c3aed' },
+    { label: 'الطابور', value: fmtNum(d.queue_size), icon: '🗂️', color: 'text-amber-600', accent: '#d97706' },
   ];
   document.getElementById('statCards').innerHTML = cards.map(k => `
-    <div class="bg-white dark:bg-slate-800 rounded-xl shadow p-4 fade-in">
+    <div class="stat-card bg-white dark:bg-slate-800 rounded-xl shadow p-4 fade-in" style="--accent:${k.accent}">
       <div class="text-2xl">${k.icon}</div>
       <div class="text-lg font-bold ${k.color} dark:opacity-90 mt-1">${k.value}</div>
       <div class="text-xs text-slate-500 dark:text-slate-400 mt-1">${k.label}</div>
@@ -440,6 +451,11 @@ async function refreshDashboard() {
       <div class="min-w-0">
         <div class="font-bold truncate">${esc(m.name)} ${m.is_main ? '👑' : ''}</div>
         <div class="text-xs text-slate-500 dark:text-slate-400 ltr text-right">${esc(m.phone || '')}</div>
+        <div class="flex flex-wrap gap-1 mt-1">
+          <span class="chip bg-slate-100 dark:bg-slate-700 text-slate-600 dark:text-slate-300" title="رسائل معالجة">📨 ${m.messages_processed || 0}</span>
+          ${m.errors ? `<span class="chip bg-red-100 text-red-700 dark:bg-red-900/50 dark:text-red-300" title="أخطاء">⚠️ ${m.errors}</span>` : ''}
+          ${m.duplicates ? `<span class="chip bg-slate-100 dark:bg-slate-700 text-slate-600 dark:text-slate-300" title="مكررات">🔁 ${m.duplicates}</span>` : ''}
+        </div>
         ${m.last_error ? `<div class="text-xs text-red-500 truncate mt-1">${esc(m.last_error)}</div>` : ''}
       </div>
       <span class="chip mr-auto ${m.connected ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/50 dark:text-emerald-300' : 'bg-red-100 text-red-700 dark:bg-red-900/50 dark:text-red-300'}">${m.status}</span>
@@ -598,6 +614,7 @@ async function importKeywordsFile(e) {
 
 /* ============================ Alerts ============================ */
 const alertFilters={search:'',decision:'',category:'',date_from:'',date_to:'',limit:100};
+let alertsAuto=true;
 function renderAlerts(){
   el.main.innerHTML=`
   <div class="flex flex-wrap items-end gap-2 mb-4">
@@ -609,12 +626,14 @@ function renderAlerts(){
     <button id="af-apply" class="px-4 py-2 rounded-xl bg-sky-600 hover:bg-sky-700 text-white text-sm font-bold">تطبيق</button>
     <button id="af-reset" class="px-4 py-2 rounded-xl text-sm font-bold" style="background:var(--bg-card);border:1px solid var(--border)">مسح</button>
     <button id="af-csv" class="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-sm font-bold">⬇ تصدير CSV</button>
+    <label class="flex items-center gap-1.5 text-xs font-bold px-3 py-2 rounded-xl cursor-pointer select-none" style="background:var(--bg-card);border:1px solid var(--border)" title="إعادة تحميل القائمة تلقائياً كل 20 ثانية"><input id="af-auto" type="checkbox" class="accent-sky-600"> تحديث تلقائي</label>
   </div>
   <div class="card overflow-x-auto"><table class="tbl min-w-[1000px]"><thead><tr>
     <th>الوقت</th><th>المرسل</th><th>الحساب</th><th>الكلمة المطابقة</th><th>القرار</th><th>الثقة</th><th>معاينة الرسالة</th><th>روابط</th>
   </tr></thead><tbody id="alerts-body"><tr><td colspan="8" class="text-center muted2 py-8">جارِ التحميل…</td></tr></tbody></table></div>
   <div class="flex items-center justify-between mt-3 text-xs muted2"><span id="alerts-count"></span>
-    <button id="al-more" class="px-3 py-1.5 rounded-lg" style="border:1px solid var(--border)">عرض المزيد +100</button></div>`;
+    <span class="flex items-center gap-3"><span id="al-updated"></span>
+    <button id="al-more" class="px-3 py-1.5 rounded-lg" style="border:1px solid var(--border)">عرض المزيد +100</button></span></div>`;
   document.getElementById('af-decision').value=alertFilters.decision;
   // Populate keyword-list filter from the keywords index (top-level categories)
   api('/keywords').then(d=>{
@@ -650,6 +669,14 @@ function renderAlerts(){
     if(alertFilters.limit>=200){toast('الحد الأقصى للعرض 200 سجل — استخدم تصدير CSV للمزيد','info');return;}
     alertFilters.limit=Math.min(alertFilters.limit+100,200);loadAlerts();
   };
+  const autoBox=document.getElementById('af-auto');
+  autoBox.checked=alertsAuto;
+  autoBox.onchange=()=>{
+    alertsAuto=autoBox.checked;
+    if(alertsAuto){state.timers.alerts=setInterval(loadAlerts,20000);toast('تم تفعيل التحديث التلقائي (كل 20 ثانية)','info');}
+    else{clearInterval(state.timers.alerts);delete state.timers.alerts;toast('أُوقف التحديث التلقائي','info');}
+  };
+  if(alertsAuto)state.timers.alerts=setInterval(loadAlerts,20000);
   loadAlerts();
 }
 function _toTs(dateStr,endOfDay){
@@ -694,6 +721,8 @@ async function loadAlerts(){
         <td class="text-xs whitespace-nowrap">${links||'—'}</td></tr>`;
     }).join('');
     document.getElementById('alerts-count').textContent=`المعروض: ${d.count} سجل`;
+    const up=document.getElementById('al-updated');
+    if(up)up.textContent='آخر تحديث: '+new Date().toLocaleTimeString('ar-EG-u-nu-latn');
   }catch(e){}
 }
 
@@ -862,13 +891,15 @@ async function saveSettings(schema){
 }
 
 /* ============================ Logs ============================ */
-let logsPaused=false,logsLevel='';
+let logsPaused=false,logsLevel='',logsQuery='',logsData=[],logsFileExists=true;
 function renderLogs(){
   el.main.innerHTML=`
   <div class="flex flex-wrap items-center gap-2 mb-3">
     <select id="log-level" class="inp !w-auto">
       <option value="">كل المستويات</option><option value="INFO">INFO</option>
       <option value="WARNING">WARNING</option><option value="ERROR">ERROR</option></select>
+    <input id="log-search" class="inp !w-auto flex-1 min-w-[200px]" placeholder="🔍 تصفية الأسطر المعروضة (نص حر)…" value="${esc(logsQuery)}">
+    <button id="log-copy" class="px-4 py-2 rounded-xl text-sm font-bold" style="background:var(--bg-card);border:1px solid var(--border)" title="نسخ السجلات المعروضة إلى الحافظة">📋 نسخ</button>
     <button id="log-refresh" class="px-4 py-2 rounded-xl text-sm font-bold" style="background:var(--bg-card);border:1px solid var(--border)">🔄 تحديث</button>
     <button id="log-pause" class="px-4 py-2 rounded-xl text-sm font-bold" style="background:var(--bg-card);border:1px solid var(--border)">⏸ إيقاف التحديث التلقائي</button>
     <span class="text-xs muted2 mr-auto" id="log-meta"></span>
@@ -876,26 +907,54 @@ function renderLogs(){
   <div class="card"><div id="logs-body" class="text-xs max-h-[65vh] overflow-y-auto"><div class="muted2 py-6 text-center">جارِ التحميل…</div></div></div>`;
   document.getElementById('log-level').value=logsLevel;
   document.getElementById('log-level').onchange=e=>{logsLevel=e.target.value;loadLogs();};
+  document.getElementById('log-search').oninput=e=>{logsQuery=e.target.value;paintLogs();};
+  document.getElementById('log-copy').onclick=copyLogs;
   document.getElementById('log-refresh').onclick=loadLogs;
   document.getElementById('log-pause').onclick=function(){logsPaused=!logsPaused;this.textContent=logsPaused?'▶ استئناف التحديث التلقائي':'⏸ إيقاف التحديث التلقائي';};
   loadLogs();
   state.timers.logs=setInterval(()=>{if(state.section==='logs'&&!logsPaused)loadLogs();},10000);
 }
+function filteredLogs(){
+  const q=logsQuery.trim().toLowerCase();
+  if(!q)return logsData;
+  return logsData.filter(ln=>((ln.time||'')+' '+(ln.level||'')+' '+(ln.source||'')+' '+(ln.message||'')).toLowerCase().includes(q));
+}
+function paintLogs(){
+  const body=document.getElementById('logs-body');
+  if(!body)return;
+  const entries=filteredLogs();
+  if(!logsData.length){body.innerHTML='<div class="muted2 py-6 text-center">'+(logsFileExists===false?'ملف السجل غير موجود بعد.':'لا توجد سجلات مطابقة.')+'</div>';return;}
+  if(!entries.length){body.innerHTML='<div class="muted2 py-6 text-center">🔍 لا أسطر مطابقة للتصفية «'+esc(logsQuery)+'»</div>';return;}
+  body.innerHTML=entries.map(ln=>{
+    const cls=ln.level==='ERROR'?'log-err':ln.level==='WARNING'?'log-warn':ln.level==='DEBUG'?'log-debug':'log-info';
+    return `<div class="log-line"><span class="muted2">[${esc(ln.time||'')}]</span> <span class="${cls} font-bold">${esc(ln.level||'')}</span> <span class="muted2">${esc(ln.source||'')}</span> ${esc(ln.message||'')}</div>`;
+  }).join('');
+  body.scrollTop=body.scrollHeight;
+}
 async function loadLogs(){
   try{
     const d=await api('/logs?lines=200'+(logsLevel?`&level=${logsLevel}`:''));
-    const body=document.getElementById('logs-body');
-    if(!body)return;
-    const entries=d.entries||[];
-    if(!entries.length){body.innerHTML='<div class="muted2 py-6 text-center">'+(d.file_exists===false?'ملف السجل غير موجود بعد.':'لا توجد سجلات مطابقة.')+'</div>';}
-    else body.innerHTML=entries.map(ln=>{
-      const cls=ln.level==='ERROR'?'log-err':ln.level==='WARNING'?'log-warn':ln.level==='DEBUG'?'log-debug':'log-info';
-      return `<div class="log-line"><span class="muted2">[${esc(ln.time||'')}]</span> <span class="${cls} font-bold">${esc(ln.level||'')}</span> <span class="muted2">${esc(ln.source||'')}</span> ${esc(ln.message||'')}</div>`;
-    }).join('');
+    logsData=d.entries||[];logsFileExists=d.file_exists!==false;
+    paintLogs();
     const meta=document.getElementById('log-meta');
-    if(meta)meta.textContent=`الملف: ${d.file||'—'} · المعروض: ${d.total_shown??entries.length} سطر`;
-    body.scrollTop=body.scrollHeight;
+    if(meta){
+      const shown=filteredLogs().length;
+      meta.textContent=`الملف: ${d.file||'—'} · المعروض: ${shown}${logsQuery.trim()?` من ${logsData.length}`:''} سطر`;
+    }
   }catch(e){}
+}
+async function copyLogs(){
+  const entries=filteredLogs();
+  if(!entries.length){toast('لا توجد أسطر لنسخها','warning');return;}
+  const text=entries.map(ln=>`[${ln.time||''}] ${ln.level||''} ${ln.source||''} ${ln.message||''}`).join('\n');
+  try{
+    if(navigator.clipboard&&window.isSecureContext){await navigator.clipboard.writeText(text);}
+    else{
+      const ta=document.createElement('textarea');ta.value=text;ta.style.position='fixed';ta.style.opacity='0';
+      document.body.appendChild(ta);ta.select();document.execCommand('copy');ta.remove();
+    }
+    toast(`تم نسخ ${entries.length} سطر إلى الحافظة ✓`,'success');
+  }catch(e){toast('فشل النسخ إلى الحافظة','error');}
 }
 
 /* ============================ Control Center ============================ */
@@ -1022,6 +1081,22 @@ async function restoreBackup(name){
   }catch(e){}
   showLogin();
 })();
+
+/* Global heartbeat — header live badge + tab title reflect connectivity on
+   every section (independent of the per-section timers that navigate() clears). */
+setInterval(async()=>{
+  try{
+    const d=await api('/stats');
+    const mons=d.monitors||[], conn=mons.filter(m=>m.connected).length, tot=mons.length;
+    const b=document.getElementById('liveBadge');
+    if(b){
+      if(!tot||conn===0){b.className='chip bg-red-100 text-red-700 dark:bg-red-900/50 dark:text-red-300 mr-auto';b.textContent='● منقطع';}
+      else if(conn<tot){b.className='chip bg-amber-100 text-amber-700 dark:bg-amber-900/50 dark:text-amber-300 mr-auto';b.textContent=`● ${conn}/${tot} متصل`;}
+      else{b.className='chip bg-emerald-100 text-emerald-700 dark:bg-emerald-900/50 dark:text-emerald-300 mr-auto';b.textContent='● مباشر';}
+    }
+    document.title=(tot&&conn<tot?`(${conn}/${tot}) `:'')+'لوحة إدارة البوت';
+  }catch(e){}
+},30000);
 </script>
 </body>
 </html>

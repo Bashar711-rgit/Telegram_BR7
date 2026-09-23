@@ -74,3 +74,31 @@ class TestBackupPathSafety:
         assert "backups" in result
         assert ".." not in result
         assert result.endswith(".zip")
+
+
+class TestAccountRowCounters:
+    def test_account_row_exposes_monitor_counters(self):
+        """v9.13.3: dashboard mini-stats need messages/errors/duplicates."""
+        from webadmin.routes import _account_row
+
+        class FakeMonitor:
+            account = {"prefix": "MAIN"}
+            is_connected = True
+            _last_connect_error = None
+            _stats = {"messages_processed": 7, "errors": 2, "duplicates": 3,
+                      "alerts": 1, "last_connected": 1234}
+
+        acc = {"prefix": "MAIN", "name": "Main", "phone": "+966...", "priority": 10}
+        row = _account_row(acc, [FakeMonitor()])
+        assert row["connected"] is True
+        assert row["messages_processed"] == 7
+        assert row["errors"] == 2
+        assert row["duplicates"] == 3
+
+    def test_account_row_counters_default_without_monitor(self):
+        from webadmin.routes import _account_row
+        row = _account_row({"prefix": "X", "name": "X"}, [])
+        assert row["messages_processed"] == 0
+        assert row["errors"] == 0
+        assert row["duplicates"] == 0
+        assert row["connected"] is False

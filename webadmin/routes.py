@@ -120,6 +120,10 @@ def _account_row(acc: Dict[str, Any], monitors: List[Any]) -> Dict[str, Any]:
         "last_error": last_error or stats.get("last_error"),
         "has_session": bool(acc.get("session_string")),
         "alerts": stats.get("alerts", 0) if mon else 0,
+        # Lightweight counters for dashboard mini-stats (0 when no monitor yet)
+        "messages_processed": stats.get("messages_processed", 0),
+        "errors": stats.get("errors", 0),
+        "duplicates": stats.get("duplicates", 0),
     }
 
 
