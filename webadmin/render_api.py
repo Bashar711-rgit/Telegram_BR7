@@ -9,7 +9,7 @@ RENDER_SERVICE_ID are not configured (local/dev environments).
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 import aiohttp
 
@@ -58,22 +58,51 @@ async def upsert_env(key: str, value: str) -> Dict[str, Any]:
 
 
 async def upsert_env_many(pairs: Dict[str, str]) -> Dict[str, Any]:
-    """Bulk upsert env vars (single redeploy on Render's side)."""
+    """Upsert several env vars WITHOUT touching unrelated ones.
+
+    P0 fix (v9.13.1): the previous implementation used the bulk endpoint
+    PUT /services/{id}/env-vars, which on Render has REPLACE semantics —
+    every variable not included in the payload was WIPED from the service.
+    Saving a single account from the dashboard therefore deleted the whole
+    environment (session strings, TARGET_GROUP_ID, dashboard tokens, ...),
+    after which every new deploy boots with a broken env and permanently
+    fails with update_failed.
+
+    The per-variable endpoint PUT /services/{id}/env-vars/{key} is a true
+    upsert: it creates or updates exactly one key and leaves all others
+    untouched. We now iterate over the requested keys with that endpoint.
+    Render applies env-var changes on the next deploy, so the number of
+    HTTP calls does not translate into multiple redeploys.
+    """
     if not is_configured():
         return {"saved": False, "reason": "RENDER_API_KEY / RENDER_SERVICE_ID غير مضبوطة"}
     _, service_id = _credentials()
-    payload: List[Dict[str, str]] = [{"key": k, "value": v} for k, v in pairs.items()]
+    results: Dict[str, str] = {}
     try:
         async with aiohttp.ClientSession(timeout=_TIMEOUT, headers=_headers()) as s:
-            async with s.put(
-                f"{_API_BASE}/services/{service_id}/env-vars", json=payload
-            ) as r:
-                if r.status in (200, 201):
-                    return {"saved": True}
-                body = (await r.text())[:200]
-                return {"saved": False, "reason": f"Render API HTTP {r.status}: {body}"}
-    except Exception as e:
+            for key, value in pairs.items():
+                try:
+                    async with s.put(
+                        f"{_API_BASE}/services/{service_id}/env-vars/{key}",
+                        json={"value": value},
+                    ) as r:
+                        if r.status in (200, 201):
+                            results[key] = "ok"
+                        else:
+                            body = (await r.text())[:150]
+                            results[key] = f"HTTP {r.status}: {body}"
+                except Exception as e:  # one bad key must not abort the batch
+                    results[key] = f"{type(e).__name__}: {e}"
+    except Exception as e:  # network errors must never crash the dashboard
         return {"saved": False, "reason": f"{type(e).__name__}: {e}"}
+    failed = {k: v for k, v in results.items() if v != "ok"}
+    if failed:
+        return {
+            "saved": False,
+            "reason": "; ".join(f"{k}: {v}" for k, v in failed.items()),
+            "results": results,
+        }
+    return {"saved": True, "results": results}
 
 
 async def delete_env(key: str) -> Dict[str, Any]:
