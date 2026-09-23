@@ -2204,12 +2204,14 @@ async function loadBlocked() {
         ]);
         const sCnt = document.getElementById('blockedSendersCount');
         const cCnt = document.getElementById('blockedChatsCount');
-        // v9.16: العدّاد يعرض الإجمالي الفعلي من الإحصاءات الحية (API مقصوص بـ LIMIT 100)
+        // v9.16: العدّاد = طول القائمة إن كان أقل من سقف الـ LIMIT 100 (يتبع الحذف/الإضافة فوراً)،
+        // وإلا الإجمالي الفعلي من الإحصاءات الحية
         const realSenders = (window.__LAST_STATS__ || {}).blocked_senders;
         const realChats = (window.__LAST_STATS__ || {}).blocked_chats;
-        if (sCnt) sCnt.textContent = String(realSenders !== undefined ? realSenders : ((senders.senders || []).length));
-        if (cCnt) cCnt.textContent = String(realChats !== undefined ? realChats : ((chats.chats || []).length));
         const sList = senders.senders || [];
+        const cList = chats.chats || [];
+        if (sCnt) sCnt.textContent = String(sList.length < 100 ? sList.length : (realSenders !== undefined ? realSenders : sList.length));
+        if (cCnt) cCnt.textContent = String(cList.length < 100 ? cList.length : (realChats !== undefined ? realChats : cList.length));
         if (sList.length > 0) {
             sendersContainer.innerHTML = sList.map(s => {
                 const src = blockSourceLabel(s.blocked_by);
@@ -2228,7 +2230,6 @@ async function loadBlocked() {
         } else {
             sendersContainer.innerHTML = emptyBox('✅', 'لا يوجد مستخدمون محظورون', 'ستظهر هنا أي قوائم تضيفها من النموذج أدناه أو من مودال التنبيه');
         }
-        const cList = chats.chats || [];
         if (cList.length > 0) {
             chatsContainer.innerHTML = cList.map(c => {
                 const src = blockSourceLabel(c.blocked_by);
