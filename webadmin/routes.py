@@ -22,8 +22,10 @@ from __future__ import annotations
 
 import asyncio
 import csv
+import html as _html
 import io
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -243,7 +245,10 @@ async def get_stats(request: Request, session: Dict[str, Any] = Protected):
         except Exception:
             out["hourly"] = []
         try:
-            out["recent_alerts"] = await db.get_recent_alerts_for_dashboard(5)
+            out["recent_alerts"] = [
+                {**a, "alert_text": _strip_html(a.get("alert_text") or "", 120)}
+                for a in await db.get_recent_alerts_for_dashboard(5)
+            ]
         except Exception:
             out["recent_alerts"] = []
         try:
@@ -280,6 +285,23 @@ async def _enrich_contact_links(db: Any, rows: List[Dict[str, Any]]) -> None:
             r["last_group_link"] = c.get("last_group_link")
 
 
+def _strip_html(text: str, limit: int = 200) -> str:
+    """Convert a Telegram-HTML alert_text into a clean single-line preview.
+
+    alert_text stored in the DB carries Telegram formatting (<b>الرسالة:</b>,
+    <a href=...>, <blockquote>...). Rendering it raw in the dashboard showed
+    literal tags (they are HTML-escaped client-side). Strip the tags, undo
+    the entities so the original user text is shown, and collapse all
+    whitespace. The result is safe: every frontend sink esc()s it again.
+    """
+    if not text:
+        return ""
+    clean = re.sub(r"<[^>]+>", " ", str(text))
+    clean = _html.unescape(clean)
+    clean = re.sub(r"\s+", " ", clean).strip()
+    return clean[:limit]
+
+
 def _serialize_alert(row: Dict[str, Any]) -> Dict[str, Any]:
     text = row.get("alert_text") or ""
     links = _telegram_links(row)
@@ -295,7 +317,7 @@ def _serialize_alert(row: Dict[str, Any]) -> Dict[str, Any]:
         "chat_id": row.get("chat_id"),
         "account": row.get("account_name"),
         "keyword": row.get("keyword"),
-        "preview": text[:200],
+        "preview": _strip_html(text, 200),
         "decision": row.get("decision"),
         "confidence": row.get("confidence"),
         "links": links,
