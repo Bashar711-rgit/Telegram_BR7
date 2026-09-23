@@ -5,11 +5,15 @@ Runs against the real app with lifespan handled manually (no bot attached →
 dashboard opens its own SQLite connection via CFG.DB_FILE → tests/_test_bot.db).
 """
 
+import time
+
 import pytest
 from httpx import ASGITransport, AsyncClient
 
 import dashboard as dashboard_module
+from config import fast_hash
 from dashboard import app
+from database import AlertRecord
 
 TOKEN = "test-dashboard-token-0123456789"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
@@ -221,3 +225,83 @@ class TestMessagesExactSearch:
         assert body, "stats_cache was never populated"
         assert "blocked_chats" in body
         assert isinstance(body["blocked_chats"], int)
+
+
+class TestAlertsHoursFilter:
+    """v9.17: فلتر النطاق الزمني hours على /api/alerts و /api/alerts/export."""
+
+    @pytest.mark.asyncio
+    async def test_alerts_hours_echoed_in_filters(self, client):
+        r = await client.get("/api/alerts", headers=AUTH, params={"hours": 24})
+        assert r.status_code == 200
+        body = r.json()
+        assert body["filters"]["hours"] == 24
+
+    @pytest.mark.asyncio
+    async def test_alerts_hours_excludes_old_rows(self, client):
+        # أضف تنبيهاً قديماً (سنتان) ثم تحقق أن hours=1 يستبعده من العدد
+        db = dashboard_module.app.state.db
+        old_ts = time.time() - 2 * 365 * 24 * 3600
+        rec = AlertRecord(
+            message_hash=fast_hash("old-alert-hours-test"), chat_id=-1000,
+            sender_id=900001, account_name="Main", keyword="قديمة",
+            alert_text="تنبيه قديم جداً", timestamp=old_ts,
+            decision="accept", confidence=0.9)
+        assert await db.add_alert(rec) is True
+        await db._flush()  # alerts live in a batch buffer until flushed
+        r = await client.get("/api/alerts", headers=AUTH, params={"hours": 1, "keyword": "قديمة"})
+        assert r.status_code == 200
+        body = r.json()
+        assert body["total"] == 0 and body["count"] == 0
+        # بلا فلتر زمني يظهر نفس التنبيه
+        r2 = await client.get("/api/alerts", headers=AUTH, params={"keyword": "قديمة"})
+        assert r2.status_code == 200
+        assert r2.json()["total"] >= 1
+
+    @pytest.mark.asyncio
+    async def test_alerts_hours_out_of_range_clamped(self, client):
+        # hours أكبر من السقف (168) أو غير رقمي لا تكسر الطلب
+        r = await client.get("/api/alerts", headers=AUTH, params={"hours": 99999})
+        assert r.status_code == 200
+        r2 = await client.get("/api/alerts", headers=AUTH, params={"hours": "abc"})
+        assert r2.status_code == 200
+
+
+class TestBlockSenderSource:
+    """v9.17: source يُسجَّل فعلياً في blocked_by (قائمة سماح dashboard/alert/system)."""
+
+    @pytest.mark.asyncio
+    async def test_block_from_alert_records_alert_source(self, client):
+        uid = 911001
+        r = await client.post("/api/blocked/senders", headers=AUTH,
+                              json={"user_id": uid, "reason": "اختبار", "source": "alert"})
+        assert r.status_code == 200
+        assert r.json()["source"] == "alert"
+        rows = await dashboard_module.app.state.db._fetchall(
+            "SELECT blocked_by FROM blocked_senders WHERE sender_id = ?", (uid,))
+        assert rows and rows[0]["blocked_by"] == "alert"
+        # تنظيف
+        await client.delete(f"/api/blocked/senders/{uid}", headers=AUTH)
+
+    @pytest.mark.asyncio
+    async def test_block_default_source_is_dashboard(self, client):
+        uid = 911002
+        r = await client.post("/api/blocked/senders", headers=AUTH,
+                              json={"user_id": uid, "reason": "اختبار"})
+        assert r.status_code == 200
+        rows = await dashboard_module.app.state.db._fetchall(
+            "SELECT blocked_by FROM blocked_senders WHERE sender_id = ?", (uid,))
+        assert rows and rows[0]["blocked_by"] == "dashboard"
+        await client.delete(f"/api/blocked/senders/{uid}", headers=AUTH)
+
+    @pytest.mark.asyncio
+    async def test_block_invalid_source_falls_back(self, client):
+        uid = 911003
+        r = await client.post("/api/blocked/senders", headers=AUTH,
+                              json={"user_id": uid, "source": "evil-value"})
+        assert r.status_code == 200
+        assert r.json()["source"] == "dashboard"
+        rows = await dashboard_module.app.state.db._fetchall(
+            "SELECT blocked_by FROM blocked_senders WHERE sender_id = ?", (uid,))
+        assert rows and rows[0]["blocked_by"] == "dashboard"
+        await client.delete(f"/api/blocked/senders/{uid}", headers=AUTH)

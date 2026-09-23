@@ -223,8 +223,12 @@ class KeywordDelete(BaseModel):
 
 
 class BlockUser(BaseModel):
+    """v9.17: `source` يتتبع مكان الحظر (dashboard/alert) ليظهر في صفحة الحظر
+    كشريحة "من تنبيه" بدل أن تُسجَّل كل حظرات اللوحات كمصدر dashboard."""
+
     user_id: int
     reason: str = ""
+    source: str = "dashboard"
 
 
 class BlockChat(BaseModel):
@@ -973,6 +977,7 @@ async def get_alerts(
     keyword: Optional[str] = None,
     decision: Optional[str] = None,
     min_confidence: Optional[float] = None,
+    hours: Optional[str] = None,
 ):
     """جلب التنبيهات مع تصفية متقدمة (بما فيها IntentEngine).
 
@@ -980,22 +985,41 @@ async def get_alerts(
     تيليجرام (<b>/<a>/<blockquote>) فتظهر حرفياً في لوحة BotPanel؛
     الآن يُنظّف قبل الإرجاع. كما أصبح total العدد الكلي الحقيقي بدل
     حجم الصفحة الحالية (كان يجعل شارة العدّاد خاطئة بعد أول 50 تنبيهاً).
+    v9.17: فلتر نطاق زمني `hours` (1/24/168) يستخدم from_date الموجود
+    أصلاً في طبقة قاعدة البيانات — سقف 168 ساعة (7 أيام). النوع str عمداً
+    حتى لا يرفع FastAPI خطأ 422 على قيم غير رقمية — المعالج نفسه يتغاضى
+    عنها بأمان (يرجع النتائج بلا فلتر زمني).
     """
     db = request.app.state.db
+    from_ts: Optional[float] = None
+    h_clamped: Optional[int] = None
+    if hours is not None:
+        try:
+            h = max(1, min(int(hours), 168))
+            from_ts = time.time() - h * 3600
+            h_clamped = h
+        except (TypeError, ValueError):
+            from_ts = None
     try:
         rows = await db.get_alerts_with_filters(
             limit=limit, offset=offset, keyword=keyword, account=account,
             decision=decision, min_confidence=min_confidence,
+            from_date=from_ts,
         )
         total = await db.count_alerts_with_filters(
             keyword=keyword, account=account,
             decision=decision, min_confidence=min_confidence,
+            from_date=from_ts,
         )
         return JSONResponse({
             "alerts": [_clean_alert_row(r) for r in rows],
             "total": total,
             "count": len(rows),
-            "filters": {"decision": decision, "min_confidence": min_confidence},
+            "filters": {
+                "decision": decision,
+                "min_confidence": min_confidence,
+                "hours": h_clamped,
+            },
         })
     except Exception as e:
         logger.error(f"Error fetching alerts: {e}")
@@ -1008,16 +1032,26 @@ async def export_alerts_csv(
     account: Optional[str] = None,
     keyword: Optional[str] = None,
     decision: Optional[str] = None,
+    hours: Optional[str] = None,
     limit: int = 5000,
 ):
-    """v9.14: تصدير التنبيهات CSV من BotPanel (نفس الفلاتر النشطة)."""
+    """v9.14: تصدير التنبيهات CSV من BotPanel (نفس الفلاتر النشطة).
+    v9.17: يرث فلتر النطاق الزمني hours مثل /api/alerts."""
     db = request.app.state.db
+    from_ts: Optional[float] = None
+    if hours is not None:
+        try:
+            h = max(1, min(int(hours), 168))
+            from_ts = time.time() - h * 3600
+        except (TypeError, ValueError):
+            from_ts = None
     rows: List[Dict[str, Any]] = []
     if db is not None:
         try:
             rows = await db.get_alerts_with_filters(
                 limit=max(1, min(limit, 20000)), offset=0,
                 keyword=keyword, account=account, decision=decision,
+                from_date=from_ts,
             )
         except Exception as e:
             logger.error(f"Error exporting alerts: {e}")
@@ -1271,9 +1305,16 @@ async def get_blocked_chats(request: Request):
 
 @app.post("/api/blocked/senders", dependencies=[Depends(verify_token)])
 async def block_sender(data: BlockUser, request: Request):
+    """v9.17: source يُمرَّر من العميل (dashboard/alert) مع قائمة سماح —
+    كانت تُسجَّل كل حظرات اللوحة كمصدر dashboard حتى لو أُرسلت من مودال
+    التنبيه فتظهر شرائح المصدر في صفحة الحظر غير دقيقة."""
     db = request.app.state.db
-    await db.block_sender(data.user_id, data.reason, "dashboard")
-    return JSONResponse({"success": True})
+    allowed = {"dashboard", "alert", "system"}
+    src = (data.source or "dashboard").strip().lower()
+    if src not in allowed:
+        src = "dashboard"
+    await db.block_sender(data.user_id, data.reason, src)
+    return JSONResponse({"success": True, "source": src})
 
 
 @app.delete("/api/blocked/senders/{user_id}", dependencies=[Depends(verify_token)])

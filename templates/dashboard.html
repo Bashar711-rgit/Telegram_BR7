@@ -592,6 +592,42 @@ body { font-family: var(--sans); background: var(--bg); color: var(--text); font
 }
 .search-input:focus { outline: none; border-color: var(--accent); }
 
+/* ── v9.17 ───────────────────────────────────────────────────── */
+/* segmented control — فلتر النطاق الزمني للتنبيهات */
+.seg-control {
+  display: inline-flex; align-items: stretch;
+  background: var(--bg2); border: 1px solid var(--border);
+  border-radius: 10px; padding: 3px; gap: 2px;
+}
+.seg-btn {
+  border: none; background: transparent; cursor: pointer;
+  color: var(--text3); font: inherit; font-size: 11px; font-weight: 700;
+  padding: 5px 12px; border-radius: 7px; white-space: nowrap;
+  transition: background .18s ease, color .18s ease, box-shadow .18s ease;
+}
+.seg-btn:hover { color: var(--text); background: var(--bg3); }
+.seg-btn.active {
+  color: var(--accent); background: var(--bg3);
+  box-shadow: inset 0 0 0 1px rgba(79, 142, 247, .35), 0 0 0 3px rgba(79, 142, 247, .08);
+}
+.seg-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+/* فواصل الأيام في قائمة التنبيهات */
+.alert-day-sep {
+  display: flex; align-items: center; gap: 10px;
+  padding: 12px 16px 4px; color: var(--text3);
+  font-size: 10.5px; font-weight: 800; letter-spacing: .4px;
+  user-select: none;
+}
+.alert-day-sep::before, .alert-day-sep::after {
+  content: ''; height: 1px; flex: 1;
+  background: linear-gradient(90deg, transparent, var(--border2), transparent);
+}
+.alert-day-sep span {
+  background: var(--bg3); border: 1px solid var(--border);
+  padding: 2px 12px; border-radius: 20px; color: var(--text2);
+}
+
 /* ── v9.16 ───────────────────────────────────────────────────── */
 /* skeleton shimmer loaders — تُظهر أثناء تحميل القوائم بدل النص الثابت */
 .skel {
@@ -689,7 +725,7 @@ body { font-family: var(--sans); background: var(--bg); color: var(--text); font
     <div class="brand-icon">🤖</div>
     <div>
       <div class="brand-name">BotPanel</div>
-      <div class="brand-ver" id="brandVer">BR7 · v9.16</div>
+      <div class="brand-ver" id="brandVer">BR7 · v9.17</div>
     </div>
   </div>
 
@@ -1254,7 +1290,12 @@ const PAGES = {
                             <option value="ignore">متجاهل</option>
                         </select>
                         <button class="tb-btn" onclick="loadAlerts()">بحث</button>
-                        <button class="tb-btn" onclick="document.getElementById('alert-search').value='';document.getElementById('alert-decision').value='';loadAlerts()">مسح</button>
+                        <div class="seg-control" id="alertRangeSeg" role="group" aria-label="النطاق الزمني للتنبيهات">
+                            <button class="seg-btn" data-range="" onclick="setAlertRange('')">الكل</button>
+                            <button class="seg-btn" data-range="1" onclick="setAlertRange('1')">ساعة</button>
+                            <button class="seg-btn" data-range="24" onclick="setAlertRange('24')">24س</button>
+                            <button class="seg-btn" data-range="168" onclick="setAlertRange('168')">7 أيام</button>
+                        </div>
                         <button class="tb-btn ${ALERTS_AUTOREFRESH ? 'notify-on' : ''}" id="alertsAutoBtn" onclick="toggleAlertsAuto()" title="تحديث القائمة كل 15 ثانية">⏱️ ${ALERTS_AUTOREFRESH ? 'تلقائي (15ث)' : 'تحديث تلقائي'}</button>
                         <button class="tb-btn" onclick="exportAlertsCsv()" title="تنزيل التنبيهات المطابقة للفلاتر الحالية CSV">⬇️ تصدير CSV</button>
                     </div>
@@ -1263,7 +1304,7 @@ const PAGES = {
                 <div id="alertsMoreWrap" style="padding:0 16px 14px"></div>
             </div>`;
         },
-        load() { loadAlerts(); }
+        load() { setAlertRange(getAlertRange()); loadAlerts(); }
     },
 
     analytics: {
@@ -1430,7 +1471,7 @@ const PAGES = {
                     <div class="panel-actions"><button class="tb-btn" onclick="renderSysInfo(true)" title="تحديث من الخادم">⟳</button></div>
                 </div>
                 <div class="sysinfo-grid" id="sysinfo-grid">
-                    <div class="sysinfo-cell"><span class="k">الإصدار</span><span class="v">v9.16</span></div>
+                    <div class="sysinfo-cell"><span class="k">الإصدار</span><span class="v">v9.17</span></div>
                     <div class="sysinfo-cell"><span class="k">جاري التحميل…</span><span class="v">—</span></div>
                 </div>
             </div>
@@ -1695,6 +1736,31 @@ async function loadMessages() {
 // + شارة العدد الكلي الحقيقي (كانت تعرض حجم الصفحة فقط).
 const DEC_SHORT = { accept: 'مقبول', review: 'مراجعة', ignore: 'متجاهل' };
 
+// v9.17: النطاق الزمني للتنبيهات (يُحفظ في localStorage) — '' = الكل
+const ALERT_RANGE_KEY = 'br7_alert_range';
+function getAlertRange() {
+    const v = localStorage.getItem(ALERT_RANGE_KEY) || '';
+    return ['1', '24', '168'].includes(v) ? v : '';
+}
+function setAlertRange(v) {
+    localStorage.setItem(ALERT_RANGE_KEY, v || '');
+    document.querySelectorAll('#alertRangeSeg .seg-btn').forEach(b =>
+        b.classList.toggle('active', (b.dataset.range || '') === (v || '')));
+}
+
+// v9.17: فواصل الأيام في قائمة التنبيهات (اليوم / أمس / التاريخ)
+function alertDayLabel(ts) {
+    if (!ts) return null;
+    const d = new Date((Number(ts) || 0) * 1000);
+    if (isNaN(d.getTime())) return null;
+    const now = new Date();
+    const day = x => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
+    const diff = Math.round((day(now) - day(d)) / 86400000);
+    if (diff === 0) return 'اليوم';
+    if (diff === 1) return 'أمس';
+    return d.toLocaleDateString('ar-EG-u-nu-latn', { weekday: 'long', day: 'numeric', month: 'long' });
+}
+
 function cacheAlerts(list) {
     (list || []).forEach(a => { if (a && a.id != null) ALERTS_CACHE[a.id] = a; });
 }
@@ -1713,6 +1779,8 @@ async function loadAlerts(append) {
         const params = new URLSearchParams({ limit: String(PAGE), offset: String(ALERTS_OFFSET) });
         if (q) params.set('keyword', q);
         if (dec) params.set('decision', dec);
+        const range = getAlertRange();
+        if (range) params.set('hours', range);
         const data = await apiFetch(`/api/alerts?${params}`);
         cacheAlerts(data.alerts);
         ALERTS_TOTAL_KNOWN = data.total || 0;
@@ -1726,10 +1794,18 @@ async function loadAlerts(append) {
             return;
         }
         const DEC_LABEL = { accept: ['مقبول', 'green'], review: ['مراجعة', 'yellow'], ignore: ['متجاهل', 'red'] };
+        let lastDay = null;
         const html = rows.map(a => {
             const d = DEC_LABEL[a.decision] || ['—', 'blue'];
             const sender = a.first_name || a.username || a.sender_id || 'غير معروف';
+            const ts = Number(a.timestamp || a.created_at || 0);
+            const dayLbl = alertDayLabel(ts);
+            const daySep = (dayLbl && dayLbl !== lastDay)
+                ? (lastDay !== null || !append ? `<div class="alert-day-sep"><span>${esc(dayLbl)}</span></div>` : '')
+                : '';
+            if (dayLbl) lastDay = dayLbl;
             return `
+            ${daySep}
             <div class="alert-item dec-${esc(a.decision || 'accept')}" onclick='showAlertModal(${JSON.stringify(a.id)})' title="اضغط لعرض التفاصيل الكاملة">
                 <div class="al-top">
                     ${a.confidence ? `<span class="al-conf ${confClass(a.confidence)}">${(a.confidence * 100).toFixed(0)}%</span>` : ''}
@@ -1792,9 +1868,11 @@ function toggleAlertsAuto() {
 function exportAlertsCsv() {
     const q = (document.getElementById('alert-search')?.value || '').trim();
     const dec = (document.getElementById('alert-decision')?.value || '').trim();
+    const range = getAlertRange();
     const p = new URLSearchParams();
     if (q) p.set('keyword', q);
     if (dec) p.set('decision', dec);
+    if (range) p.set('hours', range);
     logEvent('inf', 'alerts CSV export started');
     // Same-origin GET with Bearer — use fetch so the token never appears in URL
     fetch(`${API_BASE}/api/alerts/export?${p}`, {
@@ -1849,13 +1927,14 @@ function showAlertModal(id) {
 }
 
 // v9.15: حظر المُرسل مباشرة من مودال التنبيه (يستخدم /api/blocked/senders)
+// v9.17: يرسل source=alert ليعرض صف الحظر شريحة "🚨 من تنبيه" بدلاً من "لوحة التحكم"
 async function blockSenderFromAlert() {
     if (!CURRENT_ALERT_SENDER) { showToast('لا يوجد معرّف مُرسل لهذا التنبيه', 'wrn'); return; }
     if (!confirm(`حظر المُرسل ${CURRENT_ALERT_SENDER}؟ لن تُعالج رسائله بعد الآن.`)) return;
     try {
         const r = await apiFetch('/api/blocked/senders', {
             method: 'POST',
-            body: JSON.stringify({ user_id: Number(CURRENT_ALERT_SENDER), reason: 'محظور من مودال التنبيه — BotPanel' }),
+            body: JSON.stringify({ user_id: Number(CURRENT_ALERT_SENDER), reason: 'محظور من مودال التنبيه — BotPanel', source: 'alert' }),
         });
         showToast('✓ تم حظر المُرسل', 'ok');
         logEvent('ok', `sender ${CURRENT_ALERT_SENDER} blocked via alert modal`);
@@ -2332,7 +2411,7 @@ async function renderSysInfo(refresh) {
     }
     const dbOk = d.db_healthy !== false;
     const cells = [
-        ['الإصدار', 'v9.16'],
+        ['الإصدار', 'v9.17'],
         ['مدة التشغيل', fmtUptime(d.uptime || 0)],
         ['الذاكرة', `${d.memory_used_mb || 0}MB`],
         ['المعالج', `${(d.cpu_percent || 0).toFixed ? (d.cpu_percent || 0).toFixed(1) : (d.cpu_percent || 0)}%`],

@@ -47,6 +47,10 @@ tailwind.config = {
   .badge.info { @apply bg-sky-100 text-sky-700; }
   .dark .badge.info { @apply bg-sky-900/50 text-sky-300; }
 
+  /* v9.17: خلايا بطاقة معلومات النظام (صفحة الإعدادات) */
+  .sys-cell { background: rgba(148,163,184,.08); border: 1px solid var(--border); }
+  .sys-cell:hover { border-color: #38bdf8; background: rgba(56,189,248,.08); }
+
   .tbl { @apply w-full text-sm; border-collapse: collapse; }
   .tbl th { @apply text-right text-xs font-bold pb-2 px-1 opacity-60 whitespace-nowrap; border-bottom: 1px solid var(--border); }
   .tbl td { @apply py-2.5 px-1 align-top; border-bottom: 1px solid var(--border); }
@@ -438,12 +442,13 @@ async function refreshDashboard() {
     });
   }
 
-  // Recent alerts
+  // Recent alerts — v9.17: حدود ملوّنة يمين كل تنبيه حسب القرار (أخضر/كهرماني/أحمر) + hover
   const recent = d.recent_alerts || [];
+  const decBorder = dec => dec === 'accept' ? '#059669' : dec === 'review' ? '#d97706' : '#e11d48';
   document.getElementById('recentAlerts').innerHTML = recent.length ? recent.map(a => `
-    <div class="border-r-4 border-blue-500 bg-slate-50 dark:bg-slate-700/50 rounded-lg p-2.5">
+    <div class="recent-al rounded-lg p-2.5 bg-slate-50 dark:bg-slate-700/50 transition-all duration-150 hover:shadow-md hover:-translate-y-px" style="border-right:4px solid ${decBorder(a.decision)}">
       <div class="flex justify-between gap-2">
-        <span class="font-bold text-blue-600 dark:text-blue-400 truncate">${esc(a.keyword || '—')}</span>
+        <span class="font-bold truncate" style="color:${decBorder(a.decision)}">${esc(a.keyword || '—')}</span>
         <span class="text-xs text-slate-400 whitespace-nowrap">${fmtTs(a.timestamp)}</span>
       </div>
       <div class="text-xs text-slate-600 dark:text-slate-300 mt-1 line-clamp-2">${esc((a.alert_text || '').slice(0, 120))}</div>
@@ -851,11 +856,12 @@ const SETTING_LABELS={
 };
 async function renderSettings(){
   el.main.innerHTML='<div class="muted2 text-sm py-8 text-center">جارِ التحميل…</div>';
-  let d;
-  try{d=await api('/settings');}catch(e){return;}
+  let d,sys;
+  try{[d,sys]=await Promise.all([api('/settings'),api('/stats').catch(()=>null)]);}catch(e){return;}
   const schema=d.schema||{},vals=d.settings||{};
   el.main.innerHTML=`
-  <div class="card max-w-2xl">
+  ${sys?renderSysInfoCard(sys):''}
+  <div class="card max-w-2xl mt-4">
     <h3 class="font-black mb-1">إعدادات البوت أثناء التشغيل</h3>
     <p class="text-xs muted2 mb-4">القيم المميزة بـ <span class="badge ok">فوري</span> تُطبَّق مباشرة دون إعادة تشغيل. الباقي يُحفظ ويُطبَّق عند إعادة تشغيل البوت.</p>
     <div class="grid sm:grid-cols-2 gap-3">
@@ -875,6 +881,40 @@ async function renderSettings(){
   </div>`;
   document.getElementById('set-save').onclick=()=>saveSettings(schema);
   document.getElementById('set-reload').onclick=renderSettings;
+}
+/* v9.17: بطاقة معلومات النظام — مكافئة لبطاقة BotPanel (12 خلية حية من /stats) */
+function renderSysInfoCard(s){
+  const mem=s.memory||{},sum=s.summary||{},db=s.db||{},rl=s.rate_limiter||{};
+  const mons=s.monitors||[];
+  const conn=mons.filter(m=>m.connected).length;
+  const dbOk=s.db?!(db.error):true;
+  const cells=[
+    ['⏱️ مدة التشغيل',fmtUptime(s.uptime||0)],
+    ['🧠 الذاكرة الحالية',(mem.current_mb??0)+'MB'],
+    ['📈 ذروة الذاكرة',(mem.peak_mb??0)+'MB'],
+    ['🗂️ الطابور',fmtNum(s.queue_size??0)],
+    ['📨 الرسائل',fmtNum(db.total_messages??sum.total_messages??0)],
+    ['🚨 التنبيهات',fmtNum(db.alerts_sent??sum.total_alerts??0)],
+    ['👤 مرسلون فريدون',fmtNum(sum.unique_senders??0)],
+    ['📱 الحسابات',`${conn}/${mons.length||6} متصل`],
+    ['🚦 المعدل/ساعة',`${fmtNum(rl.per_hr??0)}/${rl.limit_hr??100}`],
+    ['🚫 محظورون',fmtNum(sum.blocked_senders??0)],
+    ['💾 قاعدة البيانات',dbOk?'✅ سليمة':'⚠️ مشكلة'],
+    ['🕳️ تسرب ذاكرة',mem.leak_suspected?'⚠️ مشتبه':'لا'],
+  ];
+  return `<div class="card">
+    <div class="flex items-center justify-between mb-3">
+      <h3 class="font-black">🖥️ معلومات النظام</h3>
+      <span class="badge info">حية من الخادم</span>
+    </div>
+    <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2">
+      ${cells.map(([k,v])=>`
+        <div class="sys-cell rounded-xl p-2.5 text-center transition-all duration-150 hover:-translate-y-0.5 hover:shadow-md" title="${esc(k)}">
+          <div class="text-[10px] muted2 mb-1">${k}</div>
+          <div class="text-sm font-bold mono">${esc(String(v))}</div>
+        </div>`).join('')}
+    </div>
+  </div>`;
 }
 async function saveSettings(schema){
   const updates={};
