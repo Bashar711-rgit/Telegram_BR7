@@ -442,6 +442,99 @@ body { font-family: var(--sans); background: var(--bg); color: var(--text); font
 .modal-actions { display: flex; gap: 8px; margin-top: 14px; }
 .modal-actions .tb-btn { flex: 1; justify-content: center; padding: 9px; }
 
+/* ── v9.14 ALERT POLISH ─────────────────────────────────────────── */
+.alert-item { cursor: pointer; position: relative; }
+.alert-item::before {
+  content: ''; position: absolute; right: 0; top: 0; bottom: 0;
+  width: 3px; background: var(--accent); opacity: .55;
+  border-radius: 0 3px 3px 0; transition: opacity .15s;
+}
+.alert-item.dec-accept::before { background: var(--green); }
+.alert-item.dec-review::before { background: var(--yellow); }
+.alert-item.dec-ignore::before { background: var(--red); }
+.alert-item:hover { background: var(--bg2); }
+.alert-item:hover::before { opacity: 1; }
+.alert-item.dec-accept:hover { background: rgba(52, 211, 153, 0.05); }
+.alert-item.dec-review:hover { background: rgba(251, 191, 36, 0.05); }
+.alert-item.dec-ignore:hover { background: rgba(248, 113, 113, 0.05); }
+.al-time { font-variant-numeric: tabular-nums; direction: ltr; unicode-bidi: embed; }
+
+/* feed scrollbar (home + alerts page) */
+.alert-feed { max-height: 560px; overflow-y: auto; scroll-behavior: smooth; }
+.alert-feed::-webkit-scrollbar { width: 8px; }
+.alert-feed::-webkit-scrollbar-track { background: transparent; }
+.alert-feed::-webkit-scrollbar-thumb {
+  background: rgba(255,255,255,0.12); border-radius: 8px;
+}
+.alert-feed::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.22); }
+
+/* detail modal */
+#alertDetailModal .modal-box { max-width: 560px; animation: modalIn .18s ease-out; }
+@keyframes modalIn {
+  from { transform: translateY(10px) scale(.98); opacity: 0; }
+  to   { transform: none; opacity: 1; }
+}
+.ad-conf-bar {
+  height: 6px; border-radius: 6px; background: var(--bg3); overflow: hidden; margin-top: 6px;
+}
+.ad-conf-bar > div { height: 100%; border-radius: 6px; transition: width .3s ease; }
+.ad-text {
+  background: var(--bg2); border: 1px solid var(--border);
+  border-radius: var(--r); padding: 12px 14px;
+  font-size: 13px; line-height: 1.8; color: var(--text);
+  white-space: pre-wrap; word-break: break-word; max-height: 240px; overflow-y: auto;
+  unicode-bidi: plaintext;
+}
+.ad-meta { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; margin-top: 12px; }
+.ad-meta .ad-kv {
+  background: var(--bg2); border: 1px solid var(--border);
+  border-radius: var(--r); padding: 8px 10px; font-size: 11.5px;
+}
+.ad-meta .ad-k { color: var(--text3); font-size: 10.5px; margin-bottom: 3px; }
+.ad-meta .ad-v { color: var(--text); direction: ltr; unicode-bidi: plaintext; text-align: right; word-break: break-all; }
+@media (max-width: 520px) { .ad-meta { grid-template-columns: 1fr; } }
+
+/* desktop-notification toggle */
+.tb-btn.notify-on {
+  background: var(--green2); color: var(--green);
+  border-color: rgba(52, 211, 153, 0.35);
+}
+.tb-btn.notify-on:hover { background: var(--green2); }
+
+/* sidebar badge pulse on fresh alert */
+@keyframes badgePulse {
+  0% { transform: scale(1); box-shadow: 0 0 0 0 rgba(248,113,113,.55); }
+  70% { transform: scale(1.18); box-shadow: 0 0 0 7px rgba(248,113,113,0); }
+  100% { transform: scale(1); box-shadow: 0 0 0 0 rgba(248,113,113,0); }
+}
+.nav-badge.pulse { animation: badgePulse 1.1s ease-out 2; }
+
+/* v9.14 toast notifications */
+.toast-wrap {
+  position: fixed; bottom: 18px; left: 18px; z-index: 900;
+  display: flex; flex-direction: column; gap: 8px; max-width: 320px;
+}
+.toast {
+  background: var(--bg2); border: 1px solid var(--border2);
+  border-right: 3px solid var(--accent);
+  color: var(--text); font-size: 12.5px;
+  border-radius: var(--r); padding: 10px 14px;
+  box-shadow: 0 6px 24px rgba(0,0,0,0.45);
+  animation: toastIn .22s ease-out;
+}
+.toast.ok   { border-right-color: var(--green); }
+.toast.err  { border-right-color: var(--red); }
+.toast.wrn  { border-right-color: var(--yellow); }
+.toast.out  { animation: toastOut .25s ease-in forwards; }
+@keyframes toastIn  { from { transform: translateY(8px); opacity: 0; } to { transform: none; opacity: 1; } }
+@keyframes toastOut { to   { transform: translateY(8px); opacity: 0; } }
+
+/* keyboard focus visibility (a11y) */
+.tb-btn:focus-visible, .kw-select:focus-visible, .search-input:focus-visible,
+.nav-item:focus-visible, .logout-btn:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: 2px;
+}
+
 /* ── SEARCH CONTROLS ── */
 .search-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 .search-input {
@@ -487,7 +580,7 @@ body { font-family: var(--sans); background: var(--bg); color: var(--text); font
     <div class="brand-icon">🤖</div>
     <div>
       <div class="brand-name">BotPanel</div>
-      <div class="brand-ver" id="brandVer">BR7</div>
+      <div class="brand-ver" id="brandVer">BR7 · v9.14</div>
     </div>
   </div>
 
@@ -552,6 +645,7 @@ body { font-family: var(--sans); background: var(--bg); color: var(--text); font
       <div class="page-sub" id="pageSub">نظرة عامة على حالة البوت</div>
     </div>
     <div class="topbar-right">
+      <button class="tb-btn" id="notifyBtn" onclick="toggleNotify()" title="إشعارات المتصفح عند وصول تنبيه جديد">🔕 تنبيهات</button>
       <button class="tb-btn" onclick="refreshCurrent()">⟳ تحديث</button>
       <button class="tb-btn danger" onclick="restartBot()">⏻ إعادة التشغيل</button>
       <button class="tb-btn primary hidden" id="saveBtn" onclick="saveSettings()">💾 حفظ</button>
@@ -560,6 +654,18 @@ body { font-family: var(--sans); background: var(--bg); color: var(--text); font
 
   <div class="content" id="mainContent"></div>
 </main>
+
+<!-- ══ MODAL: ALERT DETAIL (v9.14) ══ -->
+<div id="alertDetailModal" class="modal-overlay hidden" onclick="if(event.target===this)closeModal('alertDetailModal')">
+  <div class="modal-box">
+    <h2>🚨 تفاصيل التنبيه <button class="logout-btn" style="margin-inline-start:auto" title="إغلاق" onclick="closeModal('alertDetailModal')">✕</button></h2>
+    <div id="alertDetailBody"></div>
+    <div class="modal-actions">
+      <button class="tb-btn" onclick="copyAlertText()">📋 نسخ النص</button>
+      <button class="tb-btn primary" onclick="closeModal('alertDetailModal')">إغلاق</button>
+    </div>
+  </div>
+</div>
 
 <!-- ══ MODAL: ADD ACCOUNT ══ -->
 <div id="add-account-modal" class="modal-overlay hidden">
@@ -593,6 +699,11 @@ let SETTINGS_SCHEMA = {};
 let EVENT_LOG = [];            // client-side live event log (max 300)
 let uptimeBase = 0;            // last reported uptime seconds from WS
 let uptimeTick = 0;            // seconds since last WS stats message
+// ── v9.14 ──
+let ALERTS_CACHE = {};         // id → alert row (feeds the detail modal)
+let ALERTS_AUTOREFRESH = null; // interval handle for the alerts page
+let LAST_SEEN_ALERT_ID = 0;    // for desktop notifications
+const NOTIFY_KEY = 'br7_notify'; // persisted notification preference
 
 // ================================================================
 // XSS GUARD (audit H-3): every dynamic value interpolated into HTML
@@ -698,6 +809,8 @@ function connectWebSocket() {
                 uptimeBase = data.data.uptime || uptimeBase;
                 uptimeTick = 0;
                 applyStats(data.data);
+                detectNewAlerts(data.data.recent_alerts);   // v9.14
+                if (currentTab === 'dashboard') cacheAlerts(data.data.recent_alerts);
             }
         } catch (e) { /* ignore malformed frame */ }
     };
@@ -789,6 +902,8 @@ function applyStats(d) {
 // PAGE MANAGEMENT
 // ================================================================
 function showTab(tab) {
+    // v9.14: unknown keys blanked the whole workspace — fall back home.
+    if (!PAGE_META[tab]) tab = 'dashboard';
     currentTab = tab;
     document.querySelectorAll('.nav-item').forEach(el =>
         el.classList.toggle('active', el.dataset.page === tab));
@@ -834,20 +949,21 @@ function renderRecentAlertsFeed(alerts) {
     const box = document.getElementById('recentAlertsFeed');
     if (!box) return;
     if (!alerts || alerts.length === 0) {
-        box.innerHTML = '<div class="empty">لا توجد تنبيهات حديثة</div>';
+        box.innerHTML = '<div class="empty">لا توجد تنبيهات حديثة — ستظهر هنا فور رصد أي رسالة مطابقة 👌</div>';
         return;
     }
     box.innerHTML = alerts.slice(0, 10).map(a => `
-        <div class="alert-item">
+        <div class="alert-item dec-${esc(a.decision || 'accept')}" onclick='showAlertModal(${JSON.stringify(a.id)})' title="اضغط للتفاصيل">
             <div class="al-top">
                 ${a.confidence ? `<span class="al-conf ${confClass(a.confidence)}">${(a.confidence * 100).toFixed(0)}%</span>` : '<span class="al-conf na">—</span>'}
+                <span class="al-conf na">${DEC_SHORT[a.decision] || '•'}</span>
                 <div class="al-text">${esc(a.alert_text || a.keyword || '(بدون نص)')}</div>
             </div>
             <div class="al-meta">
                 <span>🏷 <span class="al-kw">${esc(a.keyword || 'غير معروف')}</span></span>
                 <span>👤 ${esc(a.first_name || a.username || a.sender_id || 'غير معروف')}</span>
                 <span>📱 ${esc(a.account_name || '')}</span>
-                <span>🕐 ${esc(fmtTime(a.timestamp || a.created_at))}</span>
+                <span class="al-time">🕐 ${esc(fmtTime(a.timestamp || a.created_at))}</span>
             </div>
         </div>`).join('');
 }
@@ -959,6 +1075,8 @@ const PAGES = {
                         </select>
                         <button class="tb-btn" onclick="loadAlerts()">بحث</button>
                         <button class="tb-btn" onclick="document.getElementById('alert-search').value='';document.getElementById('alert-decision').value='';loadAlerts()">مسح</button>
+                        <button class="tb-btn ${ALERTS_AUTOREFRESH ? 'notify-on' : ''}" id="alertsAutoBtn" onclick="toggleAlertsAuto()" title="تحديث القائمة كل 15 ثانية">⏱️ ${ALERTS_AUTOREFRESH ? 'تلقائي (15ث)' : 'تحديث تلقائي'}</button>
+                        <button class="tb-btn" onclick="exportAlertsCsv()" title="تنزيل التنبيهات المطابقة للفلاتر الحالية CSV">⬇️ تصدير CSV</button>
                     </div>
                 </div>
                 <div class="alert-feed" id="alerts-list"><div class="empty">جاري التحميل...</div></div>
@@ -1350,6 +1468,14 @@ async function loadMessages() {
 }
 
 // ── ALERTS ──
+// v9.14: أزرار التصدير/التحديث التلقائي + نقر على التنبيه لعرض التفاصيل
+// + شارة العدد الكلي الحقيقي (كانت تعرض حجم الصفحة فقط).
+const DEC_SHORT = { accept: 'مقبول', review: 'مراجعة', ignore: 'متجاهل' };
+
+function cacheAlerts(list) {
+    (list || []).forEach(a => { if (a && a.id != null) ALERTS_CACHE[a.id] = a; });
+}
+
 async function loadAlerts() {
     const container = document.getElementById('alerts-list');
     if (!container) return;
@@ -1361,6 +1487,7 @@ async function loadAlerts() {
         if (q) params.set('keyword', q);
         if (dec) params.set('decision', dec);
         const data = await apiFetch(`/api/alerts?${params}`);
+        cacheAlerts(data.alerts);
         const cnt = document.getElementById('alertsCount');
         if (cnt) cnt.textContent = data.total || 0;
         if (!data.alerts || data.alerts.length === 0) {
@@ -1372,23 +1499,214 @@ async function loadAlerts() {
             const d = DEC_LABEL[a.decision] || ['—', 'blue'];
             const sender = a.first_name || a.username || a.sender_id || 'غير معروف';
             return `
-            <div class="alert-item">
+            <div class="alert-item dec-${esc(a.decision || 'accept')}" onclick='showAlertModal(${JSON.stringify(a.id)})' title="اضغط لعرض التفاصيل الكاملة">
                 <div class="al-top">
                     ${a.confidence ? `<span class="al-conf ${confClass(a.confidence)}">${(a.confidence * 100).toFixed(0)}%</span>` : ''}
                     <span class="al-conf na">${d[0]}</span>
-                    <div class="al-text">${esc(a.alert_text || '(بدون نص)')}</div>
+                    <div class="al-text">${esc(a.alert_text || '(بدون نص)')}${a.text_truncated ? ' …' : ''}</div>
                 </div>
                 <div class="al-meta">
                     <span>🏷 <span class="al-kw">${esc(a.keyword || 'غير معروف')}</span></span>
                     <span>👤 ${esc(sender)}${a.username ? ` <span class="al-conf na">@${esc(a.username)}</span>` : ''}</span>
                     <span>📱 ${esc(a.account_name || '')}</span>
-                    <span>🕐 ${esc(fmtTime(a.timestamp || a.created_at))}</span>
+                    <span class="al-time">🕐 ${esc(fmtTime(a.timestamp || a.created_at))}</span>
                 </div>
             </div>`;
         }).join('');
     } catch (e) {
         container.innerHTML = `<div class="empty" style="color:var(--red)">خطأ: ${esc(e.message)}</div>`;
     }
+}
+
+function toggleAlertsAuto() {
+    const btn = document.getElementById('alertsAutoBtn');
+    if (!btn) return;
+    if (ALERTS_AUTOREFRESH) {
+        clearInterval(ALERTS_AUTOREFRESH);
+        ALERTS_AUTOREFRESH = null;
+        btn.classList.remove('notify-on');
+        btn.textContent = '⏱️ تحديث تلقائي';
+        logEvent('inf', 'alerts auto-refresh off');
+    } else {
+        ALERTS_AUTOREFRESH = setInterval(() => {
+            if (currentTab === 'alerts') loadAlerts();
+        }, 15000);
+        btn.classList.add('notify-on');
+        btn.textContent = '⏱️ تلقائي (15ث)';
+        logEvent('ok', 'alerts auto-refresh on (15s)');
+    }
+}
+
+function exportAlertsCsv() {
+    const q = (document.getElementById('alert-search')?.value || '').trim();
+    const dec = (document.getElementById('alert-decision')?.value || '').trim();
+    const p = new URLSearchParams();
+    if (q) p.set('keyword', q);
+    if (dec) p.set('decision', dec);
+    logEvent('inf', 'alerts CSV export started');
+    // Same-origin GET with Bearer — use fetch so the token never appears in URL
+    fetch(`${API_BASE}/api/alerts/export?${p}`, {
+        headers: { 'Authorization': `Bearer ${AUTH_TOKEN}` }
+    }).then(r => {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.blob();
+    }).then(b => {
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(b);
+        a.download = `br7_alerts_${new Date().toISOString().slice(0, 10)}.csv`;
+        a.click();
+        setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+        logEvent('ok', 'alerts CSV downloaded');
+    }).catch(e => {
+        logEvent('err', 'CSV export failed: ' + e.message);
+        showToast('فشل تصدير CSV: ' + e.message, 'err');
+    });
+}
+
+// ── ALERT DETAIL MODAL (v9.14) ──
+let CURRENT_ALERT_TEXT = '';
+
+function showAlertModal(id) {
+    const a = ALERTS_CACHE[id];
+    if (!a) return;
+    CURRENT_ALERT_TEXT = a.alert_text || a.keyword || '';
+    const pct = Math.round((a.confidence || 0) * 100);
+    const confColor = a.confidence >= 0.75 ? 'var(--green)' : a.confidence >= 0.5 ? 'var(--yellow)' : 'var(--red)';
+    const senderName = [a.first_name, a.last_name].filter(Boolean).join(' ') || a.username || '—';
+    const kv = (k, v) => `<div class="ad-kv"><div class="ad-k">${k}</div><div class="ad-v">${v}</div></div>`;
+    document.getElementById('alertDetailBody').innerHTML = `
+        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:10px">
+            <span class="al-conf na">🏷 ${esc(a.keyword || 'غير معروف')}</span>
+            <span class="al-conf na">${DEC_SHORT[a.decision] || '—'}</span>
+            <span class="al-conf ${confClass(a.confidence || 0)}">ثقة ${pct}%</span>
+        </div>
+        <div class="ad-conf-bar"><div style="width:${pct}%;background:${confColor}"></div></div>
+        <div class="ad-text" style="margin-top:12px">${esc(a.alert_text || '(بدون نص)')}</div>
+        <div class="ad-meta">
+            ${kv('👤 المُرسل', esc(senderName))}
+            ${a.username ? kv('🔗 المعرّف', '@' + esc(a.username)) : ''}
+            ${kv('📱 الحساب الراصد', esc(a.account_name || '—'))}
+            ${kv('🆔 معرّف المُرسل', esc(a.sender_id ?? '—'))}
+            ${kv('💬 المحادثة', esc(a.chat_id ?? '—'))}
+            ${kv('🕐 الوقت', esc(fmtTime(a.timestamp)))}
+        </div>`;
+    document.getElementById('alertDetailModal').classList.remove('hidden');
+    logEvent('inf', `alert detail opened #${id}`);
+}
+
+function copyAlertText() {
+    const done = () => { showToast('✓ تم نسخ النص', 'ok'); logEvent('ok', 'alert text copied'); };
+    if (navigator.clipboard && window.isSecureContext) {
+        navigator.clipboard.writeText(CURRENT_ALERT_TEXT).then(done).catch(() => fallbackCopy(CURRENT_ALERT_TEXT, done));
+    } else fallbackCopy(CURRENT_ALERT_TEXT, done);
+}
+
+function fallbackCopy(text, done) {
+    const ta = document.createElement('textarea');
+    ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+    document.body.appendChild(ta); ta.select();
+    try { document.execCommand('copy'); done(); } catch (e) {}
+    ta.remove();
+}
+
+// ── TOAST NOTIFICATIONS (v9.14) ──
+function showToast(msg, kind) {
+    let wrap = document.querySelector('.toast-wrap');
+    if (!wrap) {
+        wrap = document.createElement('div');
+        wrap.className = 'toast-wrap';
+        document.body.appendChild(wrap);
+    }
+    const t = document.createElement('div');
+    t.className = `toast ${kind || ''}`;
+    t.textContent = msg;
+    wrap.appendChild(t);
+    setTimeout(() => { t.classList.add('out'); setTimeout(() => t.remove(), 300); }, 3500);
+}
+
+// ── DESKTOP NOTIFICATIONS + SOUND (v9.14) ──
+function notifyEnabled() { return localStorage.getItem(NOTIFY_KEY) === '1'; }
+
+function updateNotifyBtn() {
+    const btn = document.getElementById('notifyBtn');
+    if (!btn) return;
+    const on = notifyEnabled();
+    btn.classList.toggle('notify-on', on);
+    btn.textContent = on ? '🔔 التنبيهات مفعّلة' : '🔕 تنبيهات';
+    btn.title = on ? 'الإشعارات مفعّلة — اضغط للتعطيل' : 'تفعيل إشعارات المتصفح عند وصول تنبيه جديد';
+}
+
+function toggleNotify() {
+    if (notifyEnabled()) {
+        localStorage.setItem(NOTIFY_KEY, '0');
+        logEvent('inf', 'desktop notifications disabled');
+        updateNotifyBtn();
+        return;
+    }
+    if (!('Notification' in window)) {
+        showToast('متصفحك لا يدعم إشعارات سطح المكتب — سيبقى الصوت فقط', 'wrn');
+        localStorage.setItem(NOTIFY_KEY, '1');
+        updateNotifyBtn();
+        return;
+    }
+    if (Notification.permission === 'granted') {
+        localStorage.setItem(NOTIFY_KEY, '1');
+        logEvent('ok', 'desktop notifications enabled');
+    } else {
+        Notification.requestPermission().then(p => {
+            if (p === 'granted') {
+                localStorage.setItem(NOTIFY_KEY, '1');
+                logEvent('ok', 'desktop notifications granted');
+                try { new Notification('BotPanel BR7', { body: 'سيصلك إشعار عند وصول تنبيه جديد 🎉' }); } catch (e) {}
+            } else {
+                logEvent('wrn', 'notification permission denied');
+                showToast('رُفض إذن الإشعارات في المتصفح — عدّله من إعدادات الموقع', 'wrn');
+            }
+        }).catch(() => {});
+    }
+    updateNotifyBtn();
+}
+
+function playChime() {
+    try {
+        const ctx = new (window.AudioContext || window.webkitAudioContext)();
+        const notes = [[880, 0], [1174.66, 0.12]];  // A5 → D6 لحن لطيف قصير
+        notes.forEach(([freq, delay]) => {
+            const osc = ctx.createOscillator();
+            const gain = ctx.createGain();
+            osc.type = 'sine'; osc.frequency.value = freq;
+            gain.gain.setValueAtTime(0.0001, ctx.currentTime + delay);
+            gain.gain.exponentialRampToValueAtTime(0.18, ctx.currentTime + delay + 0.02);
+            gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + delay + 0.28);
+            osc.connect(gain); gain.connect(ctx.destination);
+            osc.start(ctx.currentTime + delay); osc.stop(ctx.currentTime + delay + 0.3);
+        });
+        setTimeout(() => ctx.close(), 900);
+    } catch (e) { /* audio not available */ }
+}
+
+function detectNewAlerts(list) {
+    if (!Array.isArray(list) || !list.length) return;
+    const maxId = Math.max(...list.map(a => Number(a.id) || 0));
+    if (!maxId) return;
+    if (LAST_SEEN_ALERT_ID === 0) { LAST_SEEN_ALERT_ID = maxId; return; }  // أول اتصال: لا إشعارات للتنبيهات القديمة
+    if (maxId <= LAST_SEEN_ALERT_ID) return;
+    const fresh = list.filter(a => Number(a.id) > LAST_SEEN_ALERT_ID);
+    LAST_SEEN_ALERT_ID = maxId;
+    const badge = document.getElementById('navAlertsBadge');
+    if (badge) { badge.classList.remove('pulse'); void badge.offsetWidth; badge.classList.add('pulse'); }
+    if (!notifyEnabled()) return;
+    playChime();
+    if ('Notification' in window && Notification.permission === 'granted' && document.visibilityState !== 'visible') {
+        const a = fresh[0];
+        try {
+            new Notification('🚨 تنبيه جديد — BotPanel BR7', {
+                body: `${a.keyword ? '🏷 ' + a.keyword + ' — ' : ''}${(a.alert_text || '').slice(0, 110)}`,
+                tag: 'br7-alert',
+            });
+        } catch (e) {}
+    }
+    logEvent('ok', `🔔 ${fresh.length} تنبيه جديد وصل`);
 }
 
 // ================================================================
@@ -1836,6 +2154,7 @@ function initApp() {
     connectWebSocket();
     renderPage('dashboard');
     loadPageData('dashboard');
+    updateNotifyBtn();   // v9.14: reflect persisted notification preference
     // Document-level delegation — page content re-renders on every showTab,
     // so per-element listeners would be lost (keyword select, search Enter).
     document.addEventListener('change', e => {
@@ -1846,6 +2165,10 @@ function initApp() {
         if (e.target.id === 'alert-search' && e.key === 'Enter') loadAlerts();
         if (e.target.id === 'msg-search' && e.key === 'Enter') loadMessages();
         if (e.target.id === 'new-keyword' && e.key === 'Enter') addKeyword();
+        // v9.14: ESC closes any open modal (a11y)
+        if (e.key === 'Escape') {
+            document.querySelectorAll('.modal-overlay:not(.hidden)').forEach(m => m.classList.add('hidden'));
+        }
     });
     logEvent('ok', 'BotPanel initialized');
 }

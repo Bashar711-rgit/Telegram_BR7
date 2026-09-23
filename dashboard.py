@@ -144,17 +144,21 @@ browsing, account creation) are preserved unchanged in behavior.
 from __future__ import annotations
 
 import asyncio
+import csv
 import hmac
+import io
 import json
 import os
+import re
 import time
+import html as _html
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import aiohttp
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, Depends
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
@@ -465,6 +469,13 @@ async def _update_stats_loop(app: FastAPI):
     last_db_stats_ts: float = 0.0
     last_db_stats: Optional[Dict[str, Any]] = None
     DB_STATS_TTL = 5.0  # seconds — coalesce concurrent pulls
+    # v9.14: home "آخر التنبيهات" feed — the WS stats payload never carried
+    # recent_alerts, so the feed stayed on "جاري التحميل..." forever. Cached
+    # on the same 5 s TTL as the heavy aggregates (cheap LIMIT-5 query, but
+    # no reason to re-run it every 2 s).
+    recent_alerts_cache: Optional[List[Dict[str, Any]]] = None
+    recent_alerts_ts: float = 0.0
+    RECENT_ALERTS_TTL = 5.0
     while True:
         try:
             await asyncio.sleep(2)
@@ -489,6 +500,16 @@ async def _update_stats_loop(app: FastAPI):
                 last_db_stats_ts = now
             else:
                 db_stats = last_db_stats
+
+            if recent_alerts_cache is None or (now - recent_alerts_ts) > RECENT_ALERTS_TTL:
+                try:
+                    recent_alerts_cache = [
+                        _clean_alert_row(a, 160)
+                        for a in await db.get_recent_alerts_for_dashboard(5)
+                    ]
+                except Exception as e:
+                    logger.debug(f"recent_alerts fetch failed: {e}")
+                recent_alerts_ts = now
             filter_tele = await bot.filter.get_telemetry() if bot else {}
             queue_size = await db.queue_size()
 
@@ -582,6 +603,9 @@ async def _update_stats_loop(app: FastAPI):
                 "db_reviewed": db_stats.get("decision_review", 0),
                 "db_ignored": db_stats.get("decision_ignore", 0),
                 "db_avg_confidence": db_stats.get("avg_confidence", 0.0),
+                # v9.14: powers the home "آخر التنبيهات" live feed (was missing
+                # → feed stuck on "جاري التحميل...").
+                "recent_alerts": recent_alerts_cache or [],
             }
             app.state.stats_cache = stats
             await manager.broadcast({"type": "stats", "data": stats})
@@ -699,6 +723,41 @@ try:
 except Exception as _tpl_err:  # noqa: BLE001
     logger.error(f"failed to pre-load dashboard template: {_tpl_err}")
     _DASHBOARD_TEMPLATE_CONTENT = None
+
+
+# ===========================================================================
+# v9.14 alert text sanitation for the BotPanel
+# ---------------------------------------------------------------------------
+# alert_text stored in the DB carries Telegram formatting (<b>الرسالة:</b>,
+# <a href=...>, <blockquote>...). The BotPanel renders values with esc() so
+# raw tags showed as literal noise in the alerts log and the home feed.
+# Same semantics as webadmin.routes._strip_html — duplicated here on
+# purpose: dashboard.py must not import webadmin (deployment coupling).
+# ===========================================================================
+
+def _strip_html(text: str, limit: int = 200) -> str:
+    """Telegram-HTML → clean single-line preview (entities undone, ws squeezed)."""
+    if not text:
+        return ""
+    clean = re.sub(r"<[^>]+>", " ", str(text))
+    clean = _html.unescape(clean)
+    clean = re.sub(r"\s+", " ", clean).strip()
+    return clean[:limit] if limit and limit > 0 else clean
+
+
+def _clean_alert_row(row: Dict[str, Any], text_limit: int = 2000) -> Dict[str, Any]:
+    """Return a shallow copy of an alerts-table row with a clean alert_text.
+
+    Keeps every original column (frontend + CSV rely on them) and adds
+    `text_truncated` so the UI can tell when a preview was cut (the detail
+    modal shows the same clean text up to 2000 chars — plenty for a message).
+    """
+    raw = row.get("alert_text") or ""
+    out = dict(row)
+    full_clean = _strip_html(raw, 0)          # 0 → no truncation
+    out["alert_text"] = full_clean[:text_limit]
+    out["text_truncated"] = len(full_clean) > text_limit
+    return out
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -902,21 +961,74 @@ async def get_alerts(
     decision: Optional[str] = None,
     min_confidence: Optional[float] = None,
 ):
-    """جلب التنبيهات مع تصفية متقدمة (بما فيها IntentEngine)."""
+    """جلب التنبيهات مع تصفية متقدمة (بما فيها IntentEngine).
+
+    v9.14: alert_text كان يُعاد كما هو من قاعدة البيانات متضمناً وسوم
+    تيليجرام (<b>/<a>/<blockquote>) فتظهر حرفياً في لوحة BotPanel؛
+    الآن يُنظّف قبل الإرجاع. كما أصبح total العدد الكلي الحقيقي بدل
+    حجم الصفحة الحالية (كان يجعل شارة العدّاد خاطئة بعد أول 50 تنبيهاً).
+    """
     db = request.app.state.db
     try:
         rows = await db.get_alerts_with_filters(
             limit=limit, offset=offset, keyword=keyword, account=account,
             decision=decision, min_confidence=min_confidence,
         )
+        total = await db.count_alerts_with_filters(
+            keyword=keyword, account=account,
+            decision=decision, min_confidence=min_confidence,
+        )
         return JSONResponse({
-            "alerts": rows,
-            "total": len(rows),
+            "alerts": [_clean_alert_row(r) for r in rows],
+            "total": total,
+            "count": len(rows),
             "filters": {"decision": decision, "min_confidence": min_confidence},
         })
     except Exception as e:
         logger.error(f"Error fetching alerts: {e}")
         return JSONResponse({"alerts": [], "total": 0})
+
+
+@app.get("/api/alerts/export", dependencies=[Depends(verify_token)])
+async def export_alerts_csv(
+    request: Request,
+    account: Optional[str] = None,
+    keyword: Optional[str] = None,
+    decision: Optional[str] = None,
+    limit: int = 5000,
+):
+    """v9.14: تصدير التنبيهات CSV من BotPanel (نفس الفلاتر النشطة)."""
+    db = request.app.state.db
+    rows: List[Dict[str, Any]] = []
+    if db is not None:
+        try:
+            rows = await db.get_alerts_with_filters(
+                limit=max(1, min(limit, 20000)), offset=0,
+                keyword=keyword, account=account, decision=decision,
+            )
+        except Exception as e:
+            logger.error(f"Error exporting alerts: {e}")
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(
+        ["id", "timestamp", "keyword", "decision", "confidence",
+         "sender_id", "sender_name", "username", "account", "chat_id", "text"]
+    )
+    for r in rows:
+        writer.writerow([
+            r.get("id"), r.get("timestamp"), r.get("keyword"),
+            r.get("decision"), r.get("confidence"), r.get("sender_id"),
+            " ".join(p for p in [r.get("first_name"), r.get("last_name")] if p) or "",
+            r.get("username") or "", r.get("account_name") or "",
+            r.get("chat_id") or "", _strip_html(r.get("alert_text") or "", 1000),
+        ])
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    return Response(
+        content="\ufeff" + buf.getvalue(),  # BOM حتى يفتح الإكسل العربي سليماً
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="br7_alerts_{stamp}.csv"'},
+    )
 
 
 @app.get("/api/alerts/stats", dependencies=[Depends(verify_token)])

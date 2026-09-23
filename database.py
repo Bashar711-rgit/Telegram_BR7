@@ -2499,6 +2499,47 @@ class EnhancedDatabase:
         params.extend([limit, offset])
         return await self._fetchall(sql, tuple(params))
 
+    async def count_alerts_with_filters(
+        self,
+        keyword: Optional[str] = None,
+        account: Optional[str] = None,
+        sender_id: Optional[int] = None,
+        from_date: Optional[float] = None,
+        to_date: Optional[float] = None,
+        decision: Optional[str] = None,
+        min_confidence: Optional[float] = None,
+    ) -> int:
+        """v9.14: العدد الكلي للتنبيهات مع نفس شروط get_alerts_with_filters.
+
+        كانت /api/alerts تُرجع total=len(rows) أي حجم الصفحة الحالية فقط،
+        فتعرض شارة العدّاد في اللوحة قيمة خاطئة بعد تجاوز حد الصفحة.
+        """
+        sql = "SELECT COUNT(*) AS cnt FROM alerts a WHERE 1=1"
+        params: List[Any] = []
+        if keyword:
+            sql += " AND a.keyword LIKE ?"
+            params.append(f"%{keyword}%")
+        if account:
+            sql += " AND a.account_name = ?"
+            params.append(account)
+        if sender_id:
+            sql += " AND a.sender_id = ?"
+            params.append(sender_id)
+        if from_date:
+            sql += " AND a.timestamp >= ?"
+            params.append(from_date)
+        if to_date:
+            sql += " AND a.timestamp <= ?"
+            params.append(to_date)
+        if decision:
+            sql += " AND a.decision = ?"
+            params.append(decision)
+        if min_confidence is not None:
+            sql += " AND a.confidence >= ?"
+            params.append(min_confidence)
+        row = await self._fetchone(sql, tuple(params))
+        return int(row["cnt"]) if row else 0
+
     async def get_hourly_stats(self, hours: int = 24) -> List[Dict[str, Any]]:
         """
         Hourly aggregates for the last N hours.
