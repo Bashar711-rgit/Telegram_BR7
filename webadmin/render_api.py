@@ -123,6 +123,46 @@ async def delete_env(key: str) -> Dict[str, Any]:
         return {"saved": False, "reason": f"{type(e).__name__}: {e}"}
 
 
+async def get_latest_deploy() -> Dict[str, Any]:
+    """Fetch the most recent deploy of the service (for the dashboard card).
+
+    Returns a normalized dict:
+      {"available": bool, "status": str|None, "commit_id": str,
+       "commit_message": str, "created_at": str, "finished_at": str|None,
+       "reason": str (only when available=False)}
+    Never raises — the dashboard must keep working without Render access.
+    """
+    if not is_configured():
+        return {"available": False, "reason": "RENDER_API_KEY / RENDER_SERVICE_ID غير مضبوطة"}
+    _, service_id = _credentials()
+    try:
+        async with aiohttp.ClientSession(timeout=_TIMEOUT, headers=_headers()) as s:
+            async with s.get(
+                f"{_API_BASE}/services/{service_id}/deploys",
+                params={"limit": "1"},
+            ) as r:
+                if r.status != 200:
+                    body = (await r.text())[:150]
+                    return {"available": False, "reason": f"Render API HTTP {r.status}: {body}"}
+                data = await r.json()
+                items = data if isinstance(data, list) else data.get("deploys", [])
+                if not items:
+                    return {"available": True, "status": None}
+                dep = items[0].get("deploy", {}) if isinstance(items[0], dict) else {}
+                commit = dep.get("commit") or {}
+                message = (commit.get("message") or "").splitlines()
+                return {
+                    "available": True,
+                    "status": dep.get("status"),
+                    "commit_id": (commit.get("id") or "")[:7],
+                    "commit_message": (message[0] if message else "")[:140],
+                    "created_at": dep.get("createdAt"),
+                    "finished_at": dep.get("finishedAt"),
+                }
+    except Exception as e:  # network errors must never crash the dashboard
+        return {"available": False, "reason": f"{type(e).__name__}: {e}"}
+
+
 async def restart_service() -> Dict[str, Any]:
     """Ask Render to restart the service."""
     if not is_configured():

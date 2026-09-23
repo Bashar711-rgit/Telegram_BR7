@@ -143,6 +143,7 @@ const state = {
   logsLevel: '',
   chart: null,
   kwData: null,
+  dismissOffline: false,
 };
 const el = { main: document.getElementById('content') };
 
@@ -346,6 +347,7 @@ document.getElementById('sidebarOverlay').onclick = () => {
 async function renderDashboard() {
   const c = document.getElementById('content');
   c.innerHTML = `
+    <div id="offlineBanner"></div>
     <div id="statCards" class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3 mb-4"></div>
     <div class="grid grid-cols-1 lg:grid-cols-3 gap-4 mb-4">
       <div class="lg:col-span-2 bg-white dark:bg-slate-800 rounded-xl shadow p-4">
@@ -381,6 +383,25 @@ async function refreshDashboard() {
       <div class="text-lg font-bold ${k.color} dark:opacity-90 mt-1">${k.value}</div>
       <div class="text-xs text-slate-500 dark:text-slate-400 mt-1">${k.label}</div>
     </div>`).join('');
+
+  // Offline accounts banner — actionable hint pointing to the /login page
+  const off = (d.monitors || []).filter(m => !m.connected);
+  const bw = document.getElementById('offlineBanner');
+  if (bw) {
+    if (!off.length) { state.dismissOffline = false; bw.innerHTML = ''; }
+    else if (!state.dismissOffline) {
+      bw.innerHTML = `
+      <div class="rounded-xl p-4 mb-4 border-r-4 border-red-500 bg-red-50 dark:bg-red-900/30 flex flex-wrap items-center gap-3 fade-in shadow-sm">
+        <span class="text-2xl">🔌</span>
+        <div class="min-w-0 flex-1">
+          <div class="font-bold text-red-700 dark:text-red-300">${off.length===1?'حساب غير متصل — يتطلب إعادة دخول':off.length+' حسابات غير متصلة — تتطلب إعادة دخول'}</div>
+          <div class="text-xs text-red-600/80 dark:text-red-300/80 mt-0.5 truncate" dir="rtl">${off.map(m=>esc(m.name)+' · '+esc(m.phone||'')).join(' &nbsp;|&nbsp; ')}</div>
+        </div>
+        <a href="/login" target="_blank" class="px-4 py-2 rounded-xl bg-red-600 hover:bg-red-700 text-white text-xs font-bold whitespace-nowrap shadow" title="افتح صفحة إعادة الدخول في تبويب جديد">🔑 إعادة الدخول الآن</a>
+        <button onclick="state.dismissOffline=true;document.getElementById('offlineBanner').innerHTML=''" class="px-3 py-2 rounded-lg text-xs font-bold text-slate-500 hover:bg-slate-200 dark:hover:bg-slate-700" title="إخفاء مؤقتاً">✕</button>
+      </div>`;
+    }
+  }
 
   // Chart
   const hourly = d.hourly || [];
@@ -880,6 +901,13 @@ async function loadLogs(){
 /* ============================ Control Center ============================ */
 function renderControl(){
   el.main.innerHTML=`
+  <div class="card mb-4">
+    <div class="flex items-center justify-between mb-3">
+      <h3 class="font-black">🚀 آخر نشر على Render</h3>
+      <button id="ctl-deploy-refresh" class="text-xs lnk">تحديث</button>
+    </div>
+    <div id="deploy-body" class="text-sm"><div class="muted2">جارِ التحميل…</div></div>
+  </div>
   <div class="grid sm:grid-cols-2 gap-4 max-w-4xl">
     <div class="card">
       <h3 class="font-black mb-3">التحكم بالبوت</h3>
@@ -917,6 +945,47 @@ function renderControl(){
   };
   document.getElementById('ctl-list-refresh').onclick=loadBackups;
   loadBackups();
+  loadDeployStatus();
+  state.timers.deploy = setInterval(loadDeployStatus, 30000);
+}
+function deployBadge(s){
+  const map={
+    live:               ['bg-emerald-100 text-emerald-700 dark:bg-emerald-900/50 dark:text-emerald-300','● مباشر'],
+    build_in_progress:  ['bg-amber-100 text-amber-700 dark:bg-amber-900/50 dark:text-amber-300','● قيد البناء'],
+    update_in_progress: ['bg-amber-100 text-amber-700 dark:bg-amber-900/50 dark:text-amber-300','● قيد التحديث'],
+    pre_deploy_in_progress: ['bg-amber-100 text-amber-700 dark:bg-amber-900/50 dark:text-amber-300','● قيد ما قبل النشر'],
+    update_failed:      ['bg-red-100 text-red-700 dark:bg-red-900/50 dark:text-red-300','● فشل النشر'],
+    build_failed:       ['bg-red-100 text-red-700 dark:bg-red-900/50 dark:text-red-300','● فشل البناء'],
+    canceled:           ['bg-slate-100 text-slate-600 dark:bg-slate-700 dark:text-slate-300','● ملغى'],
+    deactivated:        ['bg-slate-100 text-slate-600 dark:bg-slate-700 dark:text-slate-300','● مستبدل']
+  };
+  const [cls,label]=map[s]||['bg-slate-100 text-slate-600 dark:bg-slate-700 dark:text-slate-300','● '+esc(s||'—')];
+  return `<span class="chip ${cls}">${label}</span>`;
+}
+async function loadDeployStatus(){
+  const w=document.getElementById('deploy-body');
+  if(!w)return;
+  try{
+    const d=await api('/bot/deploy-status');
+    if(!d || d.available===false){
+      w.innerHTML=`<div class="muted2 text-xs">تعذر جلب الحالة من Render: ${esc((d&&d.reason)||'غير مضبوط')}</div>`;return;
+    }
+    if(!d.status){ w.innerHTML='<div class="muted2 text-xs">لا توجد عمليات نشر بعد.</div>';return; }
+    const failed=d.status==='update_failed'||d.status==='build_failed';
+    const inflight=d.status==='build_in_progress'||d.status==='update_in_progress';
+    const when=d.created_at?new Date(d.created_at).toLocaleString('ar',{dateStyle:'short',timeStyle:'short'}):'';
+    w.innerHTML=`
+      <div class="flex flex-wrap items-center gap-2">
+        ${deployBadge(d.status)}
+        <span class="mono text-xs font-bold" dir="ltr">${esc(d.commit_id||'')}</span>
+        <span class="text-[11px] muted2">${esc(when)}</span>
+        ${inflight?'<span class="inline-block w-2 h-2 rounded-full bg-amber-500 animate-pulse"></span>':''}
+      </div>
+      <div class="text-xs mt-1.5 ${failed?'text-red-600 dark:text-red-400 font-bold':'muted2'} truncate" dir="ltr" title="${esc(d.commit_message||'')}">${esc(d.commit_message||'—')}</div>
+      ${failed?'<div class="text-[11px] text-red-500 mt-1.5 bg-red-50 dark:bg-red-900/30 rounded-lg px-2.5 py-1.5">⚠ النشر الجديد لم يُفعّل — النسخة الحالية ما زالت تعمل. تحقق من سجلات Render.</div>':''}`;
+  }catch(e){
+    if(w) w.innerHTML='<div class="muted2 text-xs">تعذر جلب حالة النشر.</div>';
+  }
 }
 async function loadBackups(){
   try{

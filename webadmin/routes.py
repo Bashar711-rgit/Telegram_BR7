@@ -638,6 +638,12 @@ async def settings_update(body: SettingsBody, _: Any = CsrfProtected):
 # ===========================================================================
 # Control center
 # ===========================================================================
+@router.get("/bot/deploy-status")
+async def bot_deploy_status(_: Any = Protected):
+    """Latest Render deploy info for the control-center card (read-only)."""
+    return await render_api.get_latest_deploy()
+
+
 @router.post("/bot/reload")
 async def bot_reload(_: Any = CsrfProtected):
     result = await keywords_store.hot_reload()
