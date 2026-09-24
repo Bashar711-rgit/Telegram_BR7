@@ -180,6 +180,19 @@ async def restore_backup(name: str) -> Dict[str, Any]:
     if not os.path.exists(zip_path):
         return {"success": False, "error": "النسخة غير موجودة"}
 
+    # v9.18 P0-2: نسخة أمان تلقائية قبل أي استعادة — التراجع ممكن دائماً.
+    # فشل إنشاء نسخة الأمان لا يمنع الاستعادة (يُسجّل ويُتجاوز فقط).
+    safety_backup: Dict[str, Any] = {}
+    try:
+        safety = await create_backup()
+        if safety.get("success"):
+            safety_backup = {"name": safety.get("name"), "file": safety.get("file")}
+            logger.info(f"Safety backup created before restore: {safety.get('name')}")
+        else:
+            logger.warning(f"Safety backup before restore failed: {safety.get('error')}")
+    except Exception as e:
+        logger.warning(f"Safety backup before restore raised: {e}")
+
     def _extract() -> Dict[str, Any]:
         import tempfile
 
@@ -241,4 +254,6 @@ async def restore_backup(name: str) -> Dict[str, Any]:
     if "keywords.json" in result.get("restored", []):
         await keywords_store.hot_reload()
     result["success"] = not result.get("errors")
+    if safety_backup:
+        result["safety_backup"] = safety_backup
     return result

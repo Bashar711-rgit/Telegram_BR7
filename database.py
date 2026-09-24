@@ -97,7 +97,7 @@ import os
 import sqlite3
 import time
 import zlib
-from datetime import datetime
+from datetime import datetime, timedelta
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -689,6 +689,20 @@ class EnhancedDatabase:
                 classified TEXT DEFAULT 'cross_group_spam',
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             );
+            -- v9.18 P0: سجل التدقيق — كل عملية كتابة من اللوحتين تُسجّل هنا
+            -- (fire-and-forget، بلا أسرار، الهواتف مُقنَّعة). يُقرأ من
+            -- GET /api/audit (BotPanel) ويُقَلَّم دورياً بـ90 يوماً.
+            CREATE TABLE IF NOT EXISTS audit_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                actor TEXT NOT NULL,
+                action TEXT NOT NULL,
+                object_type TEXT,
+                object_id TEXT,
+                old_value TEXT,
+                new_value TEXT,
+                source TEXT DEFAULT 'botpanel',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
         """
         for stmt in stmts.split(";"):
             s = stmt.strip()
@@ -921,6 +935,11 @@ class EnhancedDatabase:
             # v9.11 antispam: فحص سريع لقائمة المراقبة/التجاهل
             "CREATE INDEX IF NOT EXISTS idx_watch_sender_time ON spam_watch(sender_id, created_at DESC)",
             "CREATE INDEX IF NOT EXISTS idx_watch_until       ON spam_watch(watch_until)",
+            # v9.18 P0: فهارس سجل التدقيق (زمن/إجراء/فاعل) — القوائم دائماً
+            # بترتيب زمني تنازلي والفلترة بالإجراء أو الفاعل.
+            "CREATE INDEX IF NOT EXISTS idx_audit_time   ON audit_logs(created_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_logs(action)",
+            "CREATE INDEX IF NOT EXISTS idx_audit_actor  ON audit_logs(actor)",
         ]
         for idx in indexes:
             await self._execute(idx)
@@ -2075,6 +2094,11 @@ class EnhancedDatabase:
                 await self._execute("DELETE FROM spam_watch WHERE watch_until < ?", (cutoff,))
             except Exception:
                 pass
+            # v9.18 P0: تقليم سجل التدقيق (90 يوماً — قابل للضبط من v9.28)
+            try:
+                await self.cleanup_old_audit_logs(90)
+            except Exception:
+                pass
             await self._commit()
             if total > 500 and self.db_type == "sqlite":
                 await self._execute("PRAGMA optimize")
@@ -2083,6 +2107,99 @@ class EnhancedDatabase:
         return total
 
     # ─── Resource pressure check (fix #12) ────────────────────────────────────
+    # ─── v9.18 P0: سجل التدقيق (Audit Log) ───────────────────
+    async def record_audit(self, actor: str, action: str, object_type: str = "",
+                           object_id: str = "", old_value: str = "", new_value: str = "",
+                           source: str = "botpanel") -> bool:
+        """v9.18 P0: تسجيل عملية في سجل التدقيق — فشل-آمن تماماً.
+
+        يُستدعى fire-and-forget من اللوحتين (BotPanel/webadmin) فلا يُسمح له
+        أبداً برفع استثناء أو تعطيل المسار الأصلي. لا أسرار ولا كلمات مرور
+        تُكتب هنا — والمتصل مسؤول عن إخفاء الهواتف (القناع في dashboard.py).
+        """
+        try:
+            await self._execute(
+                "INSERT INTO audit_logs (actor, action, object_type, object_id, old_value, new_value, source)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    str(actor or "unknown")[:120],
+                    str(action or "unknown")[:120],
+                    str(object_type or "")[:120],
+                    str(object_id or "")[:200],
+                    str(old_value or "")[:2000],
+                    str(new_value or "")[:2000],
+                    str(source or "botpanel")[:40],
+                ),
+            )
+            await self._commit()
+            return True
+        except Exception as e:
+            logger.debug(f"record_audit skipped: {e}")
+            return False
+
+    async def get_audit_logs(self, limit: int = 100, offset: int = 0,
+                             action: Optional[str] = None) -> List[Dict[str, Any]]:
+        """v9.18 P0: قراءة سجل التدقيق — الأحدث أولاً. فشل-آمن (قائمة فارغة)."""
+        try:
+            limit = max(1, min(int(limit), 500))
+            offset = max(0, int(offset))
+        except Exception:
+            limit, offset = 100, 0
+        try:
+            if action:
+                return await self._fetchall(
+                    "SELECT * FROM audit_logs WHERE action = ?"
+                    " ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+                    (str(action)[:120], limit, offset),
+                )
+            return await self._fetchall(
+                "SELECT * FROM audit_logs ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+                (limit, offset),
+            )
+        except Exception as e:
+            logger.debug(f"get_audit_logs skipped: {e}")
+            return []
+
+    async def count_audit_logs(self, action: Optional[str] = None) -> int:
+        """v9.18 P0: عدّاد سجل التدقيق (كله أو إجراء محدد) — فشل-آمن (0)."""
+        try:
+            if action:
+                row = await self._fetchone(
+                    "SELECT COUNT(*) AS n FROM audit_logs WHERE action = ?", (str(action)[:120],)
+                )
+            else:
+                row = await self._fetchone("SELECT COUNT(*) AS n FROM audit_logs")
+            return int(row["n"]) if row else 0
+        except Exception:
+            return 0
+
+    async def cleanup_old_audit_logs(self, days: int = 90) -> int:
+        """v9.18 P0: تقليم سجل التدقيق الأقدم من days يوماً (افتراضي 90).
+
+        أرضية يوم واحد فلا تحذف قيمة فاسدة كل التاريخ. يعمل على المحركين
+        (SQLite: مقارنة معجمية على الصيغة النصية — PostgreSQL: كائن توقيت).
+        """
+        try:
+            days = max(1, int(days))
+        except Exception:
+            days = 90
+        try:
+            cutoff_dt = datetime.utcnow() - timedelta(days=days)
+            if self.db_type == "sqlite":
+                cur = await self._execute(
+                    "DELETE FROM audit_logs WHERE created_at < ?",
+                    (cutoff_dt.strftime("%Y-%m-%d %H:%M:%S"),),
+                )
+            else:
+                cur = await self._execute(
+                    "DELETE FROM audit_logs WHERE created_at < $1", (cutoff_dt,)
+                )
+            await self._commit()
+            return cur.rowcount or 0
+        except Exception as e:
+            logger.debug(f"cleanup_old_audit_logs skipped: {e}")
+            return 0
+
     async def _resource_pressure_check(self) -> None:
         """
         Inspect SQLite file size. If it exceeds CFG.MEMORY_THRESHOLD_MB,

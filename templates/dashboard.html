@@ -628,6 +628,18 @@ body { font-family: var(--sans); background: var(--bg); color: var(--text); font
   padding: 2px 12px; border-radius: 20px; color: var(--text2);
 }
 
+/* ── v9.18 AUDIT TAB ─────────────────────────────────────────── */
+.al-select {
+  background: var(--bg2); color: var(--text); border: 1px solid var(--border);
+  border-radius: 8px; padding: 6px 10px; font-size: 12px; font-family: inherit;
+  cursor: pointer; outline: none;
+}
+.al-select:focus-visible { border-color: var(--accent); }
+.td-time { white-space: nowrap; font-size: 11px; color: var(--text3); }
+.td-obj { font-family: var(--mono); font-size: 11px; direction: ltr; text-align: right; }
+.td-val { max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-family: var(--mono); font-size: 11px; direction: ltr; text-align: right; cursor: help; }
+
 /* ── v9.16 ───────────────────────────────────────────────────── */
 /* skeleton shimmer loaders — تُظهر أثناء تحميل القوائم بدل النص الثابت */
 .skel {
@@ -764,6 +776,9 @@ body { font-family: var(--sans); background: var(--bg); color: var(--text); font
     </div>
 
     <div class="nav-section">النظام</div>
+    <div class="nav-item" data-page="audit" onclick="showTab('audit')">
+      <span class="ni">🛡</span> التدقيق
+    </div>
     <div class="nav-item" data-page="settings" onclick="showTab('settings')">
       <span class="ni">⚙️</span> الإعدادات
     </div>
@@ -1141,6 +1156,7 @@ const PAGE_META = {
     blocked:   { title: 'الحظر', sub: 'المستخدمون والمجموعات المحظورة' },
     settings:  { title: 'الإعدادات', sub: 'ضبط البوت — يُحفظ مباشرة في قاعدة البيانات' },
     logs:      { title: 'السجلات', sub: 'أحداث النظام المباشرة' },
+    audit:     { title: 'سجل التدقيق', sub: 'كل عملية كتابة من اللوحتين — بفلتر الإجراءات' },
 };
 
 function renderPage(tab) {
@@ -1154,6 +1170,55 @@ function renderPage(tab) {
 
 function loadPageData(tab) {
     if (PAGES[tab] && PAGES[tab].load) PAGES[tab].load();
+}
+
+
+// ================================================================
+// PAGE: AUDIT (v9.18 P0)
+// ================================================================
+const AUDIT_LABELS = {
+    'block.sender': '🚫 حظر مرسل', 'unblock.sender': '✅ رفع حظر مرسل',
+    'block.chat': '🚫 حظر مجموعة', 'unblock.chat': '✅ رفع حظر مجموعة',
+    'keyword.add': '🏷 + كلمة', 'keyword.update': '🏷 ✏️ كلمة', 'keyword.remove': '🏷 − كلمة',
+    'settings.update': '⚙️ إعدادات', 'account.add': '📱 + حساب', 'account.remove': '📱 − حساب',
+    'queue.purge': '🧹 تفريغ الطابور', 'bot.restart': '↻ إعادة تشغيل',
+    'data.restore': '🗄 استعادة بيانات', 'data.export': '🗄 تصدير بيانات', 'data.import': '🗄 استيراد بيانات',
+};
+
+function fmtAuditTime(v) {
+    if (!v) return '—';
+    const d = new Date(String(v).replace(' ', 'T') + (String(v).includes('Z') || String(v).includes('+') ? '' : 'Z'));
+    if (isNaN(d)) return esc(String(v));
+    return d.toLocaleString('ar', { hour12: false });
+}
+
+async function loadAudit() {
+    const body = document.getElementById('auditBody');
+    if (!body) return;
+    const sel = document.getElementById('auditAction');
+    const action = sel ? sel.value : '';
+    try {
+        const res = await apiFetch(`/api/audit?limit=200&action=${encodeURIComponent(action)}`);
+        const data = await res.json();
+        const cnt = document.getElementById('auditCount');
+        if (cnt) cnt.textContent = `${data.count ?? (data.items || []).length} عملية`;
+        const items = data.items || [];
+        if (!items.length) {
+            body.innerHTML = '<tr><td colspan="6" class="empty">لا عمليات مسجلة بعد — نفّذ أي تغيير من اللوحة وسيظهر هنا فوراً.</td></tr>';
+            return;
+        }
+        body.innerHTML = items.map(a => `
+            <tr>
+                <td class="td-time" title="${esc(String(a.created_at || ''))}">${fmtAuditTime(a.created_at)}</td>
+                <td>${esc(a.actor || '—')}</td>
+                <td><span class="pill blue">${AUDIT_LABELS[a.action] || esc(a.action)}</span></td>
+                <td class="td-obj">${esc([a.object_type, a.object_id].filter(Boolean).join(': ') || '—')}</td>
+                <td class="td-val" title="${esc(a.old_value || '')}">${esc(a.old_value || '—')}</td>
+                <td class="td-val" title="${esc(a.new_value || '')}">${esc(a.new_value || '—')}</td>
+            </tr>`).join('');
+    } catch (e) {
+        if (body) body.innerHTML = '<tr><td colspan="6" class="empty">فشل تحميل السجل — تحقق من الاتصال.</td></tr>';
+    }
 }
 
 // ================================================================
@@ -1493,6 +1558,44 @@ const PAGES = {
         load() { loadSettings(); renderSysInfo(true); }
     },
 
+    audit: {
+        render() {
+            return `
+            <div class="panel">
+                <div class="panel-head">
+                    <div class="panel-title"><span class="ico">🛡</span> سجل التدقيق</div>
+                    <div class="panel-actions">
+                        <select id="auditAction" onchange="loadAudit()" class="al-select">
+                            <option value="">كل الإجراءات</option>
+                            <option value="block.sender">حظر مرسل</option>
+                            <option value="unblock.sender">إلغاء حظر مرسل</option>
+                            <option value="block.chat">حظر مجموعة</option>
+                            <option value="unblock.chat">إلغاء حظر مجموعة</option>
+                            <option value="keyword.add">إضافة كلمة</option>
+                            <option value="keyword.update">تعديل كلمة</option>
+                            <option value="keyword.remove">حذف كلمة</option>
+                            <option value="settings.update">تعديل إعدادات</option>
+                            <option value="account.add">إضافة حساب</option>
+                            <option value="account.remove">حذف حساب</option>
+                            <option value="queue.purge">تفريغ الطابور</option>
+                            <option value="bot.restart">إعادة تشغيل</option>
+                            <option value="data.restore">استعادة بيانات</option>
+                        </select>
+                        <span class="pill blue" id="auditCount">0 عملية</span>
+                        <button class="al-btn d" onclick="refreshCurrent()">↻</button>
+                    </div>
+                </div>
+                <div class="table-wrap" id="auditTableWrap">
+                    <table class="tbl">
+                        <thead><tr><th>الوقت</th><th>الفاعل</th><th>الإجراء</th><th>الكائن</th><th>قبل</th><th>بعد</th></tr></thead>
+                        <tbody id="auditBody"><tr><td colspan="6" class="empty">جارٍ التحميل…</td></tr></tbody>
+                    </table>
+                </div>
+                <div class="panel-note">ℹ️ يُسجَّل هنا كل تغيير من لوحة البوت ولوحة الويب (من أذن، ماذا، قبل/بعد) — بلا أسرار، والهواتف مُقنَّعة. يُحفظ السجل 90 يوماً.</div>
+            </div>`;
+        },
+        load() { loadAudit(); }
+    },
     logs: {
         render() {
             return `

@@ -920,6 +920,10 @@ async def add_account(data: AccountCreate, request: Request):
         if acc["phone"] == data.phone:
             raise HTTPException(status_code=400, detail="Account already exists")
 
+    # v9.18 P0: 20-account cap — same ceiling webadmin enforces (409).
+    if len(ACCOUNTS) >= 20:
+        raise HTTPException(status_code=409, detail="Account limit reached (20). Remove an account first.")
+
     env_path = "accounts.env"
     prefix = f"ACCOUNT_{len(ACCOUNTS) + 1}"
     new_account_lines = [
@@ -936,6 +940,8 @@ async def add_account(data: AccountCreate, request: Request):
             f.writelines(new_account_lines)
 
     await asyncio.get_event_loop().run_in_executor(None, _write)
+    await _audit(request, "account.add", object_type="account", object_id=data.name or prefix,
+                 new_value=_mask_phone(data.phone or ""))
     return JSONResponse({"success": True, "message": "Account added. Restart the service to apply."})
 
 
@@ -1227,6 +1233,8 @@ async def add_keyword(data: KeywordCreate, request: Request):
         if db is not None and db.is_connected:
             persisted = await dashboard_store.persist_keywords(db, all_data)
 
+        await _audit(request, "keyword.add", object_type="keyword", object_id=path,
+                     new_value=keyword)
         return JSONResponse({
             "success": True,
             "keyword": keyword,
@@ -1278,6 +1286,8 @@ async def delete_keyword(data: KeywordDelete, request: Request):
         if db is not None and db.is_connected:
             persisted = await dashboard_store.persist_keywords(db, all_data)
 
+        await _audit(request, "keyword.remove", object_type="keyword", object_id=path,
+                     old_value=keyword)
         return JSONResponse({
             "success": True,
             "category": path,
@@ -1314,6 +1324,8 @@ async def block_sender(data: BlockUser, request: Request):
     if src not in allowed:
         src = "dashboard"
     await db.block_sender(data.user_id, data.reason, src)
+    await _audit(request, "block.sender", object_type="sender", object_id=str(data.user_id),
+                 new_value=data.reason or "")
     return JSONResponse({"success": True, "source": src})
 
 
@@ -1321,6 +1333,7 @@ async def block_sender(data: BlockUser, request: Request):
 async def unblock_sender(user_id: int, request: Request):
     db = request.app.state.db
     await db.unblock_sender(user_id)
+    await _audit(request, "unblock.sender", object_type="sender", object_id=str(user_id))
     return JSONResponse({"success": True})
 
 
@@ -1328,6 +1341,8 @@ async def unblock_sender(user_id: int, request: Request):
 async def block_chat(data: BlockChat, request: Request):
     db = request.app.state.db
     await db.block_chat(data.chat_id, data.reason, "dashboard")
+    await _audit(request, "block.chat", object_type="chat", object_id=str(data.chat_id),
+                 new_value=data.reason or "")
     return JSONResponse({"success": True})
 
 
@@ -1335,7 +1350,31 @@ async def block_chat(data: BlockChat, request: Request):
 async def unblock_chat(chat_id: int, request: Request):
     db = request.app.state.db
     await db.unblock_chat(chat_id)
+    await _audit(request, "unblock.chat", object_type="chat", object_id=str(chat_id))
     return JSONResponse({"success": True})
+
+
+@app.get("/api/audit", dependencies=[Depends(verify_token)])
+async def get_audit(
+    request: Request,
+    limit: int = 200,
+    offset: int = 0,
+    action: str = "",
+):
+    """v9.18 P0: read the audit log (newest first). Read-only, fail-safe."""
+    db = getattr(request.app.state, "db", None)
+    if db is None:
+        return JSONResponse({"items": [], "count": 0})
+    try:
+        rows = await db.get_audit_logs(limit=limit, offset=offset, action=action or None)
+    except Exception:
+        rows = []
+    count = 0
+    try:
+        count = await db.count_audit_logs(action or None)
+    except Exception:
+        count = len(rows)
+    return JSONResponse({"items": rows, "count": count})
 
 
 @app.get("/api/settings", dependencies=[Depends(verify_token)])
@@ -1398,6 +1437,9 @@ async def update_settings(data: SettingsBody, request: Request):
         status = dashboard_store.apply_setting(request.app, key, value)
         (applied if status == "applied" else stored)[key] = value
 
+    if clean:
+        await _audit(request, "settings.update", object_type="settings",
+                     new_value=json.dumps(clean, ensure_ascii=False, default=str)[:2000])
     return JSONResponse(
         {
             "success": not errors,
@@ -1414,6 +1456,7 @@ async def update_settings(data: SettingsBody, request: Request):
 async def purge_queue(request: Request):
     db = request.app.state.db
     count = await db.purge_queue()
+    await _audit(request, "queue.purge", object_type="queue", new_value=str(count))
     return JSONResponse({"success": True, "purged": count})
 
 
@@ -1434,6 +1477,7 @@ async def restart_bot(request: Request):
         raise HTTPException(status_code=503, detail="Bot not yet initialized")
 
     logger.warning("Restart requested via dashboard — initiating graceful shutdown")
+    await _audit(request, "bot.restart", object_type="bot")
     _track_local_task(_trigger_restart(bot), "dashboard_restart_trigger")
 
     return JSONResponse({
@@ -1579,6 +1623,53 @@ def _mask_phone(phone: str) -> str:
     if not phone:
         return ""
     return "*" * max(0, len(phone) - 4) + phone[-4:]
+
+
+async def _audit(request: Request, action: str, object_type: str = "",
+                 object_id: str = "", old_value: str = "", new_value: str = "") -> None:
+    """v9.18 P0: تسجيل عملية من BotPanel في سجل التدقيق — fire-and-forget.
+
+    لا يُلمس مسار الطلب أبداً: أي خلل في قاعدة البيانات يُبتلع بصمت.
+    الفاعل ثابت "botpanel-admin" (مصادقة التوكن الواحد)، والمصدر "botpanel".
+    """
+    db = getattr(request.app.state, "db", None)
+    if db is None:
+        return
+    try:
+        _track_local_task(
+            db.record_audit(
+                actor="botpanel-admin", action=action, object_type=object_type,
+                object_id=object_id, old_value=old_value, new_value=new_value,
+                source="botpanel",
+            ),
+            "audit_write",
+        )
+    except Exception:
+        pass
+
+
+async def _audit(request: Request, action: str, object_type: str = "",
+                 object_id: str = "", old_value: str = "", new_value: str = "") -> None:
+    """v9.18 P0: audit log write from BotPanel — fire-and-forget, fail-safe.
+
+    The request path is never touched: any DB glitch is swallowed. The
+    actor is the constant "botpanel-admin" (single-token auth) and the
+    source is "botpanel". Callers are responsible for masking phones.
+    """
+    db = getattr(request.app.state, "db", None)
+    if db is None:
+        return
+    try:
+        _track_local_task(
+            db.record_audit(
+                actor="botpanel-admin", action=action, object_type=object_type,
+                object_id=object_id, old_value=old_value, new_value=new_value,
+                source="botpanel",
+            ),
+            "audit_write",
+        )
+    except Exception:
+        pass
 
 
 @app.get("/api/login/accounts", dependencies=[Depends(verify_token)])

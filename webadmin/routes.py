@@ -145,6 +145,38 @@ def _telegram_links(row: Dict[str, Any]) -> Dict[str, Optional[str]]:
 # ===========================================================================
 # Auth
 # ===========================================================================
+async def _audit_web(
+    request: Request,
+    action: str,
+    object_type: str = "",
+    object_id: str = "",
+    old_value: str = "",
+    new_value: str = "",
+) -> None:
+    """v9.18 P0: تسجيل عملية من webadmin في سجل التدقيق — fire-and-forget.
+
+    الفاعل من الجلسة الموقّعة: "webadmin:<user>" (أو webadmin:unknown إن
+    غابت الجلسة). أي خلل يُبتلع — لا يُلمس مسار الطلب أبداً.
+    """
+    db = _db(request)
+    if db is None:
+        return
+    try:
+        session = auth.read_session(request) or {}
+        actor = f"webadmin:{session.get('u') or 'unknown'}"
+    except Exception:
+        actor = "webadmin:unknown"
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(db.record_audit(
+            actor=actor, action=action, object_type=object_type,
+            object_id=object_id, old_value=old_value, new_value=new_value,
+            source="webadmin",
+        ))
+    except Exception:
+        pass
+
+
 @router.post("/admin/api/auth/login")
 async def auth_login(body: LoginBody, request: Request, response: Response):
     if not auth.auth_is_configured():
@@ -443,26 +475,32 @@ async def keywords_import(request: Request, _: Any = CsrfProtected):
 
 
 @router.post("/keywords/add")
-async def keywords_add(body: KeywordAddBody, _: Any = CsrfProtected):
+async def keywords_add(body: KeywordAddBody, request: Request, _: Any = CsrfProtected):
     result = await keywords_store.add_keyword(body.path, body.value)
     if not result.get("success"):
         raise HTTPException(status_code=400, detail=result.get("error"))
+    await _audit_web(request, "keyword.add", object_type="keyword",
+                     object_id=body.path, new_value=body.value)
     return result
 
 
 @router.post("/keywords/update")
-async def keywords_update(body: KeywordUpdateBody, _: Any = CsrfProtected):
+async def keywords_update(body: KeywordUpdateBody, request: Request, _: Any = CsrfProtected):
     result = await keywords_store.update_keyword(body.path, body.old, body.new)
     if not result.get("success"):
         raise HTTPException(status_code=400, detail=result.get("error"))
+    await _audit_web(request, "keyword.update", object_type="keyword",
+                     object_id=body.path, old_value=body.old, new_value=body.new)
     return result
 
 
 @router.post("/keywords/delete")
-async def keywords_delete(body: KeywordDeleteBody, _: Any = CsrfProtected):
+async def keywords_delete(body: KeywordDeleteBody, request: Request, _: Any = CsrfProtected):
     result = await keywords_store.delete_keyword(body.path, body.value)
     if not result.get("success"):
         raise HTTPException(status_code=400, detail=result.get("error"))
+    await _audit_web(request, "keyword.remove", object_type="keyword",
+                     object_id=body.path, old_value=body.value)
     return result
 
 
@@ -492,7 +530,7 @@ async def get_accounts(request: Request, session: Dict[str, Any] = Protected):
 
 
 @router.post("/accounts/add")
-async def accounts_add(body: AccountAddBody, _: Any = CsrfProtected):
+async def accounts_add(body: AccountAddBody, request: Request, _: Any = CsrfProtected):
     phone = body.phone.strip()
     if not phone.lstrip("+").isdigit():
         raise HTTPException(status_code=400, detail="رقم الهاتف غير صالح")
@@ -516,6 +554,9 @@ async def accounts_add(body: AccountAddBody, _: Any = CsrfProtected):
             detail=f"تعذر حفظ الحساب في متغيرات Render: {result.get('reason')}",
         )
     logger.info(f"Account {prefix} env vars written via dashboard")
+    masked = "*" * max(0, len(phone) - 4) + phone[-4:]
+    await _audit_web(request, "account.add", object_type="account",
+                     object_id=prefix, new_value=masked)
     return {
         "success": True,
         "prefix": prefix,
@@ -525,6 +566,7 @@ async def accounts_add(body: AccountAddBody, _: Any = CsrfProtected):
 
 @router.post("/accounts/delete")
 async def accounts_delete(body: AccountPrefixBody, request: Request, _: Any = CsrfProtected):
+    pass_marker = True
     prefix = body.prefix.strip().upper()
     acc = next((a for a in ACCOUNTS if a.get("prefix") == prefix), None)
     if acc is None:
@@ -551,6 +593,8 @@ async def accounts_delete(body: AccountPrefixBody, request: Request, _: Any = Cs
             failures[suffix] = r.get("reason")
     if failures:
         return {"success": False, "error": "بعض المتغيرات لم تحذف", "details": failures}
+    await _audit_web(request, "account.remove", object_type="account",
+                     object_id=prefix)
     return {"success": True, "message": f"حُذف الحساب {prefix} - ستعاد إعادة النشر تلقائياً"}
 
 
@@ -635,8 +679,15 @@ async def settings_get(session: Dict[str, Any] = Protected):
 
 
 @router.post("/settings")
-async def settings_update(body: SettingsBody, _: Any = CsrfProtected):
-    return await settings_store.update_settings(body.updates)
+async def settings_update(body: SettingsBody, request: Request, _: Any = CsrfProtected):
+    result = await settings_store.update_settings(body.updates)
+    try:
+        keys = ",".join(sorted((body.updates or {}).keys()))[:200]
+    except Exception:
+        keys = ""
+    await _audit_web(request, "settings.update", object_type="settings",
+                     object_id=keys)
+    return result
 
 
 # ===========================================================================
@@ -657,6 +708,8 @@ async def bot_reload(_: Any = CsrfProtected):
 @router.post("/bot/restart")
 async def bot_restart(request: Request, _: Any = CsrfProtected):
     result = await render_api.restart_service()
+    await _audit_web(request, "bot.restart", object_type="bot",
+                     new_value="render" if result.get("restarted") else "local")
     if result.get("restarted"):
         return {"success": True, "mode": "render", "message": "طُلبت إعادة التشغيل من Render"}
 
@@ -698,10 +751,13 @@ async def bot_backups(session: Dict[str, Any] = Protected):
 
 
 @router.post("/bot/restore")
-async def bot_restore(body: RestoreBody, _: Any = CsrfProtected):
+async def bot_restore(body: RestoreBody, request: Request, _: Any = CsrfProtected):
     result = await backup.restore_backup(body.name)
     if not result.get("success") and result.get("error"):
         raise HTTPException(status_code=404, detail=result["error"])
+    safety = (result.get("safety_backup") or {}).get("name", "")
+    await _audit_web(request, "data.restore", object_type="backup",
+                     object_id=body.name, new_value=safety)
     return result
 
 
