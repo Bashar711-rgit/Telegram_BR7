@@ -1329,8 +1329,7 @@ async function loadFeatures() {
     const wrap = document.getElementById('featCards');
     if (!wrap) return;
     try {
-        const res = await apiFetch('/api/features');
-        const data = await res.json();
+        const data = await apiFetch('/api/features');
         const items = data.items || [];
         const allOn = items.every(f => f.enabled);
         const st = document.getElementById('featStatus');
@@ -1362,8 +1361,7 @@ async function toggleFeature(key, inputEl) {
         inputEl.checked = true; return;
     }
     try {
-        const res = await apiFetch(`/api/features/${encodeURIComponent(key)}/toggle`, { method: 'POST' });
-        if (!res.ok) throw new Error('فشل');
+        await apiFetch(`/api/features/${encodeURIComponent(key)}/toggle`, { method: 'POST' });
         showToast(target ? '✓ فُعّلت الميزة' : '⏸ أُوقفت الميزة', target ? 'ok' : 'wrn');
         loadFeatures();
     } catch (e) {
@@ -1388,8 +1386,7 @@ async function loadRules() {
     const body = document.getElementById('rulesBody');
     if (!body) return;
     try {
-        const res = await apiFetch('/api/rules');
-        const data = await res.json();
+        const data = await apiFetch('/api/rules');
         const cnt = document.getElementById('ruleCount');
         if (cnt) cnt.textContent = `${data.count ?? 0} / ${data.limit ?? 50} قاعدة`;
         const items = data.items || [];
@@ -1450,13 +1447,13 @@ async function submitRule() {
         priority: parseInt((document.getElementById('rulePriority').value || '100'), 10) || 100,
     };
     try {
-        let res;
+        let data;
         if (EDITING_RULE_ID !== null) {
-            res = await apiFetch(`/api/rules/${EDITING_RULE_ID}/edit`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+            data = await apiFetch(`/api/rules/${EDITING_RULE_ID}/edit`, { method: 'POST', body: JSON.stringify(payload) });
         } else {
-            res = await apiFetch('/api/rules', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+            data = await apiFetch('/api/rules', { method: 'POST', body: JSON.stringify(payload) });
         }
-        if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.detail || 'فشل'); }
+        if (!data || !data.success) throw new Error((data && data.detail) || 'فشل');
         showToast(EDITING_RULE_ID !== null ? '✓ حُفظ التعديل' : '✓ أُضيفت القاعدة', 'ok');
         cancelRuleEdit();
         loadRules();
@@ -1465,8 +1462,7 @@ async function submitRule() {
 
 async function editRule(id) {
     try {
-        const res = await apiFetch('/api/rules');
-        const data = await res.json();
+        const data = await apiFetch('/api/rules');
         const rule = (data.items || []).find(r => r.id === id);
         if (!rule) { showToast('القاعدة غير موجودة', 'err'); return; }
         EDITING_RULE_ID = id;
@@ -1497,8 +1493,7 @@ function cancelRuleEdit() {
 
 async function toggleRule(id) {
     try {
-        const res = await apiFetch(`/api/rules/${id}/toggle`, { method: 'POST' });
-        if (!res.ok) throw new Error();
+        await apiFetch(`/api/rules/${id}/toggle`, { method: 'POST' });
         loadRules();
     } catch (e) { showToast('فشل تبديل حالة القاعدة', 'err'); }
 }
@@ -1506,8 +1501,7 @@ async function toggleRule(id) {
 async function removeRule(id) {
     if (!confirm('حذف هذه القاعدة نهائياً؟')) return;
     try {
-        const res = await apiFetch(`/api/rules/${id}`, { method: 'DELETE' });
-        if (!res.ok) throw new Error();
+        await apiFetch(`/api/rules/${id}`, { method: 'DELETE' });
         showToast('✓ حُذفت القاعدة', 'ok');
         loadRules();
     } catch (e) { showToast('فشل حذف القاعدة', 'err'); }
@@ -1517,8 +1511,7 @@ async function loadAllowed() {
     const body = document.getElementById('allowedBody');
     if (!body) return;
     try {
-        const res = await apiFetch('/api/allowed');
-        const data = await res.json();
+        const data = await apiFetch('/api/allowed');
         const cnt = document.getElementById('allowedCount');
         if (cnt) cnt.textContent = `${data.count ?? 0} كيان`;
         const items = data.items || [];
@@ -1545,8 +1538,8 @@ async function addAllowed() {
     const entityId = parseInt((idEl.value || '').trim(), 10);
     if (!entityId) { showToast('أدخل ID رقمياً صحيحاً', 'wrn'); return; }
     try {
-        const res = await apiFetch('/api/allowed', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ entity_type: type, entity_id: entityId, note: (document.getElementById('allowedNote').value || '').trim() }) });
-        if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.detail || 'فشل'); }
+        const data = await apiFetch('/api/allowed', { method: 'POST', body: JSON.stringify({ entity_type: type, entity_id: entityId, note: (document.getElementById('allowedNote').value || '').trim() }) });
+        if (!data || !data.success) throw new Error((data && data.detail) || 'فشل');
         showToast('✓ أُضيف الكيان الموثوق', 'ok');
         idEl.value = ''; document.getElementById('allowedNote').value = '';
         loadAllowed();
@@ -1556,8 +1549,7 @@ async function addAllowed() {
 async function removeAllowed(type, id) {
     if (!confirm('إزالة هذا الكيان من قائمة السماح؟')) return;
     try {
-        const res = await apiFetch(`/api/allowed/${type}/${id}`, { method: 'DELETE' });
-        if (!res.ok) throw new Error();
+        await apiFetch(`/api/allowed/${type}/${id}`, { method: 'DELETE' });
         showToast('✓ أُزيل الكيان', 'ok');
         loadAllowed();
     } catch (e) { showToast('فشل الإزالة', 'err'); }
@@ -1570,8 +1562,7 @@ async function loadSources() {
     const body = document.getElementById('srcBody');
     if (!body) return;
     try {
-        const res = await apiFetch('/api/sources');
-        const data = await res.json();
+        const data = await apiFetch('/api/sources');
         const badge = document.getElementById('srcModeBadge');
         if (badge) {
             if (data.mode === 'filtered') {
@@ -1618,8 +1609,8 @@ async function addSource() {
         type: document.getElementById('srcType').value,
     };
     try {
-        const res = await apiFetch('/api/sources', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
-        if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.detail || 'فشل'); }
+        const data = await apiFetch('/api/sources', { method: 'POST', body: JSON.stringify(payload) });
+        if (!data || !data.success) throw new Error(data.detail || 'فشل');
         showToast('✓ أُضيف المصدر — أصبحت المراقبة للمفعّلة فقط', 'ok');
         idEl.value = ''; document.getElementById('srcTitle').value = ''; document.getElementById('srcUsername').value = '';
         loadSources();
@@ -1628,8 +1619,7 @@ async function addSource() {
 
 async function toggleSource(chatId) {
     try {
-        const res = await apiFetch(`/api/sources/${chatId}/toggle`, { method: 'POST' });
-        if (!res.ok) throw new Error('فشل');
+        await apiFetch(`/api/sources/${chatId}/toggle`, { method: 'POST' });
         loadSources();
     } catch (e) { showToast('فشل تبديل حالة المصدر', 'err'); }
 }
@@ -1637,8 +1627,7 @@ async function toggleSource(chatId) {
 async function removeSource(chatId) {
     if (!confirm('حذف هذا المصدر نهائياً؟')) return;
     try {
-        const res = await apiFetch(`/api/sources/${chatId}`, { method: 'DELETE' });
-        if (!res.ok) throw new Error('فشل');
+        await apiFetch(`/api/sources/${chatId}`, { method: 'DELETE' });
         showToast('✓ حُذف المصدر', 'ok');
         loadSources();
     } catch (e) { showToast('فشل حذف المصدر', 'err'); }
@@ -1760,8 +1749,7 @@ async function loadAudit(append) {
     try {
         if (!append) { AUDIT_DEPTH = 0; AUDIT_ALL_ITEMS = []; }
         const f = auditFilterParams();
-        const res = await apiFetch(`/api/audit?limit=${AUDIT_PAGE}&offset=${AUDIT_DEPTH}&action=${encodeURIComponent(f.action)}&actor=${encodeURIComponent(f.actor)}&q=${encodeURIComponent(f.q)}&since_hours=${encodeURIComponent(f.period)}`);
-        const data = await res.json();
+        const data = await apiFetch(`/api/audit?limit=${AUDIT_PAGE}&offset=${AUDIT_DEPTH}&action=${encodeURIComponent(f.action)}&actor=${encodeURIComponent(f.actor)}&q=${encodeURIComponent(f.q)}&since_hours=${encodeURIComponent(f.period)}`);
         AUDIT_ALL_ITEMS = AUDIT_ALL_ITEMS.concat(data.items || []);
         AUDIT_DEPTH = AUDIT_ALL_ITEMS.length;
         renderAuditRows();
@@ -1785,7 +1773,7 @@ async function exportAuditCsv() {
     try {
         const f = auditFilterParams();
         const p = new URLSearchParams({ action: f.action, actor: f.actor, q: f.q, since_hours: f.period });
-        const res = await apiFetch(`/api/audit/export?${p}`);
+        const res = await fetch(`${API_BASE}/api/audit/export?${p}`, { headers: { 'Authorization': `Bearer ${AUTH_TOKEN}` } });
         if (!res.ok) throw new Error("فشل");
         const blob = await res.blob();
         const a = document.createElement("a");
@@ -2748,7 +2736,7 @@ function toggleAlertsAuto() {
 
 async function exportCriticalData() {
     try {
-        const res = await apiFetch('/api/backup/export');
+        const res = await fetch(`${API_BASE}/api/backup/export`, { headers: { 'Authorization': `Bearer ${AUTH_TOKEN}` } });
         if (!res.ok) throw new Error('فشل التصدير');
         const blob = await res.blob();
         const a = document.createElement('a');
@@ -2767,9 +2755,9 @@ async function importCriticalData(ev) {
     if (!confirm('استيراد هذا الملف سيستبدل البيانات الحرجة الحالية. متابعة؟')) return;
     try {
         const text = await file.text();
-        const res = await apiFetch('/api/backup/import', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: text });
-        const body = await res.json().catch(() => ({}));
-        if (!res.ok) throw new Error(body.detail || 'فشل الاستيراد');
+        const body = await apiFetch('/api/backup/import', { method: 'POST', body: text });
+        if (!body || (!body.success && !body.detail)) throw new Error('فشل الاستيراد');
+        if (body.detail && !body.success) throw new Error(body.detail);
         const pill = document.getElementById('importResultPill');
         if (pill) {
             pill.style.display = '';
