@@ -54,21 +54,18 @@ agent-browser open "${BASE}" >/dev/null 2>&1
 sleep 1
 # login via the token modal
 agent-browser find placeholder "Dashboard token..." fill "${TOKEN}" >/dev/null 2>&1
-agent-browser snapshot >/dev/null 2>&1
-agent-browser click text "دخول" >/dev/null 2>&1
-sleep 2
+agent-browser press Enter >/dev/null 2>&1
+sleep 2.5
 
-TAB_EMOJI=(
-  "الرئيسية" "التنبيهات" "الإحصاء والتحليل" "الحسابات" "الرسائل"
-  "الكلمات المفتاحية" "الحظر" "المصادر" "القواعد" "السماح"
-  "التدقيق" "الميزات" "الإعدادات" "السجلات"
-)
+# nav items are onclick divs — agent-browser "click text" is unsupported,
+# so drive the SPA through its own showTab()
+TABS=(dashboard alerts analytics accounts messages keywords blocked sources rules allowed audit features settings logs)
 i=0
-for tab in "${TAB_EMOJI[@]}"; do
+for tab in "${TABS[@]}"; do
   i=$((i+1))
-  ab click text "${tab}" >/dev/null 2>&1
-  sleep 1
-  ab screenshot "${QA_DIR}/v928-tab-${i}.png" >/dev/null 2>&1
+  agent-browser eval "showTab('${tab}')" >/dev/null 2>&1
+  sleep 0.9
+  agent-browser screenshot "${QA_DIR}/v928-tab-${i}-${tab}.png" >/dev/null 2>&1
 done
 
 echo "── live audit trail check ───────────────────────────────"
@@ -77,8 +74,8 @@ curl -s -X POST -H "$AUTH" -H "Content-Type: application/json" \
   -d '{"user_id": 99000999, "reason": "qa-live-audit"}' \
   "${BASE}/api/blocked/senders" >/dev/null
 curl -s -X DELETE -H "$AUTH" "${BASE}/api/blocked/senders/99000999" >/dev/null
-agent-browser click text "التدقيق" >/dev/null 2>&1
-sleep 1.5
+agent-browser eval "showTab('audit')" >/dev/null 2>&1
+sleep 2
 agent-browser screenshot "${QA_DIR}/v928-audit-live.png" >/dev/null 2>&1
 
 echo "── console errors ───────────────────────────────────────"
