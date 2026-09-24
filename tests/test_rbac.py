@@ -462,3 +462,76 @@ class TestGithubPanel:
         assert "GITHUB_TOKEN" in r["hint"]
         # لا أسرار ولا استثناءات — قاموس تفسيري فقط.
         assert "error" not in r or isinstance(r.get("error"), str)
+
+
+class TestWebadminUsersRoutes:
+    """v9.29: مسارات إدارة المستخدمين عبر جلسة webadmin (CSRF + تدقيق)."""
+
+    async def _login_admin(self, ac: AsyncClient, monkeypatch) -> str:
+        monkeypatch.setenv("DASHBOARD_USERNAME", "wa")
+        monkeypatch.setenv("DASHBOARD_PASSWORD", "wa-pass-12345")
+        r = await ac.post("/admin/api/auth/login",
+                          json={"username": "wa", "password": "wa-pass-12345"})
+        assert r.status_code == 200
+        return r.json()["csrf"]
+
+    @pytest.mark.asyncio
+    async def test_users_list_requires_session(self, client, monkeypatch):
+        monkeypatch.delenv("DASHBOARD_USERNAME", raising=False)
+        r = await client.get("/admin/api/users")
+        assert r.status_code in (401, 403, 503)
+
+    @pytest.mark.asyncio
+    async def test_create_update_delete_via_webadmin(self, client, monkeypatch):
+        from conftest import drain_dashboard_tasks
+        csrf = await self._login_admin(client, monkeypatch)
+        h = {"x-csrf-token": csrf}
+        # إنشاء
+        r = await client.post("/admin/api/users/create",
+                              json={"username": "web.user", "password": "longenough1",
+                                    "role": "operator"}, headers=h)
+        assert r.status_code == 200
+        uid = r.json()["user"]["id"]
+        # تكرار → 409
+        r2 = await client.post("/admin/api/users/create",
+                               json={"username": "web.user", "password": "longenough1",
+                                     "role": "viewer"}, headers=h)
+        assert r2.status_code == 409
+        # قائمة تحتويه بلا hash
+        lst = (await client.get("/admin/api/users")).json()
+        row = next(u for u in lst["users"] if u["username"] == "web.user")
+        assert row["role"] == "operator" and "password_hash" not in row
+        assert set(lst["roles"]) == set(EnhancedDatabase.DASHBOARD_ROLES)
+        # تعطيل ثم حذف ناعم
+        assert (await client.post("/admin/api/users/update",
+                                  json={"user_id": uid, "enabled": False},
+                                  headers=h)).status_code == 200
+        assert (await client.post("/admin/api/users/delete",
+                                  json={"user_id": uid}, headers=h)).status_code == 200
+        # مسح CSRF → رفض
+        r3 = await client.post("/admin/api/users/create",
+                               json={"username": "nocsrf", "password": "longenough1"},
+                               headers={"x-csrf-token": "bad"})
+        assert r3.status_code in (401, 403)
+        # التدقيق من مصدر webadmin
+        await drain_dashboard_tasks()
+        audits = await client.get("/api/audit?action=user.create&limit=50",
+                                  headers=AUTH)
+        assert any(a["actor"] == "webadmin:wa" and a["source"] == "webadmin"
+                   for a in audits.json()["items"])
+
+    @pytest.mark.asyncio
+    async def test_github_status_with_session_not_configured(self, client, monkeypatch):
+        monkeypatch.setenv("DASHBOARD_USERNAME", "wa")
+        monkeypatch.setenv("DASHBOARD_PASSWORD", "wa-pass-12345")
+        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+        monkeypatch.delenv("GITHUB_REPO", raising=False)
+        await self._login_admin(client, monkeypatch)
+        # الجلسة في كوكيز العميل تلقائياً — المسار محمي ويعيد التدهور الرشيق.
+        r = await client.get("/bot/github/status")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["github"]["configured"] is False
+        assert "GITHUB_TOKEN" in body["github"]["hint"]
+        # داخل المستودع أثناء الاختبارات: git متاح فيرجع sha/فرع.
+        assert "branch" in body["git"]
