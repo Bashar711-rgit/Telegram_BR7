@@ -12,7 +12,9 @@
 import base64
 import hmac as hmac_mod
 import json
+import sys
 import time
+from pathlib import Path
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -21,6 +23,7 @@ import dashboard as dash
 from dashboard import app
 from database import EnhancedDatabase
 
+PROJ_DIR = Path(__file__).resolve().parent.parent
 TOKEN = "test-dashboard-token-0123456789"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
 
@@ -436,3 +439,26 @@ class TestAuditReflection:
         # التوكن الرئيسي لم يتأثر: كل المسارات القديمة تعمل كما هي.
         r = await client.get("/api/stats", headers={**AUTH, **_ip(24)})
         assert r.status_code == 200
+
+
+# ─────────────── v9.31: لوحة GitHub (تدهور رشيق بلا توكنات) ───────────────
+
+class TestGithubPanel:
+    def test_local_git_state_failsafe(self):
+        from webadmin.github_api import local_git_state
+        st = local_git_state(str(PROJ_DIR))
+        # داخل المستودع: يجب أن يعيد sha + فرع + owner/repo من origin.
+        assert st["head"] and len(st["head"]) == 40
+        assert st["branch"] == "main"
+        assert "Telegram_BR7" in st["repo"]
+
+    def test_overview_not_configured_shape(self, monkeypatch):
+        from webadmin import github_api
+        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+        monkeypatch.delenv("GITHUB_REPO", raising=False)
+        import asyncio
+        r = asyncio.new_event_loop().run_until_complete(github_api.get_overview("abc"))
+        assert r["configured"] is False
+        assert "GITHUB_TOKEN" in r["hint"]
+        # لا أسرار ولا استثناءات — قاموس تفسيري فقط.
+        assert "error" not in r or isinstance(r.get("error"), str)

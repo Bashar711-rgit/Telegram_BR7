@@ -36,7 +36,7 @@ from loguru import logger
 from pydantic import BaseModel, Field
 
 from config import ACCOUNTS
-from webadmin import auth, backup, keywords_store, logs_reader, render_api, settings_store
+from webadmin import auth, backup, github_api, keywords_store, logs_reader, render_api, settings_store
 
 router = APIRouter()
 
@@ -743,6 +743,20 @@ async def bot_restart(request: Request, _: Any = CsrfProtected):
 @router.post("/bot/backup")
 async def bot_backup(_: Any = CsrfProtected):
     return await backup.create_backup()
+
+
+@router.get("/bot/github/status")
+async def bot_github_status(request: Request, session: Dict[str, Any] = Protected):
+    """v9.31: لوحة GitHub (Master Prompt 6.13) — قراءة فقط، اعتماد كامل على
+    متغيرات البيئة GITHUB_TOKEN/GITHUB_REPO مع تدهور رشيق عند غيابهما."""
+    local = github_api.local_git_state(str(Path(__file__).resolve().parent.parent))
+    repo = os.getenv("GITHUB_REPO") or local.get("repo") or ""
+    if repo and not os.getenv("GITHUB_REPO"):
+        os.environ["GITHUB_REPO"] = repo  # اكتشاف تلقائي لطيف للجلسة
+    overview = await github_api.get_overview(local_head=local.get("head"))
+    return {"git": {"head": (local.get("head") or "")[:7],
+                    "branch": local.get("branch", "")},
+            "github": overview}
 
 
 @router.get("/bot/backups")

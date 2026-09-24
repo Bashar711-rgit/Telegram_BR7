@@ -1168,6 +1168,13 @@ function renderControl(){
     </div>
     <div id="deploy-body" class="text-sm"><div class="muted2">جارِ التحميل…</div></div>
   </div>
+  <div class="card mb-4">
+    <div class="flex items-center justify-between mb-3">
+      <h3 class="font-black">🐙 حالة GitHub</h3>
+      <button id="ctl-github-refresh" class="text-xs lnk">تحديث</button>
+    </div>
+    <div id="github-body" class="text-sm"><div class="muted2">جارِ التحميل…</div></div>
+  </div>
   <div class="grid sm:grid-cols-2 gap-4 max-w-4xl">
     <div class="card">
       <h3 class="font-black mb-3">التحكم بالبوت</h3>
@@ -1207,6 +1214,7 @@ function renderControl(){
   loadBackups();
   loadDeployStatus();
   state.timers.deploy = setInterval(loadDeployStatus, 30000);
+  loadGithubStatus();
 }
 function deployBadge(s){
   const map={
@@ -1245,6 +1253,52 @@ async function loadDeployStatus(){
       ${failed?'<div class="text-[11px] text-red-500 mt-1.5 bg-red-50 dark:bg-red-900/30 rounded-lg px-2.5 py-1.5">⚠ النشر الجديد لم يُفعّل — النسخة الحالية ما زالت تعمل. تحقق من سجلات Render.</div>':''}`;
   }catch(e){
     if(w) w.innerHTML='<div class="muted2 text-xs">تعذر جلب حالة النشر.</div>';
+  }
+}
+async function loadGithubStatus(){
+  const w=document.getElementById('github-body');
+  if(!w)return;
+  try{
+    const d=await api('/bot/github/status');
+    const g=d.github||{};
+    if(!g.configured){
+      const why=g.error ? ` — ${esc(g.error)}` : '';
+      w.innerHTML=`<div class="text-xs rounded-lg p-3" style="background:var(--yellow2);border:1px solid var(--border)">
+        <div class="font-bold mb-1">🐙 غير مضبوط${why}</div>
+        <div class="muted2">${esc(g.hint||'عرّف GITHUB_TOKEN وGITHUB_REPO في متغيرات البيئة.')}</div>
+        ${d.git&&d.git.head?`<div class="mt-2 muted2">الكود المحلي: <span class="mono font-bold" dir="ltr">${esc(d.git.head)}</span> · فرع <span class="mono">${esc(d.git.branch||'—')}</span></div>`:''}
+      </div>`;
+      return;
+    }
+    const lc=g.latest_commit||{};
+    const sync=g.up_to_date
+      ? '<span class="chip bg-emerald-100 text-emerald-700 dark:bg-emerald-900/50 dark:text-emerald-300">● الكود المنشور محدّث</span>'
+      : '<span class="chip bg-amber-100 text-amber-700 dark:bg-amber-900/50 dark:text-amber-300">● يوجد كود لم يُنشر بعد</span>';
+    const commits=(g.commits||[]).map(c=>`
+      <div class="flex items-center gap-2 py-1.5" style="border-bottom:1px solid var(--border)">
+        <span class="mono text-xs font-bold text-sky-600 dark:text-sky-400" dir="ltr">${esc(c.sha)}</span>
+        <span class="text-xs muted2 truncate flex-1" dir="ltr" title="${esc(c.message)}">${esc(c.message)}</span>
+        <span class="text-[10px] muted2">${esc((c.author||'').split(' ')[0])}</span>
+      </div>`).join('');
+    w.innerHTML=`
+      <div class="flex flex-wrap items-center gap-2">
+        <span class="chip bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-200 mono" dir="ltr">${esc(g.repo||'')}</span>
+        <span class="chip bg-slate-100 text-slate-600 dark:bg-slate-700 dark:text-slate-300 mono">⎇ ${esc(g.branch||'')}</span>
+        ${sync}
+      </div>
+      ${lc.sha?`
+      <div class="mt-2.5 rounded-xl p-3" style="border:1px solid var(--border)">
+        <div class="flex items-center gap-2">
+          <span class="mono text-xs font-bold text-sky-600 dark:text-sky-400" dir="ltr">${esc(lc.sha)}</span>
+          <span class="text-[11px] muted2">آخر commit على GitHub</span>
+          <span class="text-[11px] muted2 mono" dir="ltr">محدّث من: ${esc((g.local_head||'—'))}</span>
+        </div>
+        <div class="text-xs mt-1 muted2" dir="ltr">${esc(lc.message||'')}</div>
+      </div>`:''}
+      <div class="mt-2">${commits||'<div class="muted2 text-xs">لا commits.</div>'}</div>
+      <div class="text-[11px] muted2 mt-2">🔗 ${esc(g.deploy_relation||'')}</div>`;
+  }catch(e){
+    if(w) w.innerHTML='<div class="muted2 text-xs">تعذر جلب حالة GitHub.</div>';
   }
 }
 async function loadBackups(){
