@@ -1181,11 +1181,23 @@ async def get_analytics(request: Request, hours: int = 24):
     except Exception as e:
         logger.error(f"analytics top_senders failed: {e}")
         top_senders = []
+    # v9.22-3: عدّادات خط الأنابيب من ذاكرة المراقبين — بلا استعلامات.
+    counters = {"rules_blocked": 0, "allowlist_hits": 0, "source_skipped": 0}
+    bot = getattr(request.app.state, "bot_ref", None)
+    if bot is not None:
+        try:
+            for m in bot.monitors:
+                s = await m.get_stats()
+                for key in counters:
+                    counters[key] += int(s.get(key, 0) or 0)
+        except Exception as e:
+            logger.debug(f"analytics counters skipped: {e}")
     return JSONResponse({
         "hours": hours,
         "hourly": hourly,
         "top_keywords": [dict(r) for r in top_keywords] if top_keywords else [],
         "top_senders": [dict(r) for r in top_senders] if top_senders else [],
+        "counters": counters,
     })
 
 
@@ -1417,6 +1429,47 @@ async def add_rule(data: RuleCreate, request: Request):
     return JSONResponse({"success": True, "rule": row})
 
 
+@app.post("/api/rules/{rule_id}/edit", dependencies=[Depends(verify_token)])
+async def edit_rule(rule_id: int, data: RuleCreate, request: Request):
+    """v9.22-2: تعديل قاعدة (جزئي) — نفس تحقق الإضافة، لا يلمس enabled/hits."""
+    db = request.app.state.db
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    before = await db.get_rule(rule_id)
+    if before is None:
+        raise HTTPException(status_code=404, detail="Rule not found")
+    updates: Dict[str, Any] = {}
+    if data.name is not None:
+        updates["name"] = data.name
+    if data.conditions is not None:
+        clean, err = db.validate_rule_conditions(data.conditions)
+        if err:
+            raise HTTPException(status_code=400, detail=err)
+        updates["conditions"] = clean
+    if data.action is not None:
+        if data.action not in db.RULE_ACTIONS:
+            raise HTTPException(status_code=400, detail=f"unknown action: {data.action}")
+        if data.action == "tag" and not (data.action_value or "").strip():
+            raise HTTPException(status_code=400, detail="tag action requires action_value")
+        updates["action"] = data.action
+    updates["action_value"] = data.action_value or ""
+    updates["priority"] = data.priority
+    try:
+        after = await db.update_rule(rule_id, updates)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if after is None:
+        raise HTTPException(status_code=500, detail="Failed to update rule")
+    await _audit(request, "rule.edit", object_type="rule", object_id=str(rule_id),
+                 old_value=json.dumps({"name": before.get("name"), "conditions": before.get("conditions"),
+                                       "action": before.get("action"), "priority": before.get("priority")},
+                                      ensure_ascii=False, default=str)[:2000],
+                 new_value=json.dumps({"name": after.get("name"), "conditions": after.get("conditions"),
+                                       "action": after.get("action"), "priority": after.get("priority")},
+                                      ensure_ascii=False, default=str)[:2000])
+    return JSONResponse({"success": True, "rule": after})
+
+
 @app.post("/api/rules/{rule_id}/toggle", dependencies=[Depends(verify_token)])
 async def toggle_rule(rule_id: int, request: Request):
     """v9.21 P2: تفعيل/إيقاف قاعدة — مدقَّق."""
@@ -1566,6 +1619,70 @@ async def get_audit(
     except Exception:
         count = len(rows)
     return JSONResponse({"items": rows, "count": count})
+
+
+@app.get("/api/backup/export", dependencies=[Depends(verify_token)])
+async def backup_export(request: Request):
+    """v9.22-1: تصدير البيانات الحرجة JSON — تنزيل برأس Content-Disposition."""
+    db = request.app.state.db
+    payload = await db.export_critical_data() if db else {"version": 1, "tables": {}}
+    await _audit(request, "data.export", object_type="backup",
+                 new_value=json.dumps(list((payload.get("tables") or {}).keys())))
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    return JSONResponse(
+        payload,
+        headers={"Content-Disposition": f'attachment; filename="br7-critical-{stamp}.json"'},
+    )
+
+
+@app.post("/api/backup/import", dependencies=[Depends(verify_token)])
+async def backup_import(request: Request):
+    """v9.22-1: استيراد البيانات الحرجة — نسخة أمان أولاً، 400 إن لم يُستورد شيء."""
+    db = request.app.state.db
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="JSON غير صالح")
+    if not isinstance(body, dict) or not isinstance(body.get("tables"), dict):
+        raise HTTPException(status_code=400, detail="صيغة الملف غير صالحة (توقع tables)")
+
+    # نسخة أمان تلقائية pre-import-*.json في backups/ قبل أي كتابة —
+    # نُبقي آخر 20 نسخة. فشل النسخة لا يمنع الاستعادة.
+    safety_name = ""
+    try:
+        import os as _os
+        _os.makedirs("backups", exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        safety_name = f"pre-import-{stamp}.json"
+        safety_payload = await db.export_critical_data()
+        with open(_os.path.join("backups", safety_name), "w", encoding="utf-8") as f:
+            json.dump(safety_payload, f, ensure_ascii=False)
+        # احتفظ بآخر 20
+        try:
+            old = sorted(
+                (n for n in _os.listdir("backups") if n.startswith("pre-import-")),
+                reverse=True,
+            )
+            for n in old[20:]:
+                _os.unlink(_os.path.join("backups", n))
+        except Exception:
+            pass
+    except Exception as e:
+        logger.warning(f"pre-import safety backup failed: {e}")
+        safety_name = ""
+
+    counts = await db.import_critical_data(body, replace=True)
+    if not counts:
+        raise HTTPException(status_code=400, detail="لم يُستورد أي صف — تحقق من صيغة الملف")
+    await _audit(request, "data.import", object_type="backup",
+                 new_value=json.dumps(counts, ensure_ascii=False)[:2000])
+    return JSONResponse({
+        "success": True,
+        "imported": counts,
+        "safety_backup": safety_name,
+    })
 
 
 @app.get("/api/settings", dependencies=[Depends(verify_token)])

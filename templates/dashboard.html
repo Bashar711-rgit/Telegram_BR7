@@ -1705,6 +1705,13 @@ const PAGES = {
             </div>
             <div class="panel">
                 <div class="panel-head">
+                    <div class="panel-title"><span class="ico">🔀</span> قرارات خط الأنابيب (مباشرة من ذاكرة المراقبين)</div>
+                    <div class="panel-actions"><span class="pill blue" id="pipeTotal">0</span></div>
+                </div>
+                <div class="meter-row" id="pipeCounters"><div class="empty">جاري التحميل...</div></div>
+            </div>
+            <div class="panel">
+                <div class="panel-head">
                     <div class="panel-title"><span class="ico">💀</span> الرسائل الميتة (Dead Letters)</div>
                     <div class="panel-actions"><span class="pill red" id="dlCount">0</span></div>
                 </div>
@@ -1844,6 +1851,15 @@ const PAGES = {
                 <div id="settings-persistence" class="badge-line ok" style="margin:14px 16px 0">💾 جاري التحميل...</div>
                 <div id="settings-form"></div>
                 <div class="settings-status" id="settings-status"></div>
+                <div class="panel" style="margin:14px 16px;border:1px solid var(--border)">
+                    <div class="panel-head"><div class="panel-title"><span class="ico">🗄️</span> سلامة بيانات الإعدادات (تصدير/استيراد حرج)</div></div>
+                    <div class="settings-actions" style="border-top:none">
+                        <button class="tb-btn" onclick="exportCriticalData()">⬇️ تصدير JSON</button>
+                        <label class="tb-btn" style="cursor:pointer">⬆️ استيراد ملف<input type="file" id="importCriticalFile" accept=".json" style="display:none" onchange="importCriticalData(event)"></label>
+                        <span class="pill blue" id="importResultPill" style="display:none"></span>
+                    </div>
+                    <div class="panel-note">ℹ️ يغطي الإعدادات والمصادر والقواعد والسماح والكلمات — يعمل على SQLite وPostgreSQL معاً. الاستعادة تنشئ نسخة أمان تلقائياً (pre-import) قبل أي كتابة.</div>
+                </div>
                 <div class="settings-actions" style="border-top:1px solid var(--border)">
                     <button class="tb-btn primary" onclick="saveSettings()">💾 حفظ مباشر</button>
                     <button class="tb-btn" onclick="loadSettings()">⟳ تحديث</button>
@@ -2050,6 +2066,26 @@ const PAGES = {
 // ================================================================
 // DATA LOADERS
 // ================================================================
+
+function renderPipelineCounters() {
+    const wrap = document.getElementById('pipeCounters');
+    if (!wrap) return;
+    const c = (ANALYTICS && ANALYTICS.counters) || {};
+    const items = [
+        { key: 'rules_blocked', label: '🚫 محظورة بقاعدة', val: c.rules_blocked || 0, cls: 'red' },
+        { key: 'allowlist_hits', label: '✅ قبول موثوق', val: c.allowlist_hits || 0, cls: 'green' },
+        { key: 'source_skipped', label: '🎯 خارج النطاق', val: c.source_skipped || 0, cls: 'blue' },
+    ];
+    const total = items.reduce((s, i) => s + i.val, 0);
+    const tot = document.getElementById('pipeTotal');
+    if (tot) tot.textContent = `${total} قرار`;
+    wrap.innerHTML = items.map(i => `
+        <div class="m-item">
+            <div class="m-label"><span class="m-name">${i.label}</span><span class="m-val">${i.val}</span></div>
+            <div class="m-track"><div class="m-fill ${i.cls}" style="width:${total ? Math.max(2, i.val / total * 100) : 2}%"></div></div>
+        </div>`).join('');
+}
+
 async function loadAnalytics(renderCharts) {
     try {
         const data = await apiFetch('/api/analytics?hours=24');
@@ -2087,6 +2123,7 @@ function renderHomeChart() {
 }
 
 function renderAnalyticsPage() {
+    renderPipelineCounters();
     renderBars(document.getElementById('anChart'), document.getElementById('anLabels'), ANALYTICS.hourly);
 
     // Top keywords → meters
@@ -2377,6 +2414,40 @@ function toggleAlertsAuto() {
         btn.textContent = '⏱️ تلقائي (15ث)';
         logEvent('ok', 'alerts auto-refresh on (15s)');
     }
+}
+
+
+async function exportCriticalData() {
+    try {
+        const res = await apiFetch('/api/backup/export');
+        if (!res.ok) throw new Error('فشل التصدير');
+        const blob = await res.blob();
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = `br7-critical-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.json`;
+        a.click();
+        URL.revokeObjectURL(a.href);
+        showToast('✓ صُدّرت البيانات الحرجة', 'ok');
+    } catch (e) { showToast('فشل التصدير: ' + e.message, 'err'); }
+}
+
+async function importCriticalData(ev) {
+    const file = ev.target.files && ev.target.files[0];
+    ev.target.value = '';
+    if (!file) return;
+    if (!confirm('استيراد هذا الملف سيستبدل البيانات الحرجة الحالية. متابعة؟')) return;
+    try {
+        const text = await file.text();
+        const res = await apiFetch('/api/backup/import', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: text });
+        const body = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(body.detail || 'فشل الاستيراد');
+        const pill = document.getElementById('importResultPill');
+        if (pill) {
+            pill.style.display = '';
+            pill.textContent = '✓ ' + Object.entries(body.imported || {}).map(([k, v]) => `${k}: ${v}`).join(' · ') + (body.safety_backup ? ` — نسخة أمان: ${body.safety_backup}` : '');
+        }
+        showToast('✓ تم الاستيراد بنجاح', 'ok');
+    } catch (e) { showToast('فشل الاستيراد: ' + e.message, 'err'); }
 }
 
 function exportAlertsCsv() {

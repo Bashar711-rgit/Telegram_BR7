@@ -218,6 +218,26 @@ class DeadLetterRecord:
 # =============================================================================
 # SQL helpers
 # =============================================================================
+# v9.22-1: القائمة البيضاء لتصدير البيانات الحرجة — جدول → أعمدة مسموحة.
+# التصدير/الاستيراد من طبقة المحرك (يعمل على aiosqlite/asyncpg معاً).
+CRITICAL_EXPORT_TABLES: Dict[str, Tuple[str, ...]] = {
+    "app_settings": ("key", "value"),
+    "sources": ("chat_id", "username", "title", "type", "enabled", "added_by", "notes"),
+    "rules": ("name", "conditions", "action", "action_value", "priority", "hits",
+              "enabled", "created_by"),
+    "allowed_entities": ("entity_type", "entity_id", "note"),
+    "keywords_json": (),  # mirror handled via dashboard_store, not a table
+}
+
+
+# v9.22-1: قيم افتراضية لعمود ناقص في الاستيراد — صف بلا enabled مثلاً
+# لا يُدرَج NULL فيصير غير مرئي لفحص "enabled = 1" بل يُدرَج مفعّلاً.
+_IMPORT_COLUMN_DEFAULTS: Dict[str, Any] = {
+    "enabled": 1, "priority": 100, "hits": 0, "action": "tag",
+    "entity_type": "sender", "added_by": "import", "created_by": "import",
+}
+
+
 def _pg(sql: str) -> str:
     """Convert SQLite ?-placeholders to PostgreSQL $N placeholders."""
     counter = 0
@@ -2708,6 +2728,94 @@ class EnhancedDatabase:
             return int(chat_id) in chats
         except Exception:
             return False
+
+    # ─── v9.22-1: تصدير/استيراد البيانات الحرجة (سلامة عبر المحركات) ──
+    async def export_critical_data(self) -> Dict[str, Any]:
+        """v9.22-1: تصدير JSON للجداول الحرجة — يعمل على المحركين.
+
+        القائمة البيضاء فقط (CRITICAL_EXPORT_TABLES) فلا بيانات حساسة
+        (رسائل/تنبيهات/جهات) تُصدَّر. فشل-آمن: جدول فاشل يُتجاوز.
+        """
+        payload: Dict[str, Any] = {"version": 1, "exported_at": time.time(), "tables": {}}
+        for table, columns in CRITICAL_EXPORT_TABLES.items():
+            if table == "keywords_json" or not columns:
+                continue  # keywords mirror يُدار عبر dashboard_store
+            try:
+                cols = ", ".join(columns)
+                rows = await self._fetchall(f"SELECT {cols} FROM {table}")
+                payload["tables"][table] = [dict(r) for r in rows]
+            except Exception as e:
+                logger.debug(f"export_critical_data skip {table}: {e}")
+                payload["tables"][table] = []
+        return payload
+
+    async def import_critical_data(self, payload: Dict[str, Any],
+                                   replace: bool = False) -> Dict[str, int]:
+        """v9.22-1: استيراد JSON مُصدَّر سابقاً — متسامح وآمن.
+
+        * الصفوف غير الصالحة تُتجاهل (لا استثناءات أبداً).
+        * شروط القواعد تُرمَّز JSON قبل الكتابة.
+        * كل الكاشات تُبطَل فوراً بعد الاستيراد.
+        * replace=True يمسح الجدول أولاً (لكل جدول مستقل).
+        يعيد عدّادات {table: imported}.
+        """
+        counts: Dict[str, int] = {}
+        tables = (payload or {}).get("tables")
+        if not isinstance(tables, dict):
+            return counts
+        cleared: set = set()
+        try:
+            for table, columns in CRITICAL_EXPORT_TABLES.items():
+                if table == "keywords_json" or not columns:
+                    continue
+                rows = tables.get(table)
+                if not isinstance(rows, list) or not rows:
+                    continue
+                imported = 0
+                if replace and table not in cleared:
+                    try:
+                        await self._execute(f"DELETE FROM {table}")
+                    except Exception:
+                        pass
+                    cleared.add(table)
+                for row in rows:
+                    if not isinstance(row, dict):
+                        continue
+                    values = []
+                    ok = True
+                    for col in columns:
+                        val = row.get(col)
+                        if val is None and col in _IMPORT_COLUMN_DEFAULTS:
+                            val = _IMPORT_COLUMN_DEFAULTS[col]
+                        if val is None and col in ("chat_id", "entity_id", "conditions"):
+                            ok = False
+                            break
+                        if col == "conditions" and not isinstance(val, str):
+                            val = json.dumps(val if isinstance(val, dict) else {},
+                                             ensure_ascii=False)
+                        values.append(val)
+                    if not ok:
+                        continue
+                    try:
+                        placeholders = ", ".join("?" for _ in columns)
+                        await self._execute(
+                            f"INSERT INTO {table} ({', '.join(columns)})"
+                            f" VALUES ({placeholders})",
+                            tuple(values),
+                        )
+                        imported += 1
+                    except Exception:
+                        continue  # صف مكرر/فاسد — تجاهل
+                counts[table] = imported
+            await self._commit()
+        except Exception as e:
+            logger.debug(f"import_critical_data skipped: {e}")
+        finally:
+            # إبطال كل الكاشات — الجداول الثلاثة كلها قد تكون تغيّرت
+            self.invalidate_sources_cache()
+            self.invalidate_rules_cache()
+            self._invalidate_allowed_cache()
+        return counts
 
     async def _resource_pressure_check(self) -> None:
         """
