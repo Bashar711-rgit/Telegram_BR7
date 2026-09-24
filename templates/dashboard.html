@@ -628,6 +628,11 @@ body { font-family: var(--sans); background: var(--bg); color: var(--text); font
   padding: 2px 12px; border-radius: 20px; color: var(--text2);
 }
 
+/* ── v9.21 RULES + ALLOWED ───────────────────────────────────── */
+#rulePanel.editing { border-color: rgba(250,204,21,0.45); }
+#ruleEditBanner { animation: ruleSlideDown .25s cubic-bezier(0.16,1,0.3,1); }
+@keyframes ruleSlideDown { from { opacity: 0; transform: translateY(-6px); } to { opacity: 1; transform: none; } }
+
 /* ── v9.20 SOURCES TAB ───────────────────────────────────────── */
 .src-form { display: flex; flex-wrap: wrap; gap: 8px; padding: 14px 16px; }
 .src-form .kw-input { flex: 1 1 180px; min-width: 150px; }
@@ -781,6 +786,12 @@ body { font-family: var(--sans); background: var(--bg); color: var(--text); font
     </div>
     <div class="nav-item" data-page="sources" onclick="showTab('sources')">
       <span class="ni">🎯</span> المصادر
+    </div>
+    <div class="nav-item" data-page="rules" onclick="showTab('rules')">
+      <span class="ni">📏</span> القواعد
+    </div>
+    <div class="nav-item" data-page="allowed" onclick="showTab('allowed')">
+      <span class="ni">✅</span> السماح
     </div>
 
     <div class="nav-section">النظام</div>
@@ -1166,6 +1177,8 @@ const PAGE_META = {
     logs:      { title: 'السجلات', sub: 'أحداث النظام المباشرة' },
     audit:     { title: 'سجل التدقيق', sub: 'كل عملية كتابة من اللوحتين — بفلتر الإجراءات' },
     sources:   { title: 'مصادر المراقبة', sub: 'حدد المجموعات/القنوات التي يراقبها البوت — فارغة = الكل' },
+    rules:     { title: 'محرك القواعد', sub: 'إذا طابقت الشروط → إجراء — أول قاعدة مطابقة تُطبَّق حسب الأولوية' },
+    allowed:   { title: 'قائمة السماح', sub: 'كيانات موثوقة تتجاوز فلترة الكلمات فقط — لا الحظر ولا مكافحة السبام' },
 };
 
 function renderPage(tab) {
@@ -1182,6 +1195,198 @@ function loadPageData(tab) {
 }
 
 
+
+
+// ================================================================
+// PAGE: RULES + ALLOWED (v9.21)
+// ================================================================
+const RULE_ACTION_LABELS = { block: '🚫 حظر', allow: '✅ قبول قسري', tag: '🏷 وسم' };
+let EDITING_RULE_ID = null;
+
+function ruleCondChips(conds) {
+    const labels = { keyword: '🏷', source_chat_id: '🎯', sender_id: '👤', min_confidence: '📊' };
+    return Object.entries(conds || {}).map(([k, v]) =>
+        `<span class="pill blue" style="margin-inline-end:4px" title="${esc(k)}">${labels[k] || esc(k)} ${esc(String(v))}</span>`).join(' ');
+}
+
+async function loadRules() {
+    const body = document.getElementById('rulesBody');
+    if (!body) return;
+    try {
+        const res = await apiFetch('/api/rules');
+        const data = await res.json();
+        const cnt = document.getElementById('ruleCount');
+        if (cnt) cnt.textContent = `${data.count ?? 0} / ${data.limit ?? 50} قاعدة`;
+        const items = data.items || [];
+        if (!items.length) {
+            body.innerHTML = '<tr><td colspan="8" class="empty">لا قواعد — الفلترة تعمل بشكلها الأصلي. أضف قاعدة للتحكم الدقيق.</td></tr>';
+            return;
+        }
+        body.innerHTML = items.map(r => `
+            <tr>
+                <td class="td-obj">${r.id}</td>
+                <td>${esc(r.name || '—')}</td>
+                <td>${ruleCondChips(r.conditions)}</td>
+                <td><span class="pill ${r.action === 'block' ? 'red' : r.action === 'allow' ? 'green' : 'blue'}">${RULE_ACTION_LABELS[r.action] || esc(r.action)}${r.action_value ? ' — ' + esc(r.action_value) : ''}</span></td>
+                <td class="td-obj">${r.priority}</td>
+                <td class="td-obj">${r.hits || 0}</td>
+                <td><span class="pill ${r.enabled ? 'green' : 'red'}">${r.enabled ? 'مفعّلة' : 'موقوفة'}</span></td>
+                <td>
+                    <button class="al-btn" onclick="toggleRule(${r.id})">${r.enabled ? '⏸' : '▶'}</button>
+                    <button class="al-btn" onclick="editRule(${r.id})" title="تعديل">✏️</button>
+                    <button class="al-btn d" onclick="removeRule(${r.id})">🗑</button>
+                </td>
+            </tr>`).join('');
+    } catch (e) {
+        if (body) body.innerHTML = '<tr><td colspan="8" class="empty">فشل تحميل القواعد.</td></tr>';
+    }
+}
+
+function setRuleEditing(on) {
+    const panel = document.getElementById('rulePanel');
+    const banner = document.getElementById('ruleEditBanner');
+    const submit = document.getElementById('ruleSubmitBtn');
+    const cancel = document.getElementById('ruleCancelBtn');
+    const title = document.getElementById('rulePanelTitle');
+    if (!panel) return;
+    panel.classList.toggle('editing', on);
+    if (banner) banner.classList.toggle('hidden', !on);
+    if (submit) submit.innerHTML = on ? '💾 حفظ التعديل' : '＋ إضافة';
+    if (cancel) cancel.classList.toggle('hidden', !on);
+    if (title) title.textContent = on ? 'تعديل القاعدة' : 'إضافة قاعدة';
+}
+
+async function submitRule() {
+    const conds = {};
+    const kw = (document.getElementById('ruleKeyword').value || '').trim();
+    const src = (document.getElementById('ruleSource').value || '').trim();
+    const snd = (document.getElementById('ruleSender').value || '').trim();
+    const conf = (document.getElementById('ruleConf').value || '').trim();
+    if (kw) conds.keyword = kw;
+    if (src) conds.source_chat_id = parseInt(src, 10);
+    if (snd) conds.sender_id = parseInt(snd, 10);
+    if (conf) conds.min_confidence = parseFloat(conf);
+    const action = document.getElementById('ruleAction').value;
+    const payload = {
+        name: (document.getElementById('ruleName').value || '').trim(),
+        conditions: conds,
+        action,
+        action_value: (document.getElementById('ruleTagValue').value || '').trim(),
+        priority: parseInt((document.getElementById('rulePriority').value || '100'), 10) || 100,
+    };
+    try {
+        let res;
+        if (EDITING_RULE_ID !== null) {
+            res = await apiFetch(`/api/rules/${EDITING_RULE_ID}/edit`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+        } else {
+            res = await apiFetch('/api/rules', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+        }
+        if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.detail || 'فشل'); }
+        showToast(EDITING_RULE_ID !== null ? '✓ حُفظ التعديل' : '✓ أُضيفت القاعدة', 'ok');
+        cancelRuleEdit();
+        loadRules();
+    } catch (e) { showToast('فشل حفظ القاعدة: ' + e.message, 'err'); }
+}
+
+async function editRule(id) {
+    try {
+        const res = await apiFetch('/api/rules');
+        const data = await res.json();
+        const rule = (data.items || []).find(r => r.id === id);
+        if (!rule) { showToast('القاعدة غير موجودة', 'err'); return; }
+        EDITING_RULE_ID = id;
+        document.getElementById('ruleName').value = rule.name || '';
+        const c = rule.conditions || {};
+        document.getElementById('ruleKeyword').value = c.keyword || '';
+        document.getElementById('ruleSource').value = c.source_chat_id ?? '';
+        document.getElementById('ruleSender').value = c.sender_id ?? '';
+        document.getElementById('ruleConf').value = c.min_confidence ?? '';
+        document.getElementById('ruleAction').value = rule.action || 'tag';
+        document.getElementById('ruleTagValue').value = rule.action_value || '';
+        document.getElementById('rulePriority').value = rule.priority ?? 100;
+        const eid = document.getElementById('ruleEditId');
+        if (eid) eid.textContent = String(id);
+        setRuleEditing(true);
+        window.scrollTo({ top: 0, behavior: 'smooth' });
+    } catch (e) { showToast('فشل جلب القاعدة', 'err'); }
+}
+
+function cancelRuleEdit() {
+    EDITING_RULE_ID = null;
+    ['ruleName', 'ruleKeyword', 'ruleSource', 'ruleSender', 'ruleConf', 'ruleTagValue'].forEach(id => {
+        const el = document.getElementById(id); if (el) el.value = '';
+    });
+    const pr = document.getElementById('rulePriority'); if (pr) pr.value = '100';
+    setRuleEditing(false);
+}
+
+async function toggleRule(id) {
+    try {
+        const res = await apiFetch(`/api/rules/${id}/toggle`, { method: 'POST' });
+        if (!res.ok) throw new Error();
+        loadRules();
+    } catch (e) { showToast('فشل تبديل حالة القاعدة', 'err'); }
+}
+
+async function removeRule(id) {
+    if (!confirm('حذف هذه القاعدة نهائياً؟')) return;
+    try {
+        const res = await apiFetch(`/api/rules/${id}`, { method: 'DELETE' });
+        if (!res.ok) throw new Error();
+        showToast('✓ حُذفت القاعدة', 'ok');
+        loadRules();
+    } catch (e) { showToast('فشل حذف القاعدة', 'err'); }
+}
+
+async function loadAllowed() {
+    const body = document.getElementById('allowedBody');
+    if (!body) return;
+    try {
+        const res = await apiFetch('/api/allowed');
+        const data = await res.json();
+        const cnt = document.getElementById('allowedCount');
+        if (cnt) cnt.textContent = `${data.count ?? 0} كيان`;
+        const items = data.items || [];
+        if (!items.length) {
+            body.innerHTML = '<tr><td colspan="5" class="empty">لا كيانات موثوقة — الجميع يخضع للفلترة العادية.</td></tr>';
+            return;
+        }
+        body.innerHTML = items.map(a => `
+            <tr>
+                <td><span class="pill ${a.entity_type === 'sender' ? 'blue' : 'green'}">${a.entity_type === 'sender' ? '👤 مرسل' : '👥 مجموعة'}</span></td>
+                <td class="td-obj">${esc(String(a.entity_id))}</td>
+                <td>${esc(a.note || '—')}</td>
+                <td class="td-time" title="${esc(String(a.created_at || ''))}">${fmtAuditTime(a.created_at)}</td>
+                <td><button class="al-btn d" onclick="removeAllowed('${esc(a.entity_type)}', ${esc(String(a.entity_id))})">🗑</button></td>
+            </tr>`).join('');
+    } catch (e) {
+        if (body) body.innerHTML = '<tr><td colspan="5" class="empty">فشل التحميل.</td></tr>';
+    }
+}
+
+async function addAllowed() {
+    const type = document.getElementById('allowedType').value;
+    const idEl = document.getElementById('allowedId');
+    const entityId = parseInt((idEl.value || '').trim(), 10);
+    if (!entityId) { showToast('أدخل ID رقمياً صحيحاً', 'wrn'); return; }
+    try {
+        const res = await apiFetch('/api/allowed', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ entity_type: type, entity_id: entityId, note: (document.getElementById('allowedNote').value || '').trim() }) });
+        if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.detail || 'فشل'); }
+        showToast('✓ أُضيف الكيان الموثوق', 'ok');
+        idEl.value = ''; document.getElementById('allowedNote').value = '';
+        loadAllowed();
+    } catch (e) { showToast('فشل الإضافة: ' + e.message, 'err'); }
+}
+
+async function removeAllowed(type, id) {
+    if (!confirm('إزالة هذا الكيان من قائمة السماح؟')) return;
+    try {
+        const res = await apiFetch(`/api/allowed/${type}/${id}`, { method: 'DELETE' });
+        if (!res.ok) throw new Error();
+        showToast('✓ أُزيل الكيان', 'ok');
+        loadAllowed();
+    } catch (e) { showToast('فشل الإزالة', 'err'); }
+}
 
 // ================================================================
 // PAGE: SOURCES (v9.20 P1)
@@ -1649,6 +1854,82 @@ const PAGES = {
         load() { loadSettings(); renderSysInfo(true); }
     },
 
+    rules: {
+        render() {
+            return `
+            <div class="panel" id="rulePanel">
+                <div class="panel-head">
+                    <div class="panel-title"><span class="ico">📏</span> <span id="rulePanelTitle">إضافة قاعدة</span></div>
+                    <div class="panel-actions">
+                        <span class="pill blue" id="ruleCount">0 قاعدة</span>
+                        <button class="al-btn d" onclick="refreshCurrent()">↻</button>
+                    </div>
+                </div>
+                <div id="ruleEditBanner" class="hidden" style="margin:0 16px;padding:8px 12px;border:1px solid rgba(250,204,21,.35);background:rgba(250,204,21,.08);border-radius:8px;color:#facc15;font-size:12px;">✏️ وضع التعديل — القاعدة رقم <b id="ruleEditId"></b></div>
+                <div class="src-form">
+                    <input class="kw-input" id="ruleName" placeholder="اسم القاعدة (اختياري)">
+                    <input class="kw-input" id="ruleKeyword" placeholder="كلمة داخل النص (اختياري)">
+                    <input class="kw-input" id="ruleSource" placeholder="Source chat ID (اختياري)" dir="ltr">
+                    <input class="kw-input" id="ruleSender" placeholder="Sender ID (اختياري)" dir="ltr">
+                    <input class="kw-input" id="ruleConf" placeholder="أدنى ثقة 0-1 (اختياري)" dir="ltr">
+                    <select class="al-select" id="ruleAction">
+                        <option value="block">🚫 حظر</option>
+                        <option value="allow">✅ قبول قسري</option>
+                        <option value="tag">🏷 وسم</option>
+                    </select>
+                    <input class="kw-input" id="ruleTagValue" placeholder="نص الوسم (لإجراء الوسم)">
+                    <input class="kw-input" id="rulePriority" placeholder="الأولوية (1=أعلى)" dir="ltr" value="100">
+                    <button class="tb-btn primary" id="ruleSubmitBtn" onclick="submitRule()">＋ إضافة</button>
+                    <button class="al-btn hidden" id="ruleCancelBtn" onclick="cancelRuleEdit()">إلغاء التعديل</button>
+                </div>
+                <div class="panel-note">ℹ️ الشروط مترابطة بـ<b>و</b> (يجب تحقق كل ما أدخلته). شرط واحد على الأقل إلزامي. الإجراءات: <b>حظر</b> = إسقاط صامت، <b>قبول قسري</b> = تجاوز فلترة الكلمات فقط، <b>وسم</b> = إلحاق «🏷 قاعدة: …» أعلى التنبيه. حد 50 قاعدة.</div>
+            </div>
+            <div class="panel">
+                <div class="panel-head"><div class="panel-title"><span class="ico">📋</span> القواعد المحفوظة</div></div>
+                <div style="overflow-x:auto">
+                <table class="tbl">
+                    <thead><tr><th>#</th><th>الاسم</th><th>الشروط</th><th>الإجراء</th><th>الأولوية</th><th>التطابقات</th><th>الحالة</th><th></th></tr></thead>
+                    <tbody id="rulesBody"><tr><td colspan="8" class="empty">جارٍ التحميل…</td></tr></tbody>
+                </table>
+                </div>
+            </div>`;
+        },
+        load() { loadRules(); }
+    },
+    allowed: {
+        render() {
+            return `
+            <div class="panel">
+                <div class="panel-head">
+                    <div class="panel-title"><span class="ico">✅</span> إضافة كيان موثوق</div>
+                    <div class="panel-actions">
+                        <span class="pill blue" id="allowedCount">0 كيان</span>
+                        <button class="al-btn d" onclick="refreshCurrent()">↻</button>
+                    </div>
+                </div>
+                <div class="src-form">
+                    <select class="al-select" id="allowedType">
+                        <option value="sender">مرسل</option>
+                        <option value="chat">مجموعة/قناة</option>
+                    </select>
+                    <input class="kw-input" id="allowedId" placeholder="ID رقمي" dir="ltr">
+                    <input class="kw-input" id="allowedNote" placeholder="ملاحظة (اختياري)">
+                    <button class="tb-btn primary" onclick="addAllowed()">＋ إضافة</button>
+                </div>
+                <div class="panel-note">⚠️ الأولوية الموثقة: <b>الحظر ← مكافحة السبام ← السماح ← الفلترة</b> — الكيان الموثوق يتجاوز فلترة الكلمات فقط، ولا يتجاوز الحظر ولا مكافحة السبام أبداً.</div>
+            </div>
+            <div class="panel">
+                <div class="panel-head"><div class="panel-title"><span class="ico">📋</span> الكيانات الموثوقة</div></div>
+                <div style="overflow-x:auto">
+                <table class="tbl">
+                    <thead><tr><th>النوع</th><th>ID</th><th>ملاحظة</th><th>أُضيف</th><th></th></tr></thead>
+                    <tbody id="allowedBody"><tr><td colspan="5" class="empty">جارٍ التحميل…</td></tr></tbody>
+                </table>
+                </div>
+            </div>`;
+        },
+        load() { loadAllowed(); }
+    },
     sources: {
         render() {
             return `

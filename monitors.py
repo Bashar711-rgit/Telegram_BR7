@@ -1017,7 +1017,11 @@ class EnhancedAccountMonitor:
         else:
             msg_html = f'<a href="{msg_link}"><b>عرض الرسالة الأصلية</b></a>' if msg_link != "#" else "الرابط غير متاح"
             group_card = f'<blockquote dir="rtl">{msg_html}</blockquote>'
-        alert = (f"<b>الرسالة:</b>\n{message_html}\n\n👤: {sender_link}\n\n{group_card}")
+        rule_tag_html = ""
+        rule_tag = (analysis or {}).get("rule_tag") if isinstance(analysis, dict) else None
+        if rule_tag:
+            rule_tag_html = f'<blockquote dir="rtl">🏷 قاعدة: {InputSanitizer.escape_html(str(rule_tag))}</blockquote>\n\n'
+        alert = (f"{rule_tag_html}<b>الرسالة:</b>\n{message_html}\n\n👤: {sender_link}\n\n{group_card}")
         # v9.11: الأزرار الثلاثة المطلوبة في صفّين:
         #   [ عرض الرسالة ] [ تواصل مع المرسل ]
         #   [ مراسلة ] [ 📋 نسخ النص ]
@@ -1893,9 +1897,52 @@ class EnhancedAccountMonitor:
                     return  # إيقاف كل التنبيهات — رسائله لا تُعالج مرة أخرى
             except Exception as e:
                 logger.debug(f"antispam observe skipped [{self.account['name']}]: {e}")
+
+        # ====== v9.21 P3: قائمة السماح — بعد مكافحة السبام مباشرة ======
+        # أولوية التقييم الموثقة: الحظر (أعلى) ← مكافحة السبام ← السماح ← الفلترة.
+        # الكيان الموثوق يتجاوز فلترة الكلمات فقط — لا الحظر ولا السبام.
+        chat_id_rule = data.get("chat_id", 0)
+        allowlist_hit = False
+        if CFG.ALLOWLIST_ENABLED:
+            try:
+                allowlist_hit = (
+                    await self.db.is_sender_allowed(sender_id)
+                    or await self.db.is_chat_allowed(chat_id_rule)
+                )
+                if allowlist_hit:
+                    await self._inc_stat("allowlist_hits")
+            except Exception as _al_err:
+                logger.debug(f"allowlist check skipped [{self.account['name']}]: {_al_err}")
+
+        # ====== v9.21 P2: محرك القواعد — بعد السماح وقبل الفلترة ======
+        # أول قاعدة مطابقة (priority ASC, id ASC) تُطبَّق:
+        #   allow → قبول قسري (يتجاوز فلترة الكلمات فقط)
+        #   block → إسقاط + عداد rules_blocked
+        #   tag   → analysis["rule_tag"] يظهر كـ"🏷 قاعدة: …" أعلى التنبيه
+        rule_result = None
+        if not allowlist_hit and CFG.RULE_ENGINE_ENABLED:
+            try:
+                rule_result = await self.db.apply_rules(
+                    validated_text or "", source_chat_id=chat_id_rule,
+                    sender_id=sender_id, confidence=analysis.get("confidence", 0.0),
+                )
+                if rule_result is not None:
+                    action = rule_result.get("action")
+                    if action == "block":
+                        await self._inc_stat("rules_blocked")
+                        return  # إسقاط الرسالة — لا تنبيه
+                    if action == "tag" and rule_result.get("action_value"):
+                        analysis["rule_tag"] = str(rule_result["action_value"])[:120]
+            except Exception as _rule_err:
+                logger.debug(f"rule engine skipped [{self.account['name']}]: {_rule_err}")
+
         # ====== الإصلاح الجوهري: التأكد من أن القرار النهائي هو "accept" فقط ======
         decision = analysis.get("decision", "ignore")
-        is_valid = analysis.get("valid", False) and decision == "accept"
+        is_valid = (
+            (analysis.get("valid", False) and decision == "accept")
+            or allowlist_hit
+            or (rule_result is not None and rule_result.get("action") == "allow")
+        )
         # =========================================================================
         try: await self.db.update_sender_reputation(sender_id, is_valid)
         except Exception as e: logger.warning(f"update_sender_reputation failed [{self.account['name']}]: {e}")

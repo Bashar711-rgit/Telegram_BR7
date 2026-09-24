@@ -93,6 +93,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import os
 import sqlite3
 import time
@@ -154,6 +155,8 @@ _DEAD_LETTER_MAX_ROWS: int = int(os.getenv("DEAD_LETTER_MAX_ROWS", "5000"))
 
 # Resource pressure check interval (every N writer-loop cycles, fix #12)
 _PRESSURE_CHECK_EVERY: int = int(os.getenv("DB_PRESSURE_CHECK_EVERY", "12"))
+# v9.21 P2: دفع عدّادات تطابق القواعد كل N دورة كتابة (6 × 5 ثوانٍ = 30 ثانية)
+_RULE_HITS_FLUSH_EVERY: int = max(1, int(os.getenv("DB_RULE_HITS_FLUSH_CYCLES", "6")))
 
 
 # =============================================================================
@@ -421,6 +424,15 @@ class EnhancedDatabase:
         # v9.20 P1: كاش نطاق المصادر — (expiry, set) أو None. مجموعة فارغة
         # تعني "جدول فارغ = مراقبة كل شيء" (لا تخلط مع كاش فارغ منتهٍ).
         self._sources_cache: Optional[Tuple[float, set]] = None
+
+        # v9.21 P2: كاش القواعد — (expiry, rules_list) جاهزة للتقييم.
+        self._rules_cache: Optional[Tuple[float, List[Dict[str, Any]]]] = None
+        # v9.21 P2: عدّاد تطابقات القواعد في الذاكرة — يُدفَع دفعياً
+        # (دورة التنظيف كل 30 ثانية + عند أي تعديل من اللوحة) حمايةً
+        # للمسار السريع من كتابة UPDATE لكل رسالة.
+        self._rule_hits_pending: Dict[int, int] = {}
+        # v9.21 P3: كاش قائمة السماح — (expiry, senders_set, chats_set)
+        self._allowed_cache: Optional[Tuple[float, set, set]] = None
 
         # Backup health tracking (fix #7)
         self._backup_failure_count: int = 0
@@ -707,6 +719,30 @@ class EnhancedDatabase:
                 notes TEXT DEFAULT '',
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             );
+            -- v9.21 P2: محرك القواعد — شروط JSON + إجراء + أولوية. أول قاعدة
+            -- مطابقة (priority ASC, id ASC) تُطبَّق. العدّاد hits يُدفَع دفعياً.
+            CREATE TABLE IF NOT EXISTS rules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT DEFAULT '',
+                conditions TEXT NOT NULL DEFAULT '{}',
+                action TEXT NOT NULL DEFAULT 'tag',
+                action_value TEXT DEFAULT '',
+                priority INTEGER DEFAULT 100,
+                hits INTEGER DEFAULT 0,
+                enabled INTEGER DEFAULT 1,
+                created_by TEXT DEFAULT 'panel',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+            -- v9.21 P3: قائمة السماح — كيان موثوق يتجاوز فلترة الكلمات فقط
+            -- (الأولوية: الحظر ← مكافحة السبام ← السماح ← الفلترة).
+            CREATE TABLE IF NOT EXISTS allowed_entities (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                entity_type TEXT NOT NULL DEFAULT 'sender',
+                entity_id INTEGER NOT NULL,
+                note TEXT DEFAULT '',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(entity_type, entity_id)
+            );
             -- v9.18 P0: سجل التدقيق — كل عملية كتابة من اللوحتين تُسجّل هنا
             -- (fire-and-forget، بلا أسرار، الهواتف مُقنَّعة). يُقرأ من
             -- GET /api/audit (BotPanel) ويُقَلَّم دورياً بـ90 يوماً.
@@ -960,6 +996,10 @@ class EnhancedDatabase:
             "CREATE INDEX IF NOT EXISTS idx_audit_actor  ON audit_logs(actor)",
             # v9.20 P1: فحص نطاق المصادر — دائماً مفعّل فقط
             "CREATE INDEX IF NOT EXISTS idx_sources_enabled ON sources(enabled)",
+            # v9.21 P2: ترتيب تقييم القواعد (مفعّل، أولوية، معرف)
+            "CREATE INDEX IF NOT EXISTS idx_rules_eval ON rules(enabled, priority, id)",
+            # v9.21 P3: فحص السماح السريع
+            "CREATE INDEX IF NOT EXISTS idx_allowed_lookup ON allowed_entities(entity_type, entity_id)",
         ]
         for idx in indexes:
             await self._execute(idx)
@@ -2315,6 +2355,360 @@ class EnhancedDatabase:
         except Exception:
             return True  # فشل-آمن: أي خلل = فتح المسار
 
+    # ─── v9.21 P2: محرك القواعد (Rule Engine) ─────────────────
+    RULE_CONDITION_KEYS = ("keyword", "source_chat_id", "sender_id", "min_confidence")
+    RULE_ACTIONS = ("allow", "block", "tag")
+
+    @staticmethod
+    def validate_rule_conditions(conditions: Any) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        """v9.21 P2: تحقق صارم من الشروط — مفاتيح معروفة فقط، معرفات رقمية،
+        ثقة 0-1، وشرط واحد على الأقل (لا قاعدة "تطابق كل شيء" عن غير قصد).
+
+        يعيد (clean, None) عند النجاح أو (None, error) عند الفشل.
+        """
+        if not isinstance(conditions, dict) or not conditions:
+            return None, "conditions must be a non-empty object"
+        clean: Dict[str, Any] = {}
+        for key, value in conditions.items():
+            if key not in EnhancedDatabase.RULE_CONDITION_KEYS:
+                return None, f"unknown condition key: {key}"
+            if key == "keyword":
+                kw = str(value or "").strip()
+                if not kw:
+                    return None, "keyword must not be empty"
+                if len(kw) > 120:
+                    return None, "keyword too long (max 120)"
+                clean[key] = kw
+            elif key in ("source_chat_id", "sender_id"):
+                try:
+                    iv = int(value)
+                except Exception:
+                    return None, f"{key} must be an integer"
+                clean[key] = iv
+            else:  # min_confidence
+                try:
+                    fv = float(value)
+                except Exception:
+                    return None, "min_confidence must be a number"
+                if not (0.0 <= fv <= 1.0):
+                    return None, "min_confidence must be within 0..1"
+                clean[key] = fv
+        if not clean:
+            return None, "at least one condition is required"
+        return clean, None
+
+    async def add_rule(self, name: str, conditions: Dict[str, Any], action: str,
+                       action_value: str = "", priority: int = 100,
+                       created_by: str = "panel") -> Optional[Dict[str, Any]]:
+        """v9.21 P2: إضافة قاعدة (بعد تحقق المتصل) — يعيد الصف أو None."""
+        try:
+            cur = await self._execute(
+                "INSERT INTO rules (name, conditions, action, action_value, priority, enabled, created_by)"
+                " VALUES (?, ?, ?, ?, ?, 1, ?)",
+                (
+                    str(name or "")[:120],
+                    json.dumps(conditions, ensure_ascii=False),
+                    str(action)[:20],
+                    str(action_value or "")[:200],
+                    max(1, min(int(priority), 100000)),
+                    str(created_by or "panel")[:80],
+                ),
+            )
+            await self._commit()
+            self.invalidate_rules_cache()
+            return await self.get_rule(cur.lastrowid)
+        except Exception as e:
+            logger.error(f"add_rule error: {e}")
+            return None
+
+    async def list_rules(self, limit: int = 200) -> List[Dict[str, Any]]:
+        """v9.21 P2: قائمة القواعد بترتيب التقييم (priority, id). فشل-آمن."""
+        try:
+            limit = max(1, min(int(limit), 500))
+        except Exception:
+            limit = 200
+        try:
+            rows = await self._fetchall(
+                "SELECT * FROM rules ORDER BY priority ASC, id ASC LIMIT ?", (limit,)
+            )
+            for r in rows:
+                try:
+                    r["conditions"] = json.loads(r.get("conditions") or "{}")
+                except Exception:
+                    r["conditions"] = {}
+            return rows
+        except Exception as e:
+            logger.debug(f"list_rules skipped: {e}")
+            return []
+
+    async def count_rules(self) -> int:
+        """v9.21 P2: عدد القواعد (لحد 50). فشل-آمن (0)."""
+        try:
+            row = await self._fetchone("SELECT COUNT(*) AS n FROM rules")
+            return int(row["n"]) if row else 0
+        except Exception:
+            return 0
+
+    async def get_rule(self, rule_id: int) -> Optional[Dict[str, Any]]:
+        """v9.22: قاعدة واحدة (للتعديل) — أو None."""
+        try:
+            row = await self._fetchone("SELECT * FROM rules WHERE id = ?", (int(rule_id),))
+            if row:
+                try:
+                    row["conditions"] = json.loads(row.get("conditions") or "{}")
+                except Exception:
+                    row["conditions"] = {}
+            return row
+        except Exception:
+            return None
+
+    async def update_rule(self, rule_id: int, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """v9.22: تعديل جزئي لقاعدة — لا يلمس enabled/hits أبداً.
+
+        المفاتيح المسموحة: name/conditions/action/action_value/priority.
+        يعيد الصف المحدّث أو None (غير موجود أو لا شيء صالح).
+        """
+        allowed = {"name", "conditions", "action", "action_value", "priority"}
+        sets: List[str] = []
+        params: List[Any] = []
+        for key, value in (updates or {}).items():
+            if key not in allowed:
+                continue
+            if key == "conditions":
+                clean, err = self.validate_rule_conditions(value)
+                if err:
+                    raise ValueError(err)
+                sets.append("conditions = ?")
+                params.append(json.dumps(clean, ensure_ascii=False))
+            elif key == "priority":
+                sets.append("priority = ?")
+                params.append(max(1, min(int(value), 100000)))
+            elif key == "action":
+                if value not in self.RULE_ACTIONS:
+                    raise ValueError(f"unknown action: {value}")
+                sets.append("action = ?")
+                params.append(str(value)[:20])
+            else:
+                sets.append(f"{key} = ?")
+                params.append(str(value or "")[:200])
+        if not sets:
+            return await self.get_rule(rule_id)
+        try:
+            params.append(int(rule_id))
+            await self._execute(f"UPDATE rules SET {', '.join(sets)} WHERE id = ?", tuple(params))
+            await self._commit()
+            self.invalidate_rules_cache()
+            return await self.get_rule(rule_id)
+        except ValueError:
+            raise
+        except Exception as e:
+            logger.error(f"update_rule error: {e}")
+            return None
+
+    async def set_rule_enabled(self, rule_id: int, enabled: bool) -> bool:
+        """v9.21 P2: تفعيل/إيقاف قاعدة. فشل-آمن."""
+        try:
+            cur = await self._execute(
+                "UPDATE rules SET enabled = ? WHERE id = ?",
+                (1 if enabled else 0, int(rule_id)),
+            )
+            await self._commit()
+            self.invalidate_rules_cache()
+            return (cur.rowcount or 0) > 0
+        except Exception as e:
+            logger.error(f"set_rule_enabled error: {e}")
+            return False
+
+    async def delete_rule(self, rule_id: int) -> bool:
+        """v9.21 P2: حذف قاعدة. فشل-آمن."""
+        try:
+            cur = await self._execute("DELETE FROM rules WHERE id = ?", (int(rule_id),))
+            await self._commit()
+            self.invalidate_rules_cache()
+            return (cur.rowcount or 0) > 0
+        except Exception as e:
+            logger.error(f"delete_rule error: {e}")
+            return False
+
+    def invalidate_rules_cache(self) -> None:
+        """v9.21 P2: إبطال كاش القواعد + دفع العدّادات المعلّقة فوراً."""
+        self._rules_cache = None
+        try:
+            pending = self._rule_hits_pending
+            if pending:
+                import asyncio as _aio
+                try:
+                    loop = _aio.get_running_loop()
+                    loop.create_task(self.flush_rule_hits())
+                except RuntimeError:
+                    pass
+        except Exception:
+            pass
+
+    async def flush_rule_hits(self) -> int:
+        """v9.21 P2: دفع عدّادات hits المتراكمة في الذاكرة إلى القاعدة."""
+        if not self._rule_hits_pending:
+            return 0
+        snapshot = dict(self._rule_hits_pending)
+        self._rule_hits_pending.clear()
+        pushed = 0
+        try:
+            for rule_id, n in snapshot.items():
+                if n <= 0:
+                    continue
+                cur = await self._execute(
+                    "UPDATE rules SET hits = hits + ? WHERE id = ?", (int(n), int(rule_id))
+                )
+                pushed += cur.rowcount or 0
+            await self._commit()
+        except Exception as e:
+            logger.debug(f"flush_rule_hits skipped: {e}")
+            # أعِد العدّادات لتُدفع لاحقاً — لا فقدان
+            for rule_id, n in snapshot.items():
+                self._rule_hits_pending[rule_id] = self._rule_hits_pending.get(rule_id, 0) + n
+        return pushed
+
+    async def apply_rules(self, text: str, source_chat_id: int = 0,
+                          sender_id: int = 0, confidence: float = 0.0) -> Optional[Dict[str, Any]]:
+        """v9.21 P2: تقييم القواعد — أول قاعدة مطابقة (priority ASC, id ASC).
+
+        مطابقة AND لكل الشروط المعرّفة في القاعدة:
+          * keyword        → بحث نصي غير حساس لحالة داخل النص
+          * source_chat_id → مطابقة تامة
+          * sender_id      → مطابقة تامة
+          * min_confidence → درجة الثقة ≥ الحد
+        الإجراءات: allow/block/tag(action_value=نص الوسم).
+        فشل-آمن تماماً: أي خلل = None (فلترة عادية). كاش 30 ثانية.
+        يعيد dict {rule, action, action_value} أو None.
+        """
+        try:
+            now = time.time()
+            if self._rules_cache is not None and now < self._rules_cache[0]:
+                rules = self._rules_cache[1]
+            else:
+                rules = await self.list_rules(limit=200)
+                rules = [r for r in rules if r.get("enabled")]
+                ttl = max(5.0, float(os.getenv("RULES_CACHE_TTL", "30")))
+                self._rules_cache = (now + ttl, rules)
+            if not rules:
+                return None
+            haystack = (text or "").lower()
+            for rule in rules:
+                conds = rule.get("conditions") or {}
+                if not isinstance(conds, dict) or not conds:
+                    continue
+                matched = True
+                for key, value in conds.items():
+                    if key == "keyword":
+                        if str(value).lower() not in haystack:
+                            matched = False; break
+                    elif key == "source_chat_id":
+                        try:
+                            if int(value) != int(source_chat_id): matched = False; break
+                        except Exception: matched = False; break
+                    elif key == "sender_id":
+                        try:
+                            if int(value) != int(sender_id): matched = False; break
+                        except Exception: matched = False; break
+                    elif key == "min_confidence":
+                        try:
+                            if float(confidence) < float(value): matched = False; break
+                        except Exception: matched = False; break
+                if matched:
+                    rid = int(rule.get("id") or 0)
+                    if rid > 0:
+                        self._rule_hits_pending[rid] = self._rule_hits_pending.get(rid, 0) + 1
+                    return {
+                        "rule": rule,
+                        "action": rule.get("action") or "tag",
+                        "action_value": rule.get("action_value") or "",
+                    }
+            return None
+        except Exception as e:
+            logger.debug(f"apply_rules skipped: {e}")
+            return None
+
+    # ─── v9.21 P3: قائمة السماح (Allowlist) ───────────────────
+    def _invalidate_allowed_cache(self) -> None:
+        self._allowed_cache = None
+
+    async def add_allowed_entity(self, entity_type: str, entity_id: int,
+                                 note: str = "") -> bool:
+        """v9.21 P3: إضافة/تحديث كيان موثوق (sender|chat). فشل-آمن."""
+        etype = str(entity_type or "").strip().lower()
+        if etype not in ("sender", "chat"):
+            return False
+        try:
+            await self._execute(
+                "INSERT INTO allowed_entities (entity_type, entity_id, note)"
+                " VALUES (?, ?, ?)"
+                " ON CONFLICT(entity_type, entity_id) DO UPDATE SET note=excluded.note",
+                (etype, int(entity_id), str(note or "")[:200]),
+            )
+            await self._commit()
+            self._invalidate_allowed_cache()
+            return True
+        except Exception as e:
+            logger.error(f"add_allowed_entity error: {e}")
+            return False
+
+    async def remove_allowed_entity(self, entity_type: str, entity_id: int) -> bool:
+        """v9.21 P3: حذف كيان من قائمة السماح. فشل-آمن."""
+        try:
+            cur = await self._execute(
+                "DELETE FROM allowed_entities WHERE entity_type = ? AND entity_id = ?",
+                (str(entity_type).lower(), int(entity_id)),
+            )
+            await self._commit()
+            self._invalidate_allowed_cache()
+            return (cur.rowcount or 0) > 0
+        except Exception as e:
+            logger.error(f"remove_allowed_entity error: {e}")
+            return False
+
+    async def list_allowed_entities(self, limit: int = 500) -> List[Dict[str, Any]]:
+        """v9.21 P3: قائمة الكيانات الموثوقة. فشل-آمن."""
+        try:
+            limit = max(1, min(int(limit), 1000))
+        except Exception:
+            limit = 500
+        try:
+            return await self._fetchall(
+                "SELECT * FROM allowed_entities ORDER BY created_at DESC, id DESC LIMIT ?",
+                (limit,),
+            )
+        except Exception as e:
+            logger.debug(f"list_allowed_entities skipped: {e}")
+            return []
+
+    async def _allowed_sets(self) -> Tuple[set, set]:
+        """v9.21 P3: (senders, chats) الموثوقون — كاش 30 ثانية."""
+        now = time.time()
+        if self._allowed_cache is not None and now < self._allowed_cache[0]:
+            return self._allowed_cache[1], self._allowed_cache[2]
+        rows = await self._fetchall("SELECT entity_type, entity_id FROM allowed_entities")
+        senders = {int(r["entity_id"]) for r in rows if r["entity_type"] == "sender"}
+        chats = {int(r["entity_id"]) for r in rows if r["entity_type"] == "chat"}
+        ttl = max(5.0, float(os.getenv("ALLOWED_CACHE_TTL", "30")))
+        self._allowed_cache = (now + ttl, senders, chats)
+        return senders, chats
+
+    async def is_sender_allowed(self, sender_id: int) -> bool:
+        """v9.21 P3: هل المرسل موثوق؟ فشل-آمن (False = فلترة عادية)."""
+        try:
+            senders, _ = await self._allowed_sets()
+            return int(sender_id) in senders
+        except Exception:
+            return False
+
+    async def is_chat_allowed(self, chat_id: int) -> bool:
+        """v9.21 P3: هل المجموعة موثوقة؟ فشل-آمن (False = فلترة عادية)."""
+        try:
+            _, chats = await self._allowed_sets()
+            return int(chat_id) in chats
+        except Exception:
+            return False
+
     async def _resource_pressure_check(self) -> None:
         """
         Inspect SQLite file size. If it exceeds CFG.MEMORY_THRESHOLD_MB,
@@ -2371,6 +2765,10 @@ class EnhancedDatabase:
                 # Periodic resource-pressure check (fix #12)
                 if self._writer_cycle % _PRESSURE_CHECK_EVERY == 0:
                     await self._resource_pressure_check()
+                # v9.21 P2: دفع عدّادات تطابق القواعد دفعياً (≈30 ثانية)
+                # — حماية المسار السريع من كتابة UPDATE لكل رسالة.
+                if self._writer_cycle % _RULE_HITS_FLUSH_EVERY == 0:
+                    await self.flush_rule_hits()
 
                 ping_counter += 1
                 if ping_counter >= (60 // max(CFG.DB_BATCH_INTERVAL, 1)):

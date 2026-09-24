@@ -245,6 +245,22 @@ class SourceCreate(BaseModel):
     notes: str = ""
 
 
+class RuleCreate(BaseModel):
+    """v9.21 P2: قاعدة جديدة — شرط واحد على الأقل (تحقق صارم في DB layer)."""
+    name: str = ""
+    conditions: Dict[str, Any] = {}
+    action: str = "tag"
+    action_value: str = ""
+    priority: int = 100
+
+
+class AllowedCreate(BaseModel):
+    """v9.21 P3: كيان موثوق — sender أو chat."""
+    entity_type: str = "sender"
+    entity_id: int
+    note: str = ""
+
+
 class SettingsBody(BaseModel):
     """v3.1: flexible settings body — {"updates": {...}} or a flat dict of
     validated setting names. Actual validation happens in dashboard_store."""
@@ -1360,6 +1376,106 @@ async def unblock_chat(chat_id: int, request: Request):
     db = request.app.state.db
     await db.unblock_chat(chat_id)
     await _audit(request, "unblock.chat", object_type="chat", object_id=str(chat_id))
+    return JSONResponse({"success": True})
+
+
+@app.get("/api/rules", dependencies=[Depends(verify_token)])
+async def get_rules(request: Request):
+    """v9.21 P2: قائمة القواعد بترتيب التقييم."""
+    db = request.app.state.db
+    rows = await db.list_rules() if db else []
+    return JSONResponse({
+        "items": rows,
+        "count": len(rows),
+        "limit": 50,
+        "enabled_count": sum(1 for r in rows if r.get("enabled")),
+    })
+
+
+@app.post("/api/rules", dependencies=[Depends(verify_token)])
+async def add_rule(data: RuleCreate, request: Request):
+    """v9.21 P2: إضافة قاعدة — تحقق صارم + حد 50 قاعدة (409)."""
+    db = request.app.state.db
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    if await db.count_rules() >= 50:
+        raise HTTPException(status_code=409, detail="Rule limit reached (50). Remove a rule first.")
+    clean, err = db.validate_rule_conditions(data.conditions)
+    if err:
+        raise HTTPException(status_code=400, detail=err)
+    if data.action not in db.RULE_ACTIONS:
+        raise HTTPException(status_code=400, detail=f"unknown action: {data.action}")
+    if data.action == "tag" and not data.action_value.strip():
+        raise HTTPException(status_code=400, detail="tag action requires action_value")
+    row = await db.add_rule(data.name, clean, data.action, data.action_value, data.priority)
+    if row is None:
+        raise HTTPException(status_code=500, detail="Failed to save rule")
+    await _audit(request, "rule.add", object_type="rule", object_id=str(row["id"]),
+                 new_value=json.dumps({"name": data.name, "conditions": clean,
+                                       "action": data.action, "priority": data.priority},
+                                      ensure_ascii=False, default=str)[:2000])
+    return JSONResponse({"success": True, "rule": row})
+
+
+@app.post("/api/rules/{rule_id}/toggle", dependencies=[Depends(verify_token)])
+async def toggle_rule(rule_id: int, request: Request):
+    """v9.21 P2: تفعيل/إيقاف قاعدة — مدقَّق."""
+    db = request.app.state.db
+    row = await db.get_rule(rule_id) if db else None
+    if row is None:
+        raise HTTPException(status_code=404, detail="Rule not found")
+    new_state = not bool(row.get("enabled"))
+    await db.set_rule_enabled(rule_id, new_state)
+    await _audit(request, "rule.toggle", object_type="rule", object_id=str(rule_id),
+                 old_value=str(bool(row.get("enabled"))), new_value=str(new_state))
+    return JSONResponse({"success": True, "id": rule_id, "enabled": new_state})
+
+
+@app.delete("/api/rules/{rule_id}", dependencies=[Depends(verify_token)])
+async def delete_rule(rule_id: int, request: Request):
+    """v9.21 P2: حذف قاعدة — مدقَّق."""
+    db = request.app.state.db
+    ok = await db.delete_rule(rule_id) if db else False
+    if not ok:
+        raise HTTPException(status_code=404, detail="Rule not found")
+    await _audit(request, "rule.remove", object_type="rule", object_id=str(rule_id))
+    return JSONResponse({"success": True})
+
+
+@app.get("/api/allowed", dependencies=[Depends(verify_token)])
+async def get_allowed(request: Request):
+    """v9.21 P3: قائمة الكيانات الموثوقة."""
+    db = request.app.state.db
+    rows = await db.list_allowed_entities() if db else []
+    return JSONResponse({
+        "items": rows,
+        "count": len(rows),
+        "note": "الكيان الموثوق يتجاوز فلترة الكلمات فقط — لا يتجاوز الحظر ولا مكافحة السبام",
+    })
+
+
+@app.post("/api/allowed", dependencies=[Depends(verify_token)])
+async def add_allowed(data: AllowedCreate, request: Request):
+    """v9.21 P3: إضافة كيان موثوق — مدقَّق."""
+    db = request.app.state.db
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    ok = await db.add_allowed_entity(data.entity_type, data.entity_id, data.note)
+    if not ok:
+        raise HTTPException(status_code=400, detail="entity_type must be sender|chat")
+    await _audit(request, "allow.add", object_type=data.entity_type,
+                 object_id=str(data.entity_id), new_value=data.note or "")
+    return JSONResponse({"success": True})
+
+
+@app.delete("/api/allowed/{entity_type}/{entity_id}", dependencies=[Depends(verify_token)])
+async def remove_allowed(entity_type: str, entity_id: int, request: Request):
+    """v9.21 P3: حذف كيان موثوق — مدقَّق."""
+    db = request.app.state.db
+    ok = await db.remove_allowed_entity(entity_type, entity_id) if db else False
+    if not ok:
+        raise HTTPException(status_code=404, detail="Entity not found")
+    await _audit(request, "allow.remove", object_type=entity_type, object_id=str(entity_id))
     return JSONResponse({"success": True})
 
 

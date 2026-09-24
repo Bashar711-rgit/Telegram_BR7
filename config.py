@@ -399,6 +399,9 @@ class _ConfigData:
 
     # ── Anti-Spam (المرحلة الثانية: Watch List → Confirmation → Permanent Ignore) ──
     ANTISPAM_ENABLED: bool
+    # v9.21: محرك القواعد وقائمة السماح (مفاتيح تشغيل — تبديل لاحق من اللوحة)
+    RULE_ENGINE_ENABLED: bool
+    ALLOWLIST_ENABLED: bool
     ANTISPAM_WATCH_DURATION_SECONDS: int
     ANTISPAM_BURST_MESSAGES: int
     ANTISPAM_BURST_WINDOW_SECONDS: int
@@ -698,6 +701,9 @@ class Config:
             # Watch List (10 دقائق مراقبة) → Spam Confirmation → Permanent Ignore.
             # لا يتجاهل ولا يحظر أحداً عند المراقبة — فقط بعد تأكيد السبام.
             ANTISPAM_ENABLED=SecretManager.get_bool("ANTISPAM_ENABLED", True),
+            # v9.21: القواعد والسماح مفعّلة افتراضياً (الجداول الفارغة = لا أثر)
+            RULE_ENGINE_ENABLED=SecretManager.get_bool("RULE_ENGINE_ENABLED", True),
+            ALLOWLIST_ENABLED=SecretManager.get_bool("ALLOWLIST_ENABLED", True),
             ANTISPAM_WATCH_DURATION_SECONDS=SecretManager.get_int("ANTISPAM_WATCH_DURATION_SECONDS", 600, required=False),
             # شرط المراقبة 1: رسالتان خلال 60 ثانية
             ANTISPAM_BURST_MESSAGES=SecretManager.get_int("ANTISPAM_BURST_MESSAGES", 2, required=False),
