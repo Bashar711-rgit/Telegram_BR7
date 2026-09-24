@@ -628,6 +628,22 @@ body { font-family: var(--sans); background: var(--bg); color: var(--text); font
   padding: 2px 12px; border-radius: 20px; color: var(--text2);
 }
 
+/* ── v9.27 AUDIT V2 ──────────────────────────────────────────── */
+.audit-toolbar { display: flex; flex-wrap: wrap; gap: 8px; padding: 12px 16px 4px; }
+.audit-toolbar .kw-input { flex: 1 1 200px; min-width: 160px; }
+.audit-chips { display: flex; gap: 6px; padding: 8px 16px; flex-wrap: wrap; }
+.audit-chip {
+  background: var(--bg2); border: 1px solid var(--border); color: var(--text3);
+  border-radius: 999px; padding: 4px 14px; font-size: 11.5px; font-family: inherit;
+  cursor: pointer; transition: all .2s;
+}
+.audit-chip:hover { color: var(--text); border-color: rgba(255,255,255,0.25); }
+.audit-chip.active { background: var(--accent2); color: var(--accent); border-color: var(--accent); }
+.audit-chip:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.td-rel { font-size: 10px; color: var(--text3); margin-top: 2px; }
+.audit-foot { display: flex; justify-content: center; padding: 12px; }
+@media (prefers-reduced-motion: reduce) { .audit-chip { transition: none !important; } }
+
 /* ── v9.25 FEATURES ──────────────────────────────────────────── */
 .feat-card {
   padding: 14px 16px; border-bottom: 1px solid var(--border);
@@ -1191,6 +1207,7 @@ function showTab(tab) {
     // v9.14: unknown keys blanked the whole workspace — fall back home.
     if (!PAGE_META[tab]) tab = 'dashboard';
     currentTab = tab;
+    try { localStorage.setItem('bp_last_tab', tab); } catch (e) {}
     document.querySelectorAll('.nav-item').forEach(el =>
         el.classList.toggle('active', el.dataset.page === tab));
     document.getElementById('saveBtn').classList.toggle('hidden', tab !== 'settings');
@@ -1578,33 +1595,137 @@ function fmtAuditTime(v) {
     return d.toLocaleString('ar', { hour12: false });
 }
 
-async function loadAudit() {
-    const body = document.getElementById('auditBody');
-    if (!body) return;
-    const sel = document.getElementById('auditAction');
-    const action = sel ? sel.value : '';
+const AUDIT_PAGE = 50;
+let AUDIT_DEPTH = 0;          // total rows loaded so far
+let AUDIT_ALL_ITEMS = [];     // all rows loaded in this session
+let AUDIT_LOADING = false;    // concurrency guard
+let AUDIT_CATEGORY = "";      // local chip filter
+
+function auditCategoryOf(action) {
+    if (/add$/.test(action)) return "add";
+    if (/(edit|update|toggle)$/.test(action)) return "edit";
+    if (/(remove|delete)$/.test(action)) return "remove";
+    if (/(restart|purge|restore|import|export)$/.test(action)) return "run";
+    return "";
+}
+
+function relAuditTime(v) {
+    if (!v) return "";
+    const d = new Date(String(v).replace(" ", "T") + (String(v).includes("Z") || String(v).includes("+") ? "" : "Z"));
+    if (isNaN(d)) return "";
+    const s = Math.floor((Date.now() - d.getTime()) / 1000);
+    if (s < 5) return "الآن";
+    if (s < 60) return `منذ ${s} ث`;
+    if (s < 3600) return `منذ ${Math.floor(s / 60)} د`;
+    if (s < 86400) return `منذ ${Math.floor(s / 3600)} س`;
+    return `منذ ${Math.floor(s / 86400)} ي`;
+}
+
+function auditFilterParams() {
+    const q = (document.getElementById("auditQ") || {}).value || "";
+    const action = (document.getElementById("auditAction") || {}).value || "";
+    const period = (document.getElementById("auditPeriod") || {}).value || "";
+    const actor = (document.getElementById("auditActor") || {}).value || "";
+    return { q: q.trim(), action, period, actor: actor.trim() };
+}
+
+function saveAuditFilters() {
     try {
-        const res = await apiFetch(`/api/audit?limit=200&action=${encodeURIComponent(action)}`);
-        const data = await res.json();
-        const cnt = document.getElementById('auditCount');
-        if (cnt) cnt.textContent = `${data.count ?? (data.items || []).length} عملية`;
-        const items = data.items || [];
-        if (!items.length) {
-            body.innerHTML = '<tr><td colspan="6" class="empty">لا عمليات مسجلة بعد — نفّذ أي تغيير من اللوحة وسيظهر هنا فوراً.</td></tr>';
-            return;
+        localStorage.setItem("audit_filters_v2", JSON.stringify({ ...auditFilterParams(), category: AUDIT_CATEGORY }));
+    } catch (e) {}
+}
+
+function restoreAuditFilters() {
+    try {
+        const saved = JSON.parse(localStorage.getItem("audit_filters_v2") || "{}");
+        if (saved.q != null) { const el = document.getElementById("auditQ"); if (el) el.value = saved.q; }
+        if (saved.action) { const el = document.getElementById("auditAction"); if (el) el.value = saved.action; }
+        if (saved.period) { const el = document.getElementById("auditPeriod"); if (el) el.value = saved.period; }
+        if (saved.actor != null) { const el = document.getElementById("auditActor"); if (el) el.value = saved.actor; }
+        if (saved.category) {
+            const chip = document.querySelector(`.audit-chip[data-cat="${saved.category}"]`);
+            if (chip) setAuditCategory(chip, true);
         }
-        body.innerHTML = items.map(a => `
-            <tr>
-                <td class="td-time" title="${esc(String(a.created_at || ''))}">${fmtAuditTime(a.created_at)}</td>
-                <td>${esc(a.actor || '—')}</td>
-                <td><span class="pill blue">${AUDIT_LABELS[a.action] || esc(a.action)}</span></td>
-                <td class="td-obj">${esc([a.object_type, a.object_id].filter(Boolean).join(': ') || '—')}</td>
-                <td class="td-val" title="${esc(a.old_value || '')}">${esc(a.old_value || '—')}</td>
-                <td class="td-val" title="${esc(a.new_value || '')}">${esc(a.new_value || '—')}</td>
-            </tr>`).join('');
-    } catch (e) {
-        if (body) body.innerHTML = '<tr><td colspan="6" class="empty">فشل تحميل السجل — تحقق من الاتصال.</td></tr>';
+    } catch (e) {}
+}
+
+let AUDIT_SEARCH_TIMER = null;
+function onAuditSearch() {
+    clearTimeout(AUDIT_SEARCH_TIMER);
+    AUDIT_SEARCH_TIMER = setTimeout(() => loadAudit(), 350);
+}
+
+function setAuditCategory(chipEl, silent) {
+    document.querySelectorAll(".audit-chip").forEach(c => c.classList.remove("active"));
+    if (chipEl) { chipEl.classList.add("active"); AUDIT_CATEGORY = chipEl.dataset.cat || ""; }
+    else AUDIT_CATEGORY = "";
+    if (!silent) { saveAuditFilters(); renderAuditRows(); }
+}
+
+function renderAuditRows() {
+    const body = document.getElementById("auditBody");
+    if (!body) return;
+    const rows = AUDIT_CATEGORY ? AUDIT_ALL_ITEMS.filter(a => auditCategoryOf(a.action || "") === AUDIT_CATEGORY) : AUDIT_ALL_ITEMS;
+    const cnt = document.getElementById("auditCount");
+    if (cnt) {
+        cnt.textContent = `${rows.length} عملية`;
+        cnt.title = AUDIT_CATEGORY ? "العدّاد من الصفوف المحمّلة — الفلترة عرضية محلياً" : "";
     }
+    if (!rows.length) {
+        body.innerHTML = '<tr><td colspan="6" class="empty">لا عمليات مطابقة — نفّذ أي تغيير من اللوحة وسيظهر هنا فوراً.</td></tr>';
+        return;
+    }
+    body.innerHTML = rows.map(a => `
+        <tr>
+            <td class="td-time" title="${esc(String(a.created_at || ""))}">${fmtAuditTime(a.created_at)}<div class="td-rel">${relAuditTime(a.created_at)}</div></td>
+            <td>${esc(a.actor || "—")}</td>
+            <td><span class="pill blue">${AUDIT_LABELS[a.action] || esc(a.action)}</span></td>
+            <td class="td-obj">${esc([a.object_type, a.object_id].filter(Boolean).join(": ") || "—")}</td>
+            <td class="td-val" title="${esc(a.old_value || "")}">${esc(a.old_value || "—")}</td>
+            <td class="td-val" title="${esc(a.new_value || "")}">${esc(a.new_value || "—")}</td>
+        </tr>`).join("");
+}
+
+async function loadAudit(append) {
+    if (AUDIT_LOADING) return;
+    AUDIT_LOADING = true;
+    try {
+        if (!append) { AUDIT_DEPTH = 0; AUDIT_ALL_ITEMS = []; }
+        const f = auditFilterParams();
+        const res = await apiFetch(`/api/audit?limit=${AUDIT_PAGE}&offset=${AUDIT_DEPTH}&action=${encodeURIComponent(f.action)}&actor=${encodeURIComponent(f.actor)}&q=${encodeURIComponent(f.q)}&since_hours=${encodeURIComponent(f.period)}`);
+        const data = await res.json();
+        AUDIT_ALL_ITEMS = AUDIT_ALL_ITEMS.concat(data.items || []);
+        AUDIT_DEPTH = AUDIT_ALL_ITEMS.length;
+        renderAuditRows();
+        const more = document.getElementById("auditMoreBtn");
+        if (more) {
+            const serverCount = data.count ?? 0;
+            const exhausted = AUDIT_DEPTH >= serverCount || (data.items || []).length < AUDIT_PAGE;
+            more.classList.toggle("hidden", exhausted);
+            more.textContent = `↓ تحميل المزيد (${AUDIT_DEPTH} من ${serverCount})`;
+        }
+        saveAuditFilters();
+    } catch (e) {
+        const body = document.getElementById("auditBody");
+        if (body && !append) body.innerHTML = '<tr><td colspan="6" class="empty">فشل تحميل السجل — تحقق من الاتصال.</td></tr>';
+    } finally {
+        AUDIT_LOADING = false;
+    }
+}
+
+async function exportAuditCsv() {
+    try {
+        const f = auditFilterParams();
+        const p = new URLSearchParams({ action: f.action, actor: f.actor, q: f.q, since_hours: f.period });
+        const res = await apiFetch(`/api/audit/export?${p}`);
+        if (!res.ok) throw new Error("فشل");
+        const blob = await res.blob();
+        const a = document.createElement("a");
+        a.href = URL.createObjectURL(blob);
+        a.download = `br7-audit-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.csv`;
+        a.click();
+        URL.revokeObjectURL(a.href);
+    } catch (e) { showToast("فشل تصدير CSV: " + e.message, "err"); }
 }
 
 // ================================================================
@@ -2099,36 +2220,69 @@ const PAGES = {
                 <div class="panel-head">
                     <div class="panel-title"><span class="ico">🛡</span> سجل التدقيق</div>
                     <div class="panel-actions">
-                        <select id="auditAction" onchange="loadAudit()" class="al-select">
-                            <option value="">كل الإجراءات</option>
-                            <option value="block.sender">حظر مرسل</option>
-                            <option value="unblock.sender">إلغاء حظر مرسل</option>
-                            <option value="block.chat">حظر مجموعة</option>
-                            <option value="unblock.chat">إلغاء حظر مجموعة</option>
-                            <option value="keyword.add">إضافة كلمة</option>
-                            <option value="keyword.update">تعديل كلمة</option>
-                            <option value="keyword.remove">حذف كلمة</option>
-                            <option value="settings.update">تعديل إعدادات</option>
-                            <option value="account.add">إضافة حساب</option>
-                            <option value="account.remove">حذف حساب</option>
-                            <option value="queue.purge">تفريغ الطابور</option>
-                            <option value="bot.restart">إعادة تشغيل</option>
-                            <option value="data.restore">استعادة بيانات</option>
-                        </select>
                         <span class="pill blue" id="auditCount">0 عملية</span>
                         <button class="al-btn d" onclick="refreshCurrent()">↻</button>
                     </div>
                 </div>
-                <div class="table-wrap" id="auditTableWrap">
-                    <table class="tbl">
-                        <thead><tr><th>الوقت</th><th>الفاعل</th><th>الإجراء</th><th>الكائن</th><th>قبل</th><th>بعد</th></tr></thead>
-                        <tbody id="auditBody"><tr><td colspan="6" class="empty">جارٍ التحميل…</td></tr></tbody>
-                    </table>
+                <div class="audit-toolbar">
+                    <input class="kw-input" id="auditQ" placeholder="🔍 بحث حر (إجراء/كائن/فاعل/قيم)…" oninput="onAuditSearch()">
+                    <select class="al-select" id="auditAction" onchange="loadAudit()">
+                        <option value="">كل الإجراءات</option>
+                        <option value="block.sender">حظر مرسل</option>
+                        <option value="unblock.sender">إلغاء حظر مرسل</option>
+                        <option value="block.chat">حظر مجموعة</option>
+                        <option value="unblock.chat">إلغاء حظر مجموعة</option>
+                        <option value="keyword.add">إضافة كلمة</option>
+                        <option value="keyword.update">تعديل كلمة</option>
+                        <option value="keyword.remove">حذف كلمة</option>
+                        <option value="settings.update">تعديل إعدادات</option>
+                        <option value="account.add">إضافة حساب</option>
+                        <option value="account.remove">حذف حساب</option>
+                        <option value="source.add">إضافة مصدر</option>
+                        <option value="source.remove">حذف مصدر</option>
+                        <option value="source.toggle">تبديل مصدر</option>
+                        <option value="rule.add">إضافة قاعدة</option>
+                        <option value="rule.edit">تعديل قاعدة</option>
+                        <option value="rule.remove">حذف قاعدة</option>
+                        <option value="allow.add">إضافة سماح</option>
+                        <option value="allow.remove">إزالة سماح</option>
+                        <option value="feature.toggle">تبديل ميزة</option>
+                        <option value="queue.purge">تفريغ الطابور</option>
+                        <option value="bot.restart">إعادة تشغيل</option>
+                        <option value="data.restore">استعادة بيانات</option>
+                        <option value="data.export">تصدير بيانات</option>
+                        <option value="data.import">استيراد بيانات</option>
+                        <option value="audit.export">تصدير تدقيق</option>
+                    </select>
+                    <select class="al-select" id="auditPeriod" onchange="loadAudit()">
+                        <option value="">كل الفترات</option>
+                        <option value="24">آخر 24 ساعة</option>
+                        <option value="168">آخر 7 أيام</option>
+                        <option value="720">آخر 30 يوماً</option>
+                    </select>
+                    <input class="kw-input" id="auditActor" placeholder="الفاعل" style="max-width:150px" oninput="onAuditSearch()" dir="ltr">
+                    <button class="tb-btn" onclick="exportAuditCsv()" title="تصدير CSV بنفس الفلاتر">⬇️ CSV</button>
                 </div>
-                <div class="panel-note">ℹ️ يُسجَّل هنا كل تغيير من لوحة البوت ولوحة الويب (من أذن، ماذا، قبل/بعد) — بلا أسرار، والهواتف مُقنَّعة. يُحفظ السجل 90 يوماً.</div>
+                <div class="audit-chips" id="auditChips">
+                    <button class="audit-chip active" data-cat="" onclick="setAuditCategory(this)">الكل</button>
+                    <button class="audit-chip" data-cat="add" onclick="setAuditCategory(this)">إضافة</button>
+                    <button class="audit-chip" data-cat="edit" onclick="setAuditCategory(this)">تعديل</button>
+                    <button class="audit-chip" data-cat="remove" onclick="setAuditCategory(this)">حذف</button>
+                    <button class="audit-chip" data-cat="run" onclick="setAuditCategory(this)">تشغيل</button>
+                </div>
+                <div style="overflow-x:auto">
+                <table class="tbl">
+                    <thead><tr><th>الوقت</th><th>الفاعل</th><th>الإجراء</th><th>الكائن</th><th>قبل</th><th>بعد</th></tr></thead>
+                    <tbody id="auditBody"><tr><td colspan="6" class="empty">جارٍ التحميل…</td></tr></tbody>
+                </table>
+                </div>
+                <div class="audit-foot">
+                    <button class="tb-btn hidden" id="auditMoreBtn" onclick="loadAudit(true)">↓ تحميل المزيد</button>
+                </div>
+                <div class="panel-note">ℹ️ كل تغيير من لوحة البوت ولوحة الويب — بلا أسرار والهواتف مُقنَّعة. الفلاتر محفوظة محلياً وتُستعاد تلقائياً. يُحفظ السجل 90 يوماً.</div>
             </div>`;
         },
-        load() { loadAudit(); }
+        load() { restoreAuditFilters(); loadAudit(); }
     },
     logs: {
         render() {
@@ -3333,8 +3487,13 @@ function renderFilterMeters() {
 // ================================================================
 function initApp() {
     connectWebSocket();
-    renderPage('dashboard');
-    loadPageData('dashboard');
+    // v9.27: تذكّر آخر تبويب — إعادة التحميل تعيد لآخر صفحة (fallback آمن)
+    let startTab = 'dashboard';
+    try {
+        const last = localStorage.getItem('bp_last_tab');
+        if (last && PAGE_META[last]) startTab = last;
+    } catch (e) {}
+    showTab(startTab);
     updateNotifyBtn();   // v9.14: reflect persisted notification preference
     // Document-level delegation — page content re-renders on every showTab,
     // so per-element listeners would be lost (keyword select, search Enter).

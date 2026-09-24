@@ -238,6 +238,15 @@ _IMPORT_COLUMN_DEFAULTS: Dict[str, Any] = {
 }
 
 
+def _escape_like(text: str) -> str:
+    """v9.27: تهريب حرفي لقيمة LIKE — % و _ و الشرطة المائلة المعاكسة لا تُفسَّر كأنماط.
+
+    تُستخدم مع "LIKE ? ESCAPE '\\'" بحيث يبقى البحث النصي حرفياً تماماً
+    (نفس أسلوب البحث الشامل v9.24).
+    """
+    return str(text).replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 def _pg(sql: str) -> str:
     """Convert SQLite ?-placeholders to PostgreSQL $N placeholders."""
     counter = 0
@@ -2439,38 +2448,81 @@ class EnhancedDatabase:
             logger.debug(f"record_audit skipped: {e}")
             return False
 
+    @staticmethod
+    def _audit_filters(where: List[str], params: List[Any], action: Optional[str] = None,
+                       actor: Optional[str] = None, q: Optional[str] = None,
+                       since_hours: Optional[int] = None) -> None:
+        """v9.27: بناء شروط فلترة سجل التدقيق المشتركة بين القائمة والتصدير.
+
+        q: بحث نصي حر عبر action/object_id/actor/old_value/new_value
+        (تهريب حرفي — لا % سحرية). since_hours: سقف 90 يوماً بمقارنة
+        معجمية آمنة على created_at بصيغة SQLite النصية.
+        """
+        if action:
+            where.append("action = ?")
+            params.append(str(action)[:120])
+        if actor:
+            where.append("actor = ?")
+            params.append(str(actor)[:120])
+        if q:
+            needle = f"%{_escape_like(q)}%"
+            where.append(
+                "(action LIKE ? ESCAPE '\\' OR object_id LIKE ? ESCAPE '\\'"
+                " OR actor LIKE ? ESCAPE '\\' OR old_value LIKE ? ESCAPE '\\'"
+                " OR new_value LIKE ? ESCAPE '\\')"
+            )
+            params.extend([needle] * 5)
+        if since_hours:
+            try:
+                hours = max(1, min(int(since_hours), 90 * 24))
+            except Exception:
+                hours = 0
+            if hours > 0:
+                cutoff = (datetime.utcnow() - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
+                where.append("created_at >= ?")
+                params.append(cutoff)
+
     async def get_audit_logs(self, limit: int = 100, offset: int = 0,
-                             action: Optional[str] = None) -> List[Dict[str, Any]]:
-        """v9.18 P0: قراءة سجل التدقيق — الأحدث أولاً. فشل-آمن (قائمة فارغة)."""
+                             action: Optional[str] = None,
+                             actor: Optional[str] = None, q: Optional[str] = None,
+                             since_hours: Optional[int] = None) -> List[Dict[str, Any]]:
+        """v9.18 P0: قراءة سجل التدقيق — الأحدث أولاً. فشل-آمن (قائمة فارغة).
+
+        v9.27: فلاتر actor/q/since_hours (قراءة فقط — صفر تغيير مخطط).
+        """
         try:
             limit = max(1, min(int(limit), 500))
             offset = max(0, int(offset))
         except Exception:
             limit, offset = 100, 0
         try:
-            if action:
-                return await self._fetchall(
-                    "SELECT * FROM audit_logs WHERE action = ?"
-                    " ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
-                    (str(action)[:120], limit, offset),
-                )
-            return await self._fetchall(
-                "SELECT * FROM audit_logs ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
-                (limit, offset),
-            )
+            where: List[str] = []
+            params: List[Any] = []
+            self._audit_filters(where, params, action=action, actor=actor, q=q,
+                                since_hours=since_hours)
+            sql = "SELECT * FROM audit_logs"
+            if where:
+                sql += " WHERE " + " AND ".join(where)
+            sql += " ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?"
+            params.extend([limit, offset])
+            return await self._fetchall(sql, tuple(params))
         except Exception as e:
             logger.debug(f"get_audit_logs skipped: {e}")
             return []
 
-    async def count_audit_logs(self, action: Optional[str] = None) -> int:
-        """v9.18 P0: عدّاد سجل التدقيق (كله أو إجراء محدد) — فشل-آمن (0)."""
+    async def count_audit_logs(self, action: Optional[str] = None,
+                               actor: Optional[str] = None, q: Optional[str] = None,
+                               since_hours: Optional[int] = None) -> int:
+        """v9.18 P0: عدّاد سجل التدقيق — فشل-آمن (0). v9.27: نفس فلاتر القائمة."""
         try:
-            if action:
-                row = await self._fetchone(
-                    "SELECT COUNT(*) AS n FROM audit_logs WHERE action = ?", (str(action)[:120],)
-                )
-            else:
-                row = await self._fetchone("SELECT COUNT(*) AS n FROM audit_logs")
+            where: List[str] = []
+            params: List[Any] = []
+            self._audit_filters(where, params, action=action, actor=actor, q=q,
+                                since_hours=since_hours)
+            sql = "SELECT COUNT(*) AS n FROM audit_logs"
+            if where:
+                sql += " WHERE " + " AND ".join(where)
+            row = await self._fetchone(sql, tuple(params))
             return int(row["n"]) if row else 0
         except Exception:
             return 0

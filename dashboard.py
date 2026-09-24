@@ -1671,21 +1671,79 @@ async def get_audit(
     limit: int = 200,
     offset: int = 0,
     action: str = "",
+    actor: str = "",
+    q: str = "",
+    since_hours: Optional[str] = None,
 ):
-    """v9.18 P0: read the audit log (newest first). Read-only, fail-safe."""
+    """v9.18 P0: read the audit log (newest first). Read-only, fail-safe.
+
+    v9.27: فلاتر actor/q/since_hours — since_hours نصي عمداً (نمط
+    /api/alerts): القيم الفاسدة تُعامل «الكل» دون 422.
+    """
     db = getattr(request.app.state, "db", None)
     if db is None:
         return JSONResponse({"items": [], "count": 0})
     try:
-        rows = await db.get_audit_logs(limit=limit, offset=offset, action=action or None)
+        rows = await db.get_audit_logs(
+            limit=limit, offset=offset, action=action or None,
+            actor=actor or None, q=q or None, since_hours=since_hours,
+        )
     except Exception:
         rows = []
     count = 0
     try:
-        count = await db.count_audit_logs(action or None)
+        count = await db.count_audit_logs(action=action or None, actor=actor or None,
+                                          q=q or None, since_hours=since_hours)
     except Exception:
         count = len(rows)
     return JSONResponse({"items": rows, "count": count})
+
+
+@app.get("/api/audit/export", dependencies=[Depends(verify_token)])
+async def export_audit_csv(
+    request: Request,
+    action: str = "",
+    actor: str = "",
+    q: str = "",
+    since_hours: Optional[str] = None,
+):
+    """v9.27: تصدير سجل التدقيق CSV بنفس الفلاتر — 20 ألف صف كحد أعلى،
+    BOM للإكسل العربي، اسم ملف مؤرخ، 401 بلا توكن (تلقائياً من HTTPBearer)."""
+    db = getattr(request.app.state, "db", None)
+    rows = []
+    if db is not None:
+        try:
+            rows = await db.get_audit_logs(
+                limit=20000, offset=0, action=action or None,
+                actor=actor or None, q=q or None, since_hours=since_hours,
+            )
+        except Exception:
+            rows = []
+
+    def _render() -> str:
+        import csv as _csv
+        import io as _io
+        buf = _io.StringIO()
+        w = _csv.writer(buf)
+        w.writerow(["id", "created_at", "actor", "action", "object_type",
+                    "object_id", "old_value", "new_value", "source"])
+        for a in rows:
+            w.writerow([
+                a.get("id", ""), a.get("created_at", ""), a.get("actor", ""),
+                a.get("action", ""), a.get("object_type", ""), a.get("object_id", ""),
+                a.get("old_value", ""), a.get("new_value", ""), a.get("source", ""),
+            ])
+        return "\ufeff" + buf.getvalue()
+
+    csv_text = await asyncio.get_event_loop().run_in_executor(None, _render)
+    await _audit(request, "audit.export", object_type="audit",
+                 new_value=str(len(rows)))
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    return Response(
+        content=csv_text,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="br7-audit-{stamp}.csv"'},
+    )
 
 
 @app.get("/api/backup/export", dependencies=[Depends(verify_token)])
