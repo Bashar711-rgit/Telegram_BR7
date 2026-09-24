@@ -1532,6 +1532,73 @@ async def remove_allowed(entity_type: str, entity_id: int, request: Request):
     return JSONResponse({"success": True})
 
 
+@app.get("/api/notifications", dependencies=[Depends(verify_token)])
+async def get_notifications(request: Request, limit: int = 30, offset: int = 0,
+                            unread_only: bool = False):
+    """v9.24 P5-1: قائمة الإشعارات + عدّاد غير المقروء (للشارة الحية)."""
+    db = request.app.state.db
+    items = await db.get_notifications(limit=limit, offset=offset, unread_only=unread_only) if db else []
+    unread = await db.count_unread_notifications() if db else 0
+    return JSONResponse({"items": items, "unread": unread})
+
+
+class NotificationReadBody(BaseModel):
+    id: int
+
+
+@app.post("/api/notifications/read", dependencies=[Depends(verify_token)])
+async def read_notification(data: NotificationReadBody, request: Request):
+    """v9.24: تعليم إشعار واحداً كمقروء — تحقق id رقمي في النموذج."""
+    db = request.app.state.db
+    ok = await db.mark_notification_read(data.id) if db else False
+    if not ok:
+        raise HTTPException(status_code=404, detail="Notification not found")
+    unread = await db.count_unread_notifications() if db else 0
+    return JSONResponse({"success": True, "unread": unread})
+
+
+@app.post("/api/notifications/read-all", dependencies=[Depends(verify_token)])
+async def read_all_notifications(request: Request):
+    """v9.24: تعليم كل الإشعارات كمقروءة."""
+    db = request.app.state.db
+    changed = await db.mark_all_notifications_read() if db else 0
+    return JSONResponse({"success": True, "marked": changed, "unread": 0})
+
+
+@app.get("/api/features", dependencies=[Depends(verify_token)])
+async def get_features(request: Request):
+    """v9.25 P6-1: قائمة سجل الميزات مع الحالة الفعلية."""
+    db = request.app.state.db
+    items = await db.list_features() if db else []
+    return JSONResponse({"items": items, "count": len(items)})
+
+
+@app.post("/api/features/{key}/toggle", dependencies=[Depends(verify_token)])
+async def toggle_feature(key: str, request: Request):
+    """v9.25 P6-1: تبديل ميزة — 404 خارج السجل، مدقَّق + إشعار عند الإيقاف."""
+    db = request.app.state.db
+    if db is None or key not in db.FEATURE_REGISTRY:
+        raise HTTPException(status_code=404, detail="Unknown feature key")
+    meta = db.FEATURE_REGISTRY[key]
+    before = await db.is_feature_enabled(key)
+    new_state = not before
+    ok = await db.set_feature_enabled(key, new_state, by="botpanel-admin")
+    if not ok:
+        raise HTTPException(status_code=500, detail="Failed to toggle feature")
+    await _audit(request, "feature.toggle", object_type="feature", object_id=key,
+                 old_value=str(before), new_value=str(new_state))
+    if not new_state:
+        try:
+            await db.record_notification(
+                ntype="feature.disabled", title=f"⚙️ الميزة {meta['label']} أوقفت",
+                body=meta.get("impact") or "", severity="warn",
+                object_type="feature", object_id=key,
+            )
+        except Exception:
+            pass
+    return JSONResponse({"success": True, "key": key, "enabled": new_state})
+
+
 @app.get("/api/sources", dependencies=[Depends(verify_token)])
 async def get_sources(request: Request):
     """v9.20 P1: قائمة مصادر المراقبة + شارة الوضع.

@@ -453,6 +453,8 @@ class EnhancedDatabase:
         self._rule_hits_pending: Dict[int, int] = {}
         # v9.21 P3: كاش قائمة السماح — (expiry, senders_set, chats_set)
         self._allowed_cache: Optional[Tuple[float, set, set]] = None
+        # v9.25 P6-1: كاش الميزات — {key: (expiry, bool)}
+        self._features_cache: Dict[str, Tuple[float, bool]] = {}
 
         # Backup health tracking (fix #7)
         self._backup_failure_count: int = 0
@@ -763,6 +765,26 @@ class EnhancedDatabase:
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(entity_type, entity_id)
             );
+            -- v9.25 P6-1: سجل الميزات — المفاتيح والافتراضات في الكود
+            -- (FEATURE_REGISTRY) والجدول يخزّن الإزاحات فقط: صف غائب = افتراضي.
+            CREATE TABLE IF NOT EXISTS features (
+                key TEXT PRIMARY KEY,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                updated_by TEXT DEFAULT '',
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+            -- v9.24 P5-1: مركز الإشعارات — أحداث عالية القيمة فقط، للوحتين.
+            CREATE TABLE IF NOT EXISTS notifications (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ntype TEXT NOT NULL DEFAULT '',
+                title TEXT NOT NULL DEFAULT '',
+                body TEXT DEFAULT '',
+                severity TEXT DEFAULT 'info',
+                object_type TEXT DEFAULT '',
+                object_id TEXT DEFAULT '',
+                is_read INTEGER DEFAULT 0,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
             -- v9.18 P0: سجل التدقيق — كل عملية كتابة من اللوحتين تُسجّل هنا
             -- (fire-and-forget، بلا أسرار، الهواتف مُقنَّعة). يُقرأ من
             -- GET /api/audit (BotPanel) ويُقَلَّم دورياً بـ90 يوماً.
@@ -1020,6 +1042,8 @@ class EnhancedDatabase:
             "CREATE INDEX IF NOT EXISTS idx_rules_eval ON rules(enabled, priority, id)",
             # v9.21 P3: فحص السماح السريع
             "CREATE INDEX IF NOT EXISTS idx_allowed_lookup ON allowed_entities(entity_type, entity_id)",
+            # v9.24 P5-1: الشارة الحية (غير مقروء) والقائمة الزمنية
+            "CREATE INDEX IF NOT EXISTS idx_notif_unread_time ON notifications(is_read, created_at DESC)",
         ]
         for idx in indexes:
             await self._execute(idx)
@@ -2179,6 +2203,11 @@ class EnhancedDatabase:
                 await self.cleanup_old_audit_logs(90)
             except Exception:
                 pass
+            # v9.24 P5-1: تقليم الإشعارات (30 يوماً — قابل للضبط من v9.28)
+            try:
+                await self.cleanup_old_notifications(30)
+            except Exception:
+                pass
             await self._commit()
             if total > 500 and self.db_type == "sqlite":
                 await self._execute("PRAGMA optimize")
@@ -2187,6 +2216,199 @@ class EnhancedDatabase:
         return total
 
     # ─── Resource pressure check (fix #12) ────────────────────────────────────
+    # ─── v9.24 P5-1: مركز الإشعارات (Notifications) ───────────
+    _NOTIF_SEVERITIES = ("info", "success", "warn", "critical")
+
+    async def record_notification(self, ntype: str = "", title: str = "",
+                                  body: str = "", severity: str = "info",
+                                  object_type: str = "", object_id: str = "") -> bool:
+        """v9.24: إشعار جديد — تطبيع الشدة + قصّ الحقول + بوابة الميزة.
+
+        v9.25: البوابة الوحيدة للميزة notifications — إيقافها يمنع أي
+        إشعار جديد من اللوحتين معاً (بما فيها إشعارات تبديل الميزات نفسها:
+        سلوك مقصود وموثق). فشل-آمن تماماً.
+        """
+        try:
+            if not await self.is_feature_enabled("notifications"):
+                return False
+        except Exception:
+            pass  # بوابة فشل-آمن: خلل الفحص لا يمنع الإشعار
+        try:
+            sev = str(severity or "info").lower()
+            if sev not in self._NOTIF_SEVERITIES:
+                sev = "info"
+            await self._execute(
+                "INSERT INTO notifications (ntype, title, body, severity, object_type, object_id)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    str(ntype or "")[:80],
+                    str(title or "")[:200],
+                    str(body or "")[:500],
+                    sev,
+                    str(object_type or "")[:80],
+                    str(object_id or "")[:200],
+                ),
+            )
+            await self._commit()
+            return True
+        except Exception as e:
+            logger.debug(f"record_notification skipped: {e}")
+            return False
+
+    async def get_notifications(self, limit: int = 30, offset: int = 0,
+                                unread_only: bool = False) -> List[Dict[str, Any]]:
+        """v9.24: قائمة الإشعارات (الأحدث أولاً). فشل-آمن."""
+        try:
+            limit = max(1, min(int(limit), 100))
+            offset = max(0, int(offset))
+        except Exception:
+            limit, offset = 30, 0
+        try:
+            if unread_only:
+                return await self._fetchall(
+                    "SELECT * FROM notifications WHERE is_read = 0"
+                    " ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+                    (limit, offset),
+                )
+            return await self._fetchall(
+                "SELECT * FROM notifications ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+                (limit, offset),
+            )
+        except Exception as e:
+            logger.debug(f"get_notifications skipped: {e}")
+            return []
+
+    async def count_unread_notifications(self) -> int:
+        """v9.24: عدّاد الشارة الحية. فشل-آمن (0)."""
+        try:
+            row = await self._fetchone("SELECT COUNT(*) AS n FROM notifications WHERE is_read = 0")
+            return int(row["n"]) if row else 0
+        except Exception:
+            return 0
+
+    async def mark_notification_read(self, notification_id: int) -> bool:
+        """v9.24: تعليم إشعار واحداً كمقروء. فشل-آمن."""
+        try:
+            cur = await self._execute(
+                "UPDATE notifications SET is_read = 1 WHERE id = ?", (int(notification_id),)
+            )
+            await self._commit()
+            return (cur.rowcount or 0) > 0
+        except Exception:
+            return False
+
+    async def mark_all_notifications_read(self) -> int:
+        """v9.24: تعليم الكل — يعيد عدد الصفوف المتغيرة. فشل-آمن."""
+        try:
+            cur = await self._execute("UPDATE notifications SET is_read = 1 WHERE is_read = 0")
+            await self._commit()
+            return cur.rowcount or 0
+        except Exception:
+            return 0
+
+    async def cleanup_old_notifications(self, days: int = 30) -> int:
+        """v9.24: تقليم الإشعارات الأقدم من days يوماً (أرضية يوم). فشل-آمن."""
+        try:
+            days = max(1, int(days))
+        except Exception:
+            days = 30
+        try:
+            cutoff_dt = datetime.utcnow() - timedelta(days=days)
+            if self.db_type == "sqlite":
+                cur = await self._execute(
+                    "DELETE FROM notifications WHERE created_at < ?",
+                    (cutoff_dt.strftime("%Y-%m-%d %H:%M:%S"),),
+                )
+            else:
+                cur = await self._execute(
+                    "DELETE FROM notifications WHERE created_at < $1", (cutoff_dt,)
+                )
+            await self._commit()
+            return cur.rowcount or 0
+        except Exception as e:
+            logger.debug(f"cleanup_old_notifications skipped: {e}")
+            return 0
+
+    # ─── v9.25 P6-1: سجل الميزات (Feature Registry) ──────────
+    # مصدر الحقيقة الوحيد للمفاتيح والافتراضات. الجدول يخزّن الإزاحات
+    # فقط: صف غائب = الافتراضي. أي مفتاح غير معروف = True (فشل-آمن).
+    FEATURE_REGISTRY: Dict[str, Dict[str, str]] = {
+        "sources_scope": {"label": "🎯 نطاق المصادر", "category": "filtering",
+                          "default": "1",
+                          "impact": "الإيقاف = مراقبة كل شيء حتى مع قائمة مصادر مملوءة (سلوك ما قبل v9.20)."},
+        "allowlist": {"label": "✅ قائمة السماح", "category": "filtering",
+                      "default": "1",
+                      "impact": "الإيقاف = فلترة عادية للجميع — الكيانات الموثوقة تفقد تمييزها (سلوك ما قبل v9.21)."},
+        "rule_engine": {"label": "📏 محرك القواعد", "category": "filtering",
+                        "default": "1",
+                        "impact": "الإيقاف = لا تقييم للقواعد — القواعد المحفوظة سليمة لكنها لا تُطبَّق (سلوك ما قبل v9.21)."},
+        "notifications": {"label": "🔔 مركز الإشعارات", "category": "operations",
+                          "default": "1",
+                          "impact": "الإيقاف = لا إشعارات جديدة من أي حدث (لوحتا البوت والويب معاً)."},
+        "account_health": {"label": "❤️ صحة الحسابات", "category": "operations",
+                           "default": "1",
+                           "impact": "الإيقاف = لا رصد آلي لانقطاع الحسابات ولا إشعارات عودة."},
+    }
+
+    def _features_defaults(self) -> Dict[str, bool]:
+        return {k: v["default"] == "1" for k, v in self.FEATURE_REGISTRY.items()}
+
+    async def is_feature_enabled(self, key: str) -> bool:
+        """v9.25: هل الميزة مفعّلة؟ فشل-آمن شامل (غير معروف/خلل = True)."""
+        try:
+            if key not in self.FEATURE_REGISTRY:
+                return True
+            now = time.time()
+            cached = self._features_cache.get(key)
+            if cached is not None and now < cached[0]:
+                return cached[1]
+            row = await self._fetchone("SELECT enabled FROM features WHERE key = ?", (key,))
+            enabled = bool(row["enabled"]) if row else self._features_defaults()[key]
+            ttl = max(5.0, float(os.getenv("FEATURES_CACHE_TTL", "30")))
+            self._features_cache[key] = (now + ttl, enabled)
+            return enabled
+        except Exception:
+            return True
+
+    async def list_features(self) -> List[Dict[str, Any]]:
+        """v9.25: قائمة الميزات مع الحالة الفعلية (افتراضي أو إزاحة)."""
+        out: List[Dict[str, Any]] = []
+        defaults = self._features_defaults()
+        for key, meta in self.FEATURE_REGISTRY.items():
+            try:
+                row = await self._fetchone("SELECT enabled, updated_by, updated_at FROM features WHERE key = ?", (key,))
+                enabled = bool(row["enabled"]) if row else defaults[key]
+                overridden = row is not None
+                updated_by = (row["updated_by"] if row else "") or ""
+                updated_at = (row["updated_at"] if row else "") or ""
+            except Exception:
+                enabled, overridden, updated_by, updated_at = defaults[key], False, "", ""
+            out.append({
+                "key": key, "label": meta["label"], "category": meta["category"],
+                "impact": meta["impact"], "enabled": enabled,
+                "overridden": overridden, "updated_by": updated_by,
+                "updated_at": updated_at,
+            })
+        return out
+
+    async def set_feature_enabled(self, key: str, enabled: bool, by: str = "panel") -> bool:
+        """v9.25: تبديل ميزة (upsert إزاحة) — 404 خارج السجل يقرره المتصل."""
+        if key not in self.FEATURE_REGISTRY:
+            return False
+        try:
+            await self._execute(
+                "INSERT INTO features (key, enabled, updated_by) VALUES (?, ?, ?)"
+                " ON CONFLICT(key) DO UPDATE SET enabled=excluded.enabled,"
+                " updated_by=excluded.updated_by, updated_at=CURRENT_TIMESTAMP",
+                (key, 1 if enabled else 0, str(by or "panel")[:80]),
+            )
+            await self._commit()
+            self._features_cache.pop(key, None)
+            return True
+        except Exception as e:
+            logger.error(f"set_feature_enabled error: {e}")
+            return False
+
     # ─── v9.18 P0: سجل التدقيق (Audit Log) ───────────────────
     async def record_audit(self, actor: str, action: str, object_type: str = "",
                            object_id: str = "", old_value: str = "", new_value: str = "",

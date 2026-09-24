@@ -628,6 +628,39 @@ body { font-family: var(--sans); background: var(--bg); color: var(--text); font
   padding: 2px 12px; border-radius: 20px; color: var(--text2);
 }
 
+/* ── v9.25 FEATURES ──────────────────────────────────────────── */
+.feat-card {
+  padding: 14px 16px; border-bottom: 1px solid var(--border);
+  animation: featIn .3s cubic-bezier(0.16,1,0.3,1) both;
+  transition: background .2s, transform .2s;
+}
+.feat-card:hover { background: var(--bg2); transform: translateY(-1px); }
+.feat-card.off { border-left: 3px dashed var(--red); }
+@keyframes featIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+.feat-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.feat-title { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text); font-weight: 600; flex-wrap: wrap; }
+.feat-impact { margin-top: 6px; font-size: 11.5px; color: var(--text3); line-height: 1.7; }
+.feat-switch { position: relative; display: inline-block; width: 40px; height: 22px; flex-shrink: 0; cursor: pointer; }
+.feat-switch input { opacity: 0; width: 0; height: 0; }
+.feat-slider {
+  position: absolute; inset: 0; border-radius: 22px;
+  background: var(--bg2); border: 1px solid var(--border);
+  transition: all .3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+.feat-slider::before {
+  content: ""; position: absolute; width: 16px; height: 16px; border-radius: 50%;
+  top: 2px; inset-inline-start: 3px; background: var(--text3);
+  transition: all .3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+.feat-switch input:checked + .feat-slider { background: rgba(52,211,153,0.25); border-color: var(--green); box-shadow: 0 0 0 3px rgba(52,211,153,0.08); }
+.feat-switch input:checked + .feat-slider::before { background: var(--green); transform: translateX(-18px); }
+.feat-switch input:focus-visible + .feat-slider { outline: 2px solid var(--accent); outline-offset: 2px; }
+.feat-switch.busy { opacity: .5; pointer-events: none; }
+@media (prefers-reduced-motion: reduce) {
+  .feat-card, #ruleEditBanner { animation: none !important; }
+  .feat-slider, .feat-slider::before { transition: none !important; }
+}
+
 /* ── v9.21 RULES + ALLOWED ───────────────────────────────────── */
 #rulePanel.editing { border-color: rgba(250,204,21,0.45); }
 #ruleEditBanner { animation: ruleSlideDown .25s cubic-bezier(0.16,1,0.3,1); }
@@ -747,7 +780,7 @@ body { font-family: var(--sans); background: var(--bg); color: var(--text); font
     <div class="brand-icon">🤖</div>
     <div>
       <div class="brand-name">BotPanel</div>
-      <div class="brand-ver" id="brandVer">BR7 · v9.19</div>
+      <div class="brand-ver" id="brandVer">BR7 · v9.25</div>
     </div>
   </div>
 
@@ -797,6 +830,9 @@ body { font-family: var(--sans); background: var(--bg); color: var(--text); font
     <div class="nav-section">النظام</div>
     <div class="nav-item" data-page="audit" onclick="showTab('audit')">
       <span class="ni">🛡</span> التدقيق
+    </div>
+    <div class="nav-item" data-page="features" onclick="showTab('features')">
+      <span class="ni">🧩</span> الميزات
     </div>
     <div class="nav-item" data-page="settings" onclick="showTab('settings')">
       <span class="ni">⚙️</span> الإعدادات
@@ -1176,6 +1212,7 @@ const PAGE_META = {
     settings:  { title: 'الإعدادات', sub: 'ضبط البوت — يُحفظ مباشرة في قاعدة البيانات' },
     logs:      { title: 'السجلات', sub: 'أحداث النظام المباشرة' },
     audit:     { title: 'سجل التدقيق', sub: 'كل عملية كتابة من اللوحتين — بفلتر الإجراءات' },
+    features:  { title: 'سجل الميزات', sub: 'تبديل لحظي لميزات البوت — فشل-آمن دائماً' },
     sources:   { title: 'مصادر المراقبة', sub: 'حدد المجموعات/القنوات التي يراقبها البوت — فارغة = الكل' },
     rules:     { title: 'محرك القواعد', sub: 'إذا طابقت الشروط → إجراء — أول قاعدة مطابقة تُطبَّق حسب الأولوية' },
     allowed:   { title: 'قائمة السماح', sub: 'كيانات موثوقة تتجاوز فلترة الكلمات فقط — لا الحظر ولا مكافحة السبام' },
@@ -1196,6 +1233,59 @@ function loadPageData(tab) {
 
 
 
+
+
+// ================================================================
+// PAGE: FEATURES (v9.25 P6-1)
+// ================================================================
+const FEAT_OFF_IMPACT = {};
+
+async function loadFeatures() {
+    const wrap = document.getElementById('featCards');
+    if (!wrap) return;
+    try {
+        const res = await apiFetch('/api/features');
+        const data = await res.json();
+        const items = data.items || [];
+        const allOn = items.every(f => f.enabled);
+        const st = document.getElementById('featStatus');
+        if (st) {
+            st.className = 'pill ' + (allOn ? 'green' : 'red');
+            st.textContent = allOn ? 'كل الميزات مفعّلة' : 'توجد ميزات موقوفة';
+        }
+        wrap.innerHTML = items.map((f, i) => `
+            <div class="feat-card ${f.enabled ? '' : 'off'}" style="animation-delay:${Math.min(i * 40, 240)}ms">
+                <div class="feat-head">
+                    <div class="feat-title">${esc(f.label)} <span class="pill blue" style="font-size:10px">${esc(f.category)}</span>${f.overridden ? '<span class="pill" style="font-size:10px" title="الحالة الحالية تختلف عن الافتراضي">معدّلة يدوياً</span>' : ''}</div>
+                    <label class="feat-switch" role="switch" aria-checked="${f.enabled}" aria-label="${esc(f.label)}" tabindex="0">
+                        <input type="checkbox" ${f.enabled ? 'checked' : ''} onchange="toggleFeature('${esc(f.key)}', this)" ${f.busy ? 'disabled' : ''}>
+                        <span class="feat-slider"></span>
+                    </label>
+                </div>
+                <div class="feat-impact">${esc(f.impact || '')}</div>
+            </div>`).join('');
+        window.FEAT_OFF_IMPACT = {};
+        items.forEach(f => { window.FEAT_OFF_IMPACT[f.key] = f.impact || ''; });
+    } catch (e) {
+        if (wrap) wrap.innerHTML = '<div class="empty">فشل تحميل الميزات.</div>';
+    }
+}
+
+async function toggleFeature(key, inputEl) {
+    const target = !inputEl.checked;
+    if (!target && !confirm(`إيقاف هذه الميزة؟\n\n${(window.FEAT_OFF_IMPACT || {})[key] || ''}\n\n(اضغط موافق للتأكيد — التفعيل اللاحق يتم بنفس المفتاح)`)) {
+        inputEl.checked = true; return;
+    }
+    try {
+        const res = await apiFetch(`/api/features/${encodeURIComponent(key)}/toggle`, { method: 'POST' });
+        if (!res.ok) throw new Error('فشل');
+        showToast(target ? '✓ فُعّلت الميزة' : '⏸ أُوقفت الميزة', target ? 'ok' : 'wrn');
+        loadFeatures();
+    } catch (e) {
+        showToast('فشل تبديل الميزة', 'err');
+        inputEl.checked = !target;
+    }
+}
 
 // ================================================================
 // PAGE: RULES + ALLOWED (v9.21)
@@ -1839,7 +1929,7 @@ const PAGES = {
                     <div class="panel-actions"><button class="tb-btn" onclick="renderSysInfo(true)" title="تحديث من الخادم">⟳</button></div>
                 </div>
                 <div class="sysinfo-grid" id="sysinfo-grid">
-                    <div class="sysinfo-cell"><span class="k">الإصدار</span><span class="v">v9.17</span></div>
+                    <div class="sysinfo-cell"><span class="k">الإصدار</span><span class="v">v9.25</span></div>
                     <div class="sysinfo-cell"><span class="k">جاري التحميل…</span><span class="v">—</span></div>
                 </div>
             </div>
@@ -1870,6 +1960,23 @@ const PAGES = {
         load() { loadSettings(); renderSysInfo(true); }
     },
 
+    features: {
+        render() {
+            return `
+            <div class="panel" style="max-width:860px">
+                <div class="panel-head">
+                    <div class="panel-title"><span class="ico">🧩</span> سجل الميزات</div>
+                    <div class="panel-actions">
+                        <span class="pill green" id="featStatus">—</span>
+                        <button class="al-btn d" onclick="refreshCurrent()">↻</button>
+                    </div>
+                </div>
+                <div id="featCards"><div class="empty" style="padding:20px">جارٍ التحميل…</div></div>
+                <div class="panel-note">ℹ️ التبديل لحظي ولا يحتاج إعادة تشغيل. أي خلل في قاعدة البيانات يعني الميزة مفعّلة (فشل-آمن) — لا انكسار للفلترة أبداً. الوسم «معدّلة يدوياً» يعني أن الحالة الحالية تختلف عن افتراضي السجل.</div>
+            </div>`;
+        },
+        load() { loadFeatures(); }
+    },
     rules: {
         render() {
             return `

@@ -1825,7 +1825,8 @@ class EnhancedAccountMonitor:
         # v9.20 P1: نطاق المصادر — بعد قوائم الحظر مباشرة.
         # جدول فارغ = مراقبة كل شيء (السلوك الأصلي حرفياً)؛ مملوء = المفعّلة فقط.
         # is_source_allowed فشل-آمن (أي خلل = فتح المسار).
-        if not await self.db.is_source_allowed(chat_id):
+        # v9.25: حرس الميزة sources_scope — الإيقاف = مراقبة الكل دائماً.
+        if await self.db.is_feature_enabled("sources_scope") and not await self.db.is_source_allowed(chat_id):
             await self._inc_stat("source_skipped")
             return False
         # v9.11 مكافحة السبام: المستخدم المصنف Cross-Group Spam / Mass Poster
@@ -1903,7 +1904,7 @@ class EnhancedAccountMonitor:
         # الكيان الموثوق يتجاوز فلترة الكلمات فقط — لا الحظر ولا السبام.
         chat_id_rule = data.get("chat_id", 0)
         allowlist_hit = False
-        if CFG.ALLOWLIST_ENABLED:
+        if CFG.ALLOWLIST_ENABLED and await self.db.is_feature_enabled("allowlist"):
             try:
                 allowlist_hit = (
                     await self.db.is_sender_allowed(sender_id)
@@ -1920,7 +1921,7 @@ class EnhancedAccountMonitor:
         #   block → إسقاط + عداد rules_blocked
         #   tag   → analysis["rule_tag"] يظهر كـ"🏷 قاعدة: …" أعلى التنبيه
         rule_result = None
-        if not allowlist_hit and CFG.RULE_ENGINE_ENABLED:
+        if not allowlist_hit and CFG.RULE_ENGINE_ENABLED and await self.db.is_feature_enabled("rule_engine"):
             try:
                 rule_result = await self.db.apply_rules(
                     validated_text or "", source_chat_id=chat_id_rule,
