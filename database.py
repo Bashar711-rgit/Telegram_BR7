@@ -825,6 +825,29 @@ class EnhancedDatabase:
             );
             CREATE INDEX IF NOT EXISTS idx_dashboard_users_username
                 ON dashboard_users (username);
+            -- v9.33: سجل الحسابات التي أُضيفت من اللوحة — قاعدة البيانات هي
+            -- مصدر الحقيقة للوحة (Master Prompt 4). الحساب المضاف يُخزَّن هنا
+            -- فوراً فيظهر في إدارة الجلسات دون انتظار إعادة تشغيل، ويُزامَن
+            -- مع متغيرات بيئة Render (المخزن الدائم في الإنتاج) في نفس
+            -- الطلب. session_string يُخزَّن فقط بعد تسجيل دخول ناجح.
+            CREATE TABLE IF NOT EXISTS dashboard_accounts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                prefix TEXT NOT NULL UNIQUE,
+                name TEXT NOT NULL DEFAULT '',
+                api_id INTEGER NOT NULL,
+                api_hash TEXT NOT NULL,
+                phone TEXT NOT NULL,
+                session_name TEXT NOT NULL DEFAULT '',
+                priority INTEGER NOT NULL DEFAULT 10,
+                session_string TEXT,
+                is_main INTEGER NOT NULL DEFAULT 0,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                origin TEXT NOT NULL DEFAULT 'panel',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_dashboard_accounts_prefix
+                ON dashboard_accounts (prefix);
         """
         for stmt in stmts.split(";"):
             s = stmt.strip()
@@ -2713,6 +2736,101 @@ class EnhancedDatabase:
         except Exception as e:
             logger.debug(f"set_dashboard_user_enabled skipped: {e}")
             return False
+
+    # ─────────────── v9.33: سجل الحسابات من اللوحة (dashboard_accounts) ───────────────
+
+    async def list_dashboard_accounts(self, limit: int = 100) -> List[Dict[str, Any]]:
+        """v9.33: قائمة حسابات اللوحة بترتيب الإنشاء — فشل-آمن (قائمة فارغة)."""
+        try:
+            rows = await self._fetchall(
+                "SELECT * FROM dashboard_accounts ORDER BY id ASC LIMIT ?",
+                (max(1, int(limit)),),
+            )
+            out = []
+            for r in rows:
+                d = dict(r)
+                d["is_main"] = bool(d.get("is_main"))
+                d["enabled"] = bool(d.get("enabled"))
+                out.append(d)
+            return out
+        except Exception as e:
+            logger.debug(f"list_dashboard_accounts failed: {e}")
+            return []
+
+    async def get_dashboard_account(self, prefix: str) -> Optional[Dict[str, Any]]:
+        """v9.33: جلب حساب بالبادئة (MAIN / ACCOUNT_N) — None عند الغياب."""
+        try:
+            row = await self._fetchone(
+                "SELECT * FROM dashboard_accounts WHERE prefix = ?", (str(prefix).strip(),)
+            )
+            if row is None:
+                return None
+            d = dict(row)
+            d["is_main"] = bool(d.get("is_main"))
+            d["enabled"] = bool(d.get("enabled"))
+            return d
+        except Exception:
+            return None
+
+    async def upsert_dashboard_account(
+        self, prefix: str, name: str, api_id: int, api_hash: str, phone: str,
+        session_name: str = "", priority: int = 10, session_string: Optional[str] = None,
+        is_main: bool = False, origin: str = "panel",
+    ) -> Optional[Dict[str, Any]]:
+        """v9.33: إضافة/تحديث حساب بالبادئة (مصدر حقيقة اللوحة).
+
+        ON CONFLICT(prefix): تُحدَّث حقول الإعداد دائماً، وsession_string
+        لا يُمسّ إلا إذا جاءت قيمة جديدة (None = احتفظ بالموجود) — فلا
+        يمحو استدعاء إعدادي جلسة مسجلة سابقاً بالخطأ.
+        """
+        try:
+            await self._execute(
+                """
+                INSERT INTO dashboard_accounts
+                    (prefix, name, api_id, api_hash, phone, session_name,
+                     priority, session_string, is_main, origin, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(prefix) DO UPDATE SET
+                    name = excluded.name,
+                    api_id = excluded.api_id,
+                    api_hash = excluded.api_hash,
+                    phone = excluded.phone,
+                    session_name = excluded.session_name,
+                    priority = excluded.priority,
+                    is_main = excluded.is_main,
+                    origin = excluded.origin,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (str(prefix).strip(), str(name or "").strip(), int(api_id),
+                 str(api_hash or "").strip(), str(phone or "").strip(),
+                 str(session_name or "").strip(), int(priority),
+                 session_string, 1 if is_main else 0, str(origin or "panel")),
+            )
+            if session_string is not None:
+                await self._execute(
+                    "UPDATE dashboard_accounts SET session_string = ? WHERE prefix = ?",
+                    (str(session_string), str(prefix).strip()),
+                )
+            await self._commit()
+        except Exception as e:
+            logger.error(f"upsert_dashboard_account failed [{prefix}]: {e}")
+            return None
+        return await self.get_dashboard_account(str(prefix).strip())
+
+    async def set_dashboard_account_session(self, prefix: str, session_string: str) -> bool:
+        """v9.33: حفظ Session String بعد تسجيل دخول ناجح (بلا إعادة كتابة الإعدادات)."""
+        try:
+            cur = await self._execute(
+                "UPDATE dashboard_accounts SET session_string = ?, updated_at = CURRENT_TIMESTAMP "
+                "WHERE prefix = ?",
+                (str(session_string), str(prefix).strip()),
+            )
+            await self._commit()
+            return bool(cur.rowcount)
+        except Exception as e:
+            logger.debug(f"set_dashboard_account_session skipped: {e}")
+            return False
+
 
     async def set_dashboard_user_role(self, user_id: int, role: str) -> bool:
         """v9.29: تغيير دور مستخدم (دور غير معروف = رفض صامت)."""

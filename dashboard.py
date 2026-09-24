@@ -189,6 +189,9 @@ except ImportError:
     logger.warning("psutil not installed. Process memory/CPU stats in dashboard will be limited.")
 
 KEYWORDS_FILE = "keywords.json"
+# v9.33: مسار ملف بيئة الحسابات (يكتبه POST /api/accounts) — متغير بيئة
+# للاختبارات حتى لا تلوّث بذور الاختبارات الملف الحقيقي.
+ACCOUNTS_ENV_PATH = os.getenv("ACCOUNTS_ENV_PATH", "accounts.env")
 
 # =============================================================================
 # Pydantic Models
@@ -1214,50 +1217,104 @@ async def get_stats(request: Request):
 
 @app.get("/api/accounts", dependencies=[Depends(require_permission("accounts.read"))])  # v9.32
 async def get_accounts(request: Request):
-    """قائمة الحسابات مع إحصائيات صحيحة الأسماء (fix #4)."""
+    """قائمة الحسابات مع إحصائيات صحيحة الأسماء (fix #4).
+
+    v9.33: مصدر موحد — صفوف المراقبات الحية (إحصاءات كاملة) + كل حساب
+    من المصدر الموحد (_merged_accounts) لا مراقب له بعد (بانتظار إعادة
+    نشر Render أو بلا جلسة) بصفوف صفرية صادقة بدل اختفائه من القائمة."""
     bot = request.app.state.bot_ref
-    if not bot:
-        return JSONResponse({"accounts": []})
     accounts = []
-    for m in bot.monitors:
-        s = await m.get_stats()
-        dlq = s.get("dlq_stats", {}) or {}
+    seen_prefixes: Set[str] = set()
+    if bot:
+        for m in bot.monitors:
+            s = await m.get_stats()
+            dlq = s.get("dlq_stats", {}) or {}
+            try:
+                seen_prefixes.add((m.account or {}).get("prefix", ""))
+            except Exception:
+                pass
+            accounts.append({
+                "name": s.get("name"),
+                "phone": s.get("phone"),
+                "connected": s.get("connected"),
+                "priority": s.get("priority"),
+                "alerts_sent": s.get("alerts_sent", 0),
+                "send_cb_state": s.get("send_cb_state"),
+                "entity_cb_state": s.get("entity_cb_state"),
+                "connect_attempts": s.get("connect_attempts"),
+                "last_error": s.get("last_error"),
+                "accepted": s.get("accepted", 0),
+                "reviewed": s.get("reviewed", 0),
+                "ignored": s.get("ignored", 0),
+                "avg_confidence": s.get("avg_confidence", 0.0),
+                "messages_processed": s.get("messages_processed", 0),
+                "avg_processing_time_ms": s.get("avg_processing_time_ms", 0),
+                "duplicates": s.get("duplicates", 0),
+                "errors": s.get("errors", 0),
+                "dead_lettered": dlq.get("dead_lettered", 0),
+            })
+    for acc in await _merged_accounts(request):
+        if acc.get("prefix", "") in seen_prefixes:
+            continue
         accounts.append({
-            "name": s.get("name"),
-            "phone": s.get("phone"),
-            "connected": s.get("connected"),
-            "priority": s.get("priority"),
-            "alerts_sent": s.get("alerts_sent", 0),
-            "send_cb_state": s.get("send_cb_state"),
-            "entity_cb_state": s.get("entity_cb_state"),
-            "connect_attempts": s.get("connect_attempts"),
-            "last_error": s.get("last_error"),
-            "accepted": s.get("accepted", 0),
-            "reviewed": s.get("reviewed", 0),
-            "ignored": s.get("ignored", 0),
-            "avg_confidence": s.get("avg_confidence", 0.0),
-            "messages_processed": s.get("messages_processed", 0),
-            "avg_processing_time_ms": s.get("avg_processing_time_ms", 0),
-            "duplicates": s.get("duplicates", 0),
-            "errors": s.get("errors", 0),
-            "dead_lettered": dlq.get("dead_lettered", 0),
+            "name": acc.get("name"),
+            "phone": acc.get("phone"),
+            "connected": False,
+            "priority": acc.get("priority"),
+            "alerts_sent": 0,
+            "send_cb_state": None,
+            "entity_cb_state": None,
+            "connect_attempts": 0,
+            "last_error": None,
+            "accepted": 0,
+            "reviewed": 0,
+            "ignored": 0,
+            "avg_confidence": 0.0,
+            "messages_processed": 0,
+            "avg_processing_time_ms": 0,
+            "duplicates": 0,
+            "errors": 0,
+            "dead_lettered": 0,
+            "pending_deploy": bool(acc.get("pending_deploy")),
         })
     return JSONResponse({"accounts": accounts})
 
 
 @app.post("/api/accounts", dependencies=[Depends(require_permission("accounts.write"))])  # v9.32
 async def add_account(data: AccountCreate, request: Request):
-    """إضافة حساب جديد (يكتب في accounts.env؛ يتطلب إعادة تشغيل للتفعيل)."""
-    for acc in ACCOUNTS:
-        if acc["phone"] == data.phone:
+    """إضافة حساب جديد — v9.33: قاعدة البيانات أولاً (dashboard_accounts =
+    مصدر حقيقة اللوحة، الظهور في إدارة الجلسات فوراً دون إعادة تشغيل)،
+    ثم مزامنة متغيرات بيئة Render (الديمومة في الإنتاج + تفعيل تلقائي
+    بعد إعادة النشر)، ثم إلحاق accounts.env للتشغيل المحلي فقط
+    (قرص Render مؤقت — الديمومة من متغيرات البيئة لا من الملف)."""
+    merged = await _merged_accounts(request)
+    for acc in merged:
+        if str(acc.get("phone") or "") == data.phone:
             raise HTTPException(status_code=400, detail="Account already exists")
 
     # v9.18 P0: 20-account cap — same ceiling webadmin enforces (409).
-    if len(ACCOUNTS) >= 20:
+    if len(merged) >= 20:
         raise HTTPException(status_code=409, detail="Account limit reached (20). Remove an account first.")
 
-    env_path = "accounts.env"
-    prefix = f"ACCOUNT_{len(ACCOUNTS) + 1}"
+    used = {a.get("prefix", "") for a in merged}
+    prefix = next((f"ACCOUNT_{i}" for i in range(1, 41) if f"ACCOUNT_{i}" not in used), None)
+    if prefix is None:
+        raise HTTPException(status_code=409, detail="Account limit reached (20). Remove an account first.")
+
+    # 1) قاعدة البيانات — مصدر الحقيقة: أي فشل هنا = فشل الطلب الصريح
+    #    (لا رسالة نجاح وهمية أبداً).
+    db = getattr(request.app.state, "db", None)
+    if db is not None:
+        row = await db.upsert_dashboard_account(
+            prefix=prefix, name=data.name, api_id=data.api_id, api_hash=data.api_hash,
+            phone=data.phone, session_name=data.session_name, priority=data.priority,
+            origin="panel",
+        )
+        if row is None:
+            raise HTTPException(status_code=500, detail="فشل حفظ الحساب في قاعدة البيانات")
+
+    # 2) accounts.env — للتشغيل المحلي (best-effort: قاعدة البيانات محفوظة
+    #    بالفعل ولا يعتمد ظهور الحساب في اللوحة على هذا الملف).
     new_account_lines = [
         f"\n# === {data.name} ===\n",
         f"{prefix}_API_ID={data.api_id}\n",
@@ -1266,15 +1323,35 @@ async def add_account(data: AccountCreate, request: Request):
         f"{prefix}_SESSION_NAME={data.session_name}\n",
         f"{prefix}_PRIORITY={data.priority}\n",
     ]
+    try:
+        def _write() -> None:
+            with open(ACCOUNTS_ENV_PATH, "a", encoding="utf-8") as f:
+                f.writelines(new_account_lines)
+        await asyncio.get_event_loop().run_in_executor(None, _write)
+    except Exception as e:
+        logger.warning(f"accounts.env append failed (DB row kept): {e}")
 
-    def _write() -> None:
-        with open(env_path, "a", encoding="utf-8") as f:
-            f.writelines(new_account_lines)
+    # 3) مزامنة Render — تخزين دائم + إعادة نشر تلقائية تفعّل الحساب.
+    render_save: Dict[str, Any] = {"saved": False, "reason": "RENDER_API_KEY / RENDER_SERVICE_ID غير مضبوطة"}
+    if (os.getenv("RENDER_API_KEY") or "").strip() and (os.getenv("RENDER_SERVICE_ID") or "").strip():
+        render_save = await render_upsert_env_many([
+            (f"{prefix}_API_ID", str(data.api_id)),
+            (f"{prefix}_API_HASH", data.api_hash),
+            (f"{prefix}_PHONE", data.phone),
+            (f"{prefix}_SESSION_NAME", data.session_name),
+            (f"{prefix}_PRIORITY", str(data.priority)),
+        ])
+        logger.info(f"account {prefix} Render env sync: saved={render_save.get('saved')}")
 
-    await asyncio.get_event_loop().run_in_executor(None, _write)
     await _audit(request, "account.add", object_type="account", object_id=data.name or prefix,
                  new_value=_mask_phone(data.phone or ""))
-    return JSONResponse({"success": True, "message": "Account added. Restart the service to apply."})
+    return JSONResponse({
+        "success": True,
+        "message": "Account added. Restart the service to apply.",
+        "prefix": prefix,
+        "saved_to_render": bool(render_save.get("saved")),
+        "render_reason": render_save.get("reason", ""),
+    })
 
 
 @app.get("/api/messages", dependencies=[Depends(require_permission("messages.read"))])  # v9.32
@@ -2569,6 +2646,41 @@ login_manager = LoginManager()
 RENDER_API_BASE = "https://api.render.com/v1"
 
 
+async def render_upsert_env_many(pairs: List[Tuple[str, str]]) -> Dict[str, Any]:
+    """v9.33: رفع عدة متغيرات بيئة على Render في نداء واحد (PUT بمصفوفة)
+    — نشر واحد بدل نشر لكل مفتاح. عند فشل الدفعة يسقط تلقائياً إلى رفع
+    فردي عبر render_upsert_env لكل مفتاح (توافق مع أي خطة/نسخة API).
+    فشل-آمن: أي خلل يعيد قاموس سبب ولا يرفع استثناء أبداً."""
+    api_key = (os.getenv("RENDER_API_KEY") or "").strip()
+    service_id = (os.getenv("RENDER_SERVICE_ID") or "").strip()
+    if not api_key or not service_id:
+        return {"saved": False, "reason": "RENDER_API_KEY / RENDER_SERVICE_ID غير مضبوطة"}
+    if not pairs:
+        return {"saved": True}
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+    timeout = aiohttp.ClientTimeout(total=30)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as s:
+            async with s.put(
+                f"{RENDER_API_BASE}/services/{service_id}/env-vars",
+                json=[{"key": k, "value": v} for k, v in pairs],
+            ) as r:
+                if r.status in (200, 201):
+                    return {"saved": True, "bulk": True}
+        # الدفعة غير مدعومة/فشلت → سقوط رشيق إلى الرفع الفردي المجرّب
+        for k, v in pairs:
+            one = await render_upsert_env(k, v)
+            if not one.get("saved"):
+                return {"saved": False, "reason": one.get("reason", ""), "failed_key": k}
+        return {"saved": True, "bulk": False}
+    except Exception as e:
+        return {"saved": False, "reason": f"{type(e).__name__}: {e}"}
+
+
 async def render_upsert_env(key: str, value: str) -> Dict[str, Any]:
     """Upsert a single, specific env var on the Render service via Render API
     (triggers redeploy). Scope is already minimal — only ever called to set
@@ -2603,27 +2715,45 @@ def _mask_phone(phone: str) -> str:
     return "*" * max(0, len(phone) - 4) + phone[-4:]
 
 
-async def _audit(request: Request, action: str, object_type: str = "",
-                 object_id: str = "", old_value: str = "", new_value: str = "") -> None:
-    """v9.18 P0: تسجيل عملية من BotPanel في سجل التدقيق — fire-and-forget.
+async def _merged_accounts(request: Request) -> List[Dict[str, Any]]:
+    """v9.33: المصدر الموحد للحسابات في اللوحة — ACCOUNTS (الإقلاع/البيئة،
+    وهي التكوين النشط فعلياً) ∪ dashboard_accounts (حسابات مضافة من اللوحة
+    بانتظار النشر). الاتحاد بمفتاح prefix، والحاضر في البيئة يفوز لمشاركة
+    prefix (هو المستوى الحي)، وقاعدة البيانات تضيف الباقي.
 
-    لا يُلمس مسار الطلب أبداً: أي خلل في قاعدة البيانات يُبتلع بصمت.
-    الفاعل ثابت "botpanel-admin" (مصادقة التوكن الواحد)، والمصدر "botpanel".
-    """
+    فشل-آمن: أي خلل في قاعدة البيانات يعيد ACCOUNTS وحدها — لا تنكسر
+    صفحة الجلسات أبداً. الصفوف القادمة من قاعدة البيانات فقط تحمل
+    pending_deploy=True (لم تصل إلى بيئة الإنتاج بعد)."""
+    merged: Dict[str, Dict[str, Any]] = {
+        a.get("prefix", ""): dict(a) for a in ACCOUNTS if a.get("prefix")
+    }
     db = getattr(request.app.state, "db", None)
-    if db is None:
-        return
-    try:
-        _track_local_task(
-            db.record_audit(
-                actor="botpanel-admin", action=action, object_type=object_type,
-                object_id=object_id, old_value=old_value, new_value=new_value,
-                source="botpanel",
-            ),
-            "audit_write",
-        )
-    except Exception:
-        pass
+    if db is not None:
+        try:
+            rows = await db.list_dashboard_accounts()
+            for r in rows:
+                p = (r.get("prefix") or "").strip()
+                if not p or p in merged:
+                    continue
+                merged[p] = {
+                    "id": 0,
+                    "prefix": p,
+                    "name": (r.get("name") or p.replace("_", " ").title()),
+                    "api_id": r.get("api_id"),
+                    "api_hash": r.get("api_hash"),
+                    "phone": r.get("phone") or "",
+                    "session": r.get("session_name") or p.lower(),
+                    "session_string": r.get("session_string"),
+                    "priority": r.get("priority", 10),
+                    "is_main": bool(r.get("is_main")),
+                    "enabled": bool(r.get("enabled", True)),
+                    "pending_deploy": True,
+                    "retry_count": 0,
+                    "last_error": None,
+                }
+        except Exception as e:
+            logger.debug(f"_merged_accounts: db branch skipped: {e}")
+    return list(merged.values())
 
 
 async def _audit(request: Request, action: str, object_type: str = "",
@@ -2652,11 +2782,15 @@ async def _audit(request: Request, action: str, object_type: str = "",
 
 @app.get("/api/login/accounts", dependencies=[Depends(require_permission("accounts.read"))])  # v9.32
 async def login_accounts(request: Request):
-    """قائمة الحسابات المهيأة وحالة جلساتها."""
+    """قائمة الحسابات المهيأة وحالة جلساتها.
+
+    v9.33: المصدر الموحد (بيئة الإقلاع + dashboard_accounts) — الحساب
+    المضاف من اللوحة يظهر في القائمة المنسدلة فوراً حتى قبل إعادة
+    النشر (pending_deploy=True)، فلا تعود الصفحة فارغة أبداً."""
     bot = getattr(request.app.state, "bot_ref", None)
     monitors = {m.account.get("prefix"): m for m in bot.monitors} if bot else {}
     out = []
-    for acc in ACCOUNTS:
+    for acc in await _merged_accounts(request):
         prefix = acc.get("prefix", "")
         mon = monitors.get(prefix)
         out.append({
@@ -2666,15 +2800,21 @@ async def login_accounts(request: Request):
             "has_session_string": bool(acc.get("session_string")),
             "connected": bool(mon and mon.is_connected),
             "last_error": (mon._last_connect_error if mon else None),
+            "pending_deploy": bool(acc.get("pending_deploy")),
         })
     return JSONResponse({"accounts": out})
 
 
 @app.post("/api/login/send-code", dependencies=[Depends(require_permission("accounts.write"))])  # v9.32
-async def login_send_code(data: LoginSendCode):
-    """إرسال رمز التحقق OTP إلى هاتف الحساب."""
+async def login_send_code(data: LoginSendCode, request: Request):
+    """إرسال رمز التحقق OTP إلى هاتف الحساب.
+
+    v9.33: البحث في المصدر الموحد — الحساب المضاف من اللوحة (لم يُنشر
+    بعد) يستقبل الكود أيضاً لأن LoginManager لا يحتاج مراقباً حياً بل
+    api_id/api_hash/phone فقط."""
     prefix = data.prefix.strip().upper()
-    acc = next((a for a in ACCOUNTS if a.get("prefix") == prefix), None)
+    merged = await _merged_accounts(request)
+    acc = next((a for a in merged if a.get("prefix") == prefix), None)
     if not acc:
         raise HTTPException(status_code=404, detail=f"الحساب {prefix} غير موجود في الإعدادات")
     try:
@@ -2740,6 +2880,21 @@ async def _login_success_response(prefix: str, result: Dict[str, Any]) -> JSONRe
     env_key = f"{prefix}_SESSION_STRING"
     save = await render_upsert_env(env_key, result["session_string"])
     logger.info(f"Login completed for {prefix} ({result.get('user')}): env {env_key} saved={save.get('saved')}")
+    # v9.33: قاعدة البيانات مصدر حقيقة حالة الجلسة في اللوحة + تحديث نسخة
+    # الإقلاع في الذاكرة — شارة الجلسة تتحول «موجودة» فور النجاح دون
+    # انتظار إعادة النشر (فشل-آمن: أي خلل لا يمس رد النجاح).
+    try:
+        db = getattr(app.state, "db", None)
+        if db is not None:
+            await db.set_dashboard_account_session(prefix, result["session_string"])
+    except Exception as e:
+        logger.debug(f"login session db update skipped: {e}")
+    try:
+        for a in ACCOUNTS:
+            if a.get("prefix") == prefix:
+                a["session_string"] = result["session_string"]
+    except Exception:
+        pass
     return JSONResponse({
         "success": True,
         "done": True,
@@ -2850,8 +3005,8 @@ let currentPrefix = null;
 const $ = id => document.getElementById(id);
 const token = () => $('token').value.trim();
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-$('token').value = localStorage.getItem('dash_token') || '';
-$('token').addEventListener('change', () => { localStorage.setItem('dash_token', token()); loadAccounts(); });
+$('token').value = localStorage.getItem('dashboard_token') || localStorage.getItem('dash_token') || '';
+$('token').addEventListener('change', () => { localStorage.setItem('dashboard_token', token()); loadAccounts(); });
 
 function show(type, text) { const m = $('msg'); m.className = 'msg ' + type; m.innerHTML = text; }
 function setStep(n) {
