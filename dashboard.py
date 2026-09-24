@@ -445,6 +445,10 @@ def require_permission(permission: Optional[str] = None):
     - توكن مستخدم موقّع → يتحقق التوقيع والانتهاء ثم الصلاحية المطلوبة
       (403 عند الغياب) — وينعكس في التدقيق كفاعل panel:<username>.
     - perm=None → مصادقة فقط بلا فحص صلاحية (لـ /api/auth/me).
+
+    v9.32: التوسيع الكامل — كل نقاط BotPanel (47 مساراً) انتقلت من
+    verify_token (الرئيسي فقط) إلى مصفوفة صلاحيات دقيقة؛ مسار
+    /health/full و/ws احتفظا بـverify_token عمداً (عمق تشخيصي/قناة بث).
     """
     async def _dep(request: Request,
                    credentials: HTTPAuthorizationCredentials = Depends(security)) -> Principal:
@@ -1202,13 +1206,13 @@ async def health_full(request: Request):
     })
 
 
-@app.get("/api/stats", dependencies=[Depends(verify_token)])
+@app.get("/api/stats", dependencies=[Depends(require_permission("auth.read"))])  # v9.32
 async def get_stats(request: Request):
     """إحصائيات كاملة مع بيانات IntentEngine."""
     return JSONResponse(request.app.state.stats_cache)
 
 
-@app.get("/api/accounts", dependencies=[Depends(verify_token)])
+@app.get("/api/accounts", dependencies=[Depends(require_permission("accounts.read"))])  # v9.32
 async def get_accounts(request: Request):
     """قائمة الحسابات مع إحصائيات صحيحة الأسماء (fix #4)."""
     bot = request.app.state.bot_ref
@@ -1241,7 +1245,7 @@ async def get_accounts(request: Request):
     return JSONResponse({"accounts": accounts})
 
 
-@app.post("/api/accounts", dependencies=[Depends(verify_token)])
+@app.post("/api/accounts", dependencies=[Depends(require_permission("accounts.write"))])  # v9.32
 async def add_account(data: AccountCreate, request: Request):
     """إضافة حساب جديد (يكتب في accounts.env؛ يتطلب إعادة تشغيل للتفعيل)."""
     for acc in ACCOUNTS:
@@ -1273,7 +1277,7 @@ async def add_account(data: AccountCreate, request: Request):
     return JSONResponse({"success": True, "message": "Account added. Restart the service to apply."})
 
 
-@app.get("/api/messages", dependencies=[Depends(verify_token)])
+@app.get("/api/messages", dependencies=[Depends(require_permission("messages.read"))])  # v9.32
 async def get_messages(
     request: Request,
     limit: int = 50,
@@ -1302,7 +1306,7 @@ async def get_messages(
         return JSONResponse({"messages": [], "total": 0})
 
 
-@app.get("/api/alerts", dependencies=[Depends(verify_token)])
+@app.get("/api/alerts", dependencies=[Depends(require_permission("messages.read"))])  # v9.32
 async def get_alerts(
     request: Request,
     limit: int = 50,
@@ -1360,7 +1364,7 @@ async def get_alerts(
         return JSONResponse({"alerts": [], "total": 0})
 
 
-@app.get("/api/alerts/export", dependencies=[Depends(verify_token)])
+@app.get("/api/alerts/export", dependencies=[Depends(require_permission("messages.read"))])  # v9.32
 async def export_alerts_csv(
     request: Request,
     account: Optional[str] = None,
@@ -1412,7 +1416,7 @@ async def export_alerts_csv(
     )
 
 
-@app.get("/api/alerts/stats", dependencies=[Depends(verify_token)])
+@app.get("/api/alerts/stats", dependencies=[Depends(require_permission("messages.read"))])  # v9.32
 async def get_alerts_stats(request: Request):
     """إحصائيات التنبيهات (db_healthy / queue_evictions مضمّنة الآن)."""
     db = request.app.state.db
@@ -1424,7 +1428,7 @@ async def get_alerts_stats(request: Request):
         return JSONResponse({})
 
 
-@app.get("/api/dead-letters", dependencies=[Depends(verify_token)])
+@app.get("/api/dead-letters", dependencies=[Depends(require_permission("messages.read"))])  # v9.32
 async def get_dead_letters_endpoint(request: Request, limit: int = 100, only_unresolved: bool = True):
     """
     قراءة فقط. NOTE: database.py's get_dead_letters() / DeadLetterRecord does
@@ -1457,7 +1461,7 @@ async def get_dead_letters_endpoint(request: Request, limit: int = 100, only_unr
         return JSONResponse({"dead_letters": [], "total": 0})
 
 
-@app.get("/api/analytics", dependencies=[Depends(verify_token)])
+@app.get("/api/analytics", dependencies=[Depends(require_permission("messages.read"))])  # v9.32
 async def get_analytics(request: Request, hours: int = 24):
     """Read-only analytics for the dashboard's statistics page.
 
@@ -1504,7 +1508,7 @@ async def get_analytics(request: Request, hours: int = 24):
     })
 
 
-@app.get("/api/keywords", dependencies=[Depends(verify_token)])
+@app.get("/api/keywords", dependencies=[Depends(require_permission("keywords.read"))])  # v9.32
 async def get_keywords(request: Request):
     """
     يعرض حالة الكلمات المفتاحية الفعلية التي يستخدمها الفلتر الآن
@@ -1524,7 +1528,7 @@ async def get_keywords(request: Request):
         return JSONResponse({"keywords": {}, "source": "error", "error": str(e)})
 
 
-@app.post("/api/keywords", dependencies=[Depends(verify_token)])
+@app.post("/api/keywords", dependencies=[Depends(require_permission("keywords.write"))])  # v9.32
 async def add_keyword(data: KeywordCreate, request: Request):
     """
     إضافة كلمة/عبارة إلى قسم (list) داخل keywords.json عبر مسار منقّط، مع
@@ -1585,7 +1589,7 @@ async def add_keyword(data: KeywordCreate, request: Request):
         })
 
 
-@app.delete("/api/keywords", dependencies=[Depends(verify_token)])
+@app.delete("/api/keywords", dependencies=[Depends(require_permission("keywords.delete"))])  # v9.32
 async def delete_keyword(data: KeywordDelete, request: Request):
     """حذف كلمة/عبارة من قسم (list) داخل keywords.json — نفس ضمانات الإضافة."""
     keyword = data.keyword.strip()
@@ -1637,7 +1641,7 @@ async def delete_keyword(data: KeywordDelete, request: Request):
         })
 
 
-@app.get("/api/blocked/senders", dependencies=[Depends(verify_token)])
+@app.get("/api/blocked/senders", dependencies=[Depends(require_permission("rules.read"))])  # v9.32
 async def get_blocked_senders(request: Request):
     # NOTE: database.py has no public list-blocked-senders method; _fetchall
     # is used as it did in the previous version. See Remaining Issues.
@@ -1646,14 +1650,14 @@ async def get_blocked_senders(request: Request):
     return JSONResponse({"senders": rows})
 
 
-@app.get("/api/blocked/chats", dependencies=[Depends(verify_token)])
+@app.get("/api/blocked/chats", dependencies=[Depends(require_permission("rules.read"))])  # v9.32
 async def get_blocked_chats(request: Request):
     db = request.app.state.db
     rows = await db._fetchall("SELECT * FROM blocked_chats ORDER BY blocked_at DESC LIMIT 100")
     return JSONResponse({"chats": rows})
 
 
-@app.post("/api/blocked/senders", dependencies=[Depends(verify_token)])
+@app.post("/api/blocked/senders", dependencies=[Depends(require_permission("rules.write"))])  # v9.32
 async def block_sender(data: BlockUser, request: Request):
     """v9.17: source يُمرَّر من العميل (dashboard/alert) مع قائمة سماح —
     كانت تُسجَّل كل حظرات اللوحة كمصدر dashboard حتى لو أُرسلت من مودال
@@ -1669,7 +1673,7 @@ async def block_sender(data: BlockUser, request: Request):
     return JSONResponse({"success": True, "source": src})
 
 
-@app.delete("/api/blocked/senders/{user_id}", dependencies=[Depends(verify_token)])
+@app.delete("/api/blocked/senders/{user_id}", dependencies=[Depends(require_permission("rules.delete"))])  # v9.32
 async def unblock_sender(user_id: int, request: Request):
     db = request.app.state.db
     await db.unblock_sender(user_id)
@@ -1677,7 +1681,7 @@ async def unblock_sender(user_id: int, request: Request):
     return JSONResponse({"success": True})
 
 
-@app.post("/api/blocked/chats", dependencies=[Depends(verify_token)])
+@app.post("/api/blocked/chats", dependencies=[Depends(require_permission("rules.write"))])  # v9.32
 async def block_chat(data: BlockChat, request: Request):
     db = request.app.state.db
     await db.block_chat(data.chat_id, data.reason, "dashboard")
@@ -1686,7 +1690,7 @@ async def block_chat(data: BlockChat, request: Request):
     return JSONResponse({"success": True})
 
 
-@app.delete("/api/blocked/chats/{chat_id}", dependencies=[Depends(verify_token)])
+@app.delete("/api/blocked/chats/{chat_id}", dependencies=[Depends(require_permission("rules.delete"))])  # v9.32
 async def unblock_chat(chat_id: int, request: Request):
     db = request.app.state.db
     await db.unblock_chat(chat_id)
@@ -1694,7 +1698,7 @@ async def unblock_chat(chat_id: int, request: Request):
     return JSONResponse({"success": True})
 
 
-@app.get("/api/rules", dependencies=[Depends(verify_token)])
+@app.get("/api/rules", dependencies=[Depends(require_permission("rules.read"))])  # v9.32
 async def get_rules(request: Request):
     """v9.21 P2: قائمة القواعد بترتيب التقييم."""
     db = request.app.state.db
@@ -1707,7 +1711,7 @@ async def get_rules(request: Request):
     })
 
 
-@app.post("/api/rules", dependencies=[Depends(verify_token)])
+@app.post("/api/rules", dependencies=[Depends(require_permission("rules.write"))])  # v9.32
 async def add_rule(data: RuleCreate, request: Request):
     """v9.21 P2: إضافة قاعدة — تحقق صارم + حد 50 قاعدة (409)."""
     db = request.app.state.db
@@ -1732,7 +1736,7 @@ async def add_rule(data: RuleCreate, request: Request):
     return JSONResponse({"success": True, "rule": row})
 
 
-@app.post("/api/rules/{rule_id}/edit", dependencies=[Depends(verify_token)])
+@app.post("/api/rules/{rule_id}/edit", dependencies=[Depends(require_permission("rules.write"))])  # v9.32
 async def edit_rule(rule_id: int, data: RuleCreate, request: Request):
     """v9.22-2: تعديل قاعدة (جزئي) — نفس تحقق الإضافة، لا يلمس enabled/hits."""
     db = request.app.state.db
@@ -1773,7 +1777,7 @@ async def edit_rule(rule_id: int, data: RuleCreate, request: Request):
     return JSONResponse({"success": True, "rule": after})
 
 
-@app.post("/api/rules/{rule_id}/toggle", dependencies=[Depends(verify_token)])
+@app.post("/api/rules/{rule_id}/toggle", dependencies=[Depends(require_permission("rules.write"))])  # v9.32
 async def toggle_rule(rule_id: int, request: Request):
     """v9.21 P2: تفعيل/إيقاف قاعدة — مدقَّق."""
     db = request.app.state.db
@@ -1787,7 +1791,7 @@ async def toggle_rule(rule_id: int, request: Request):
     return JSONResponse({"success": True, "id": rule_id, "enabled": new_state})
 
 
-@app.delete("/api/rules/{rule_id}", dependencies=[Depends(verify_token)])
+@app.delete("/api/rules/{rule_id}", dependencies=[Depends(require_permission("rules.delete"))])  # v9.32
 async def delete_rule(rule_id: int, request: Request):
     """v9.21 P2: حذف قاعدة — مدقَّق."""
     db = request.app.state.db
@@ -1798,7 +1802,7 @@ async def delete_rule(rule_id: int, request: Request):
     return JSONResponse({"success": True})
 
 
-@app.get("/api/allowed", dependencies=[Depends(verify_token)])
+@app.get("/api/allowed", dependencies=[Depends(require_permission("rules.read"))])  # v9.32
 async def get_allowed(request: Request):
     """v9.21 P3: قائمة الكيانات الموثوقة."""
     db = request.app.state.db
@@ -1810,7 +1814,7 @@ async def get_allowed(request: Request):
     })
 
 
-@app.post("/api/allowed", dependencies=[Depends(verify_token)])
+@app.post("/api/allowed", dependencies=[Depends(require_permission("rules.write"))])  # v9.32
 async def add_allowed(data: AllowedCreate, request: Request):
     """v9.21 P3: إضافة كيان موثوق — مدقَّق."""
     db = request.app.state.db
@@ -1824,7 +1828,7 @@ async def add_allowed(data: AllowedCreate, request: Request):
     return JSONResponse({"success": True})
 
 
-@app.delete("/api/allowed/{entity_type}/{entity_id}", dependencies=[Depends(verify_token)])
+@app.delete("/api/allowed/{entity_type}/{entity_id}", dependencies=[Depends(require_permission("rules.delete"))])  # v9.32
 async def remove_allowed(entity_type: str, entity_id: int, request: Request):
     """v9.21 P3: حذف كيان موثوق — مدقَّق."""
     db = request.app.state.db
@@ -1835,7 +1839,7 @@ async def remove_allowed(entity_type: str, entity_id: int, request: Request):
     return JSONResponse({"success": True})
 
 
-@app.get("/api/notifications", dependencies=[Depends(verify_token)])
+@app.get("/api/notifications", dependencies=[Depends(require_permission("notifications.read"))])  # v9.32
 async def get_notifications(request: Request, limit: int = 30, offset: int = 0,
                             unread_only: bool = False):
     """v9.24 P5-1: قائمة الإشعارات + عدّاد غير المقروء (للشارة الحية)."""
@@ -1849,7 +1853,7 @@ class NotificationReadBody(BaseModel):
     id: int
 
 
-@app.post("/api/notifications/read", dependencies=[Depends(verify_token)])
+@app.post("/api/notifications/read", dependencies=[Depends(require_permission("notifications.read"))])  # v9.32
 async def read_notification(data: NotificationReadBody, request: Request):
     """v9.24: تعليم إشعار واحداً كمقروء — تحقق id رقمي في النموذج."""
     db = request.app.state.db
@@ -1860,7 +1864,7 @@ async def read_notification(data: NotificationReadBody, request: Request):
     return JSONResponse({"success": True, "unread": unread})
 
 
-@app.post("/api/notifications/read-all", dependencies=[Depends(verify_token)])
+@app.post("/api/notifications/read-all", dependencies=[Depends(require_permission("notifications.read"))])  # v9.32
 async def read_all_notifications(request: Request):
     """v9.24: تعليم كل الإشعارات كمقروءة."""
     db = request.app.state.db
@@ -1868,7 +1872,7 @@ async def read_all_notifications(request: Request):
     return JSONResponse({"success": True, "marked": changed, "unread": 0})
 
 
-@app.get("/api/features", dependencies=[Depends(verify_token)])
+@app.get("/api/features", dependencies=[Depends(require_permission("settings.read"))])  # v9.32
 async def get_features(request: Request):
     """v9.25 P6-1: قائمة سجل الميزات مع الحالة الفعلية."""
     db = request.app.state.db
@@ -1876,7 +1880,7 @@ async def get_features(request: Request):
     return JSONResponse({"items": items, "count": len(items)})
 
 
-@app.post("/api/features/{key}/toggle", dependencies=[Depends(verify_token)])
+@app.post("/api/features/{key}/toggle", dependencies=[Depends(require_permission("settings.write"))])  # v9.32
 async def toggle_feature(key: str, request: Request):
     """v9.25 P6-1: تبديل ميزة — 404 خارج السجل، مدقَّق + إشعار عند الإيقاف."""
     db = request.app.state.db
@@ -1902,7 +1906,7 @@ async def toggle_feature(key: str, request: Request):
     return JSONResponse({"success": True, "key": key, "enabled": new_state})
 
 
-@app.get("/api/sources", dependencies=[Depends(verify_token)])
+@app.get("/api/sources", dependencies=[Depends(require_permission("sources.read"))])  # v9.32
 async def get_sources(request: Request):
     """v9.20 P1: قائمة مصادر المراقبة + شارة الوضع.
 
@@ -1921,7 +1925,7 @@ async def get_sources(request: Request):
     })
 
 
-@app.post("/api/sources", dependencies=[Depends(verify_token)])
+@app.post("/api/sources", dependencies=[Depends(require_permission("sources.write"))])  # v9.32
 async def add_source(data: SourceCreate, request: Request):
     """v9.20 P1: إضافة/تحديث مصدر (upsert حسب chat_id) — مدقَّق."""
     db = request.app.state.db
@@ -1939,7 +1943,7 @@ async def add_source(data: SourceCreate, request: Request):
     return JSONResponse({"success": True, "chat_id": data.chat_id})
 
 
-@app.delete("/api/sources/{chat_id}", dependencies=[Depends(verify_token)])
+@app.delete("/api/sources/{chat_id}", dependencies=[Depends(require_permission("sources.delete"))])  # v9.32
 async def remove_source(chat_id: int, request: Request):
     """v9.20 P1: حذف مصدر بالمفتاح chat_id — مدقَّق."""
     db = request.app.state.db
@@ -1952,7 +1956,7 @@ async def remove_source(chat_id: int, request: Request):
     return JSONResponse({"success": True})
 
 
-@app.post("/api/sources/{chat_id}/toggle", dependencies=[Depends(verify_token)])
+@app.post("/api/sources/{chat_id}/toggle", dependencies=[Depends(require_permission("sources.write"))])  # v9.32
 async def toggle_source(chat_id: int, request: Request):
     """v9.20 P1: تفعيل/إيقاف مصدر — مدقَّق."""
     db = request.app.state.db
@@ -1968,7 +1972,7 @@ async def toggle_source(chat_id: int, request: Request):
     return JSONResponse({"success": True, "chat_id": chat_id, "enabled": new_state})
 
 
-@app.get("/api/audit", dependencies=[Depends(verify_token)])
+@app.get("/api/audit", dependencies=[Depends(require_permission("audit.read"))])  # v9.32
 async def get_audit(
     request: Request,
     limit: int = 200,
@@ -2002,7 +2006,7 @@ async def get_audit(
     return JSONResponse({"items": rows, "count": count})
 
 
-@app.get("/api/audit/export", dependencies=[Depends(verify_token)])
+@app.get("/api/audit/export", dependencies=[Depends(require_permission("audit.read"))])  # v9.32
 async def export_audit_csv(
     request: Request,
     action: str = "",
@@ -2049,7 +2053,7 @@ async def export_audit_csv(
     )
 
 
-@app.get("/api/backup/export", dependencies=[Depends(verify_token)])
+@app.get("/api/backup/export", dependencies=[Depends(require_permission("backup.read"))])  # v9.32
 async def backup_export(request: Request):
     """v9.22-1: تصدير البيانات الحرجة JSON — تنزيل برأس Content-Disposition."""
     db = request.app.state.db
@@ -2063,7 +2067,7 @@ async def backup_export(request: Request):
     )
 
 
-@app.post("/api/backup/import", dependencies=[Depends(verify_token)])
+@app.post("/api/backup/import", dependencies=[Depends(require_permission("backup.write"))])  # v9.32
 async def backup_import(request: Request):
     """v9.22-1: استيراد البيانات الحرجة — نسخة أمان أولاً، 400 إن لم يُستورد شيء."""
     db = request.app.state.db
@@ -2113,7 +2117,7 @@ async def backup_import(request: Request):
     })
 
 
-@app.get("/api/settings", dependencies=[Depends(verify_token)])
+@app.get("/api/settings", dependencies=[Depends(require_permission("settings.read"))])  # v9.32
 async def get_settings(request: Request):
     """
     v3.1: current effective values + editable schema + persistence status.
@@ -2135,7 +2139,7 @@ async def get_settings(request: Request):
     )
 
 
-@app.post("/api/settings", dependencies=[Depends(verify_token)])
+@app.post("/api/settings", dependencies=[Depends(require_permission("settings.write"))])  # v9.32
 async def update_settings(data: SettingsBody, request: Request):
     """
     v3.1 — DIRECT SAVE: every validated change is written to the
@@ -2188,7 +2192,7 @@ async def update_settings(data: SettingsBody, request: Request):
     )
 
 
-@app.post("/api/purge", dependencies=[Depends(verify_token)])
+@app.post("/api/purge", dependencies=[Depends(require_permission("settings.write"))])  # v9.32
 async def purge_queue(request: Request):
     db = request.app.state.db
     count = await db.purge_queue()
@@ -2196,7 +2200,7 @@ async def purge_queue(request: Request):
     return JSONResponse({"success": True, "purged": count})
 
 
-@app.post("/api/restart", dependencies=[Depends(verify_token)])
+@app.post("/api/restart", dependencies=[Depends(require_permission("deployment.execute"))])  # v9.32
 async def restart_bot(request: Request):
     """
     FIX #7: the previous implementation called bot.stop() then
@@ -2646,7 +2650,7 @@ async def _audit(request: Request, action: str, object_type: str = "",
         pass
 
 
-@app.get("/api/login/accounts", dependencies=[Depends(verify_token)])
+@app.get("/api/login/accounts", dependencies=[Depends(require_permission("accounts.read"))])  # v9.32
 async def login_accounts(request: Request):
     """قائمة الحسابات المهيأة وحالة جلساتها."""
     bot = getattr(request.app.state, "bot_ref", None)
@@ -2666,7 +2670,7 @@ async def login_accounts(request: Request):
     return JSONResponse({"accounts": out})
 
 
-@app.post("/api/login/send-code", dependencies=[Depends(verify_token)])
+@app.post("/api/login/send-code", dependencies=[Depends(require_permission("accounts.write"))])  # v9.32
 async def login_send_code(data: LoginSendCode):
     """إرسال رمز التحقق OTP إلى هاتف الحساب."""
     prefix = data.prefix.strip().upper()
@@ -2687,7 +2691,7 @@ async def login_send_code(data: LoginSendCode):
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {str(e)[:200]}")
 
 
-@app.post("/api/login/verify-code", dependencies=[Depends(verify_token)])
+@app.post("/api/login/verify-code", dependencies=[Depends(require_permission("accounts.write"))])  # v9.32
 async def login_verify_code(data: LoginVerifyCode):
     """التحقق من رمز OTP."""
     prefix = data.prefix.strip().upper()
@@ -2708,7 +2712,7 @@ async def login_verify_code(data: LoginVerifyCode):
     return await _login_success_response(prefix, result)
 
 
-@app.post("/api/login/verify-password", dependencies=[Depends(verify_token)])
+@app.post("/api/login/verify-password", dependencies=[Depends(require_permission("accounts.write"))])  # v9.32
 async def login_verify_password(data: LoginVerifyPassword):
     """التحقق من كلمة مرور التحقق بخطوتين (2FA)."""
     prefix = data.prefix.strip().upper()
