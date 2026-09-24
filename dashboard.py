@@ -290,17 +290,111 @@ class LoginVerifyPassword(BaseModel):
 security = HTTPBearer()
 
 
-def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)) -> str:
+class _AuthGuard:
+    """v9.28-2: حارس قفل ضد تخمين توكن اللوحة (brute-force lockout).
+
+    عدّاد فشل لكل IP (أول قيمة X-Forwarded-For خلف بروكسي Render وإلا
+    client.host): AUTH_FAIL_THRESHOLD فشلاً خلال AUTH_FAIL_WINDOW_SECONDS
+    = قفل AUTH_LOCKOUT_BASE_SECONDS يتضاعف أُسّياً حتى سقف
+    AUTH_LOCKOUT_MAX_SECONDS. لا حظر دائم فلا يمكن لمخرب إغلاق المدير
+    الحقيقي، ونجاح واحد بتوكن صحيح يمسح الحالة فوراً. في الذاكرة فقط —
+    ينتفي بإعادة التشغيل (مقبول لسقف 15 دقيقة).
     """
-    Timing-safe token comparison (fix #8), sourced from CFG.DASHBOARD_AUTH_TOKEN
-    — the single source of truth already established by config.py — instead
-    of a second, independent os.getenv() read that could theoretically drift.
+
+    def __init__(self) -> None:
+        self._fails: Dict[str, List[float]] = {}
+        self._lockout_until: Dict[str, float] = {}
+        self._lockout_count: Dict[str, int] = {}
+        self.threshold = max(1, int(os.getenv("AUTH_FAIL_THRESHOLD", "10")))
+        self.window = max(10, int(os.getenv("AUTH_FAIL_WINDOW_SECONDS", "300")))
+        self.base_lock = max(5, int(os.getenv("AUTH_LOCKOUT_BASE_SECONDS", "60")))
+        self.max_lock = max(self.base_lock, int(os.getenv("AUTH_LOCKOUT_MAX_SECONDS", "900")))
+
+    @staticmethod
+    def client_ip(request: Request) -> str:
+        xff = request.headers.get("x-forwarded-for", "")
+        if xff:
+            first = xff.split(",")[0].strip()
+            if first:
+                return first[:64]
+        try:
+            return request.client.host if request.client else "unknown"
+        except Exception:
+            return "unknown"
+
+    def locked_seconds_left(self, ip: str) -> int:
+        until = self._lockout_until.get(ip, 0.0)
+        return max(0, int(until - time.time()))
+
+    def record_failure(self, ip: str) -> int:
+        """يسجل فشلاً — يعيد الثواني المتبقية للقفل (0 = غير مقفل)."""
+        now = time.time()
+        bucket = [t for t in self._fails.get(ip, []) if now - t < self.window]
+        bucket.append(now)
+        self._fails[ip] = bucket
+        if len(bucket) < self.threshold:
+            return self.locked_seconds_left(ip)
+        # بلوغ العتبة → قفل يتضاعف أُسّياً حتى السقف
+        count = min(self._lockout_count.get(ip, 0) + 1, 20)
+        self._lockout_count[ip] = count
+        lock = min(self.base_lock * (2 ** (count - 1)), self.max_lock)
+        self._lockout_until[ip] = now + lock
+        self._fails[ip] = []
+        return int(lock)
+
+    def record_success(self, ip: str) -> None:
+        """نجاح واحد بتوكن صحيح يمسح حالة الـIP فوراً."""
+        self._fails.pop(ip, None)
+        self._lockout_until.pop(ip, None)
+        self._lockout_count.pop(ip, None)
+
+
+_auth_guard = _AuthGuard()
+
+
+async def verify_token(request: Request, credentials: HTTPAuthorizationCredentials = Depends(security)) -> str:
     """
+    Timing-safe token comparison (fix #8), sourced from CFG.DASHBOARD_AUTH_TOKEN.
+
+    v9.28-2: async (التعريف المتزامن يجريه FastAPI في threadpool بلا event
+    loop فتسقط جدولة مهام التدقيق/الإشعارات بصمت) + حارس القفل: الـIP
+    المقفل يُرفض 429 مع Retry-After قبل أي مقارنة توكن. الطلبات بلا
+    ترويزة تُرفض من HTTPBearer قبل الحارس فلا تُحتسب — الحارس يستهدف
+    تخمين التوكن الفعلي فقط.
+    """
+    ip = _auth_guard.client_ip(request)
+    remaining = _auth_guard.locked_seconds_left(ip)
+    if remaining > 0:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Too many failed attempts. Try again in {remaining}s.",
+            headers={"Retry-After": str(remaining)},
+        )
     token = credentials.credentials
     expected_token = CFG.DASHBOARD_AUTH_TOKEN
-    if not hmac.compare_digest(token, expected_token):
-        raise HTTPException(status_code=401, detail="Invalid token")
-    return token
+    if hmac.compare_digest(token, expected_token):
+        _auth_guard.record_success(ip)
+        return token
+    lock = _auth_guard.record_failure(ip)
+    if lock > 0:
+        # الطلب العابر للعتبة يُرفض 401 كطبيعته — القفل يسري على الطلبات
+        # التالية (نمط cron-10 الموثق: 10 أخطاء = 401، والقادم = 429).
+        db = getattr(request.app.state, "db", None)
+        if db is not None:
+            try:
+                _track_local_task(db.record_audit(
+                    actor="botpanel-admin", action="auth.lockout", object_type="ip",
+                    object_id=ip, new_value=f"locked {lock}s",
+                    source="botpanel",
+                ), "audit_lockout")
+                _track_local_task(db.record_notification(
+                    ntype="auth.lockout", title=f"🔒 محاولة تخمين توكن — قفل {lock}s",
+                    body=f"IP {ip} أُقفل بعد {_auth_guard.threshold} فشلات. القفل يتضاعف حتى {_auth_guard.max_lock}s.",
+                    severity="critical", object_type="ip", object_id=ip,
+                ), "notify_lockout")
+            except Exception:
+                pass
+    raise HTTPException(status_code=401, detail="Invalid token")
 
 
 # =============================================================================
@@ -2409,7 +2503,11 @@ def _verify_ws_token(websocket: WebSocket) -> bool:
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
+    ws_ip = _auth_guard.client_ip(websocket)
     if not _verify_ws_token(websocket):
+        # v9.28-2: التوكن الخاطئ عبر /ws يُحتسب في نفس عدّاد الحارس
+        # (لا باب جانبي لتخمين التوكن خارج مسار API).
+        lock = _auth_guard.record_failure(ws_ip)
         # Accept-then-close is the only cross-browser way to deny a WS
         # handshake with a meaningful code (1008 = Policy Violation).
         await websocket.accept()
@@ -2417,8 +2515,10 @@ async def websocket_endpoint(websocket: WebSocket):
         logger.warning(
             "Rejected unauthenticated WebSocket handshake "
             f"from {websocket.client.host if websocket.client else 'unknown'}"
+            + (f" — IP locked for {lock}s" if lock > 0 else "")
         )
         return
+    _auth_guard.record_success(ws_ip)
     await manager.connect(websocket)
     try:
         if websocket.app.state.stats_cache:

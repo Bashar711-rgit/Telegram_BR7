@@ -968,7 +968,11 @@ class EnhancedTelegramBot:
         while self.is_running:
             try:
                 await asyncio.sleep(CFG.CLEANUP_INTERVAL)
-                deleted = await self.db.cleanup_old_data(days=7)
+                deleted = await self.db.cleanup_old_data(
+                    days=CFG.RETENTION_MESSAGES_DAYS,
+                    audit_days=CFG.RETENTION_AUDIT_DAYS,
+                    notifications_days=CFG.RETENTION_NOTIFICATIONS_DAYS,
+                )
                 if deleted:
                     logger.info(f"Cleanup: {deleted} old rows removed")
                 dl_cleaned = await self.db.cleanup_dead_letters(days=CFG.DEAD_LETTER_CLEANUP_DAYS)

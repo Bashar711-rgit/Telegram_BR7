@@ -628,6 +628,18 @@ body { font-family: var(--sans); background: var(--bg); color: var(--text); font
   padding: 2px 12px; border-radius: 20px; color: var(--text2);
 }
 
+/* ── v9.28 AUTH GUARD ────────────────────────────────────────── */
+.lockout-msg {
+  color: #facc15 !important;
+  background: rgba(250,204,21,0.08);
+  border: 1px solid rgba(250,204,21,0.3);
+  border-radius: 8px; padding: 8px 10px;
+  font-size: 12px; margin-top: 10px;
+  animation: lockPulse 2s ease-in-out infinite;
+}
+@keyframes lockPulse { 0%,100% { opacity: 1; } 50% { opacity: .7; } }
+@media (prefers-reduced-motion: reduce) { .lockout-msg { animation: none !important; } }
+
 /* ── v9.27 AUDIT V2 ──────────────────────────────────────────── */
 .audit-toolbar { display: flex; flex-wrap: wrap; gap: 8px; padding: 12px 16px 4px; }
 .audit-toolbar .kw-input { flex: 1 1 200px; min-width: 160px; }
@@ -796,7 +808,7 @@ body { font-family: var(--sans); background: var(--bg); color: var(--text); font
     <div class="brand-icon">🤖</div>
     <div>
       <div class="brand-name">BotPanel</div>
-      <div class="brand-ver" id="brandVer">BR7 · v9.25</div>
+      <div class="brand-ver" id="brandVer">BR7 · v9.28</div>
     </div>
   </div>
 
@@ -1003,17 +1015,66 @@ function logEvent(lvl, msg) {
 // ================================================================
 // AUTHENTICATION
 // ================================================================
-function authenticate() {
+async function authenticate() {
     const token = document.getElementById('tokenInput').value.trim();
-    if (token) {
-        AUTH_TOKEN = token;
-        localStorage.setItem('dashboard_token', token);
-        document.getElementById('tokenModal').classList.add('hidden');
-        document.getElementById('tokenError').style.display = 'none';
-        initApp();
-    } else {
-        document.getElementById('tokenError').style.display = 'block';
+    const errEl = document.getElementById('tokenError');
+    if (!token) { errEl.style.display = 'block'; return; }
+    // v9.28-2: الدخول يتحقق فعلياً من التوكن عبر /api/stats قبل إغلاق
+    // النافذة (كان يكتفي بتخزينه!) — والقفل يعرض عدّاداً حياً.
+    AUTH_TOKEN = token;
+    try {
+        const res = await fetch(`${API_BASE}/api/stats`, { headers: { 'Authorization': `Bearer ${token}` } });
+        if (res.status === 429) {
+            const retryAfter = parseInt(res.headers.get('retry-after') || '60', 10);
+            localStorage.removeItem('dashboard_token'); AUTH_TOKEN = '';
+            startLockoutCountdown(retryAfter);
+            return;
+        }
+        if (!res.ok) {
+            localStorage.removeItem('dashboard_token'); AUTH_TOKEN = '';
+            errEl.textContent = '✗ توكن غير صحيح';
+            errEl.style.display = 'block';
+            return;
+        }
+    } catch (e) {
+        localStorage.removeItem('dashboard_token'); AUTH_TOKEN = '';
+        errEl.textContent = '✗ تعذر الوصول للخادم';
+        errEl.style.display = 'block';
+        return;
     }
+    localStorage.setItem('dashboard_token', token);
+    document.getElementById('tokenModal').classList.add('hidden');
+    errEl.style.display = 'none';
+    errEl.textContent = '✗ توكن غير صحيح';
+    initApp();
+}
+
+// v9.28-2: عدّاد تنازلي حي بالثواني على شاشة الدخول (قفل الحارس)
+let LOCKOUT_TIMER = null;
+function startLockoutCountdown(seconds) {
+    const modal = document.getElementById('tokenModal');
+    const errEl = document.getElementById('tokenError');
+    const btn = modal ? modal.querySelector('.tb-btn.primary') : null;
+    if (!modal || !errEl) return;
+    modal.classList.remove('hidden');
+    let left = seconds;
+    errEl.className = 'lockout-msg';
+    clearInterval(LOCKOUT_TIMER);
+    const tick = () => {
+        errEl.textContent = `🔒 محاولات كثيرة — الحساب مقفل. أعِد المحاولة بعد ${left} ثانية`;
+        errEl.style.display = 'block';
+        if (btn) { btn.disabled = true; btn.textContent = `مقفل (${left}s)`; }
+        if (left <= 0) {
+            clearInterval(LOCKOUT_TIMER);
+            errEl.className = '';
+            errEl.style.display = 'none';
+            errEl.textContent = '✗ توكن غير صحيح';
+            if (btn) { btn.disabled = false; btn.textContent = 'دخول'; }
+        }
+        left--;
+    };
+    tick();
+    LOCKOUT_TIMER = setInterval(tick, 1000);
 }
 document.getElementById('tokenInput').addEventListener('keydown', e => {
     if (e.key === 'Enter') authenticate();
@@ -1047,6 +1108,13 @@ async function apiFetch(endpoint, options = {}) {
     if (response.status === 401) {
         logout();
         throw new Error('Unauthorized');
+    }
+    if (response.status === 429) {
+        // v9.28-2: قفل الحارس — العودة لشاشة الدخول بعدّاد حي
+        const retryAfter = parseInt(response.headers.get('retry-after') || '60', 10);
+        logout();
+        startLockoutCountdown(retryAfter);
+        throw new Error('Too many attempts');
     }
     return response.json();
 }
@@ -2050,7 +2118,7 @@ const PAGES = {
                     <div class="panel-actions"><button class="tb-btn" onclick="renderSysInfo(true)" title="تحديث من الخادم">⟳</button></div>
                 </div>
                 <div class="sysinfo-grid" id="sysinfo-grid">
-                    <div class="sysinfo-cell"><span class="k">الإصدار</span><span class="v">v9.25</span></div>
+                    <div class="sysinfo-cell"><span class="k">الإصدار</span><span class="v">v9.28</span></div>
                     <div class="sysinfo-cell"><span class="k">جاري التحميل…</span><span class="v">—</span></div>
                 </div>
             </div>
@@ -3308,7 +3376,7 @@ function renderSettings(data) {
     });
     const order = {
         destinations: '🎯', alerts: '🔔', dedup: '🛡️', antispam: '🚫',
-        filtering: '🧠', monitoring: '📡', limits: '⚙️'
+        filtering: '🧠', monitoring: '📡', limits: '⚙️', retention: '🗄️'
     };
     const form = document.getElementById('settings-form');
     if (!form) return;

@@ -102,6 +102,8 @@ class TestAuditAPI:
         # seed 2 operations
         await ac.post("/api/blocked/senders", headers=h, json={"user_id": 555001, "reason": "csv-qa"})
         await ac.post("/api/blocked/senders", headers=h, json={"user_id": 555002, "reason": "csv-qa"})
+        from conftest import drain_dashboard_tasks
+        await drain_dashboard_tasks()
         r = await ac.get("/api/audit/export", headers=h)
         assert r.status_code == 200
         assert "attachment" in r.headers.get("content-disposition", "")
@@ -128,6 +130,8 @@ class TestAuditAPI:
     async def test_q_filter_endpoint(self, api_client):
         ac, h = api_client
         await ac.post("/api/blocked/chats", headers=h, json={"chat_id": -1003131313, "reason": "needle-XYZZY"})
+        from conftest import drain_dashboard_tasks
+        await drain_dashboard_tasks()
         r = await ac.get("/api/audit?q=needle-XYZZY", headers=h)
         items = r.json()["items"]
         assert len(items) == 1 and items[0]["action"] == "block.chat"

@@ -33,6 +33,24 @@ if _TEST_DB.exists():
 from database import EnhancedDatabase  # noqa: E402
 
 
+async def drain_dashboard_tasks(app=None):
+    """Wait for fire-and-forget audit/notification tasks to finish.
+
+    Audit writes are fire-and-forget by design (v9.18); tests that read
+    /api/audit right after a mutating call must drain the tracked tasks
+    first — otherwise the read races the write.
+    """
+    import asyncio
+    import dashboard as _dash
+    for _ in range(50):
+        pending = [t for t in getattr(_dash, "_background_dashboard_tasks", set())
+                   if not t.done()]
+        if not pending:
+            break
+        await asyncio.sleep(0.02)
+        await asyncio.gather(*pending, return_exceptions=True)
+
+
 @pytest.fixture()
 async def db():
     """Fresh EnhancedDatabase (SQLite) per test, without background loops.

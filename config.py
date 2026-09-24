@@ -378,6 +378,11 @@ class _ConfigData:
     DASHBOARD_ENABLED: bool
     DASHBOARD_PORT: int
     DASHBOARD_AUTH_TOKEN: str
+    # v9.28-1: سياسات الاحتفاظ — قابلة للضبط حياً من اللوحة (مجموعة retention)
+    # القيم الافتراضية = السلوك التاريخي حرفياً (رسائل 7 / تدقيق 90 / إشعارات 30)
+    RETENTION_MESSAGES_DAYS: int
+    RETENTION_AUDIT_DAYS: int
+    RETENTION_NOTIFICATIONS_DAYS: int
 
     # ── Alert send behaviour (audit H-02) ──
     # When True (legacy behaviour), every text alert tries to attach the
@@ -682,6 +687,10 @@ class Config:
             DASHBOARD_ENABLED=SecretManager.get_bool("DASHBOARD_ENABLED", False),
             DASHBOARD_PORT=SecretManager.get_int("DASHBOARD_PORT", 8080, required=False),
             DASHBOARD_AUTH_TOKEN=dash_token,
+            # v9.28-1: سياسات الاحتفاظ (7/90/30 = السلوك التاريخي حرفياً)
+            RETENTION_MESSAGES_DAYS=SecretManager.get_int("RETENTION_MESSAGES_DAYS", 7, required=False),
+            RETENTION_AUDIT_DAYS=SecretManager.get_int("RETENTION_AUDIT_DAYS", 90, required=False),
+            RETENTION_NOTIFICATIONS_DAYS=SecretManager.get_int("RETENTION_NOTIFICATIONS_DAYS", 30, required=False),
             # ========== Alert send behaviour (audit H-02) ==========
             # Default False: plain send_message is the fast path. Set
             # ATTACH_GROUP_PHOTO=true to restore the legacy behaviour of

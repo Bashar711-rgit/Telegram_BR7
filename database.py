@@ -2189,10 +2189,15 @@ class EnhancedDatabase:
             logger.error(f"Stats query error: {e}")
         return out
 
-    async def cleanup_old_data(self, days: int = 7) -> int:
+    async def cleanup_old_data(self, days: int = 7, audit_days: Optional[int] = None,
+                               notifications_days: Optional[int] = None) -> int:
         """
         Remove old messages and alerts.
         Called exclusively from main.py (fix #5: single cleanup owner).
+
+        v9.28-1: audit_days/notifications_days اختياريان — None = القيم
+        الثابتة القديمة (90/30) توافق خلفي كامل مع المتصلين القدامى.
+        أرضية max(1, ...) فلا تحذف قيمة فاسدة كل التاريخ.
         """
         cutoff = time.time() - days * 86400
         total = 0
@@ -2207,14 +2212,14 @@ class EnhancedDatabase:
                 await self._execute("DELETE FROM spam_watch WHERE watch_until < ?", (cutoff,))
             except Exception:
                 pass
-            # v9.18 P0: تقليم سجل التدقيق (90 يوماً — قابل للضبط من v9.28)
+            # v9.18 P0: تقليم سجل التدقيق — v9.28: قيمة اللوحة أو 90 التاريخية
             try:
-                await self.cleanup_old_audit_logs(90)
+                await self.cleanup_old_audit_logs(90 if audit_days is None else max(1, int(audit_days)))
             except Exception:
                 pass
-            # v9.24 P5-1: تقليم الإشعارات (30 يوماً — قابل للضبط من v9.28)
+            # v9.24 P5-1: تقليم الإشعارات — v9.28: قيمة اللوحة أو 30 التاريخية
             try:
-                await self.cleanup_old_notifications(30)
+                await self.cleanup_old_notifications(30 if notifications_days is None else max(1, int(notifications_days)))
             except Exception:
                 pass
             await self._commit()

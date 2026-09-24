@@ -235,6 +235,8 @@ class TestRulesAPI:
         rid = r.json()["rule"]["id"]
         await ac.post(f"/api/rules/{rid}/toggle", headers=h)
         await ac.delete(f"/api/rules/{rid}", headers=h)
+        from conftest import drain_dashboard_tasks
+        await drain_dashboard_tasks()
         r = await ac.get("/api/audit?limit=50", headers=h)
         actions = [a["action"] for a in r.json()["items"]]
         assert "rule.add" in actions and "rule.toggle" in actions and "rule.remove" in actions
@@ -252,6 +254,8 @@ class TestAllowedAPI:
         assert r.status_code == 200
         r = await ac.delete("/api/allowed/sender/31337", headers=h)
         assert r.json()["success"] is True
+        from conftest import drain_dashboard_tasks
+        await drain_dashboard_tasks()
         r = await ac.get("/api/audit?limit=50", headers=h)
         actions = [a["action"] for a in r.json()["items"]]
         assert "allow.add" in actions and "allow.remove" in actions

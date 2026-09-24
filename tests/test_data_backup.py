@@ -169,6 +169,8 @@ class TestRuleEdit:
         assert rule["action"] == "tag" and rule["priority"] == 7
         # enabled/hits untouched
         assert rule["enabled"] == 1 and rule["hits"] == 0
+        from conftest import drain_dashboard_tasks
+        await drain_dashboard_tasks()
         r = await ac.get("/api/audit?limit=50", headers=h)
         actions = [a["action"] for a in r.json()["items"]]
         assert "rule.edit" in actions

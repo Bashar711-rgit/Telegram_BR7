@@ -264,10 +264,31 @@ SETTINGS_SCHEMA: Dict[str, Dict[str, Any]] = {
         "cfg": "MEMORY_THRESHOLD_MB", "limiter": False, "group": "limits",
         "note": "عند تجاوز حجم قاعدة البيانات هذا الحد يُطلق تنظيف طارئ.",
     },
+
+    # ── v9.28-1: سياسات الاحتفاظ — قابلة للضبط حياً (لا إعادة تشغيل) ──
+    "retention_messages_days": {
+        "label": "الاحتفاظ بالرسائل (أيام)", "type": int, "min": 1, "max": 365,
+        "cfg": "RETENTION_MESSAGES_DAYS", "limiter": False, "group": "retention",
+        "note": "تُحذف الرسائل والتنبيهات الأقدم من هذه المدة في كل دورة تنظيف.",
+        "validate": lambda v: None if v >= 1 else "قيمة غير معقولة",
+    },
+    "retention_audit_days": {
+        "label": "الاحتفاظ بسجل التدقيق (أيام)", "type": int, "min": 30, "max": 3650,
+        "cfg": "RETENTION_AUDIT_DAYS", "limiter": False, "group": "retention",
+        "note": "حد أدنى 30 يوماً عمداً لحماية الأثر التدقيقي — لا يُنصح بتقصيره.",
+        "validate": lambda v: None if v >= 30 else "الحد الأدنى للتدقيق 30 يوماً (حماية الأثر)",
+    },
+    "retention_notifications_days": {
+        "label": "الاحتفاظ بالإشعارات (أيام)", "type": int, "min": 1, "max": 365,
+        "cfg": "RETENTION_NOTIFICATIONS_DAYS", "limiter": False, "group": "retention",
+        "note": "تُحذف الإشعارات المقروءة وغير المقروءة على السواء بعد المدة.",
+        "validate": lambda v: None if v >= 1 else "قيمة غير معقولة",
+    },
 }
 
 _UI_GROUPS = {
     "destinations": "الوجهات",
+    "retention": "🗄️ سياسات الاحتفاظ",
     "alerts": "التنبيهات",
     "dedup": "منع التكرار",
     "antispam": "مكافحة السبام",
