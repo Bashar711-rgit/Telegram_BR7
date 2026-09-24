@@ -316,6 +316,7 @@ const SECTIONS = [
   { id: 'keywords',  icon: '🔑', title: 'الكلمات المفتاحية' },
   { id: 'alerts',    icon: '🚨', title: 'مركز التنبيهات' },
   { id: 'accounts',  icon: '👥', title: 'إدارة الحسابات' },
+  { id: 'users',     icon: '🔐', title: 'المستخدمون والأدوار' },
   { id: 'settings',  icon: '⚙️', title: 'إعدادات البوت' },
   { id: 'logs',      icon: '📜', title: 'السجلات' },
   { id: 'control',   icon: '🎛️', title: 'مركز التحكم' },
@@ -348,7 +349,7 @@ function navigate(section) {
   document.getElementById('sidebar').classList.add('md:translate-x-0');
   document.getElementById('sidebarOverlay').classList.add('hidden');
   const render = { dashboard: renderDashboard, keywords: renderKeywords, alerts: renderAlerts,
-                   accounts: renderAccounts, settings: renderSettings, logs: renderLogs, control: renderControl }[section];
+                   accounts: renderAccounts, users: renderUsers, settings: renderSettings, logs: renderLogs, control: renderControl }[section];
   render();
 }
 
@@ -1006,6 +1007,158 @@ async function copyLogs(){
 }
 
 /* ============================ Control Center ============================ */
+/* ==========================================================================
+ * v9.29 P4 RBAC — المستخدمون والأدوار (Master Prompt 8/9)
+ * ==========================================================================*/
+let usersData = null;
+
+async function renderUsers(){
+  el.main.innerHTML=`
+  <div class="card mb-4">
+    <div class="flex items-center justify-between mb-1">
+      <h3 class="font-black">🔐 مستخدمو اللوحة والأدوار</h3>
+      <button id="usr-refresh" class="text-xs lnk">تحديث</button>
+    </div>
+    <p class="text-xs muted2 mb-3">حسابات بشرية بأدوار وصلاحيات دقيقة (Master Prompt 9). التوكن الرئيسي يبقى مفتاح المدير الأقصى. الحذف ناعم — يبقى في السجل للتدقيق.</p>
+    <div id="usr-stats" class="grid grid-cols-2 sm:grid-cols-4 gap-2 mb-4"></div>
+    <div class="grid sm:grid-cols-4 gap-2 mb-1">
+      <input id="usr-new-name" class="px-3 py-2 rounded-xl bg-slate-100 dark:bg-slate-800 text-sm border border-transparent focus:border-sky-500 outline-none" placeholder="اسم المستخدم (3-32)" maxlength="32" dir="ltr">
+      <input id="usr-new-pass" type="password" class="px-3 py-2 rounded-xl bg-slate-100 dark:bg-slate-800 text-sm border border-transparent focus:border-sky-500 outline-none" placeholder="كلمة المرور (8+)" dir="ltr">
+      <select id="usr-new-role" class="px-3 py-2 rounded-xl bg-slate-100 dark:bg-slate-800 text-sm outline-none"></select>
+      <button id="usr-create" class="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-sm font-bold">➕ إنشاء مستخدم</button>
+    </div>
+    <p id="usr-role-hint" class="text-[11px] muted2 mt-1"></p>
+  </div>
+  <div class="card">
+    <h3 class="font-black mb-3">القائمة</h3>
+    <div id="usr-list" class="space-y-2 max-h-[60vh] overflow-y-auto thin-scroll"><div class="muted2 text-sm">جارِ التحميل…</div></div>
+  </div>`;
+  document.getElementById('usr-refresh').onclick=()=>renderUsers();
+  document.getElementById('usr-create').onclick=usersCreate;
+  document.getElementById('usr-new-role').onchange=usersRoleHint;
+  try{
+    usersData = await api('/admin/api/users');
+    usersRenderStats(); usersRenderList(); usersFillRoleSelect();
+  }catch(e){
+    document.getElementById('usr-list').innerHTML=`<div class="text-red-500 text-sm">فشل التحميل: ${esc(e.message)}</div>`;
+  }
+}
+
+function usersRoleHint(){
+  const sel=document.getElementById('usr-new-role');
+  const lbl=(usersData&&usersData.role_labels)||{};
+  document.getElementById('usr-role-hint').textContent = lbl[sel.value] ? ('الدور: '+lbl[sel.value]) : '';
+}
+
+function usersFillRoleSelect(){
+  const sel=document.getElementById('usr-new-role');
+  if(!sel||!usersData)return;
+  const lbl=usersData.role_labels||{};
+  sel.innerHTML=(usersData.roles||[]).map(r=>`<option value="${esc(r)}">${esc(r)}${lbl[r]?(' — '+esc(lbl[r])):''}</option>`).join('');
+  usersRoleHint();
+}
+
+function usersRenderStats(){
+  const wrap=document.getElementById('usr-stats'); if(!wrap||!usersData)return;
+  const us=usersData.users||[];
+  const active=us.filter(u=>u.enabled&&!u.deleted_at).length;
+  const sup=us.filter(u=>u.role==='super_admin'&&!u.deleted_at).length;
+  const dis=us.filter(u=>!u.enabled&&!u.deleted_at).length;
+  wrap.innerHTML=[
+    ['الإجمالي',us.length,'text-sky-500'],
+    ['نشط',active,'text-emerald-500'],
+    ['معطّل',dis,'text-amber-500'],
+    ['مدير أقصى',sup,'text-rose-500'],
+  ].map(([k,v,c])=>`
+    <div class="rounded-xl bg-slate-100 dark:bg-slate-800/60 p-3 text-center">
+      <div class="text-2xl font-black ${c}">${v}</div>
+      <div class="text-[11px] muted2">${k}</div>
+    </div>`).join('');
+}
+
+function usersRenderList(){
+  const wrap=document.getElementById('usr-list'); if(!wrap||!usersData)return;
+  const us=usersData.users||[];
+  const lbl=usersData.role_labels||{};
+  if(!us.length){wrap.innerHTML='<div class="muted2 text-sm">لا مستخدمون بعد — أنشئ أول حساب من النموذج أعلاه.</div>';return;}
+  const roleColor={super_admin:'bg-rose-100 text-rose-700 dark:bg-rose-900/40 dark:text-rose-300',
+                   admin:'bg-sky-100 text-sky-700 dark:bg-sky-900/40 dark:text-sky-300',
+                   supervisor:'bg-violet-100 text-violet-700 dark:bg-violet-900/40 dark:text-violet-300',
+                   operator:'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300',
+                   viewer:'bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300'};
+  wrap.innerHTML=us.map(u=>{
+    const deleted=!!u.deleted_at;
+    const badge=roleColor[u.role]||roleColor.viewer;
+    const last=u.last_login_at?new Date(u.last_login_at.replace(' ','T')+'Z').toLocaleString('ar'):'—';
+    return `
+    <div class="rounded-xl border ${deleted?'opacity-50 border-slate-200 dark:border-slate-700':'border-slate-200 dark:border-slate-700'} p-3 flex flex-wrap items-center gap-2">
+      <div class="flex-1 min-w-[180px]">
+        <div class="font-bold text-sm">${deleted?'🗑 ':''}${esc(u.username)} ${deleted?'<span class="text-[10px] muted2">(محذوف ناعماً)</span>':''}</div>
+        <div class="text-[11px] muted2">آخر دخول: ${last}</div>
+      </div>
+      <span class="text-[11px] px-2 py-1 rounded-lg font-bold ${badge}">${esc(u.role)}</span>
+      <span class="text-[11px] px-2 py-1 rounded-lg font-bold ${u.enabled?'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300':'bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300'}">${u.enabled?'نشط':'معطّل'}</span>
+      ${deleted?'':`
+      <select data-uid="${u.id}" class="usr-role-sel px-2 py-1.5 rounded-lg bg-slate-100 dark:bg-slate-800 text-xs outline-none" title="تغيير الدور">
+        ${(usersData.roles||[]).map(r=>`<option value="${esc(r)}" ${r===u.role?'selected':''}>${esc(r)}</option>`).join('')}
+      </select>
+      <button data-uid="${u.id}" data-en="${u.enabled?1:0}" class="usr-toggle px-2 py-1.5 rounded-lg text-xs font-bold ${u.enabled?'bg-amber-500 hover:bg-amber-600 text-white':'bg-emerald-600 hover:bg-emerald-700 text-white'}">${u.enabled?'تعطيل':'تفعيل'}</button>
+      <button data-uid="${u.id}" data-name="${esc(u.username)}" class="usr-pass px-2 py-1.5 rounded-lg text-xs font-bold bg-sky-600 hover:bg-sky-700 text-white">كلمة مرور</button>
+      <button data-uid="${u.id}" data-name="${esc(u.username)}" class="usr-del px-2 py-1.5 rounded-lg text-xs font-bold bg-red-600 hover:bg-red-700 text-white">حذف</button>`}
+    </div>`;
+  }).join('');
+  wrap.querySelectorAll('.usr-role-sel').forEach(s=>s.onchange=()=>usersSetRole(+s.dataset.uid,s.value));
+  wrap.querySelectorAll('.usr-toggle').forEach(b=>b.onclick=()=>usersToggle(+b.dataset.uid,b.dataset.en==='1'));
+  wrap.querySelectorAll('.usr-pass').forEach(b=>b.onclick=()=>usersResetPass(+b.dataset.uid,b.dataset.name));
+  wrap.querySelectorAll('.usr-del').forEach(b=>b.onclick=()=>usersDelete(+b.dataset.uid,b.dataset.name));
+}
+
+async function usersCreate(){
+  const name=document.getElementById('usr-new-name').value.trim();
+  const pass=document.getElementById('usr-new-pass').value;
+  const role=document.getElementById('usr-new-role').value;
+  if(!name||!pass){toast('أدخل الاسم وكلمة المرور','warning');return;}
+  if(!await confirmDialog(`إنشاء المستخدم «${name}» بدور ${role}؟`))return;
+  try{
+    await api('/admin/api/users/create',{method:'POST',body:{username:name,password:pass,role}});
+    toast('أُنشئ المستخدم ✓','success');
+    renderUsers();
+  }catch(e){toast(e.message,'error');}
+}
+
+async function usersSetRole(uid,role){
+  try{
+    await api('/admin/api/users/update',{method:'POST',body:{user_id:uid,role}});
+    toast('تغيّر الدور ✓','success'); renderUsers();
+  }catch(e){toast(e.message,'error');renderUsers();}
+}
+
+async function usersToggle(uid,currentlyEnabled){
+  if(!await confirmDialog(currentlyEnabled?'تعطيل هذا الحساب سيمنع دخوله فوراً. متابعة؟':'تفعيل هذا الحساب؟'))return;
+  try{
+    await api('/admin/api/users/update',{method:'POST',body:{user_id:uid,enabled:!currentlyEnabled}});
+    toast(currentlyEnabled?'عُطّل الحساب ✓':'فُعّل الحساب ✓','success'); renderUsers();
+  }catch(e){toast(e.message,'error');}
+}
+
+async function usersResetPass(uid,name){
+  const p=prompt(`كلمة مرور جديدة لـ «${name}» (8 أحرف على الأقل):`);
+  if(p===null)return;
+  if(p.length<8){toast('8 أحرف على الأقل','warning');return;}
+  try{
+    await api('/admin/api/users/update',{method:'POST',body:{user_id:uid,password:p}});
+    toast('أُعيدت كلمة المرور ✓','success');
+  }catch(e){toast(e.message,'error');}
+}
+
+async function usersDelete(uid,name){
+  if(!await confirmDialog(`حذف ناعم للحساب «${name}»؟ لن يستطيع الدخول، ويبقى سجله في التدقيق.`))return;
+  try{
+    await api('/admin/api/users/delete',{method:'POST',body:{user_id:uid}});
+    toast('حُذف الحساب (ناعم) ✓','success'); renderUsers();
+  }catch(e){toast(e.message,'error');}
+}
+
 function renderControl(){
   el.main.innerHTML=`
   <div class="card mb-4">

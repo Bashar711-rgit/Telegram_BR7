@@ -93,6 +93,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac  # v9.29: تحقق كلمات المرور timing-safe (compare_digest)
 import json
 import os
 import sqlite3
@@ -808,6 +809,22 @@ class EnhancedDatabase:
                 source TEXT DEFAULT 'botpanel',
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             );
+            -- v9.29 P4 RBAC: مستخدمو اللوحة بأدوار وصلاحيات دقيقة. التوكن
+            -- الرئيسي يبقى مفتاح Super Admin الأعلى، وهذا الجدول يضيف حسابات
+            -- بشرية بأدوار (Master Prompt 9.1) مع Soft Delete (10.2) وتدقيق
+            -- كامل. كلمة المرور scrypt-hashed — لا يُعاد النص أبداً.
+            CREATE TABLE IF NOT EXISTS dashboard_users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'viewer',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                last_login_at DATETIME,
+                deleted_at DATETIME
+            );
+            CREATE INDEX IF NOT EXISTS idx_dashboard_users_username
+                ON dashboard_users (username);
         """
         for stmt in stmts.split(";"):
             s = stmt.strip()
@@ -2557,6 +2574,212 @@ class EnhancedDatabase:
             return cur.rowcount or 0
         except Exception as e:
             logger.debug(f"cleanup_old_audit_logs skipped: {e}")
+            return 0
+
+    # ------------------------------------------------------------------
+    # v9.29 P4 RBAC: مستخدمو اللوحة (dashboard_users).
+    # ------------------------------------------------------------------
+
+    # v9.29: أدوار اللوحة — Master Prompt 9.1 حرفياً (الصلاحيات الدقيقة
+    # تُعرَّف في dashboard.py ROLE_PERMISSIONS ويعاد تسطيحها هنا للعرض).
+    DASHBOARD_ROLES: Tuple[str, ...] = (
+        "super_admin", "admin", "supervisor", "operator", "viewer",
+    )
+
+    @staticmethod
+    def hash_dashboard_password(password: str) -> str:
+        """v9.29: scrypt hashing بصيغة scrypt$n$r$p$salt$hash (stdlib فقط).
+
+        معاملات ثابتة وموثقة (n=2^14, r=8, p=1) — التحقق يستخدم نفس
+        المعاملات من رأس السلسلة فالترقية مستقبلية دون كسر القديم.
+        """
+        salt = os.urandom(16)
+        digest = hashlib.scrypt(
+            password.encode("utf-8"), salt=salt, n=2 ** 14, r=8, p=1, dklen=32
+        )
+        return f"scrypt$16384$8$1${salt.hex()}${digest.hex()}"
+
+    @staticmethod
+    def verify_dashboard_password(password: str, stored: str) -> bool:
+        """v9.29: تحقق timing-safe من كلمة المرور مقابل السلسلة المخزنة.
+
+        أي خلل في الصيغة (سلسلة قديمة/تالفة) يعيد False بدل رفع استثناء.
+        """
+        try:
+            parts = (stored or "").split("$")
+            if len(parts) != 6 or parts[0] != "scrypt":
+                return False
+            n, r, p = int(parts[1]), int(parts[2]), int(parts[3])
+            salt = bytes.fromhex(parts[4])
+            expected = bytes.fromhex(parts[5])
+            digest = hashlib.scrypt(
+                password.encode("utf-8"), salt=salt, n=n, r=r, p=p,
+                dklen=len(expected),
+            )
+            return hmac.compare_digest(digest, expected)
+        except Exception:
+            return False
+
+    @staticmethod
+    def _dashboard_user_row(row: Any) -> Dict[str, Any]:
+        """v9.29: تسطيح صف مستخدم لواجهات اللوحة — بلا hash أبداً."""
+        d = dict(row)
+        d.pop("password_hash", None)
+        for key in ("enabled",):
+            if key in d:
+                d[key] = bool(d[key])
+        return d
+
+    async def create_dashboard_user(self, username: str, password: str,
+                                    role: str = "viewer") -> Optional[Dict[str, Any]]:
+        """v9.29: إنشاء مستخدم لوحة — None عند تكرار الاسم (فشل-آمن).
+
+        التحقق من صيغة الاسم/قوة كلمة المرور/صلاحية الدور مسؤولية الطبقة
+        العليا (dashboard.py) — هنا تُخزَّن فقط بعد التحقق.
+        """
+        if role not in self.DASHBOARD_ROLES:
+            return None
+        try:
+            ph = self.hash_dashboard_password(password)
+            await self._execute(
+                "INSERT INTO dashboard_users (username, password_hash, role, enabled)"
+                " VALUES (?, ?, ?, 1)",
+                (str(username).strip(), ph, role),
+            )
+            await self._commit()
+        except Exception as e:
+            logger.debug(f"create_dashboard_user failed: {e}")
+            return None
+        return await self.get_dashboard_user_by_name(str(username).strip())
+
+    async def list_dashboard_users(self, include_deleted: bool = False,
+                                   limit: int = 200) -> List[Dict[str, Any]]:
+        """v9.29: قائمة المستخدمين (Soft Delete مخفي افتراضياً)."""
+        try:
+            sql = "" if include_deleted else " AND deleted_at IS NULL"
+            rows = await self._fetchall(
+                "SELECT * FROM dashboard_users WHERE 1=1" + sql +
+                " ORDER BY username LIMIT ?",
+                (max(1, min(int(limit), 500)),),
+            )
+            return [self._dashboard_user_row(r) for r in rows]
+        except Exception as e:
+            logger.debug(f"list_dashboard_users skipped: {e}")
+            return []
+
+    async def get_dashboard_user(self, user_id: int) -> Optional[Dict[str, Any]]:
+        """v9.29: جلب مستخدم بالمعرّف (يشمل المحذوف — للتحقق قبل الحذف)."""
+        try:
+            row = await self._fetchone(
+                "SELECT * FROM dashboard_users WHERE id = ?", (int(user_id),)
+            )
+            return self._dashboard_user_row(row) if row else None
+        except Exception:
+            return None
+
+    async def get_dashboard_user_by_name(self, username: str,
+                                         include_deleted: bool = False,
+                                         include_hash: bool = False) -> Optional[Dict[str, Any]]:
+        """v9.29: جلب مستخدم بالاسم — مسار المصادقة يطلب include_hash=True.
+
+        include_deleted=False يخفي المحذوف (لا دخول بعد الحذف الناعم)،
+        وinclude_hash=True يبقي password_hash للمصادقة فقط — الواجهات
+        تستهلك الافتراضي (بلا hash أبداً).
+        """
+        try:
+            sql = "SELECT * FROM dashboard_users WHERE username = ?"
+            if not include_deleted:
+                sql += " AND deleted_at IS NULL"
+            row = await self._fetchone(sql, (str(username).strip(),))
+            if row is None:
+                return None
+            if include_hash:
+                d = dict(row)
+                d["enabled"] = bool(d.get("enabled"))
+                return d
+            return self._dashboard_user_row(row)
+        except Exception:
+            return None
+
+    async def set_dashboard_user_enabled(self, user_id: int, enabled: bool) -> bool:
+        """v9.29: تفعيل/تعطيل مستخدم (تعطيل = منع دخول فوري بلا حذف)."""
+        try:
+            cur = await self._execute(
+                "UPDATE dashboard_users SET enabled = ? WHERE id = ? AND deleted_at IS NULL",
+                (1 if enabled else 0, int(user_id)),
+            )
+            await self._commit()
+            return bool(cur.rowcount)
+        except Exception as e:
+            logger.debug(f"set_dashboard_user_enabled skipped: {e}")
+            return False
+
+    async def set_dashboard_user_role(self, user_id: int, role: str) -> bool:
+        """v9.29: تغيير دور مستخدم (دور غير معروف = رفض صامت)."""
+        if role not in self.DASHBOARD_ROLES:
+            return False
+        try:
+            cur = await self._execute(
+                "UPDATE dashboard_users SET role = ? WHERE id = ? AND deleted_at IS NULL",
+                (role, int(user_id)),
+            )
+            await self._commit()
+            return bool(cur.rowcount)
+        except Exception as e:
+            logger.debug(f"set_dashboard_user_role skipped: {e}")
+            return False
+
+    async def set_dashboard_user_password(self, user_id: int, password: str) -> bool:
+        """v9.29: إعادة تعيين كلمة مرور — scrypt جديد بعامل ملح جديد."""
+        try:
+            ph = self.hash_dashboard_password(password)
+            cur = await self._execute(
+                "UPDATE dashboard_users SET password_hash = ? WHERE id = ? AND deleted_at IS NULL",
+                (ph, int(user_id)),
+            )
+            await self._commit()
+            return bool(cur.rowcount)
+        except Exception as e:
+            logger.debug(f"set_dashboard_user_password skipped: {e}")
+            return False
+
+    async def touch_dashboard_user_login(self, user_id: int) -> bool:
+        """v9.29: تحديث last_login_at عند دخول ناجح (فشل-آمن)."""
+        try:
+            await self._execute(
+                "UPDATE dashboard_users SET last_login_at = CURRENT_TIMESTAMP"
+                " WHERE id = ?",
+                (int(user_id),),
+            )
+            await self._commit()
+            return True
+        except Exception:
+            return False
+
+    async def soft_delete_dashboard_user(self, user_id: int) -> bool:
+        """v9.29: حذف ناعم (Master Prompt 10.2) — الصف يبقى للتدقيق مع
+        deleted_at + enabled=0 فلا يعود صالحاً للدخول إطلاقاً."""
+        try:
+            cur = await self._execute(
+                "UPDATE dashboard_users SET deleted_at = CURRENT_TIMESTAMP,"
+                " enabled = 0 WHERE id = ? AND deleted_at IS NULL",
+                (int(user_id),),
+            )
+            await self._commit()
+            return bool(cur.rowcount)
+        except Exception as e:
+            logger.debug(f"soft_delete_dashboard_user skipped: {e}")
+            return False
+
+    async def count_dashboard_users(self, include_deleted: bool = False) -> int:
+        """v9.29: عدّاد المستخدمين (لوحات الإحصاء)."""
+        try:
+            sql = "" if include_deleted else " WHERE deleted_at IS NULL"
+            row = await self._fetchone(
+                "SELECT COUNT(*) AS n FROM dashboard_users" + sql
+            )
+            return int(row["n"]) if row else 0
+        except Exception:
             return 0
 
     # ─── v9.20 P1: مصادر المراقبة (Sources) ──────────────────

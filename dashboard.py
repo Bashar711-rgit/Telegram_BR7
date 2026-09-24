@@ -144,7 +144,9 @@ browsing, account creation) are preserved unchanged in behavior.
 from __future__ import annotations
 
 import asyncio
+import base64  # v9.29: توكنات المستخدمين الموقّعة (payload.signature)
 import csv
+import hashlib  # v9.29: مشتق سر RBAC (sha256)
 import hmac
 import io
 import json
@@ -281,6 +283,192 @@ class LoginVerifyCode(BaseModel):
 class LoginVerifyPassword(BaseModel):
     prefix: str
     password: str
+
+
+# =============================================================================
+# v9.29 P4 RBAC — مستخدمو اللوحة بأدوار وصلاحيات دقيقة (Master Prompt 8/9)
+# =============================================================================
+
+# الأدوار الخمسة من Master Prompt 9.1 — صلاحيات دقيقة Granular (9.2).
+# التوكن الرئيسي (DASHBOARD_AUTH_TOKEN) يبقى مفتاح Super Admin المطلق
+# عبر "*" — حسابات dashboard_users طبقة إضافية لا تستبدله.
+ROLE_PERMISSIONS: Dict[str, Set[str]] = {
+    "super_admin": {"*"},
+    "admin": {
+        "accounts.read", "accounts.write", "accounts.delete",
+        "sources.read", "sources.write", "sources.delete",
+        "keywords.read", "keywords.write", "keywords.delete",
+        "files.read", "files.write", "files.delete",
+        "rules.read", "rules.write", "rules.delete",
+        "settings.read", "settings.write",
+        "deployment.read", "deployment.execute",
+        "backup.read", "backup.write",
+        "audit.read", "messages.read", "notifications.read",
+        "users.read", "users.write",
+        "auth.read",
+    },
+    "supervisor": {
+        "accounts.read",
+        "sources.read", "sources.write",
+        "keywords.read", "keywords.write",
+        "rules.read", "rules.write",
+        "settings.read",
+        "deployment.read",
+        "backup.read",
+        "audit.read", "messages.read", "notifications.read",
+        "auth.read",
+    },
+    "operator": {
+        "accounts.read",
+        "sources.read",
+        "keywords.read",
+        "messages.read", "notifications.read",
+        "deployment.read",
+        "auth.read",
+    },
+    "viewer": {
+        "accounts.read", "sources.read", "keywords.read", "rules.read",
+        "messages.read", "notifications.read", "audit.read",
+        "deployment.read",
+        "auth.read",
+    },
+}
+
+# توكن مستخدم صالح 12 ساعة (Master Prompt 9: جلسات محدودة).
+USER_TOKEN_TTL_SECONDS = 12 * 3600
+
+_USERNAME_RE = re.compile(r"^[A-Za-z0-9_.-]{3,32}$")
+
+
+def _rbac_secret() -> bytes:
+    """v9.29: سر توقيع توكنات المستخدمين مشتق من التوكن الرئيسي (HMAC).
+
+    لا سر جديد في البيئة: التوكن الرئيسي هو جذر الثقة (Master Prompt
+    10.1 — الأسرار عبر البيئة فقط)، وتغييره يبطل كل جلسات المستخدمين.
+    """
+    return hashlib.sha256(("rbac-v1|" + CFG.DASHBOARD_AUTH_TOKEN).encode("utf-8")).digest()
+
+
+def _b64u_encode(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _b64u_decode(data: str) -> bytes:
+    padding = "=" * (-len(data) % 4)
+    return base64.urlsafe_b64decode(data + padding)
+
+
+def make_user_token(username: str, role: str) -> Tuple[str, int]:
+    """v9.29: توكن مستخدم موقّع payload.signature (base64url، stdlib فقط).
+
+    payload بلا أسرار: username/role/iat/exp فقط. يعيد (token, exp_epoch).
+    """
+    now = int(time.time())
+    payload = {"u": username, "r": role, "iat": now, "exp": now + USER_TOKEN_TTL_SECONDS}
+    raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    sig = hmac.new(_rbac_secret(), raw, hashlib.sha256).hexdigest()
+    return f"{_b64u_encode(raw)}.{sig}", payload["exp"]
+
+
+def decode_user_token(token: str) -> Optional[Dict[str, Any]]:
+    """v9.29: تحقق timing-safe من توكن مستخدم — None عند أي خلل/انتهاء."""
+    try:
+        payload_b64, sig = token.rsplit(".", 1)
+        raw = _b64u_decode(payload_b64)
+        expected = hmac.new(_rbac_secret(), raw, hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig, expected):
+            return None
+        payload = json.loads(raw.decode("utf-8"))
+        if int(payload.get("exp", 0)) < int(time.time()):
+            return None
+        username = str(payload.get("u", ""))
+        role = str(payload.get("r", ""))
+        if not username or role not in ROLE_PERMISSIONS:
+            return None
+        return {"username": username, "role": role,
+                "exp": int(payload["exp"]), "via": "user_token"}
+    except Exception:
+        return None
+
+
+def principal_permissions(role: str) -> Set[str]:
+    """v9.29: صلاحيات دور (نسخة — لا تُعدَّل الخريطة بالخطأ)."""
+    return set(ROLE_PERMISSIONS.get(role, set()))
+
+
+def _guard_reject_locked(request: Request) -> None:
+    """v9.29: رفض موحّد 429 للـIP المقفل (نفس دلالة verify_token)."""
+    ip = _auth_guard.client_ip(request)
+    remaining = _auth_guard.locked_seconds_left(ip)
+    if remaining > 0:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Too many failed attempts. Try again in {remaining}s.",
+            headers={"Retry-After": str(remaining)},
+        )
+
+
+def _guard_note_failure(request: Request, source: str) -> None:
+    """v9.29: تسجيل فشل مصادقة في حارس القفل + تدقيق/إشعار عند بلوغ القفل.
+
+    مشترك بين verify_token و require_permission — التخمين عبر أي باب
+    (توكن رئيسي أو توكن مستخدم أو اسم/كلمة مرور) يغذي نفس العدّاد.
+    """
+    ip = _auth_guard.client_ip(request)
+    lock = _auth_guard.record_failure(ip)
+    if lock > 0:
+        db = getattr(request.app.state, "db", None)
+        if db is not None:
+            try:
+                _track_local_task(db.record_audit(
+                    actor="botpanel-admin", action="auth.lockout", object_type="ip",
+                    object_id=ip, new_value=f"locked {lock}s ({source})",
+                    source="botpanel",
+                ), "audit_lockout")
+                _track_local_task(db.record_notification(
+                    ntype="auth.lockout", title=f"🔒 محاولة تخمين — قفل {lock}s",
+                    body=f"IP {ip} أُقفل بعد {_auth_guard.threshold} فشلات ({source}).",
+                    severity="critical", object_type="ip", object_id=ip,
+                ), "notify_lockout")
+            except Exception:
+                pass
+
+
+class Principal(dict):
+    """v9.29: هوية المتصل — master token أو مستخدم dashboard_users."""
+
+
+def require_permission(permission: Optional[str] = None):
+    """v9.29: اعتمادية FastAPI — مصادقة موحدة + صلاحية دقيقة اختيارية.
+
+    - التوكن الرئيسي → super_admin مطلق (كل الاختبارات القديمة تنجو).
+    - توكن مستخدم موقّع → يتحقق التوقيع والانتهاء ثم الصلاحية المطلوبة
+      (403 عند الغياب) — وينعكس في التدقيق كفاعل panel:<username>.
+    - perm=None → مصادقة فقط بلا فحص صلاحية (لـ /api/auth/me).
+    """
+    async def _dep(request: Request,
+                   credentials: HTTPAuthorizationCredentials = Depends(security)) -> Principal:
+        _guard_reject_locked(request)
+        token = credentials.credentials
+        if hmac.compare_digest(token, CFG.DASHBOARD_AUTH_TOKEN):
+            _auth_guard.record_success(_auth_guard.client_ip(request))
+            return Principal(username="master", role="super_admin",
+                             permissions=["*"], via="master_token")
+        payload = decode_user_token(token)
+        if payload is None:
+            _guard_note_failure(request, source="user_token")
+            raise HTTPException(status_code=401, detail="Invalid token")
+        _auth_guard.record_success(_auth_guard.client_ip(request))
+        perms = principal_permissions(payload["role"])
+        if permission is not None and permission not in perms and "*" not in perms:
+            raise HTTPException(
+                status_code=403,
+                detail=f"Missing permission: {permission}",
+            )
+        return Principal(username=payload["username"], role=payload["role"],
+                         permissions=sorted(perms), via="user_token",
+                         exp=payload["exp"])
+    return _dep
 
 
 # =============================================================================
@@ -2022,6 +2210,227 @@ async def _trigger_restart(bot) -> None:
         await bot.stop()
     except Exception as e:
         logger.error(f"Restart: bot.stop() failed: {e}")
+
+
+# =============================================================================
+# v9.29 P4 RBAC — مصادقة وإدارة مستخدمي اللوحة (Master Prompt 8/9)
+# =============================================================================
+
+class UserLoginBody(BaseModel):
+    username: str
+    password: str
+
+
+class UserCreateBody(BaseModel):
+    username: str
+    password: str
+    role: str = "viewer"
+
+
+class UserPatchBody(BaseModel):
+    enabled: Optional[bool] = None
+    role: Optional[str] = None
+    password: Optional[str] = None
+
+
+def _actor_of(principal: Dict[str, Any]) -> str:
+    """v9.29: فاعل التدقيق — master يبقى botpanel-admin (توافق تاريخي)،
+    ومستخدم dashboard_users يوقَّع panel:<username>."""
+    if principal.get("via") == "master_token":
+        return "botpanel-admin"
+    return f"panel:{principal.get('username', 'unknown')}"
+
+
+@app.post("/api/auth/login")
+async def auth_login(body: UserLoginBody, request: Request):
+    """v9.29: دخول باسم/كلمة مرور → توكن مستخدم موقّع (12 ساعة).
+
+    الفشل يغذي نفس حارس القفل (نفس عدّاد التوكن الرئيسي) — لا باب جانبي
+    للتخمين. النجاح يُدقَّق user.login ويحدّث last_login_at.
+    """
+    _guard_reject_locked(request)
+    db = getattr(request.app.state, "db", None)
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not ready")
+    username = (body.username or "").strip()[:64]
+    # include_hash=True للمصادقة فقط — لا يخرج الـhash في أي استجابة.
+    user = await db.get_dashboard_user_by_name(username, include_hash=True)
+    ok = (
+        user is not None
+        and bool(user.get("enabled"))
+        and EnhancedDatabase.verify_dashboard_password(
+            body.password or "", user.get("password_hash", "")
+        )
+    )
+    if not ok:
+        _guard_note_failure(request, source=f"login:{username[:32]}")
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    _auth_guard.record_success(_auth_guard.client_ip(request))
+    token, exp = make_user_token(user["username"], user["role"])
+    _track_local_task(db.touch_dashboard_user_login(user["id"]), "user_login_touch")
+    _track_local_task(db.record_audit(
+        actor=f"panel:{user['username']}", action="user.login",
+        object_type="dashboard_user", object_id=str(user["id"]),
+        new_value=user["role"], source="botpanel",
+    ), "audit_user_login")
+    return JSONResponse({
+        "success": True,
+        "token": token,
+        "token_type": "bearer",
+        "expires_at": exp,
+        "username": user["username"],
+        "role": user["role"],
+        "permissions": sorted(principal_permissions(user["role"])),
+    })
+
+
+@app.get("/api/auth/me")
+async def auth_me(principal: Principal = Depends(require_permission(None))):
+    """v9.29: هوية المتصل الحالي — للواجهات لتعرض الدور والصلاحيات."""
+    return JSONResponse({
+        "username": principal["username"],
+        "role": principal["role"],
+        "permissions": principal["permissions"],
+        "via": principal["via"],
+    })
+
+
+@app.get("/api/users")
+async def users_list(request: Request,
+                     principal: Principal = Depends(require_permission("users.read"))):
+    """v9.29: قائمة مستخدمي اللوحة (users.read — admin فأعلى)."""
+    db = request.app.state.db
+    users = await db.list_dashboard_users(include_deleted=True, limit=500)
+    roles = {
+        r: sorted(perms) if "*" not in perms else ["*"]
+        for r, perms in ROLE_PERMISSIONS.items()
+    }
+    return JSONResponse({"users": users, "roles": roles, "total": len(users)})
+
+
+@app.post("/api/users")
+async def users_create(body: UserCreateBody, request: Request,
+                       principal: Principal = Depends(require_permission("users.write"))):
+    """v9.29: إنشاء مستخدم لوحة — تدقيق + إشعار + تحقق صارم من المدخلات."""
+    db = request.app.state.db
+    username = (body.username or "").strip()
+    if not _USERNAME_RE.match(username):
+        raise HTTPException(
+            status_code=400,
+            detail="Username must be 3-32 chars: letters, digits, dot, dash, underscore",
+        )
+    if len(body.password or "") < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+    if body.role not in EnhancedDatabase.DASHBOARD_ROLES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown role. Valid roles: {', '.join(EnhancedDatabase.DASHBOARD_ROLES)}",
+        )
+    # users.write يكفي لإدارة غير الـsuper_admin — إنشاء حساب super_admin
+    # يتطلب الثقة المطلقة (master token أو حساب super_admin آخر).
+    if body.role == "super_admin" and principal.get("role") != "super_admin":
+        raise HTTPException(status_code=403, detail="Only super_admin can create super_admin")
+    created = await db.create_dashboard_user(username, body.password, body.role)
+    if created is None:
+        raise HTTPException(status_code=409, detail="Username already exists")
+    await _audit_actor(request, principal, "user.create", object_type="dashboard_user",
+                       object_id=str(created["id"]),
+                       new_value=f"{username}:{body.role}")
+    _track_local_task(db.record_notification(
+        ntype="user.created", title=f"👤 مستخدم لوحة جديد: {username}",
+        body=f"الدور: {body.role} — بواسطة {_actor_of(principal)}",
+        severity="info", object_type="dashboard_user", object_id=str(created["id"]),
+    ), "notify_user_created")
+    return JSONResponse({"success": True, "user": created})
+
+
+@app.patch("/api/users/{user_id}")
+async def users_patch(user_id: int, body: UserPatchBody, request: Request,
+                      principal: Principal = Depends(require_permission("users.write"))):
+    """v9.29: تعديل مستخدم (تفعيل/تعطيل، دور، كلمة مرور) — تدقيق قبل/بعد."""
+    db = request.app.state.db
+    target = await db.get_dashboard_user(user_id)
+    if target is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    # حماية الذات: لا تعطيل/حذف حسابك أثناء استخدامه (self-lockout guard).
+    is_self = (
+        principal.get("via") == "user_token"
+        and principal.get("username") == target["username"]
+    )
+    changes: List[str] = []
+    if body.enabled is not None:
+        if is_self and not body.enabled:
+            raise HTTPException(status_code=400, detail="Cannot disable your own account")
+        if not await db.set_dashboard_user_enabled(user_id, bool(body.enabled)):
+            raise HTTPException(status_code=500, detail="Failed to update user")
+        changes.append(f"enabled={bool(body.enabled)}")
+    if body.role is not None:
+        if body.role not in EnhancedDatabase.DASHBOARD_ROLES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown role. Valid roles: {', '.join(EnhancedDatabase.DASHBOARD_ROLES)}",
+            )
+        if body.role == "super_admin" and principal.get("role") != "super_admin":
+            raise HTTPException(status_code=403, detail="Only super_admin can grant super_admin")
+        if is_self and body.role != "super_admin" and principal.get("role") == "super_admin":
+            raise HTTPException(status_code=400, detail="Cannot demote your own account")
+        if not await db.set_dashboard_user_role(user_id, body.role):
+            raise HTTPException(status_code=500, detail="Failed to update user")
+        changes.append(f"role:{target['role']}→{body.role}")
+    if body.password is not None:
+        if len(body.password) < 8:
+            raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+        if not await db.set_dashboard_user_password(user_id, body.password):
+            raise HTTPException(status_code=500, detail="Failed to update user")
+        changes.append("password=RESET")
+    if not changes:
+        raise HTTPException(status_code=400, detail="Nothing to update (send enabled/role/password)")
+    await _audit_actor(request, principal, "user.update", object_type="dashboard_user",
+                       object_id=str(user_id),
+                       old_value=f"{target['username']}:{target['role']}",
+                       new_value=";".join(changes))
+    updated = await db.get_dashboard_user(user_id)
+    return JSONResponse({"success": True, "user": updated, "changes": changes})
+
+
+@app.delete("/api/users/{user_id}")
+async def users_delete(user_id: int, request: Request,
+                       principal: Principal = Depends(require_permission("users.delete"))):
+    """v9.29: حذف ناعم (Soft Delete — Master Prompt 10.2) — يبقى للتدقيق."""
+    db = request.app.state.db
+    target = await db.get_dashboard_user(user_id)
+    if target is None or target.get("deleted_at"):
+        raise HTTPException(status_code=404, detail="User not found")
+    if (principal.get("via") == "user_token"
+            and principal.get("username") == target["username"]):
+        raise HTTPException(status_code=400, detail="Cannot delete your own account")
+    if not await db.soft_delete_dashboard_user(user_id):
+        raise HTTPException(status_code=500, detail="Failed to delete user")
+    await _audit_actor(request, principal, "user.delete", object_type="dashboard_user",
+                       object_id=str(user_id),
+                       old_value=f"{target['username']}:{target['role']}",
+                       new_value="soft-deleted")
+    return JSONResponse({"success": True, "deleted": target["username"]})
+
+
+async def _audit_actor(request: Request, principal: Dict[str, Any], action: str,
+                       object_type: str = "", object_id: str = "",
+                       old_value: str = "", new_value: str = "") -> None:
+    """v9.29: تدقيق بفاعل متغير (master أو panel:<username>) — fire-and-forget."""
+    db = getattr(request.app.state, "db", None)
+    if db is None:
+        return
+    try:
+        _track_local_task(
+            db.record_audit(
+                actor=_actor_of(principal), action=action, object_type=object_type,
+                object_id=object_id, old_value=old_value, new_value=new_value,
+                source="botpanel",
+            ),
+            "audit_write",
+        )
+    except Exception:
+        pass
 
 
 # =============================================================================

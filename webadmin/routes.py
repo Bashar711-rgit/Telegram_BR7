@@ -767,3 +767,131 @@ async def bot_backup_download(name: str, session: Dict[str, Any] = Protected):
     if not os.path.exists(path):
         raise HTTPException(status_code=404, detail="النسخة غير موجودة")
     return FileResponse(path, media_type="application/zip", filename=os.path.basename(path))
+
+
+# =============================================================================
+# v9.29 P4 RBAC — إدارة مستخدمي اللوحة (تبويب «المستخدمون والأدوار»)
+# Master Prompt 8/9: dashboard_users بأدوار خمسة + صلاحيات دقيقة + Soft Delete.
+# الجلسة الموقّعة (webadmin) هي بوابة الإدارة — كل تغيير يُدقَّق user.*.
+# =============================================================================
+
+class DashboardUserCreateBody(BaseModel):
+    username: str
+    password: str
+    role: str = "viewer"
+
+
+class DashboardUserPatchBody(BaseModel):
+    user_id: int
+    enabled: Optional[bool] = None
+    role: Optional[str] = None
+    password: Optional[str] = None
+
+
+class DashboardUserIdBody(BaseModel):
+    user_id: int
+
+
+_DASHBOARD_USERNAME_RE = re.compile(r"^[A-Za-z0-9_.-]{3,32}$")
+
+# أوصاف الأدوار للواجهة (المصدر الرسمي للأسماء: EnhancedDatabase.DASHBOARD_ROLES)
+_ROLE_LABELS = {
+    "super_admin": "مدير أقصى — كل الصلاحيات",
+    "admin": "إدارة النظام",
+    "supervisor": "تعديل الرسائل والقواعد",
+    "operator": "مراقبة الرسائل والعمل التشغيلي",
+    "viewer": "المشاهدة فقط",
+}
+
+
+@router.get("/admin/api/users")
+async def admin_users_list(request: Request, session: Dict[str, Any] = Protected):
+    db = _db(request)
+    if db is None:
+        raise HTTPException(status_code=503, detail="قاعدة البيانات غير متاحة")
+    users = await db.list_dashboard_users(include_deleted=True, limit=500)
+    roles = list(getattr(db, "DASHBOARD_ROLES", ()))
+    return {
+        "users": users,
+        "roles": roles,
+        "role_labels": _ROLE_LABELS,
+        "total": len(users),
+    }
+
+
+@router.post("/admin/api/users/create")
+async def admin_users_create(body: DashboardUserCreateBody, request: Request,
+                             _: Any = CsrfProtected):
+    db = _db(request)
+    if db is None:
+        raise HTTPException(status_code=503, detail="قاعدة البيانات غير متاحة")
+    username = (body.username or "").strip()
+    if not _DASHBOARD_USERNAME_RE.match(username):
+        raise HTTPException(status_code=400,
+                            detail="اسم المستخدم: 3-32 حرفاً (حروف/أرقام/._-)")
+    if len(body.password or "") < 8:
+        raise HTTPException(status_code=400, detail="كلمة المرور 8 أحرف على الأقل")
+    if body.role not in getattr(db, "DASHBOARD_ROLES", ()):
+        raise HTTPException(status_code=400, detail="دور غير معروف")
+    created = await db.create_dashboard_user(username, body.password, body.role)
+    if created is None:
+        raise HTTPException(status_code=409, detail="اسم المستخدم موجود مسبقاً")
+    await _audit_web(request, "user.create", object_type="dashboard_user",
+                     object_id=str(created["id"]), new_value=f"{username}:{body.role}")
+    logger.info(f"webadmin: dashboard user created: {username} ({body.role})")
+    return {"success": True, "user": created}
+
+
+@router.post("/admin/api/users/update")
+async def admin_users_update(body: DashboardUserPatchBody, request: Request,
+                             _: Any = CsrfProtected):
+    db = _db(request)
+    if db is None:
+        raise HTTPException(status_code=503, detail="قاعدة البيانات غير متاحة")
+    target = await db.get_dashboard_user(body.user_id)
+    if target is None or target.get("deleted_at"):
+        raise HTTPException(status_code=404, detail="المستخدم غير موجود")
+    changes: List[str] = []
+    if body.enabled is not None:
+        if not await db.set_dashboard_user_enabled(body.user_id, bool(body.enabled)):
+            raise HTTPException(status_code=500, detail="فشل التحديث")
+        changes.append(f"enabled={bool(body.enabled)}")
+    if body.role is not None:
+        if body.role not in getattr(db, "DASHBOARD_ROLES", ()):
+            raise HTTPException(status_code=400, detail="دور غير معروف")
+        if not await db.set_dashboard_user_role(body.user_id, body.role):
+            raise HTTPException(status_code=500, detail="فشل التحديث")
+        changes.append(f"role:{target['role']}→{body.role}")
+    if body.password is not None:
+        if len(body.password) < 8:
+            raise HTTPException(status_code=400, detail="كلمة المرور 8 أحرف على الأقل")
+        if not await db.set_dashboard_user_password(body.user_id, body.password):
+            raise HTTPException(status_code=500, detail="فشل التحديث")
+        changes.append("password=RESET")
+    if not changes:
+        raise HTTPException(status_code=400, detail="لا يوجد ما يُحدَّث")
+    await _audit_web(request, "user.update", object_type="dashboard_user",
+                     object_id=str(body.user_id),
+                     old_value=f"{target['username']}:{target['role']}",
+                     new_value=";".join(changes))
+    updated = await db.get_dashboard_user(body.user_id)
+    return {"success": True, "user": updated, "changes": changes}
+
+
+@router.post("/admin/api/users/delete")
+async def admin_users_delete(body: DashboardUserIdBody, request: Request,
+                             _: Any = CsrfProtected):
+    db = _db(request)
+    if db is None:
+        raise HTTPException(status_code=503, detail="قاعدة البيانات غير متاحة")
+    target = await db.get_dashboard_user(body.user_id)
+    if target is None or target.get("deleted_at"):
+        raise HTTPException(status_code=404, detail="المستخدم غير موجود")
+    if not await db.soft_delete_dashboard_user(body.user_id):
+        raise HTTPException(status_code=500, detail="فشل الحذف")
+    await _audit_web(request, "user.delete", object_type="dashboard_user",
+                     object_id=str(body.user_id),
+                     old_value=f"{target['username']}:{target['role']}",
+                     new_value="soft-deleted")
+    logger.info(f"webadmin: dashboard user soft-deleted: {target['username']}")
+    return {"success": True, "deleted": target["username"]}
