@@ -758,6 +758,19 @@ async def bot_restore(body: RestoreBody, request: Request, _: Any = CsrfProtecte
     safety = (result.get("safety_backup") or {}).get("name", "")
     await _audit_web(request, "data.restore", object_type="backup",
                      object_id=body.name, new_value=safety)
+    # v9.30: مولّد إشعار — الاستعادة حدث حرج يستحق ظهور الجرس في BotPanel.
+    db = _db(request)
+    if db is not None:
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(db.record_notification(
+                ntype="data.restore",
+                title=f"♻️ استعادة بيانات من نسخة {body.name}",
+                body=f"نسخة الأمان قبل الاستعادة: {safety or '—'}",
+                severity="warn", object_type="backup", object_id=body.name,
+            ))
+        except Exception:
+            pass
     return result
 
 

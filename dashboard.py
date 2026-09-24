@@ -787,6 +787,25 @@ async def _update_stats_loop(app: FastAPI):
     recent_alerts_cache: Optional[List[Dict[str, Any]]] = None
     recent_alerts_ts: float = 0.0
     RECENT_ALERTS_TTL = 5.0
+    # v9.30: شارة الإشعارات — نفس نمط التخزين المؤقت الخفيف (استعلام COUNT).
+    unread_cache: int = 0
+    unread_ts: float = 0.0
+    UNREAD_TTL = 5.0
+
+    async def _unread_notifications_safe(database: Any) -> int:
+        """v9.30: عدّاد غير المقروء مع كاش 5 ثوانٍ وفشل-آمن تام — الشارة
+        لا تُعطّل بث الإحصاءات أبداً عند أي خلل."""
+        nonlocal unread_cache, unread_ts
+        now = time.time()
+        if unread_ts and (now - unread_ts) < UNREAD_TTL:
+            return unread_cache
+        try:
+            unread_cache = await database.count_unread_notifications()
+            unread_ts = now
+        except Exception:
+            pass
+        return unread_cache
+
     while True:
         try:
             await asyncio.sleep(2)
@@ -918,6 +937,8 @@ async def _update_stats_loop(app: FastAPI):
                 # v9.14: powers the home "آخر التنبيهات" live feed (was missing
                 # → feed stuck on "جاري التحميل...").
                 "recent_alerts": recent_alerts_cache or [],
+                # v9.30: شارة الجرس الحية — عدّاد غير المقروء من طبقة v9.24.
+                "notifications_unread": await _unread_notifications_safe(db),
             }
             app.state.stats_cache = stats
             await manager.broadcast({"type": "stats", "data": stats})
@@ -2193,6 +2214,8 @@ async def restart_bot(request: Request):
 
     logger.warning("Restart requested via dashboard — initiating graceful shutdown")
     await _audit(request, "bot.restart", object_type="bot")
+    # v9.30: مولّد إشعار — إعادة التشغيل حدث حرج يستحق ظهور الجرس.
+    _track_local_task(db_record_restart_note(request), "notify_restart")
     _track_local_task(_trigger_restart(bot), "dashboard_restart_trigger")
 
     return JSONResponse({
@@ -2210,6 +2233,21 @@ async def _trigger_restart(bot) -> None:
         await bot.stop()
     except Exception as e:
         logger.error(f"Restart: bot.stop() failed: {e}")
+
+
+async def db_record_restart_note(request: Request) -> None:
+    """v9.30: إشعار critical عند طلب إعادة تشغيل — فشل-آمن تماماً."""
+    db = getattr(request.app.state, "db", None)
+    if db is None:
+        return
+    try:
+        await db.record_notification(
+            ntype="bot.restart", title="🔁 طُلبت إعادة تشغيل البوت",
+            body="إيقاف رشيق قيد التنفيذ — المنصة (Render) ستعيد إقلاع العملية.",
+            severity="critical", object_type="bot",
+        )
+    except Exception:
+        pass
 
 
 # =============================================================================

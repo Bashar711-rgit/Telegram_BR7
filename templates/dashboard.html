@@ -140,6 +140,49 @@ body { font-family: var(--sans); background: var(--bg); color: var(--text); font
 .page-title { font-size: 14px; font-weight: 600; color: var(--text); }
 .page-sub { font-size: 12px; color: var(--text3); }
 .topbar-right { margin-right: auto; display: flex; align-items: center; gap: 8px; }
+
+/* ── v9.30 NOTIFICATIONS CENTER ───────────────────────────── */
+.notif-wrap { position: relative; }
+#notifBell { position: relative; font-size: 16px; line-height: 1; }
+.notif-badge {
+  position: absolute; top: -6px; left: -6px; min-width: 18px; height: 18px;
+  padding: 0 4px; border-radius: 9px; background: var(--red); color: #fff;
+  font-size: 10px; font-weight: 800; display: flex; align-items: center;
+  justify-content: center; box-shadow: 0 2px 8px rgba(248,113,113,.4);
+}
+.notif-panel {
+  position: absolute; top: calc(100% + 10px); left: 0; width: 360px;
+  max-width: min(92vw, 360px); background: var(--bg2);
+  border: 1px solid var(--border2); border-radius: 14px;
+  box-shadow: 0 18px 50px rgba(0,0,0,.55); z-index: 60; overflow: hidden;
+}
+.notif-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 12px 14px; border-bottom: 1px solid var(--border);
+  background: var(--bg3);
+}
+.notif-list { max-height: 420px; overflow-y: auto; overscroll-behavior: contain; }
+.notif-item {
+  display: flex; gap: 10px; padding: 11px 14px;
+  border-bottom: 1px solid var(--border); cursor: pointer;
+  transition: background .15s;
+}
+.notif-item:last-child { border-bottom: none; }
+.notif-item:hover { background: var(--bg3); }
+.notif-item.unread { background: rgba(79,142,247,.06); }
+.notif-item.unread:hover { background: rgba(79,142,247,.1); }
+.notif-dot {
+  width: 9px; height: 9px; border-radius: 50%; margin-top: 6px;
+  flex-shrink: 0; background: var(--text3);
+}
+.notif-item.unread .notif-dot { background: var(--accent); box-shadow: 0 0 6px rgba(79,142,247,.7); }
+.notif-sev-critical { background: var(--red) !important; box-shadow: 0 0 6px rgba(248,113,113,.7) !important; }
+.notif-sev-warn { background: var(--yellow) !important; box-shadow: 0 0 6px rgba(251,191,36,.6) !important; }
+.notif-title { font-size: 13px; font-weight: 700; color: var(--text); }
+.notif-body { font-size: 11.5px; color: var(--text2); margin-top: 2px; }
+.notif-time { font-size: 10.5px; color: var(--text3); margin-top: 3px; }
+.notif-empty { padding: 26px 14px; text-align: center; color: var(--text3); font-size: 13px; }
+
 .tb-btn {
   display: flex; align-items: center; gap: 5px;
   padding: 6px 12px; border-radius: var(--r);
@@ -808,7 +851,7 @@ body { font-family: var(--sans); background: var(--bg); color: var(--text); font
     <div class="brand-icon">🤖</div>
     <div>
       <div class="brand-name">BotPanel</div>
-      <div class="brand-ver" id="brandVer">BR7 · v9.29</div>
+      <div class="brand-ver" id="brandVer">BR7 · v9.30</div>
     </div>
   </div>
 
@@ -888,6 +931,16 @@ body { font-family: var(--sans); background: var(--bg); color: var(--text); font
       <div class="page-sub" id="pageSub">نظرة عامة على حالة البوت</div>
     </div>
     <div class="topbar-right">
+      <div class="notif-wrap">
+        <button class="tb-btn" id="notifBell" onclick="toggleNotifPanel(event)" title="مركز الإشعارات (v9.24)">🔔<span class="notif-badge hidden" id="notifBadge">0</span></button>
+        <div class="notif-panel hidden" id="notifPanel">
+          <div class="notif-head">
+            <span class="font-black">مركز الإشعارات</span>
+            <button class="text-xs lnk" onclick="markAllNotifsRead()">تعليم الكل كمقروء</button>
+          </div>
+          <div class="notif-list" id="notifList"><div class="muted text-center p-4">جارِ التحميل…</div></div>
+        </div>
+      </div>
       <button class="tb-btn" id="notifyBtn" onclick="toggleNotify()" title="إشعارات المتصفح عند وصول تنبيه جديد">🔕 تنبيهات</button>
       <button class="tb-btn" onclick="refreshCurrent()">⟳ تحديث</button>
       <button class="tb-btn danger" onclick="restartBot()">⏻ إعادة التشغيل</button>
@@ -1120,6 +1173,99 @@ async function apiFetch(endpoint, options = {}) {
 }
 
 // ================================================================
+// v9.30 NOTIFICATIONS CENTER — الجرس + الشارة الحية + اللوحة المنسدلة
+// (طبقة البيانات v9.24: /api/notifications + read + read-all)
+// ================================================================
+let NOTIF_OPEN = false;
+
+function updateNotifBadge(n) {
+    const b = document.getElementById('notifBadge');
+    if (!b) return;
+    if (n > 0) { b.textContent = n > 99 ? '99+' : String(n); b.classList.remove('hidden'); }
+    else b.classList.add('hidden');
+}
+
+async function loadNotifs() {
+    const list = document.getElementById('notifList');
+    if (!list) return;
+    try {
+        const data = await apiFetch('/api/notifications?limit=30');
+        updateNotifBadge(data.unread || 0);
+        const items = data.items || [];
+        if (!items.length) {
+            list.innerHTML = '<div class="notif-empty">🔔 لا إشعارات بعد — ستظهر هنا الأحداث المهمة (قفل، إعادة تشغيل، استعادة، مستخدم جديد…)</div>';
+            return;
+        }
+        list.innerHTML = items.map(n => `
+            <div class="notif-item ${n.read ? '' : 'unread'}" onclick="markNotifRead(${n.id}, ${n.read ? 'true' : 'false'})">
+                <span class="notif-dot ${n.read ? '' : ('notif-sev-' + (n.severity || 'info'))}"></span>
+                <div style="flex:1;min-width:0">
+                    <div class="notif-title">${escNotif(n.title)}</div>
+                    ${n.body ? `<div class="notif-body">${escNotif(n.body)}</div>` : ''}
+                    <div class="notif-time">${notifRelTime(n.created_at)}${n.type ? ' · ' + escNotif(n.type) : ''}</div>
+                </div>
+            </div>`).join('');
+    } catch (e) {
+        list.innerHTML = `<div class="notif-empty">تعذّر تحميل الإشعارات</div>`;
+    }
+}
+
+function toggleNotifPanel(ev) {
+    ev && ev.stopPropagation();
+    const p = document.getElementById('notifPanel');
+    if (!p) return;
+    NOTIF_OPEN = !NOTIF_OPEN;
+    p.classList.toggle('hidden', !NOTIF_OPEN);
+    if (NOTIF_OPEN) loadNotifs();
+}
+
+function closeNotifPanel() {
+    if (!NOTIF_OPEN) return;
+    NOTIF_OPEN = false;
+    const p = document.getElementById('notifPanel');
+    if (p) p.classList.add('hidden');
+}
+
+document.addEventListener('click', (e) => {
+    const w = document.querySelector('.notif-wrap');
+    if (w && !w.contains(e.target)) closeNotifPanel();
+});
+
+async function markNotifRead(id, alreadyRead) {
+    if (alreadyRead) return;
+    try {
+        const r = await apiFetch('/api/notifications/read', { method: 'POST', body: JSON.stringify({ id }) });
+        updateNotifBadge(r.unread || 0);
+        loadNotifs();
+    } catch (e) { /* silent — الشارة لا تزعج المستخدم بأخطاء عابرة */ }
+}
+
+async function markAllNotifsRead() {
+    try {
+        await apiFetch('/api/notifications/read-all', { method: 'POST', body: '{}' });
+        updateNotifBadge(0);
+        loadNotifs();
+    } catch (e) { }
+}
+
+function escNotif(s) {
+    return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+function notifRelTime(ts) {
+    // v9.27 نمط الوقت النسبي — created_at بصيغة "YYYY-MM-DD HH:MM:SS" UTC
+    try {
+        if (!ts) return '';
+        const iso = String(ts).includes('T') ? String(ts) : String(ts).replace(' ', 'T') + 'Z';
+        const diff = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000);
+        if (diff < 60) return 'الآن';
+        if (diff < 3600) return `منذ ${Math.floor(diff / 60)} دقيقة`;
+        if (diff < 86400) return `منذ ${Math.floor(diff / 3600)} ساعة`;
+        return `منذ ${Math.floor(diff / 86400)} يوم`;
+    } catch (e) { return String(ts || ''); }
+}
+
+// ================================================================
 // WEBSOCKET (live stats)
 // ================================================================
 function setStatusBar(ok, label) {
@@ -1187,6 +1333,8 @@ function applyStats(d) {
     // Sidebar badges
     const ab = document.getElementById('navAlertsBadge');
     if (ab) ab.textContent = d.alerts_last_hour || 0;
+    // v9.30: شارة الجرس الحية من بث WS
+    updateNotifBadge(d.notifications_unread || 0);
     const acb = document.getElementById('navAccountsBadge');
     if (acb) acb.textContent = `${d.connected_accounts || 0}/${d.total_accounts || 0}`;
 
@@ -2106,7 +2254,7 @@ const PAGES = {
                     <div class="panel-actions"><button class="tb-btn" onclick="renderSysInfo(true)" title="تحديث من الخادم">⟳</button></div>
                 </div>
                 <div class="sysinfo-grid" id="sysinfo-grid">
-                    <div class="sysinfo-cell"><span class="k">الإصدار</span><span class="v">v9.29</span></div>
+                    <div class="sysinfo-cell"><span class="k">الإصدار</span><span class="v">v9.30</span></div>
                     <div class="sysinfo-cell"><span class="k">جاري التحميل…</span><span class="v">—</span></div>
                 </div>
             </div>
