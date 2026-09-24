@@ -236,6 +236,15 @@ class BlockChat(BaseModel):
     reason: str = ""
 
 
+class SourceCreate(BaseModel):
+    """v9.20 P1: إضافة/تحديث مصدر مراقبة."""
+    chat_id: int
+    username: str = ""
+    title: str = ""
+    type: str = ""
+    notes: str = ""
+
+
 class SettingsBody(BaseModel):
     """v3.1: flexible settings body — {"updates": {...}} or a flat dict of
     validated setting names. Actual validation happens in dashboard_store."""
@@ -1352,6 +1361,72 @@ async def unblock_chat(chat_id: int, request: Request):
     await db.unblock_chat(chat_id)
     await _audit(request, "unblock.chat", object_type="chat", object_id=str(chat_id))
     return JSONResponse({"success": True})
+
+
+@app.get("/api/sources", dependencies=[Depends(verify_token)])
+async def get_sources(request: Request):
+    """v9.20 P1: قائمة مصادر المراقبة + شارة الوضع.
+
+    mode: "all" = لا مصادر مفعّلة → مراقبة كل شيء (السلوك الأصلي)؛
+    "filtered" = المصادر المفعّلة فقط.
+    """
+    db = request.app.state.db
+    rows = await db.list_sources() if db else []
+    enabled = [r for r in rows if r.get("enabled")]
+    return JSONResponse({
+        "items": rows,
+        "count": len(rows),
+        "enabled_count": len(enabled),
+        "mode": "filtered" if enabled else "all",
+        "note": "جدول فارغ أو بلا مصادر مفعّلة = مراقبة كل شيء (السلوك الأصلي)",
+    })
+
+
+@app.post("/api/sources", dependencies=[Depends(verify_token)])
+async def add_source(data: SourceCreate, request: Request):
+    """v9.20 P1: إضافة/تحديث مصدر (upsert حسب chat_id) — مدقَّق."""
+    db = request.app.state.db
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    ok = await db.add_source(
+        data.chat_id, username=data.username, title=data.title,
+        type_=data.type, notes=data.notes,
+    )
+    if not ok:
+        raise HTTPException(status_code=500, detail="Failed to save source")
+    await _audit(request, "source.add", object_type="source",
+                 object_id=str(data.chat_id),
+                 new_value=data.title or data.username or "")
+    return JSONResponse({"success": True, "chat_id": data.chat_id})
+
+
+@app.delete("/api/sources/{chat_id}", dependencies=[Depends(verify_token)])
+async def remove_source(chat_id: int, request: Request):
+    """v9.20 P1: حذف مصدر بالمفتاح chat_id — مدقَّق."""
+    db = request.app.state.db
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    ok = await db.remove_source(chat_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Source not found")
+    await _audit(request, "source.remove", object_type="source", object_id=str(chat_id))
+    return JSONResponse({"success": True})
+
+
+@app.post("/api/sources/{chat_id}/toggle", dependencies=[Depends(verify_token)])
+async def toggle_source(chat_id: int, request: Request):
+    """v9.20 P1: تفعيل/إيقاف مصدر — مدقَّق."""
+    db = request.app.state.db
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    row = await db.get_source(chat_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Source not found")
+    new_state = not bool(row.get("enabled"))
+    await db.set_source_enabled(chat_id, new_state)
+    await _audit(request, "source.toggle", object_type="source", object_id=str(chat_id),
+                 old_value=str(bool(row.get("enabled"))), new_value=str(new_state))
+    return JSONResponse({"success": True, "chat_id": chat_id, "enabled": new_state})
 
 
 @app.get("/api/audit", dependencies=[Depends(verify_token)])

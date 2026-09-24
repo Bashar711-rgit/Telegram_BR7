@@ -628,6 +628,11 @@ body { font-family: var(--sans); background: var(--bg); color: var(--text); font
   padding: 2px 12px; border-radius: 20px; color: var(--text2);
 }
 
+/* ── v9.20 SOURCES TAB ───────────────────────────────────────── */
+.src-form { display: flex; flex-wrap: wrap; gap: 8px; padding: 14px 16px; }
+.src-form .kw-input { flex: 1 1 180px; min-width: 150px; }
+.src-form .al-select { flex: 0 0 140px; }
+
 /* ── v9.18 AUDIT TAB ─────────────────────────────────────────── */
 .al-select {
   background: var(--bg2); color: var(--text); border: 1px solid var(--border);
@@ -773,6 +778,9 @@ body { font-family: var(--sans); background: var(--bg); color: var(--text); font
     </div>
     <div class="nav-item" data-page="blocked" onclick="showTab('blocked')">
       <span class="ni">🚫</span> الحظر
+    </div>
+    <div class="nav-item" data-page="sources" onclick="showTab('sources')">
+      <span class="ni">🎯</span> المصادر
     </div>
 
     <div class="nav-section">النظام</div>
@@ -1157,6 +1165,7 @@ const PAGE_META = {
     settings:  { title: 'الإعدادات', sub: 'ضبط البوت — يُحفظ مباشرة في قاعدة البيانات' },
     logs:      { title: 'السجلات', sub: 'أحداث النظام المباشرة' },
     audit:     { title: 'سجل التدقيق', sub: 'كل عملية كتابة من اللوحتين — بفلتر الإجراءات' },
+    sources:   { title: 'مصادر المراقبة', sub: 'حدد المجموعات/القنوات التي يراقبها البوت — فارغة = الكل' },
 };
 
 function renderPage(tab) {
@@ -1172,6 +1181,88 @@ function loadPageData(tab) {
     if (PAGES[tab] && PAGES[tab].load) PAGES[tab].load();
 }
 
+
+
+// ================================================================
+// PAGE: SOURCES (v9.20 P1)
+// ================================================================
+async function loadSources() {
+    const body = document.getElementById('srcBody');
+    if (!body) return;
+    try {
+        const res = await apiFetch('/api/sources');
+        const data = await res.json();
+        const badge = document.getElementById('srcModeBadge');
+        if (badge) {
+            if (data.mode === 'filtered') {
+                badge.className = 'pill green';
+                badge.textContent = 'مراقبة المفعّلة فقط';
+            } else {
+                badge.className = 'pill blue';
+                badge.textContent = 'مراقبة الكل (لا قيود)';
+            }
+            badge.title = data.note || '';
+        }
+        const cnt = document.getElementById('srcCount');
+        if (cnt) cnt.textContent = `${data.count ?? 0} مصدر`;
+        const items = data.items || [];
+        if (!items.length) {
+            body.innerHTML = '<tr><td colspan="6" class="empty">لا مصادر مضافة — البوت يراقب كل المجموعات. أضف مصدراً لتقييد المراقبة.</td></tr>';
+            return;
+        }
+        body.innerHTML = items.map(s => `
+            <tr>
+                <td class="td-obj">${esc(String(s.chat_id))}</td>
+                <td>${esc(s.title || s.username || '—')}</td>
+                <td>${esc(s.type || '—')}</td>
+                <td><span class="pill ${s.enabled ? 'green' : 'red'}">${s.enabled ? 'مفعّل' : 'موقوف'}</span></td>
+                <td class="td-time" title="${esc(String(s.created_at || ''))}">${fmtAuditTime(s.created_at)}</td>
+                <td>
+                    <button class="al-btn" onclick="toggleSource(${esc(String(s.chat_id))})">${s.enabled ? '⏸ إيقاف' : '▶ تفعيل'}</button>
+                    <button class="al-btn d" onclick="removeSource(${esc(String(s.chat_id))})">🗑</button>
+                </td>
+            </tr>`).join('');
+    } catch (e) {
+        if (body) body.innerHTML = '<tr><td colspan="6" class="empty">فشل تحميل المصادر.</td></tr>';
+    }
+}
+
+async function addSource() {
+    const idEl = document.getElementById('srcChatId');
+    const chatId = parseInt((idEl.value || '').trim(), 10);
+    if (!chatId) { showToast('أدخل Chat ID رقمياً صحيحاً', 'wrn'); return; }
+    const payload = {
+        chat_id: chatId,
+        title: (document.getElementById('srcTitle').value || '').trim(),
+        username: (document.getElementById('srcUsername').value || '').trim().replace(/^@/, ''),
+        type: document.getElementById('srcType').value,
+    };
+    try {
+        const res = await apiFetch('/api/sources', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+        if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.detail || 'فشل'); }
+        showToast('✓ أُضيف المصدر — أصبحت المراقبة للمفعّلة فقط', 'ok');
+        idEl.value = ''; document.getElementById('srcTitle').value = ''; document.getElementById('srcUsername').value = '';
+        loadSources();
+    } catch (e) { showToast('فشل إضافة المصدر: ' + e.message, 'err'); }
+}
+
+async function toggleSource(chatId) {
+    try {
+        const res = await apiFetch(`/api/sources/${chatId}/toggle`, { method: 'POST' });
+        if (!res.ok) throw new Error('فشل');
+        loadSources();
+    } catch (e) { showToast('فشل تبديل حالة المصدر', 'err'); }
+}
+
+async function removeSource(chatId) {
+    if (!confirm('حذف هذا المصدر نهائياً؟')) return;
+    try {
+        const res = await apiFetch(`/api/sources/${chatId}`, { method: 'DELETE' });
+        if (!res.ok) throw new Error('فشل');
+        showToast('✓ حُذف المصدر', 'ok');
+        loadSources();
+    } catch (e) { showToast('فشل حذف المصدر', 'err'); }
+}
 
 // ================================================================
 // PAGE: AUDIT (v9.18 P0)
@@ -1558,6 +1649,45 @@ const PAGES = {
         load() { loadSettings(); renderSysInfo(true); }
     },
 
+    sources: {
+        render() {
+            return `
+            <div class="panel">
+                <div class="panel-head">
+                    <div class="panel-title"><span class="ico">🎯</span> إضافة مصدر مراقبة</div>
+                    <div class="panel-actions">
+                        <span class="pill green" id="srcModeBadge">—</span>
+                        <button class="al-btn d" onclick="refreshCurrent()">↻</button>
+                    </div>
+                </div>
+                <div class="src-form">
+                    <input class="kw-input" id="srcChatId" placeholder="Chat ID (مثل -1001234567890)" dir="ltr">
+                    <input class="kw-input" id="srcTitle" placeholder="الاسم/العنوان (اختياري)">
+                    <input class="kw-input" id="srcUsername" placeholder="@username (اختياري)" dir="ltr">
+                    <select class="al-select" id="srcType">
+                        <option value="group">مجموعة</option>
+                        <option value="channel">قناة</option>
+                        <option value="user">محادثة خاصة</option>
+                    </select>
+                    <button class="tb-btn primary" onclick="addSource()">＋ إضافة</button>
+                </div>
+                <div class="panel-note">⚠️ دلالة التوافق الذهبية: <b>جدول فارغ = مراقبة كل شيء</b> (السلوك الأصلي حرفياً)؛ وعند إضافة أول مصدر يتحول البوت لمراقبة <b>المفعّلة فقط</b>. التعديلات تُطبَّق فوراً دون إعادة تشغيل.</div>
+            </div>
+            <div class="panel">
+                <div class="panel-head">
+                    <div class="panel-title"><span class="ico">📋</span> المصادر المضافة</div>
+                    <span class="pill blue" id="srcCount">0 مصدر</span>
+                </div>
+                <div style="overflow-x:auto">
+                <table class="tbl">
+                    <thead><tr><th>Chat ID</th><th>الاسم</th><th>النوع</th><th>الحالة</th><th>أُضيف</th><th></th></tr></thead>
+                    <tbody id="srcBody"><tr><td colspan="6" class="empty">جارٍ التحميل…</td></tr></tbody>
+                </table>
+                </div>
+            </div>`;
+        },
+        load() { loadSources(); }
+    },
     audit: {
         render() {
             return `

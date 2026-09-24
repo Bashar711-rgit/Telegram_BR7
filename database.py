@@ -418,6 +418,10 @@ class EnhancedDatabase:
         self._query_cache: TTLCache = TTLCache(maxsize=100, ttl=30)
         self._cache_lock = asyncio.Lock()
 
+        # v9.20 P1: كاش نطاق المصادر — (expiry, set) أو None. مجموعة فارغة
+        # تعني "جدول فارغ = مراقبة كل شيء" (لا تخلط مع كاش فارغ منتهٍ).
+        self._sources_cache: Optional[Tuple[float, set]] = None
+
         # Backup health tracking (fix #7)
         self._backup_failure_count: int = 0
         self._backup_failure_threshold: int = 3
@@ -689,6 +693,20 @@ class EnhancedDatabase:
                 classified TEXT DEFAULT 'cross_group_spam',
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             );
+            -- v9.20 P1: مصادر المراقبة — دلالة التوافق الذهبية:
+            -- جدول فارغ = مراقبة كل شيء (السلوك الأصلي حرفياً)؛
+            -- مملوء = المفعّلة فقط. فشل-آمن: أي خلل يفتح المسار.
+            CREATE TABLE IF NOT EXISTS sources (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL UNIQUE,
+                username TEXT DEFAULT '',
+                title TEXT DEFAULT '',
+                type TEXT DEFAULT '',
+                enabled INTEGER DEFAULT 1,
+                added_by TEXT DEFAULT 'panel',
+                notes TEXT DEFAULT '',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
             -- v9.18 P0: سجل التدقيق — كل عملية كتابة من اللوحتين تُسجّل هنا
             -- (fire-and-forget، بلا أسرار، الهواتف مُقنَّعة). يُقرأ من
             -- GET /api/audit (BotPanel) ويُقَلَّم دورياً بـ90 يوماً.
@@ -940,6 +958,8 @@ class EnhancedDatabase:
             "CREATE INDEX IF NOT EXISTS idx_audit_time   ON audit_logs(created_at DESC)",
             "CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_logs(action)",
             "CREATE INDEX IF NOT EXISTS idx_audit_actor  ON audit_logs(actor)",
+            # v9.20 P1: فحص نطاق المصادر — دائماً مفعّل فقط
+            "CREATE INDEX IF NOT EXISTS idx_sources_enabled ON sources(enabled)",
         ]
         for idx in indexes:
             await self._execute(idx)
@@ -2199,6 +2219,101 @@ class EnhancedDatabase:
         except Exception as e:
             logger.debug(f"cleanup_old_audit_logs skipped: {e}")
             return 0
+
+    # ─── v9.20 P1: مصادر المراقبة (Sources) ──────────────────
+    def invalidate_sources_cache(self) -> None:
+        """v9.20 P1: إبطال كاش المصادر فوراً بعد أي تعديل من اللوحة."""
+        self._sources_cache = None
+
+    async def add_source(self, chat_id: int, username: str = "", title: str = "",
+                         type_: str = "", added_by: str = "panel",
+                         notes: str = "") -> bool:
+        """v9.20 P1: إضافة/تحديث مصدر (upsert حسب chat_id). فشل-آمن."""
+        try:
+            await self._execute(
+                "INSERT INTO sources (chat_id, username, title, type, enabled, added_by, notes)"
+                " VALUES (?, ?, ?, ?, 1, ?, ?)"
+                " ON CONFLICT(chat_id) DO UPDATE SET username=excluded.username,"
+                " title=excluded.title, type=excluded.type, notes=excluded.notes",
+                (int(chat_id), str(username or "")[:80], str(title or "")[:200],
+                 str(type_ or "")[:40], str(added_by or "panel")[:80],
+                 str(notes or "")[:500]),
+            )
+            await self._commit()
+            self.invalidate_sources_cache()
+            return True
+        except Exception as e:
+            logger.error(f"add_source error: {e}")
+            return False
+
+    async def remove_source(self, chat_id: int) -> bool:
+        """v9.20 P1: حذف مصدر نهائياً. فشل-آمن."""
+        try:
+            cur = await self._execute("DELETE FROM sources WHERE chat_id = ?", (int(chat_id),))
+            await self._commit()
+            self.invalidate_sources_cache()
+            return (cur.rowcount or 0) > 0
+        except Exception as e:
+            logger.error(f"remove_source error: {e}")
+            return False
+
+    async def set_source_enabled(self, chat_id: int, enabled: bool) -> bool:
+        """v9.20 P1: تشيل/إيقاف مصدر دون حذفه. فشل-آمن."""
+        try:
+            cur = await self._execute(
+                "UPDATE sources SET enabled = ? WHERE chat_id = ?",
+                (1 if enabled else 0, int(chat_id)),
+            )
+            await self._commit()
+            self.invalidate_sources_cache()
+            return (cur.rowcount or 0) > 0
+        except Exception as e:
+            logger.error(f"set_source_enabled error: {e}")
+            return False
+
+    async def get_source(self, chat_id: int) -> Optional[Dict[str, Any]]:
+        """v9.20 P1: مصدر واحد حسب chat_id — أو None."""
+        try:
+            return await self._fetchone("SELECT * FROM sources WHERE chat_id = ?", (int(chat_id),))
+        except Exception:
+            return None
+
+    async def list_sources(self, limit: int = 500) -> List[Dict[str, Any]]:
+        """v9.20 P1: قائمة المصادر (الأحدث أولاً). فشل-آمن (قائمة فارغة)."""
+        try:
+            limit = max(1, min(int(limit), 1000))
+        except Exception:
+            limit = 500
+        try:
+            return await self._fetchall(
+                "SELECT * FROM sources ORDER BY created_at DESC, id DESC LIMIT ?", (limit,)
+            )
+        except Exception as e:
+            logger.debug(f"list_sources skipped: {e}")
+            return []
+
+    async def is_source_allowed(self, chat_id: int) -> bool:
+        """v9.20 P1: هل يُراقَب هذا المصدر؟ — دلالة التوافق الذهبية.
+
+        * جدول فارغ  → True (مراقبة كل شيء — السلوك الأصلي حرفياً)
+        * جدول مملوء → المفعّلة فقط
+        * أي خلل     → True (فشل-آمن: لا انكسار للمسار أبداً)
+        كاش 30 ثانية + إبطال فوري عند أي تعديل من اللوحة.
+        """
+        try:
+            now = time.time()
+            if self._sources_cache is not None and now < self._sources_cache[0]:
+                allowed_set = self._sources_cache[1]
+            else:
+                rows = await self._fetchall("SELECT chat_id FROM sources WHERE enabled = 1")
+                allowed_set = {int(r["chat_id"]) for r in rows}
+                ttl = max(5.0, float(os.getenv("SOURCES_CACHE_TTL", "30")))
+                self._sources_cache = (now + ttl, allowed_set)
+            if not allowed_set:
+                return True  # جدول فارغ = مراقبة كل شيء
+            return int(chat_id) in allowed_set
+        except Exception:
+            return True  # فشل-آمن: أي خلل = فتح المسار
 
     async def _resource_pressure_check(self) -> None:
         """

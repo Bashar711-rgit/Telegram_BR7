@@ -1818,6 +1818,12 @@ class EnhancedAccountMonitor:
         sender_id = data.get("sender_id", 0); chat_id = data.get("chat_id", 0)
         if await self.db.is_blocked_sender(sender_id): return False
         if await self.db.is_blocked_chat(chat_id): return False
+        # v9.20 P1: نطاق المصادر — بعد قوائم الحظر مباشرة.
+        # جدول فارغ = مراقبة كل شيء (السلوك الأصلي حرفياً)؛ مملوء = المفعّلة فقط.
+        # is_source_allowed فشل-آمن (أي خلل = فتح المسار).
+        if not await self.db.is_source_allowed(chat_id):
+            await self._inc_stat("source_skipped")
+            return False
         # v9.11 مكافحة السبام: المستخدم المصنف Cross-Group Spam / Mass Poster
         # لا تُعالج رسائله مرة أخرى إطلاقاً (فحص ذاكري فوري — لا تكلفة DB).
         # v9.12 (audit H-07): the sync is_ignored() only checks the LRU +
