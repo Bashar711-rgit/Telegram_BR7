@@ -3296,9 +3296,17 @@ RENDER_API_BASE = "https://api.render.com/v1"
 
 
 async def render_upsert_env_many(pairs: List[Tuple[str, str]]) -> Dict[str, Any]:
-    """v9.33: رفع عدة متغيرات بيئة على Render في نداء واحد (PUT بمصفوفة)
-    — نشر واحد بدل نشر لكل مفتاح. عند فشل الدفعة يسقط تلقائياً إلى رفع
-    فردي عبر render_upsert_env لكل مفتاح (توافق مع أي خطة/نسخة API).
+    """v9.35 (حرج): رفع عدة متغيرات بيئة على Render **بدمج آمن**.
+
+    السبب الجذري لاختفاء متغيرات البيئة في الإنتاج: PUT المجمّع على
+    `/env-vars` **يستبدل كل متغيرات الخدمة** بما يُرسل له حرفياً — كان
+    v9.33 يرسل مفاتيح الحساب الجديد فقط فكان يمحو TARGET_GROUP_ID و
+    ADMIN_CHAT_ID وBOT_TOKEN وكل ما عداها في كل إضافة حساب/تسجيل دخول
+    (لهذا دخلت الخدمة وضع «اللوحة فقط» منذ 09-24).
+
+    الإصلاح: GET للقائمة الحالية الكاملة ← دمج الأزواج الجديدة فوقها ←
+    PUT بالمجموعة الكاملة (استبدال بمجموعة شاملة = لا شيء يفقد). عند أي
+    فشل يسقط إلى الرفع الفردي المجرّب عبر render_upsert_env لكل مفتاح.
     فشل-آمن: أي خلل يعيد قاموس سبب ولا يرفع استثناء أبداً."""
     api_key = (os.getenv("RENDER_API_KEY") or "").strip()
     service_id = (os.getenv("RENDER_SERVICE_ID") or "").strip()
@@ -3314,26 +3322,57 @@ async def render_upsert_env_many(pairs: List[Tuple[str, str]]) -> Dict[str, Any]
     timeout = aiohttp.ClientTimeout(total=30)
     try:
         async with aiohttp.ClientSession(timeout=timeout, headers=headers) as s:
+            # 1) القائمة الحالية الكاملة — بدونها PUT يمحو كل شيء
+            current: Dict[str, str] = {}
+            url: Optional[str] = f"{RENDER_API_BASE}/services/{service_id}/env-vars?limit=100"
+            while url:
+                async with s.get(url) as r:
+                    if r.status != 200:
+                        logger.warning(f"render env GET failed: HTTP {r.status}")
+                        break
+                    body = await r.json()
+                    if isinstance(body, dict):
+                        items = body.get("env_vars") or body.get("envVars") or []
+                    else:
+                        items = body or []
+                    for it in items:
+                        ev = it.get("envVar", it) if isinstance(it, dict) else {}
+                        k = ev.get("key")
+                        if k:
+                            current[k] = ev.get("value", "")
+                    cursor = body.get("cursor") if isinstance(body, dict) else None
+                    url = (f"{RENDER_API_BASE}/services/{service_id}/env-vars"
+                           f"?limit=100&cursor={cursor}") if cursor else None
+            # 2) دمج الجديد فوق القديم (الجديد يفوز)
+            merged = dict(current)
+            merged.update({k: v for k, v in pairs})
+            # 3) استبدال بالمجموعة الكاملة المدموجة — لا خسارة
             async with s.put(
                 f"{RENDER_API_BASE}/services/{service_id}/env-vars",
-                json=[{"key": k, "value": v} for k, v in pairs],
+                json=[{"key": k, "value": v} for k, v in merged.items()],
             ) as r:
                 if r.status in (200, 201):
-                    return {"saved": True, "bulk": True}
-        # الدفعة غير مدعومة/فشلت → سقوط رشيق إلى الرفع الفردي المجرّب
-        for k, v in pairs:
-            one = await render_upsert_env(k, v)
-            if not one.get("saved"):
-                return {"saved": False, "reason": one.get("reason", ""), "failed_key": k}
-        return {"saved": True, "bulk": False}
+                    return {"saved": True, "bulk": True, "merged": len(merged)}
+                logger.warning(f"render env bulk merge PUT failed: HTTP {r.status}")
     except Exception as e:
-        return {"saved": False, "reason": f"{type(e).__name__}: {e}"}
+        logger.warning(f"render env bulk merge failed, falling back: {type(e).__name__}: {e}")
+    # سقوط رشيق إلى الرفع الفردي المجرّب (لاحقة المفتاح = upsert آمن)
+    for k, v in pairs:
+        one = await render_upsert_env(k, v)
+        if not one.get("saved"):
+            return {"saved": False, "reason": one.get("reason", ""), "failed_key": k}
+    return {"saved": True, "bulk": False}
 
 
 async def render_upsert_env(key: str, value: str) -> Dict[str, Any]:
     """Upsert a single, specific env var on the Render service via Render API
     (triggers redeploy). Scope is already minimal — only ever called to set
-    one *_SESSION_STRING key, never broader account/service settings."""
+    one *_SESSION_STRING key, never broader account/service settings.
+
+    v9.35 (حرج): أُزيل السقوط الخاطئ إلى PUT المجمّع بمفتاح واحد — نقطة
+    النهاية `/env-vars` (بلا لاحقة مفتاح) **تستبدل كل متغيرات الخدمة**،
+    فكان هذا المسار الاحتياطي يمحو كل البيئة عند أي فشل لاحقة المفتاح.
+    الفشل الآن يُعاد صادقاً ولا يُمس أي متغير آخر."""
     api_key = (os.getenv("RENDER_API_KEY") or "").strip()
     service_id = (os.getenv("RENDER_SERVICE_ID") or "").strip()
     if not api_key or not service_id:
@@ -3349,11 +3388,8 @@ async def render_upsert_env(key: str, value: str) -> Dict[str, Any]:
             async with s.put(f"{RENDER_API_BASE}/services/{service_id}/env-vars/{key}", json={"value": value}) as r:
                 if r.status in (200, 201):
                     return {"saved": True}
-            async with s.put(f"{RENDER_API_BASE}/services/{service_id}/env-vars", json=[{"key": key, "value": value}]) as r2:
-                if r2.status in (200, 201):
-                    return {"saved": True}
-                body = (await r2.text())[:200]
-                return {"saved": False, "reason": f"Render API HTTP {r2.status}: {body}"}
+                body = (await r.text())[:200]
+                return {"saved": False, "reason": f"Render API HTTP {r.status}: {body}"}
     except Exception as e:
         return {"saved": False, "reason": f"{type(e).__name__}: {e}"}
 

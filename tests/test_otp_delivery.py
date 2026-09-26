@@ -274,7 +274,94 @@ class TestPasteSessionString:
         assert bot.added[0]["session_string"] == "1BQANOTEuMTA...fresh"
 
 
-# ─────────────────────── وضع «اللوحة فقط» ───────────────────────
+# ─────────────────────── مزامنة Render بدمج آمن (لا مسح) ───────────────────────
+
+class _FakeResp:
+    def __init__(self, status=200, json_data=None, text=""):
+        self.status = status
+        self._json = json_data
+        self._text = text
+
+    async def json(self):
+        return self._json
+
+    async def text(self):
+        return self._text
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+
+class _FakeRenderSession:
+    calls: list = []
+
+    def __init__(self, *a, **k):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    def get(self, url, **k):
+        _FakeRenderSession.calls.append(("GET", url))
+        return _FakeResp(200, {"env_vars": [
+            {"envVar": {"key": "TARGET_GROUP_ID", "value": "-100111"}},
+            {"envVar": {"key": "ADMIN_CHAT_ID", "value": "555"}},
+            {"envVar": {"key": "ACCOUNT_1_API_ID", "value": "29508560"}},
+        ], "cursor": None})
+
+    def put(self, url, json=None, **k):
+        _FakeRenderSession.calls.append(("PUT", url, json))
+        return _FakeResp(200, json)
+
+
+class TestRenderEnvMergeSafety:
+    @pytest.mark.asyncio
+    async def test_bulk_upsert_merges_never_replaces(self, client, monkeypatch):
+        """السبب الجذري لاختفاء TARGET_GROUP_ID/ADMIN_CHAT_ID من الإنتاج:
+        PUT المجمّع يستبدل كل متغيرات البيئة. الإصلاح: GET ← دمج ← PUT كامل."""
+        monkeypatch.setattr(dash.aiohttp, "ClientSession", _FakeRenderSession)
+        monkeypatch.setenv("RENDER_API_KEY", "test-key")
+        monkeypatch.setenv("RENDER_SERVICE_ID", "srv-test")
+        _FakeRenderSession.calls = []
+        result = await dash.render_upsert_env_many([("ACCOUNT_1_SESSION_STRING", "NEWSESSION")])
+        assert result.get("saved") is True
+        puts = [c for c in _FakeRenderSession.calls if c[0] == "PUT"]
+        assert puts, "لا يوجد PUT إطلاقاً"
+        payload = {p["key"]: p["value"] for p in puts[0][2]}
+        # الجديد موجود…
+        assert payload["ACCOUNT_1_SESSION_STRING"] == "NEWSESSION"
+        # …والقديم لم يُمس (هذا ما كان يُمسح قبل الإصلاح)
+        assert payload["TARGET_GROUP_ID"] == "-100111"
+        assert payload["ADMIN_CHAT_ID"] == "555"
+        assert payload["ACCOUNT_1_API_ID"] == "29508560"
+
+    @pytest.mark.asyncio
+    async def test_single_upsert_failure_never_wipes_env(self, client, monkeypatch):
+        """إزالة السقوط الخاطئ: فشل لاحقة المفتاح لا يرسل PUT مجمّعاً
+        بمفتاح واحد (كان يمحو كل البيئة)."""
+        monkeypatch.setattr(dash.aiohttp, "ClientSession", _FakeRenderSession)
+        monkeypatch.setenv("RENDER_API_KEY", "test-key")
+        monkeypatch.setenv("RENDER_SERVICE_ID", "srv-test")
+        _FakeRenderSession.calls = []
+
+        def _deny_per_key(url, json=None, **k):
+            if url.rstrip("/").endswith("/env-vars/TOP_KEY"):
+                return _FakeResp(405, text="method not allowed")
+            return _FakeResp(200, json)
+
+        monkeypatch.setattr(_FakeRenderSession, "put", _deny_per_key)
+        result = await dash.render_upsert_env("TOP_KEY", "V")
+        assert result.get("saved") is False
+        bulk_puts = [c for c in _FakeRenderSession.calls if c[0] == "PUT"
+                     and c[1].rstrip("/").endswith("/env-vars")]
+        assert bulk_puts == []  # لا استبدال كامل أبداً
+
 
 class TestMonitoringReady:
     @pytest.mark.asyncio
