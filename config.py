@@ -536,10 +536,30 @@ class Config:
             level=SecretManager.get("LOG_LEVEL", "INFO", required=False),
         )
 
-        tg = SecretManager.get_int("TARGET_GROUP_ID", required=True)
-        admin = SecretManager.get_int("ADMIN_CHAT_ID", required=True)
-        if tg == 0 or admin == 0:
-            raise ValueError("TARGET_GROUP_ID and ADMIN_CHAT_ID must be non-zero")
+        # v9.34-2: صمود الإقلاع أمام نافذة env الفارغة على Render.
+        # النمط الموثق في سجلات النشر (09-24 و09-26): النسخة الجديدة تُقلع
+        # 1-2 مرة قبل اكتمال حقن متغيرات البيئة، فترى TARGET_GROUP_ID
+        # مفقوداً وتموت FATAL (exit 1) → Render يعلن update_failed ويعيد
+        # النشر للتراجع — مهما كان الكود سليماً. الحل: غياب المتغيرين
+        # (وليس قيمة غير صالحة) يُدخل وضع «اللوحة فقط» المُمدوم أصلاً في
+        # main.py (لا مراقبة ولا تنبيهات، /health تعمل، النشر ينجح) مع
+        # تحذير CRITICAL صريح. الإقلاع العادي (البيئة كاملة) لا يتغير
+        # عليه شيء حرفياً، وقيمة 0 الصريحة تبقى خطأ رفعاً.
+        tg_raw = SecretManager.get("TARGET_GROUP_ID", None, required=False)
+        admin_raw = SecretManager.get("ADMIN_CHAT_ID", None, required=False)
+        if tg_raw is None or admin_raw is None:
+            logger.critical(
+                "TARGET_GROUP_ID/ADMIN_CHAT_ID missing at boot — running in "
+                "dashboard-only mode (no monitoring/alerts). If this is a "
+                "normal deploy, verify the Render environment variables."
+            )
+            tg = int(tg_raw) if tg_raw is not None else 0
+            admin = int(admin_raw) if admin_raw is not None else 0
+        else:
+            tg = int(tg_raw)
+            admin = int(admin_raw)
+            if tg == 0 or admin == 0:
+                raise ValueError("TARGET_GROUP_ID and ADMIN_CHAT_ID must be non-zero")
 
         workers = SecretManager.get_int("PROCESSING_WORKERS", 3, required=False)
         if workers < 1:
