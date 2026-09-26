@@ -1020,6 +1020,7 @@ body { font-family: var(--sans); background: var(--bg); color: var(--text); font
     <div class="field"><input type="text" id="new-account-api-hash" placeholder="API Hash" style="direction:ltr"></div>
     <div class="field"><input type="text" id="new-account-phone" placeholder="رقم الهاتف (مع رمز الدولة)" style="direction:ltr"></div>
     <div class="field"><input type="text" id="new-account-session" placeholder="اسم الجلسة" style="direction:ltr"></div>
+    <div class="field"><input type="text" id="new-account-session-string" placeholder="Session String (اختياري — إن كانت جاهزة)" style="direction:ltr"></div>
     <div class="field"><input type="number" id="new-account-priority" placeholder="الأولوية (1-10)" value="5"></div>
     <div class="modal-actions">
       <button onclick="addAccount()" class="tb-btn primary">إضافة</button>
@@ -1037,6 +1038,7 @@ body { font-family: var(--sans); background: var(--bg); color: var(--text); font
     <div class="field"><input type="text" id="edit-account-api-hash" placeholder="API Hash" style="direction:ltr"></div>
     <div class="field"><input type="text" id="edit-account-phone" placeholder="رقم الهاتف (مع رمز الدولة)" style="direction:ltr"></div>
     <div class="field"><input type="text" id="edit-account-session" placeholder="اسم الجلسة" style="direction:ltr"></div>
+    <div class="field"><input type="text" id="edit-account-session-string" placeholder="Session String (اتركه فارغاً للاحتفاظ بالحالي)" style="direction:ltr"></div>
     <div class="field"><input type="number" id="edit-account-priority" placeholder="الأولوية (1-10)"></div>
     <div class="modal-actions">
       <button onclick="saveAccountEdit()" class="tb-btn primary" id="edit-acc-save">حفظ التعديل</button>
@@ -2255,6 +2257,11 @@ const PAGES = {
                         <button class="tb-btn primary" onclick="showAddAccount()">+ إضافة حساب</button>
                     </div>
                 </div>
+                <div id="monitoring-warning" class="hidden" style="margin:10px 14px 0;background:rgba(245,158,11,0.08);border:1px solid rgba(245,158,11,0.45);color:#fcd34d;border-radius:10px;padding:12px 16px;font-size:12.5px;line-height:1.9">
+                    <b>⚠️ البوت بوضع «اللوحة فقط» — لا مراقبة ولا إرسال للقناة الهدف.</b>
+                    متغيرات <span style="font-family:var(--mono)">TARGET_GROUP_ID</span> و <span style="font-family:var(--mono)">ADMIN_CHAT_ID</span> غير مضبوطة في بيئة Render —
+                    أضفهما من Render ← Environment ثم أعد النشر ليبدأ الاصطياد والتنبيهات.
+                </div>
                 <div class="acc-list" id="accounts-list"><div class="empty">جاري التحميل...</div></div>
             </div>`;
         },
@@ -2861,6 +2868,8 @@ async function loadAccounts() {
     try {
         const data = await apiFetch('/api/accounts');
         renderAccountsList(data.accounts || []);
+        const mw = document.getElementById('monitoring-warning');
+        if (mw) mw.classList.toggle('hidden', data.monitoring_ready !== false);
     } catch (e) {
         logEvent('err', `accounts load failed: ${e.message}`);
     }
@@ -2949,6 +2958,8 @@ async function saveAccountEdit() {
     if (apiIdRaw) body.api_id = parseInt(apiIdRaw);
     const apiHashRaw = document.getElementById('edit-account-api-hash').value.trim();
     if (apiHashRaw) body.api_hash = apiHashRaw;  // فارغ = احتفظ بالمخزن
+    const sessStr = document.getElementById('edit-account-session-string').value.trim();
+    if (sessStr) body.session_string = sessStr;   // فارغ = احتفظ بالجلسة الحالية
     if (!body.name || !body.phone) { toast('❌ الاسم ورقم الهاتف مطلوبان', 'err'); return; }
     const btn = document.getElementById('edit-acc-save');
     btn.disabled = true;
@@ -3001,6 +3012,8 @@ async function addAccount() {
         session_name: document.getElementById('new-account-session').value.trim(),
         priority: parseInt(document.getElementById('new-account-priority').value) || 5,
     };
+    const sessStr = document.getElementById('new-account-session-string').value.trim();
+    if (sessStr) data.session_string = sessStr;
     if (!data.name || !data.api_id || !data.api_hash || !data.phone || !data.session_name) {
         toast('❌ الرجاء ملء جميع الحقول', 'err');
         return;
@@ -3010,10 +3023,10 @@ async function addAccount() {
         if (result.success) {
             closeModal('add-account-modal');
             // تفريغ النموذج للإضافة التالية
-            ['new-account-name','new-account-api-id','new-account-api-hash','new-account-phone','new-account-session'].forEach(id => {
+            ['new-account-name','new-account-api-id','new-account-api-hash','new-account-phone','new-account-session','new-account-session-string'].forEach(id => {
                 const el = document.getElementById(id); if (el) el.value = '';
             });
-            toast(`✅ تمت إضافة الحساب (${result.prefix}) — أضف الجلسة من صفحة إدارة الجلسات`, 'ok', 7000);
+            toast(`✅ ${result.message} (${result.prefix})` + (result.saved_to_render ? ' — مُزامن مع Render' : ''), 'ok', 7000);
             logEvent('ok', `account added: ${data.name} (${result.prefix})`);
             loadAccounts();
         }

@@ -175,6 +175,52 @@ from telethon.errors import (
     ApiIdInvalidError,
     FloodWaitError,
     PasswordHashInvalidError,
+    # v9.35: أخطاء توصيل رمز التحقق التي تسبّبت بـ«الرمز لا يصل» —
+    # SendCodeUnavailableError ظهر فعلياً في سجلات الإنتاج عند verify-code.
+    SendCodeUnavailableError,
+    PhoneNumberUnoccupiedError,
+    PhoneNumberBannedError,
+)
+
+# v9.35: خريطة وسائل توصيل رمز التحقق — اللوحة لم تعد تقول «تم إرسال
+# الرمز» بشكل أعمى؛ بل تخبر المستخدم بالضبط كيف سيصله الرمز (التطبيق/
+# SMS/مكالمة/مكالمة وميض) وتنصحه بالبديل الموثوق حين يكون الوسيط
+# غير قابل للاستلام على السيرفر (السبب الحقيقي وراء «الرمز لا يصل»).
+_OTP_DELIVERY_AR: Dict[str, Tuple[str, str]] = {
+    "SentCodeTypeApp": ("app", "رسالة داخل تطبيق تيليجرام (محادثة Telegram الرسمية)"),
+    "SentCodeTypeSms": ("sms", "رسالة SMS على رقم الهاتف"),
+    "SentCodeTypeCall": ("call", "مكالمة هاتفية ستقرأ لك الرمز"),
+    "SentCodeTypeFlashCall": (
+        "flash_call",
+        "مكالمة وميض (Flash Call) — الرمز في رقم المتصل، غالباً لا تصل على أرقام افتراضية/سيرفرات",
+    ),
+    "SentCodeTypeMissedCall": (
+        "missed_call",
+        "مكالمة فائتة — آخر أرقام من رقم المتصل هي الرمز",
+    ),
+    "SentCodeTypeSetUpEmailRequired": (
+        "email",
+        "تيليجرام يطلب إعداد بريد إلكتروني لاستعادة الدخول قبل إرسال الرمز",
+    ),
+}
+
+
+def _otp_delivery_info(sent_code: Any) -> Tuple[str, str]:
+    """v9.35: (مفتاح الوسيلة، وصفها بالعربية) من كائن auth.SentCode.
+    فشل-آمن: أي نوع غير معروف يعيد وصفاً عاماً بدل استثناء."""
+    try:
+        tname = type(sent_code.type).__name__
+        return _OTP_DELIVERY_AR.get(tname, ("unknown", "وسيلة توصيل غير معروفة"))
+    except Exception:
+        return ("unknown", "وسيلة توصيل غير معروفة")
+
+
+OTP_UNAVAILABLE_AR = (
+    "تيليجرام رفض إرسال رمز التحقق لهذا الرقم الآن (SEND_CODE_UNAVAILABLE — "
+    "جميع وسائل التوصيل المتاحة لنوع هذا الرقم استُخدمت). الحل الموثوق: "
+    "ولّد Session String على جهازك الشخصي (نفس رقم API_ID/API_HASH) عبر "
+    "الأداة generate_session.py أو تطبيق Telethon-Thon ثم الصقه في "
+    "«إعدادات الحسابات» — أو انتظر ساعات وأعد المحاولة."
 )
 
 from config import CFG, ACCOUNTS
@@ -204,6 +250,9 @@ class AccountCreate(BaseModel):
     phone: str
     session_name: str
     priority: int = 5
+    # v9.35: البديل الموثوق حين يرفض تيليجرام إرسال رمز التحقق من السيرفر
+    # (SEND_CODE_UNAVAILABLE) — جلسة مولّدة محلياً تُلصق مباشرة.
+    session_string: Optional[str] = None
 
 
 class AccountUpdate(BaseModel):
@@ -215,6 +264,8 @@ class AccountUpdate(BaseModel):
     api_hash: Optional[str] = None
     phone: Optional[str] = None
     session_name: Optional[str] = None
+    # v9.35: لصق/تحديث الجلسة مباشرة (بدون مسار OTP) — الفارغ لا يُمسّ
+    session_string: Optional[str] = None
 
 
 class AccountToggle(BaseModel):
@@ -1331,7 +1382,7 @@ async def get_accounts(request: Request):
             "last_activity_at": None, "origin": "env", **ms,
             "status": "connected" if ms.get("connected") else "error",
         })
-    return JSONResponse({"accounts": accounts})
+    return JSONResponse({"accounts": accounts, "monitoring_ready": _monitoring_ready()})
 
 
 @app.post("/api/accounts", dependencies=[Depends(require_permission("accounts.write"))])  # v9.32
@@ -1357,11 +1408,13 @@ async def add_account(data: AccountCreate, request: Request):
 
     # 1) قاعدة البيانات — مصدر الحقيقة: أي فشل هنا = فشل الطلب الصريح
     #    (لا رسالة نجاح وهمية أبداً).
+    session_string = (data.session_string or "").strip() or None
     db = getattr(request.app.state, "db", None)
     if db is not None:
         row = await db.upsert_dashboard_account(
             prefix=prefix, name=data.name, api_id=data.api_id, api_hash=data.api_hash,
             phone=data.phone, session_name=data.session_name, priority=data.priority,
+            session_string=session_string,
             origin="panel",
         )
         if row is None:
@@ -1386,25 +1439,54 @@ async def add_account(data: AccountCreate, request: Request):
         logger.warning(f"accounts.env append failed (DB row kept): {e}")
 
     # 3) مزامنة Render — تخزين دائم + إعادة نشر تلقائية تفعّل الحساب.
+    #    v9.35: تتضمن SESSION_STRING عند لصق جلسة جاهزة (ديمومة كاملة).
     render_save: Dict[str, Any] = {"saved": False, "reason": "RENDER_API_KEY / RENDER_SERVICE_ID غير مضبوطة"}
     if (os.getenv("RENDER_API_KEY") or "").strip() and (os.getenv("RENDER_SERVICE_ID") or "").strip():
-        render_save = await render_upsert_env_many([
+        render_pairs = [
             (f"{prefix}_API_ID", str(data.api_id)),
             (f"{prefix}_API_HASH", data.api_hash),
             (f"{prefix}_PHONE", data.phone),
             (f"{prefix}_SESSION_NAME", data.session_name),
             (f"{prefix}_PRIORITY", str(data.priority)),
-        ])
+        ]
+        if session_string:
+            render_pairs.append((f"{prefix}_SESSION_STRING", session_string))
+        render_save = await render_upsert_env_many(render_pairs)
         logger.info(f"account {prefix} Render env sync: saved={render_save.get('saved')}")
 
     await _audit(request, "account.add", object_type="account", object_id=data.name or prefix,
                  new_value=_mask_phone(data.phone or ""))
+
+    # v9.35: جلسة جاهزة = توصيل حي فوري (بلا انتظار إعادة نشر Render)
+    # + تحديث نسخة الذاكرة ليعرض البوت الحساب متصلاً في نفس اللحظة.
+    connect_scheduled = False
+    if session_string:
+        for a in ACCOUNTS:
+            if (a.get("prefix") or "").upper() == prefix:
+                a["session_string"] = session_string
+                break
+        if getattr(request.app.state, "bot_ref", None) is not None:
+            try:
+                _track_local_task(
+                    _runtime_connect_account(request, prefix),
+                    f"account_add_connect_{prefix}",
+                )
+                connect_scheduled = True
+            except Exception as e:
+                logger.debug(f"post-add connect spawn skipped [{prefix}]: {e}")
+
+    message = (
+        ("تمت إضافة الحساب وحفظ الجلسة" + (" — جاري الاتصال وبدء المراقبة الآن" if connect_scheduled else ""))
+        if session_string
+        else "تمت إضافة الحساب — سجّل الدخول من صفحة الجلسات لإنشاء الجلسة"
+    )
     return JSONResponse({
         "success": True,
-        "message": "Account added. Restart the service to apply.",
+        "message": message,
         "prefix": prefix,
         "saved_to_render": bool(render_save.get("saved")),
         "render_reason": render_save.get("reason", ""),
+        "connect_scheduled": connect_scheduled,
     })
 
 
@@ -1461,6 +1543,24 @@ async def _runtime_connect_account(request: Request, prefix: str) -> Dict[str, A
     return result
 
 
+async def _reconnect_with_new_session(request: Request, prefix: str) -> None:
+    """v9.35: إعادة توصيل حي بعد لصق جلسة جديدة من اللوحة — إزالة المراقب
+    القديم (إن وجد) ثم إنشاء مراقب بالجلسة الجديدة بنفس مسار الإقلاع.
+    فشل-آمن: يُسجّل ولا يُرفع أبداً (الرد نجح بالفعل والجلسة محفوظة)."""
+    try:
+        bot = getattr(request.app.state, "bot_ref", None)
+        if bot is None:
+            return
+        bot.remove_runtime_monitor(prefix, disconnect_client=True)
+        result = await _runtime_connect_account(request, prefix)
+        if result.get("ok"):
+            logger.info(f"✅ Account {prefix} reconnected live with new session")
+        else:
+            logger.warning(f"new-session reconnect failed [{prefix}]: {result.get('error')}")
+    except Exception as e:
+        logger.debug(f"_reconnect_with_new_session failed [{prefix}]: {e}")
+
+
 @app.get("/api/accounts/{prefix}", dependencies=[Depends(require_permission("accounts.read"))])  # v9.34
 async def get_account_detail(prefix: str, request: Request):
     """تفاصيل حساب واحد — بيانات الإعداد + حالة الإدارة + إحصاءات المراقب الحي."""
@@ -1514,8 +1614,9 @@ async def update_account(prefix: str, data: AccountUpdate, request: Request):
     الذاكرة (ACCOUNTS + المراقب الحي)، ثم مزامنة متغيرات بيئة Render.
     التغيير ينعكس فوراً في اللوحة دون إعادة تشغيل."""
     p = prefix.strip().upper()
+    session_string = (data.session_string or "").strip() or None
     if not any([data.name, data.api_id, data.api_hash, data.phone, data.session_name,
-                data.priority is not None, data.enabled is not None]):
+                data.priority is not None, data.enabled is not None, session_string]):
         raise HTTPException(status_code=400, detail="لا توجد حقول للتحديث")
     merged = await _merged_accounts(request)
     acc = _find_merged_account(merged, p)
@@ -1541,14 +1642,22 @@ async def update_account(prefix: str, data: AccountUpdate, request: Request):
             raise HTTPException(status_code=500, detail="فشل حفظ التعديل في قاعدة البيانات")
         if data.enabled is not None:
             await db.set_dashboard_account_enabled(p, bool(data.enabled))
+        if session_string:
+            # v9.35: لصق جلسة جديدة من اللوحة — تُحفظ فوراً كمصدر حقيقة
+            if not await db.set_dashboard_account_session(p, session_string):
+                logger.warning(f"session update db persist failed [{p}]")
 
     # الذاكرة: نسخة الإقلاع + المراقب الحي (تعديل اسم/أولوية ينعكس فوراً)
+    reconnect_needed = False
     for a in ACCOUNTS:
         if (a.get("prefix") or "").upper() == p:
             if data.name is not None:
                 a["name"] = data.name.strip()
             if data.priority is not None:
                 a["priority"] = int(data.priority)
+            if session_string:
+                a["session_string"] = session_string
+                reconnect_needed = True
             break
     bot = getattr(request.app.state, "bot_ref", None)
     if bot is not None:
@@ -1558,6 +1667,10 @@ async def update_account(prefix: str, data: AccountUpdate, request: Request):
                 mon.account["name"] = data.name.strip()
             if data.priority is not None:
                 mon.account["priority"] = int(data.priority)
+            if session_string:
+                # جلسة جديدة على مراقب حي = إزالة ثم توصيل بالجلسة الجديدة
+                mon.account["session_string"] = session_string
+                reconnect_needed = True
 
     # مزامنة Render — فقط الحقول الموجودة في البيئة أصلاً
     render_save: Dict[str, Any] = {"saved": False, "reason": ""}
@@ -1573,17 +1686,42 @@ async def update_account(prefix: str, data: AccountUpdate, request: Request):
             pairs.append((f"{p}_SESSION_NAME", data.session_name.strip()))
         if data.priority is not None:
             pairs.append((f"{p}_PRIORITY", str(data.priority)))
+        if session_string:
+            pairs.append((f"{p}_SESSION_STRING", session_string))
         if pairs:
             render_save = await render_upsert_env_many(pairs)
+
+    # v9.35: جلسة جديدة = توصيل حي فوري (إنشاء مراقب أو استبدال قديم).
+    # لا شرط على reconnect_needed هنا — الحساب المضاف من اللوحة ليس في
+    # ACCOUNTS ولا له مراقب بعد، وهذا بالضبط المسار الذي يجب أن يعمل.
+    if session_string and bot is not None:
+        enabled_now = True
+        if db is not None:
+            try:
+                row = await db.get_dashboard_account(p) if db else None
+                enabled_now = bool(row.get("enabled", True)) if row else True
+            except Exception:
+                pass
+        if enabled_now:
+            try:
+                _track_local_task(
+                    _reconnect_with_new_session(request, p),
+                    f"account_session_reconnect_{p}",
+                )
+            except Exception as e:
+                logger.debug(f"session reconnect spawn skipped [{p}]: {e}")
 
     await _audit(request, "account.update", object_type="account", object_id=p,
                  new_value=json.dumps({k: (v if k != "api_hash" else "***") for k, v in {
                      "name": data.name, "api_id": data.api_id, "phone": _mask_phone(data.phone or ""),
                      "session_name": data.session_name, "priority": data.priority,
+                     "session_string": bool(session_string),
                      "enabled": data.enabled}.items() if v is not None}, ensure_ascii=False))
     return JSONResponse({
         "success": True,
-        "message": "تم حفظ التعديل",
+        "message": ("تم حفظ التعديل"
+                    + (" — حُفظت الجلسة الجديدة" + (" وجاري إعادة الاتصال بها" if reconnect_needed else "")
+                       if session_string else "")),
         "prefix": p,
         "saved_to_render": bool(render_save.get("saved")),
         "render_reason": render_save.get("reason", ""),
@@ -3100,13 +3238,18 @@ class LoginManager:
             )
             await client.connect()
             sent = await client.send_code_request(phone)
+            delivery, delivery_hint = _otp_delivery_info(sent)
+            # v9.35: تسجيل وسيلة التوصيل فقط (بدون أي بيانات حساسة) — هذا
+            # السطر هو ما يكشف لماذا «لا يصل الرمز» (مثلاً: flash-call).
+            logger.info(f"send-code [{prefix}]: delivery={delivery}")
             self._pending[prefix] = {
                 "client": client,
                 "phone": phone,
                 "phone_code_hash": sent.phone_code_hash,
                 "ts": time.time(),
             }
-            return {"sent": True, "code_type": str(sent.type)}
+            return {"sent": True, "code_type": str(sent.type),
+                    "delivery": delivery, "delivery_hint": delivery_hint}
 
     async def _get(self, prefix: str) -> Dict[str, Any]:
         entry = self._pending.get(prefix)
@@ -3339,7 +3482,17 @@ async def login_accounts(request: Request):
             "pending_deploy": bool(acc.get("pending_deploy")),
             "enabled": bool(acc.get("enabled", True)),  # v9.34
         })
-    return JSONResponse({"accounts": out})
+    return JSONResponse({"accounts": out, "monitoring_ready": _monitoring_ready()})
+
+
+def _monitoring_ready() -> bool:
+    """v9.35: هل بيئة التشغيل تكفي لبدء المراقبة والإرسال للقناة الهدف؟
+    غياب TARGET_GROUP_ID/ADMIN_CHAT_ID يُدخل وضع «اللوحة فقط» — اللوحة
+    تعرض لافتة تحذير واضحة بدل سؤال المستخدم «لماذا لا يراقب ولا يرسل؟»."""
+    try:
+        return bool(int(CFG.TARGET_GROUP_ID or 0)) and bool(int(CFG.ADMIN_CHAT_ID or 0))
+    except Exception:
+        return False
 
 
 @app.post("/api/login/send-code", dependencies=[Depends(require_permission("accounts.write"))])  # v9.32
@@ -3360,7 +3513,14 @@ async def login_send_code(data: LoginSendCode, request: Request):
     except ApiIdInvalidError:
         raise HTTPException(status_code=400, detail="API_ID / API_HASH غير صالحة")
     except PhoneNumberInvalidError:
-        raise HTTPException(status_code=400, detail="رقم الهاتف غير صالح")
+        raise HTTPException(status_code=400, detail="رقم الهاتف غير صالح — تأكد من كتابته مع رمز الدولة (+966…)")
+    except PhoneNumberUnoccupiedError:
+        raise HTTPException(status_code=400, detail="هذا الرقم غير مسجل في تيليجرام — أنشئ حساباً به أولاً من التطبيق")
+    except PhoneNumberBannedError:
+        raise HTTPException(status_code=400, detail="هذا الرقم محظور من تيليجرام")
+    except SendCodeUnavailableError:
+        # v9.35: السبب الحقيقي لـ«الرمز لا يصل» — يُكتشف هنا مبكراً بدل 200 وهمي
+        raise HTTPException(status_code=400, detail=OTP_UNAVAILABLE_AR)
     except FloodWaitError as e:
         raise HTTPException(status_code=429, detail=f"حظر مؤقت من تيليجرام - انتظر {e.seconds} ثانية")
     except Exception as e:
@@ -3378,6 +3538,11 @@ async def login_verify_code(data: LoginVerifyCode):
         raise HTTPException(status_code=400, detail="رمز التحقق غير صحيح")
     except PhoneCodeExpiredError:
         raise HTTPException(status_code=400, detail="رمز التحقق منتهي - أرسل كوداً جديداً")
+    except SendCodeUnavailableError:
+        # v9.35: ظهر حرفياً في سجلات الإنتاج (22:37:59) — الرمز لم يُوصل
+        # أصلاً (flash-call) فرفضه السيرفر عند sign_in. رسالة واضحة بدل
+        # خطأ إنجليزي خام مرة 500.
+        raise HTTPException(status_code=400, detail=OTP_UNAVAILABLE_AR)
     except HTTPException:
         raise
     except Exception as e:
@@ -3425,10 +3590,41 @@ async def _connect_after_login(prefix: str, session_string: str) -> None:
         if not enabled:
             logger.info(f"post-login connect skipped [{prefix}]: account disabled in DB")
             return
-        merged_prefix_acc = next((a for a in ACCOUNTS if a.get("prefix") == prefix), None)
-        if merged_prefix_acc is None:
-            return
-        result = await bot.add_runtime_monitor(merged_prefix_acc)
+        # v9.35: يُبنى الحساب من نسخة الإقلاع أولاً، وإن لم يوجد (حساب
+        # مضاف من اللوحة لم يُنشر بعد) يُبنى من قاعدة البيانات — سابقاً كان
+        # يُتخطى بصمت هنا فلا يتصل الحساب المضاف حياً أبداً بعد التسجيل
+        # (السكوت الكامل الذي أبلّغ عنه المستخدم: «لا يُفعّل ولا يراقب»).
+        acc = next((a for a in ACCOUNTS if (a.get("prefix") or "").upper() == prefix), None)
+        if acc is None:
+            db_row: Optional[Dict[str, Any]] = None
+            if db is not None:
+                try:
+                    db_row = await db.get_dashboard_account(prefix)
+                except Exception:
+                    db_row = None
+            if db_row is None:
+                logger.warning(f"post-login connect skipped [{prefix}]: no source row found")
+                return
+            acc = {
+                "id": db_row.get("id", 0),
+                "prefix": prefix,
+                "name": db_row.get("name") or prefix.replace("_", " ").title(),
+                "api_id": db_row.get("api_id"),
+                "api_hash": db_row.get("api_hash"),
+                "phone": db_row.get("phone"),
+                "session": db_row.get("session_name") or prefix.lower(),
+                "session_string": session_string,
+                "priority": db_row.get("priority", 10),
+                "is_main": bool(db_row.get("is_main")),
+                "enabled": True,
+                "retry_count": 0,
+                "last_error": None,
+            }
+        # الجلسة المُنتجة الآن هي الأحدث دائماً (قد تكون بيئة الإقلاع تحمل
+        # قيمة قديمة/فارغة لأن التسجيل تم للتو).
+        acc = dict(acc)
+        acc["session_string"] = session_string
+        result = await bot.add_runtime_monitor(acc)
         if result.get("ok"):
             logger.info(f"✅ Account {prefix} connected live right after login")
             if db is not None:
@@ -3555,6 +3751,13 @@ a { color:#38bdf8; }
 <table id="acctTable"><thead><tr><th>الحساب</th><th>الهاتف</th><th>الجلسة</th><th>الاتصال</th></tr></thead><tbody></tbody></table>
 </div>
 
+<div id="monWarn" class="hidden" style="background:#422006;border:1px solid #f59e0b;color:#fcd34d;border-radius:12px;padding:14px 18px;margin-bottom:16px;font-size:13.5px;line-height:1.9">
+<b>⚠️ البوت يعمل حالياً بوضع «اللوحة فقط» — لا مراقبة ولا إرسال للقناة الهدف.</b><br>
+السبب: متغيرات <span class="mono">TARGET_GROUP_ID</span> و <span class="mono">ADMIN_CHAT_ID</span> غير مضبوطة في بيئة Render.
+حتى لو اتصل الحساب بنجاح فلن يراقب المجموعات ولا يرسل التنبيهات.
+أضف المتغيرين من Render ← Environment ثم أعد النشر.
+</div>
+
 <div class="card">
 <h2>2️⃣ تسجيل حساب جديد</h2>
 <div class="steps">
@@ -3585,6 +3788,21 @@ a { color:#38bdf8; }
 <div class="msg" id="msg"></div>
 </div>
 
+<div class="card">
+<h2>3️⃣ تسجيل بجلسة جاهزة (Session String) — البديل الموثوق</h2>
+<p style="font-size:13px;color:#94a3b8;line-height:1.9;margin-bottom:8px">
+إذا لم يصلك رمز التحقق (تيليجرام غالباً يمنع التوصيل من سيرفرات السحابة أو يستخدم مكالمة)،
+ولّد الجلسة على جهازك الشخصي بنفس API_ID/API_HASH عبر:
+<span class="mono" style="color:#38bdf8">python generate_session.py</span>
+أو موقع Telethon-Thon، ثم الصق الناتج هنا — الحساب يتصل ويراقب فوراً.
+</p>
+<label>اختر الحساب</label>
+<select id="sess-prefix"></select>
+<label>Session String</label>
+<input type="text" id="sess-string" class="mono" placeholder="1BQANOTEuMTA…" style="direction:ltr">
+<button id="btnSess" onclick="pasteSession()">🔗 حفظ الجلسة وتوصيل الحساب</button>
+</div>
+
 <div class="card" style="text-align:center; font-size:13px; color:#64748b;">
 بعد كل تسجيل ناجح، ستعيد Render نشر الخدمة تلقائياً (2-4 دقائق) ثم يتصل الحساب.<br>
 <a href="/">← العودة للوحة التحكم</a> | <a href="/health">/health</a>
@@ -3606,8 +3824,8 @@ function setStep(n) {
   $('stepCode').classList.toggle('hidden', n !== 2);
   $('stepPass').classList.toggle('hidden', n !== 3);
 }
-async function api(path, body) {
-  const r = await fetch(path, { method: body ? 'POST' : 'GET',
+async function api(path, body, method) {
+  const r = await fetch(path, { method: method || (body ? 'POST' : 'GET'),
     headers: { 'Authorization': 'Bearer ' + token(), 'Content-Type': 'application/json' },
     body: body ? JSON.stringify(body) : undefined });
   const data = await r.json().catch(() => ({}));
@@ -3620,6 +3838,7 @@ async function loadAccounts() {
     const d = await api('/api/login/accounts');
     const tb = document.querySelector('#acctTable tbody'); tb.innerHTML = '';
     const sel = $('prefix'); sel.innerHTML = '';
+    const ssel = $('sess-prefix'); if (ssel) ssel.innerHTML = '';
     d.accounts.forEach(a => {
       const tr = document.createElement('tr');
       const sess = a.has_session_string ? '<span class="badge b-green">موجودة</span>' : '<span class="badge b-yellow">مطلوبة</span>';
@@ -3629,7 +3848,10 @@ async function loadAccounts() {
       const op = document.createElement('option');
       op.value = a.prefix; op.textContent = `${a.name} (${a.phone_masked})${a.connected ? ' ✅' : ''}`;
       sel.appendChild(op);
+      if (ssel) { const o2 = op.cloneNode(true); ssel.appendChild(o2); }
     });
+    const warn = $('monWarn');
+    if (warn) warn.classList.toggle('hidden', d.monitoring_ready !== false);
   } catch (e) { show('err', 'تعذر تحميل الحسابات: ' + e.message); }
 }
 async function sendCode() {
@@ -3639,7 +3861,13 @@ async function sendCode() {
   show('info', '⏳ جاري إرسال رمز التحقق عبر تيليجرام...');
   try {
     const d = await api('/api/login/send-code', { prefix: currentPrefix });
-    show('ok', `📨 تم إرسال الرمز إلى ${d.phone_masked} - افتح تيليجرام وانسخ الرمز ثم أدخله هنا.`);
+    let msg = `📨 تم إرسال الطلب إلى ${esc(d.phone_masked)}`;
+    if (d.delivery_hint) msg += `<br>📬 طريقة التوصيل التي اختارها تيليجرام: <b>${esc(d.delivery_hint)}</b>`;
+    msg += `<br>افتح تيليجرام وانسخ الرمز ثم أدخله هنا.`;
+    if (d.delivery && d.delivery !== 'app' && d.delivery !== 'sms') {
+      msg += `<br>⚠️ تيليجرام اختار مكالمة لتوصيل الرمز — غالباً لن تصلك رسالة في تيليجرام. إن لم تتلقَ المكالمة استخدم <b>تسجيل بجلسة جاهزة</b> بالأسفل.`;
+    }
+    show('ok', msg);
     setStep(2);
   } catch (e) { show('err', '❌ ' + e.message); }
   $('btnSend').disabled = false;
@@ -3665,13 +3893,28 @@ function finishLogin(d) {
   setStep(4);
   let html = `✅ تم تسجيل الدخول بنجاح: <b>${esc(d.user)}</b><br>`;
   if (d.saved_to_render) {
-    html += `💾 حُفظت الجلسة في <span class="mono">${esc(d.env_key)}</span><br>🔄 ستعيد Render النشر تلقائياً وسيتصل الحساب خلال دقائق.`;
+    html += `💾 حُفظت الجلسة في <span class="mono">${esc(d.env_key)}</span><br>🔄 ستعيد Render النشر تلقائياً وسيتصل الحساب خلال دقائق — ويبدأ الاتصال الحي الآن مباشرة أيضاً.`;
   } else {
     // SECURITY (audit H-4): the Session String is never shown in the browser.
     html += `⚠️ ${esc(d.note || '')}<br>السبب: ${esc(d.save_reason || '')}`;
   }
   show(d.saved_to_render ? 'ok' : 'err', html);
   setTimeout(loadAccounts, 2000);
+}
+async function pasteSession() {
+  const pfx = $('sess-prefix').value;
+  const s = $('sess-string').value.trim();
+  if (!pfx) { show('err', '❌ اختر الحساب أولاً'); return; }
+  if (!s || s.length < 30) { show('err', '❌ الصق Session String صحيحاً (يبدأ بـ 1Ab… أو 1BQ…)'); return; }
+  const btn = $('btnSess'); btn.disabled = true;
+  show('info', '⏳ جاري حفظ الجلسة وتوصيل الحساب...');
+  try {
+    const d = await api(`/api/accounts/${encodeURIComponent(pfx)}`, { session_string: s }, 'PUT');
+    show('ok', `✅ ${esc(d.message || 'تم حفظ الجلسة')}<br>🔄 إن لم يتصل فوراً فسيتصل تلقائياً بعد إعادة نشر Render (${d.saved_to_render ? 'حُفظت في Render' : 'لم تُزامن مع Render'}).`);
+    $('sess-string').value = '';
+    setTimeout(loadAccounts, 2000);
+  } catch (e) { show('err', '❌ ' + e.message); }
+  btn.disabled = false;
 }
 setStep(1);
 if (token()) loadAccounts();
