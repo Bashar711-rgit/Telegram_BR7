@@ -353,6 +353,47 @@ body { font-family: var(--sans); background: var(--bg); color: var(--text); font
 .dot-on { width: 6px; height: 6px; border-radius: 50%; background: var(--green); box-shadow: 0 0 5px var(--green); }
 .dot-off { width: 6px; height: 6px; border-radius: 50%; background: var(--red); }
 .dot-warn { width: 6px; height: 6px; border-radius: 50%; background: var(--yellow); }
+.dot-gray { width: 6px; height: 6px; border-radius: 50%; background: var(--text3); }
+/* ── v9.34: إدارة الحسابات — شارات الحالة + صف البيانات الإضافية + أزرار الإجراءات ── */
+.acc-badge {
+  display: inline-block; padding: 1px 7px; border-radius: 10px;
+  font-size: 9.5px; font-weight: 600; margin-inline-start: 6px; vertical-align: middle;
+}
+.ab-main { background: rgba(139,92,246,0.15); color: #a78bfa; }
+.ab-pending { background: var(--yellow2); color: var(--yellow); }
+.ab-disabled { background: rgba(148,163,184,0.15); color: #94a3b8; }
+.ab-nosess { background: rgba(148,163,184,0.12); color: #94a3b8; }
+.acc-meta {
+  width: 100%; display: flex; gap: 14px; flex-wrap: wrap;
+  font-size: 10px; color: var(--text3); padding-inline-start: 42px; margin-top: -2px;
+}
+.acc-meta b { color: var(--text2); font-weight: 500; font-family: var(--mono); }
+.acc-actions {
+  width: 100%; display: flex; gap: 6px; flex-wrap: wrap;
+  padding-inline-start: 42px; margin-top: 4px;
+}
+.acc-act {
+  padding: 4px 9px; border-radius: 6px; border: 1px solid var(--border);
+  background: var(--bg2); color: var(--text3); font-size: 10px; cursor: pointer;
+  transition: all 0.12s; font-family: inherit;
+}
+.acc-act:hover { color: var(--text); border-color: rgba(255,255,255,0.2); }
+.acc-act:disabled { opacity: 0.45; cursor: wait; }
+.acc-act.danger { color: var(--red); border-color: rgba(248,113,113,0.2); }
+.acc-act.danger:hover { border-color: rgba(248,113,113,0.5); }
+.acc-act.ok { color: var(--green); border-color: rgba(74,222,128,0.25); }
+.acc-act.ok:hover { border-color: rgba(74,222,128,0.5); }
+/* ── v9.34: التوست (إشعارات النجاح/الفشل) ── */
+.toast-wrap { position: fixed; bottom: 18px; inset-inline-start: 18px; z-index: 9999; display: flex; flex-direction: column; gap: 8px; max-width: min(92vw, 380px); }
+.toast {
+  padding: 11px 14px; border-radius: 10px; font-size: 12px; line-height: 1.6;
+  border: 1px solid; animation: toastIn .2s ease-out; box-shadow: 0 8px 24px rgba(0,0,0,0.35);
+  word-break: break-word;
+}
+.toast.ok { background: #052e16; border-color: #16a34a; color: #86efac; }
+.toast.err { background: #450a0a; border-color: #dc2626; color: #fca5a5; }
+.toast.info { background: #0c4a6e; border-color: #0284c7; color: #7dd3fc; }
+@keyframes toastIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
 
 /* ── FILTER METERS ── */
 .meter-row { display: flex; flex-direction: column; gap: 10px; padding: 14px 16px; }
@@ -851,7 +892,7 @@ body { font-family: var(--sans); background: var(--bg); color: var(--text); font
     <div class="brand-icon">🤖</div>
     <div>
       <div class="brand-name">BotPanel</div>
-      <div class="brand-ver" id="brandVer">BR7 · v9.33</div>
+      <div class="brand-ver" id="brandVer">BR7 · v9.34</div>
     </div>
   </div>
 
@@ -986,6 +1027,43 @@ body { font-family: var(--sans); background: var(--bg); color: var(--text); font
     </div>
   </div>
 </div>
+
+<!-- ══ v9.34 MODAL: EDIT ACCOUNT ══ -->
+<div id="edit-account-modal" class="modal-overlay hidden">
+  <div class="modal-box">
+    <h2>✏️ تعديل الحساب <span id="edit-acc-prefix" style="font-size:11px;color:var(--text3);font-family:var(--mono)"></span></h2>
+    <div class="field"><input type="text" id="edit-account-name" placeholder="اسم الحساب"></div>
+    <div class="field"><input type="number" id="edit-account-api-id" placeholder="API ID"></div>
+    <div class="field"><input type="text" id="edit-account-api-hash" placeholder="API Hash" style="direction:ltr"></div>
+    <div class="field"><input type="text" id="edit-account-phone" placeholder="رقم الهاتف (مع رمز الدولة)" style="direction:ltr"></div>
+    <div class="field"><input type="text" id="edit-account-session" placeholder="اسم الجلسة" style="direction:ltr"></div>
+    <div class="field"><input type="number" id="edit-account-priority" placeholder="الأولوية (1-10)"></div>
+    <div class="modal-actions">
+      <button onclick="saveAccountEdit()" class="tb-btn primary" id="edit-acc-save">حفظ التعديل</button>
+      <button onclick="closeModal('edit-account-modal')" class="tb-btn">إلغاء</button>
+    </div>
+  </div>
+</div>
+
+<!-- ══ v9.34 MODAL: DELETE ACCOUNT (تأكيد) ══ -->
+<div id="delete-account-modal" class="modal-overlay hidden">
+  <div class="modal-box">
+    <h2>🗑️ تأكيد حذف الحساب</h2>
+    <p style="font-size:12px;color:var(--text2);line-height:1.8;margin-bottom:6px">
+      سيتم حذف الحساب <b id="del-acc-name" style="color:var(--red)"></b>
+      <span id="del-acc-prefix" style="font-family:var(--mono);font-size:10px"></span>
+      نهائياً مع كل بياناته وجلسته (قاعدة البيانات + متغيرات Render).
+      لا يمكن التراجع عن هذه العملية.
+    </p>
+    <div class="modal-actions">
+      <button onclick="deleteAccountConfirmed()" class="tb-btn danger" id="del-acc-confirm">🗑️ نعم، احذف نهائياً</button>
+      <button onclick="closeModal('delete-account-modal')" class="tb-btn">إلغاء</button>
+    </div>
+  </div>
+</div>
+
+<!-- ══ v9.34: حاوية إشعارات التوست ══ -->
+<div id="toastWrap" class="toast-wrap"></div>
 
 <script>
 // ================================================================
@@ -1169,7 +1247,32 @@ async function apiFetch(endpoint, options = {}) {
         startLockoutCountdown(retryAfter);
         throw new Error('Too many attempts');
     }
+    // v9.34: الأخطاء غير الناجحة (400/404/409/500...) تُرمى بسببيها الحقيقي
+    // من الخادم (FastAPI detail) — بدلاً من إرجاع JSON الخطأ كنص نجاح فترى
+    // الواجهة "خطأ غير معروف" بدل الرسالة الصادقة.
+    if (!response.ok) {
+        let detail = `HTTP ${response.status}`;
+        try {
+            const body = await response.json();
+            detail = body.detail || body.error || body.message || detail;
+        } catch (e) { /* استجابة غير JSON — يبقى HTTP status */ }
+        const err = new Error(detail);
+        err.status = response.status;
+        throw err;
+    }
     return response.json();
+}
+
+// ── v9.34: التوست — إشعارات النجاح/الفشل (بديل أنيق عن alert) ──
+function toast(msg, type = 'info', ms = 4200) {
+    const wrap = document.getElementById('toastWrap');
+    if (!wrap) return;
+    const el = document.createElement('div');
+    el.className = `toast ${type}`;
+    el.textContent = msg;
+    wrap.appendChild(el);
+    setTimeout(() => { el.style.opacity = '0'; el.style.transition = 'opacity .3s'; }, ms);
+    setTimeout(() => el.remove(), ms + 350);
 }
 
 // ================================================================
@@ -2254,7 +2357,7 @@ const PAGES = {
                     <div class="panel-actions"><button class="tb-btn" onclick="renderSysInfo(true)" title="تحديث من الخادم">⟳</button></div>
                 </div>
                 <div class="sysinfo-grid" id="sysinfo-grid">
-                    <div class="sysinfo-cell"><span class="k">الإصدار</span><span class="v">v9.33</span></div>
+                    <div class="sysinfo-cell"><span class="k">الإصدار</span><span class="v">v9.34</span></div>
                     <div class="sysinfo-cell"><span class="k">جاري التحميل…</span><span class="v">—</span></div>
                 </div>
             </div>
@@ -2657,28 +2760,81 @@ async function loadDeadLetters() {
     }
 }
 
-// ── ACCOUNTS ──
+// ── ACCOUNTS (v9.34: إدارة كاملة — بطاقات + إجراءات فعلية على Backend) ──
+const ACC_STATUS = {
+    connected:    { label: 'متصل',        cls: 'on',   dot: 'dot-on' },
+    disconnected: { label: 'منفصل',       cls: 'off',  dot: 'dot-off' },
+    error:        { label: 'خطأ',         cls: 'warn', dot: 'dot-warn' },
+    pending:      { label: 'بانتظار النشر', cls: 'warn', dot: 'dot-warn' },
+    disabled:     { label: 'معطّل',       cls: 'off',  dot: 'dot-gray' },
+    unknown:      { label: 'غير معروف',   cls: 'off',  dot: 'dot-gray' },
+};
+function accFmtTime(t) {
+    if (!t) return '—';
+    try {
+        const d = new Date(String(t).includes('T') ? t : t.replace(' ', 'T') + 'Z');
+        if (isNaN(d)) return String(t);
+        const diff = Math.floor((Date.now() - d.getTime()) / 1000);
+        if (diff < 0) return 'الآن';
+        if (diff < 60) return `منذ ${diff} ثانية`;
+        if (diff < 3600) return `منذ ${Math.floor(diff / 60)} دقيقة`;
+        if (diff < 86400) return `منذ ${Math.floor(diff / 3600)} ساعة`;
+        return `منذ ${Math.floor(diff / 86400)} يوم`;
+    } catch (e) { return String(t); }
+}
+// أقصر زمن مقبول بين نقرات نفس الإجراء — حماية من الضغط المزدوج أثناء التنفيذ
+const ACC_BUSY = {};
+function accBusy(pfx, action, busy) {
+    ACC_BUSY[`${pfx}:${action}`] = busy;
+    document.querySelectorAll(`[data-acc="${pfx}"] .acc-act[data-action="${action}"]`)
+        .forEach(b => { b.disabled = busy; });
+}
+function accIsBusy(pfx, action) { return !!ACC_BUSY[`${pfx}:${action}`]; }
+
 function renderAccountsList(accounts) {
     const container = document.getElementById('accounts-list');
     if (!container) return;
     if (!accounts || accounts.length === 0) {
         container.innerHTML = '<div class="empty">لا توجد حسابات</div>';
+        const sOn = document.getElementById('accOn'), sOff = document.getElementById('accOff'), sTot = document.getElementById('accTotal');
+        if (sOn) sOn.textContent = 0; if (sOff) sOff.textContent = 0; if (sTot) sTot.textContent = 0;
         return;
     }
     const on = accounts.filter(a => a.connected).length;
+    const dis = accounts.filter(a => a.enabled === false).length;
     const sOn = document.getElementById('accOn'), sOff = document.getElementById('accOff'), sTot = document.getElementById('accTotal');
     if (sOn) sOn.textContent = on;
     if (sOff) sOff.textContent = accounts.length - on;
     if (sTot) sTot.textContent = accounts.length;
     container.innerHTML = accounts.map((acc, i) => {
+        const pfx = esc(acc.prefix || '');
+        const st = ACC_STATUS[acc.status] || ACC_STATUS.unknown;
         const initials = (acc.name || '?').replace(/[^ء-يa-zA-Z0-9]/g, '').slice(0, 2) || 'ح' + (i + 1);
-        const cls = acc.connected ? 'on' : (acc.last_error ? 'warn' : 'off');
+        const badges = [
+            acc.is_main ? '<span class="acc-badge ab-main">👑 رئيسي</span>' : '',
+            acc.pending_deploy ? '<span class="acc-badge ab-pending">بانتظار النشر</span>' : '',
+            acc.enabled === false ? '<span class="acc-badge ab-disabled">معطّل</span>' : '',
+            (!acc.has_session && acc.enabled !== false) ? '<span class="acc-badge ab-nosess">بلا جلسة</span>' : '',
+        ].join('');
+        const busy = (action) => accIsBusy(pfx, action) ? 'disabled' : '';
+        const actBtns = [
+            `<button class="acc-act" data-action="test" ${busy('test')} onclick="accTest('${pfx}')" title="اختبار اتصال حقيقي مع تيليجرام">🔌 اختبار</button>`,
+            acc.connected
+                ? `<button class="acc-act" data-action="reconnect" ${busy('reconnect')} onclick="accReconnect('${pfx}')" title="قطع ثم إعادة الاتصال">🔄 إعادة اتصال</button>
+                   <button class="acc-act" data-action="disconnect" ${busy('disconnect')} onclick="accDisconnect('${pfx}')" title="قطع الاتصال (يبقى محفوظاً)">⛔ قطع</button>`
+                : `<button class="acc-act ok" data-action="connect" ${busy('connect')} onclick="accConnect('${pfx}')" title="توصيل فوري وبدء المراقبة">▶️ اتصال</button>`,
+            acc.enabled !== false
+                ? `<button class="acc-act" data-action="toggle" ${busy('toggle')} onclick="accToggle('${pfx}', false)" title="تعطيل الحساب (يُحفظ في قاعدة البيانات)">⏸️ تعطيل</button>`
+                : `<button class="acc-act ok" data-action="toggle" ${busy('toggle')} onclick="accToggle('${pfx}', true)" title="تفعيل الحساب">✅ تفعيل</button>`,
+            `<button class="acc-act" data-action="edit" onclick="showEditAccount('${pfx}')" title="تعديل بيانات الحساب">✏️ تعديل</button>`,
+            acc.is_main ? '' : `<button class="acc-act danger" data-action="delete" onclick="showDeleteAccount('${pfx}', '${esc(acc.name || '')}')" title="حذف نهائي">🗑️ حذف</button>`,
+        ].join('');
         return `
-        <div class="acc-row">
-            <div class="acc-av ${cls}">${esc(initials)}</div>
+        <div class="acc-row" data-acc="${pfx}">
+            <div class="acc-av ${st.cls}">${esc(initials)}</div>
             <div class="acc-info">
-                <div class="acc-name">${esc(acc.name || 'حساب')}</div>
-                <div class="acc-sub">${esc(acc.phone || '—')}${acc.priority ? ` · أولوية ${esc(acc.priority)}` : ''}</div>
+                <div class="acc-name">${esc(acc.name || 'حساب')}${badges}</div>
+                <div class="acc-sub">${esc(acc.phone || '—')}${acc.priority ? ` · أولوية ${esc(acc.priority)}` : ''}${pfx ? ` · ${pfx}` : ''}</div>
             </div>
             <div class="acc-stats">
                 <span>✉️ <b>${acc.messages_processed || 0}</b></span>
@@ -2687,10 +2843,16 @@ function renderAccountsList(accounts) {
                 <span>💀 <b>${acc.dead_lettered || 0}</b></span>
             </div>
             <div class="acc-on">
-                <div class="dot-${cls}"></div>
-                <span style="font-size:11px;color:var(--text3)">${acc.connected ? 'متصل' : (acc.last_error ? 'تحذير' : 'منفصل')}</span>
+                <div class="${st.dot}"></div>
+                <span style="font-size:11px;color:var(--text3)">${st.label}</span>
             </div>
-            ${acc.last_error ? `<div style="width:100%;font-size:10.5px;color:var(--red);opacity:0.8">↳ ${esc(acc.last_error)}</div>` : ''}
+            <div class="acc-meta">
+                <span>الجلسة: <b>${acc.has_session ? (esc(acc.session_masked || 'موجودة')) : 'غير موجودة'}</b></span>
+                <span>آخر اتصال: <b>${accFmtTime(acc.last_connected_at)}</b></span>
+                <span>آخر نشاط: <b>${accFmtTime(acc.last_activity_at)}</b></span>
+            </div>
+            ${acc.last_error ? `<div style="width:100%;font-size:10.5px;color:var(--red);opacity:0.85;padding-inline-start:42px">↳ آخر خطأ: ${esc(acc.last_error)}</div>` : ''}
+            <div class="acc-actions">${actBtns}</div>
         </div>`;
     }).join('');
 }
@@ -2701,6 +2863,162 @@ async function loadAccounts() {
         renderAccountsList(data.accounts || []);
     } catch (e) {
         logEvent('err', `accounts load failed: ${e.message}`);
+    }
+}
+
+// ── v9.34: إجراءات إدارة الحساب (كلها نفّذ فعلي على Backend) ──
+async function _accAction(pfx, action, opts = {}) {
+    if (accIsBusy(pfx, action)) return null;
+    accBusy(pfx, action, true);
+    try {
+        const method = opts.method || 'POST';
+        const init = { method };
+        if (opts.body !== undefined) init.body = JSON.stringify(opts.body);
+        const result = await apiFetch(`/api/accounts/${pfx}/${action}`, init);
+        if (opts.silent !== true) toast(result.message || 'تم', 'ok');
+        logEvent('ok', `account ${action}: ${pfx}`);
+        loadAccounts();
+        return result;
+    } catch (e) {
+        if (e.status === 401) return null;
+        toast(`فشل: ${e.message}`, 'err', 6000);
+        logEvent('err', `account ${action} failed [${pfx}]: ${e.message}`);
+        loadAccounts();
+        return null;
+    } finally {
+        accBusy(pfx, action, false);
+    }
+}
+
+async function accTest(pfx) {
+    if (accIsBusy(pfx, 'test')) return;
+    accBusy(pfx, 'test', true);
+    try {
+        const result = await apiFetch(`/api/accounts/${pfx}/test`, { method: 'POST' });
+        if (result.success) {
+            toast(`✅ ${result.message}${result.telegram_user ? ` — ${result.telegram_user}` : ''}`, 'ok', 6000);
+            logEvent('ok', `account test passed: ${pfx}`);
+        } else {
+            toast(`⚠️ ${result.message || 'فشل الاختبار'}`, 'err', 6000);
+            logEvent('err', `account test failed: ${pfx}`);
+        }
+        loadAccounts();
+    } catch (e) {
+        if (e.status !== 401) toast(`فشل الاختبار: ${e.message}`, 'err', 6000);
+    } finally {
+        accBusy(pfx, 'test', false);
+    }
+}
+async function accConnect(pfx)    { return _accAction(pfx, 'connect'); }
+async function accDisconnect(pfx) { return _accAction(pfx, 'disconnect'); }
+async function accReconnect(pfx)  { return _accAction(pfx, 'reconnect'); }
+async function accToggle(pfx, enabled) { return _accAction(pfx, 'toggle', { body: { enabled } }); }
+
+// ── v9.34: التعديل (يملأ المودال من تفاصيل الخادم — بلا بيانات محلية) ──
+let EDIT_PFX = '';
+async function showEditAccount(pfx) {
+    let acc = null;
+    try {
+        const detail = await apiFetch(`/api/accounts/${pfx}`);
+        acc = detail;
+    } catch (e) {
+        toast(`تعذر جلب بيانات الحساب: ${e.message}`, 'err');
+        return;
+    }
+    EDIT_PFX = pfx;
+    document.getElementById('edit-acc-prefix').textContent = pfx;
+    document.getElementById('edit-account-name').value = acc.name || '';
+    document.getElementById('edit-account-api-id').value = acc.api_id || '';
+    document.getElementById('edit-account-api-hash').value = '';
+    document.getElementById('edit-account-api-hash').placeholder = acc.has_session ? 'API Hash (محفوظ — اتركه فارغاً للاحتفاظ)' : 'API Hash';
+    document.getElementById('edit-account-phone').value = acc.phone || '';
+    document.getElementById('edit-account-session').value = acc.session_name || '';
+    document.getElementById('edit-account-priority').value = acc.priority ?? 5;
+    document.getElementById('edit-account-modal').classList.remove('hidden');
+}
+
+async function saveAccountEdit() {
+    if (!EDIT_PFX) return;
+    const body = {
+        name: document.getElementById('edit-account-name').value.trim(),
+        phone: document.getElementById('edit-account-phone').value.trim(),
+        session_name: document.getElementById('edit-account-session').value.trim(),
+        priority: parseInt(document.getElementById('edit-account-priority').value) || undefined,
+    };
+    const apiIdRaw = document.getElementById('edit-account-api-id').value.trim();
+    if (apiIdRaw) body.api_id = parseInt(apiIdRaw);
+    const apiHashRaw = document.getElementById('edit-account-api-hash').value.trim();
+    if (apiHashRaw) body.api_hash = apiHashRaw;  // فارغ = احتفظ بالمخزن
+    if (!body.name || !body.phone) { toast('❌ الاسم ورقم الهاتف مطلوبان', 'err'); return; }
+    const btn = document.getElementById('edit-acc-save');
+    btn.disabled = true;
+    try {
+        const result = await apiFetch(`/api/accounts/${EDIT_PFX}`, { method: 'PUT', body: JSON.stringify(body) });
+        closeModal('edit-account-modal');
+        toast(result.message || '✅ تم حفظ التعديل' + (result.saved_to_render ? ' (ومُزامن مع Render)' : ''), 'ok', 6000);
+        logEvent('ok', `account updated: ${EDIT_PFX}`);
+        loadAccounts();
+    } catch (e) {
+        if (e.status !== 401) toast(`❌ فشل الحفظ: ${e.message}`, 'err', 6000);
+    } finally {
+        btn.disabled = false;
+    }
+}
+
+// ── v9.34: الحذف (مودال تأكيد ثم DELETE فعلي) ──
+let DELETE_PFX = '';
+function showDeleteAccount(pfx, name) {
+    DELETE_PFX = pfx;
+    document.getElementById('del-acc-name').textContent = name || pfx;
+    document.getElementById('del-acc-prefix').textContent = ` (${pfx})`;
+    document.getElementById('delete-account-modal').classList.remove('hidden');
+}
+
+async function deleteAccountConfirmed() {
+    if (!DELETE_PFX) return;
+    const btn = document.getElementById('del-acc-confirm');
+    btn.disabled = true;
+    try {
+        const result = await apiFetch(`/api/accounts/${DELETE_PFX}`, { method: 'DELETE' });
+        closeModal('delete-account-modal');
+        toast(`🗑️ ${result.message}` + (result.render_deleted ? ' — شمل متغيرات Render' : ''), 'ok', 6000);
+        logEvent('ok', `account deleted: ${DELETE_PFX}`);
+        loadAccounts();
+    } catch (e) {
+        if (e.status !== 401) toast(`❌ فشل الحذف: ${e.message}`, 'err', 6000);
+    } finally {
+        btn.disabled = false;
+        DELETE_PFX = '';
+    }
+}
+
+async function addAccount() {
+    const data = {
+        name: document.getElementById('new-account-name').value.trim(),
+        api_id: parseInt(document.getElementById('new-account-api-id').value),
+        api_hash: document.getElementById('new-account-api-hash').value.trim(),
+        phone: document.getElementById('new-account-phone').value.trim(),
+        session_name: document.getElementById('new-account-session').value.trim(),
+        priority: parseInt(document.getElementById('new-account-priority').value) || 5,
+    };
+    if (!data.name || !data.api_id || !data.api_hash || !data.phone || !data.session_name) {
+        toast('❌ الرجاء ملء جميع الحقول', 'err');
+        return;
+    }
+    try {
+        const result = await apiFetch('/api/accounts', { method: 'POST', body: JSON.stringify(data) });
+        if (result.success) {
+            closeModal('add-account-modal');
+            // تفريغ النموذج للإضافة التالية
+            ['new-account-name','new-account-api-id','new-account-api-hash','new-account-phone','new-account-session'].forEach(id => {
+                const el = document.getElementById(id); if (el) el.value = '';
+            });
+            toast(`✅ تمت إضافة الحساب (${result.prefix}) — أضف الجلسة من صفحة إدارة الجلسات`, 'ok', 7000);
+            logEvent('ok', `account added: ${data.name} (${result.prefix})`);
+            loadAccounts();
+        }
+    } catch (e) {
+        if (e.status !== 401) toast(`❌ فشل الإضافة: ${e.message}`, 'err', 6500);
     }
 }
 

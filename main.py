@@ -522,6 +522,90 @@ class EnhancedTelegramBot:
                 return m
         return None
 
+    # ─── v9.34: Runtime account management (dashboard → live monitors) ──────
+    # The dashboard shares this process and event loop, so it can create/
+    # remove monitors directly — an account added & logged-in from the panel
+    # becomes a live monitor WITHOUT waiting for a Render redeploy. Every
+    # method is keyed by account PREFIX (the panel's stable identifier) and
+    # is fully fail-safe: a runtime glitch never crashes the bot loop.
+    def get_monitor_by_prefix(self, prefix: str) -> Optional[EnhancedAccountMonitor]:
+        p = str(prefix or "").strip().upper()
+        for m in self.monitors:
+            try:
+                if (m.account or {}).get("prefix", "").upper() == p:
+                    return m
+            except Exception:
+                continue
+        return None
+
+    async def add_runtime_monitor(self, acc: Dict[str, Any]) -> Dict[str, Any]:
+        """v9.34: إنشاء مراقب حي لحساب من اللوحة (نفس مسار الإقلاع حرفياً:
+        EnhancedAccountMonitor + set_bot + connect). يرفض التكرار بالبادئة."""
+        prefix = str((acc or {}).get("prefix") or "").strip().upper()
+        if not prefix:
+            return {"ok": False, "error": "prefix مفقود"}
+        existing = self.get_monitor_by_prefix(prefix)
+        if existing is not None:
+            return {"ok": bool(existing.is_connected), "already": True,
+                    "error": None if existing.is_connected else (existing._last_connect_error or "غير متصل")}
+        try:
+            mon = EnhancedAccountMonitor(acc, self.db, self.filter, self.main_client)
+            mon.set_bot(self)
+            self.monitors.append(mon)
+            ok = await asyncio.wait_for(mon.connect(), timeout=120)
+            if ok:
+                logger.info(f"✅ Runtime monitor added: {prefix} ({acc.get('name')})")
+                if self.main_client is None:
+                    self.main_client = mon.client
+                    for other in self.monitors:
+                        other.main_client = self.main_client
+                    logger.info(f"👑 Main client promoted: {prefix}")
+                return {"ok": True}
+            err = (mon._last_connect_error or "فشل الاتصال")
+            return {"ok": False, "error": str(err)[:200]}
+        except asyncio.TimeoutError:
+            return {"ok": False, "error": "انتهت مهلة الاتصال (120 ثانية)"}
+        except Exception as e:
+            logger.error(f"add_runtime_monitor failed [{prefix}]: {type(e).__name__}: {e}")
+            return {"ok": False, "error": f"{type(e).__name__}: {str(e)[:150]}"}
+
+    async def remove_runtime_monitor(self, prefix: str, disconnect_client: bool = True) -> bool:
+        """v9.34: إزالة مراقب حي (قطع اتصال + حذف من القائمة) — False إن لم يوجد."""
+        mon = self.get_monitor_by_prefix(prefix)
+        if mon is None:
+            return False
+        if disconnect_client:
+            try:
+                await mon.disconnect()
+            except Exception as e:
+                logger.warning(f"remove_runtime_monitor disconnect failed [{prefix}]: {e}")
+        try:
+            self.monitors.remove(mon)
+        except ValueError:
+            pass
+        logger.info(f"🛑 Runtime monitor removed: {prefix}")
+        return True
+
+    async def reconnect_runtime_monitor(self, prefix: str) -> Dict[str, Any]:
+        """v9.34: إعادة اتصال مراقب حي — disconnect كامل ثم connect جديد."""
+        mon = self.get_monitor_by_prefix(prefix)
+        if mon is None:
+            return {"ok": False, "error": "لا يوجد مراقب حي لهذا الحساب"}
+        try:
+            await mon.disconnect()
+        except Exception as e:
+            logger.debug(f"reconnect pre-disconnect failed [{prefix}]: {e}")
+        try:
+            ok = await asyncio.wait_for(mon.connect(), timeout=120)
+            return {"ok": bool(ok), "error": None if ok else (mon._last_connect_error or "فشل الاتصال")}
+        except asyncio.TimeoutError:
+            mon.is_connected = False
+            return {"ok": False, "error": "انتهت مهلة الاتصال (120 ثانية)"}
+        except Exception as e:
+            logger.error(f"reconnect_runtime_monitor failed [{prefix}]: {type(e).__name__}: {e}")
+            return {"ok": False, "error": f"{type(e).__name__}: {str(e)[:150]}"}
+
+
     # ─── Admin / Copy handler registration (idempotent, re-runnable) ──────────
     # Both are now re-registerable so a main-client failover (M-10/M-11)
     # can re-attach them to the newly-promoted client instead of leaving
@@ -1334,7 +1418,22 @@ class EnhancedTelegramBot:
         logger.info(f"Connecting {len(accounts)} account(s) sequentially...")
         connected = 0
 
+        # v9.34: احترام تعطيل الحسابات من لوحة التحكم — قاعدة البيانات مصدر
+        # الحقيقة (enabled=0 = لا مراقبة لهذا الحساب في هذا الإقلاع). فشل
+        # القراءة = لا تخطي (السلوك التاريخي حرفياً).
+        disabled_prefixes: Set[str] = set()
+        try:
+            for row in await self.db.list_dashboard_accounts():
+                if not row.get("enabled", True):
+                    disabled_prefixes.add((row.get("prefix") or "").upper())
+        except Exception as e:
+            logger.debug(f"disabled-accounts lookup skipped: {e}")
+
         for idx, acc in enumerate(accounts, 1):
+            acc_prefix = (acc.get("prefix") or "").upper()
+            if acc_prefix in disabled_prefixes:
+                logger.info(f"⏭️ Skipping disabled account: {acc['name']} ({acc_prefix}) — enabled=false in DB")
+                continue
             logger.info(f"\n[{idx}/{len(accounts)}] Connecting: {acc['name']} | {acc['phone']}")
             mon = EnhancedAccountMonitor(acc, self.db, self.filter, self.main_client)
             mon.set_bot(self)

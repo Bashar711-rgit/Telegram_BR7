@@ -490,6 +490,7 @@ class EnhancedDatabase:
             await self._create_tables()
             await self._migrate_bigint_ids()
             await self._migrate_sender_intel()
+            await self._migrate_dashboard_account_status()  # v9.34
             await self._create_indexes()
             self.is_connected = True
             await self.start_writer()
@@ -1054,6 +1055,57 @@ class EnhancedDatabase:
         await self._commit()
         if added:
             logger.info(f"Database migration v9.3: sender_contacts enriched (+{added} columns)")
+
+    # v9.34: أعمدة تتبع حالة الحساب في اللوحة — إضافة فقط بلا إعادة تسمية
+    # ولا حذف (نفس ضمانات _migrate_sender_intel: لا فقدان بيانات، idempotent،
+    # رخيصة عند كل إقلاع). status: connected/disconnected/error/pending/unknown.
+    _DASHBOARD_ACCOUNT_STATUS_COLUMNS = [
+        ("status", "TEXT"),
+        ("last_error", "TEXT"),
+        ("last_connected_at", "DATETIME"),
+        ("last_activity_at", "DATETIME"),
+    ]
+
+    async def _migrate_dashboard_account_status(self) -> None:
+        """v9.34: enrich dashboard_accounts with live status tracking columns.
+
+        Same backward-compatible-by-construction guarantees as
+        _migrate_sender_intel: columns are ADDED, never renamed/dropped;
+        existing queries are unaffected; idempotent on every boot.
+        PostgreSQL uses ADD COLUMN IF NOT EXISTS; SQLite is pragma-checked
+        per column (no IF NOT EXISTS support there).
+        """
+        table = "dashboard_accounts"
+        existing: set = set()
+        if self.db_type == "postgresql":
+            rows = await self._fetchall(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name = ?",
+                (table,),
+            )
+            existing = {r["column_name"] for r in rows}
+        else:
+            rows = await self._fetchall(f"PRAGMA table_info({table})", ())
+            existing = {r["name"] for r in rows}
+
+        added = 0
+        for name, decl in self._DASHBOARD_ACCOUNT_STATUS_COLUMNS:
+            if name in existing:
+                continue
+            try:
+                if self.db_type == "postgresql":
+                    await self._execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {name} {decl}")
+                else:
+                    await self._execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+                added += 1
+            except Exception as e:
+                logger.warning(
+                    f"dashboard-account migration: {table}.{name} skipped: "
+                    f"{type(e).__name__}: {str(e)[:120]}"
+                )
+        await self._commit()
+        if added:
+            logger.info(f"Database migration v9.34: dashboard_accounts enriched (+{added} columns)")
 
     async def _create_indexes(self) -> None:
         indexes = [
@@ -2829,6 +2881,121 @@ class EnhancedDatabase:
             return bool(cur.rowcount)
         except Exception as e:
             logger.debug(f"set_dashboard_account_session skipped: {e}")
+            return False
+
+    # ─────────────── v9.34: إدارة حسابات اللوحة الكاملة (CRUD + حالة حية) ───────────────
+
+    async def update_dashboard_account(
+        self, prefix: str,
+        name: Optional[str] = None, api_id: Optional[int] = None,
+        api_hash: Optional[str] = None, phone: Optional[str] = None,
+        session_name: Optional[str] = None, priority: Optional[int] = None,
+    ) -> bool:
+        """v9.34: تعديل بيانات حساب — فقط الحقول الممرّرة (None = لا يمسّ).
+        الـprefix نفسه لا يُغيَّر أبداً (هو المفتاح في البيئة والمراقبات)."""
+        sets: List[str] = []
+        vals: List[Any] = []
+        if name is not None:
+            sets.append("name = ?"); vals.append(str(name).strip())
+        if api_id is not None:
+            sets.append("api_id = ?"); vals.append(int(api_id))
+        if api_hash is not None:
+            sets.append("api_hash = ?"); vals.append(str(api_hash).strip())
+        if phone is not None:
+            sets.append("phone = ?"); vals.append(str(phone).strip())
+        if session_name is not None:
+            sets.append("session_name = ?"); vals.append(str(session_name).strip())
+        if priority is not None:
+            sets.append("priority = ?"); vals.append(int(priority))
+        if not sets:
+            return True  # لا شيء للتحديث — يُعدّ نجاحاً لا فشلاً
+        sets.append("updated_at = CURRENT_TIMESTAMP")
+        vals.append(str(prefix).strip())
+        try:
+            cur = await self._execute(
+                f"UPDATE dashboard_accounts SET {', '.join(sets)} WHERE prefix = ?",
+                tuple(vals),
+            )
+            await self._commit()
+            return bool(cur.rowcount)
+        except Exception as e:
+            logger.error(f"update_dashboard_account failed [{prefix}]: {e}")
+            return False
+
+    async def delete_dashboard_account(self, prefix: str) -> bool:
+        """v9.34: حذف حساب من قاعدة البيانات نهائياً (bool: هل حُذف فعلاً)."""
+        try:
+            cur = await self._execute(
+                "DELETE FROM dashboard_accounts WHERE prefix = ?",
+                (str(prefix).strip(),),
+            )
+            await self._commit()
+            return bool(cur.rowcount)
+        except Exception as e:
+            logger.error(f"delete_dashboard_account failed [{prefix}]: {e}")
+            return False
+
+    async def set_dashboard_account_enabled(self, prefix: str, enabled: bool) -> bool:
+        """v9.34: تفعيل/تعطيل حساب (DB مصدر الحقيقة — المراقبة تتبعه)."""
+        try:
+            cur = await self._execute(
+                "UPDATE dashboard_accounts SET enabled = ?, updated_at = CURRENT_TIMESTAMP "
+                "WHERE prefix = ?",
+                (1 if enabled else 0, str(prefix).strip()),
+            )
+            await self._commit()
+            return bool(cur.rowcount)
+        except Exception as e:
+            logger.error(f"set_dashboard_account_enabled failed [{prefix}]: {e}")
+            return False
+
+    async def set_dashboard_account_status(
+        self, prefix: str, status: str, last_error: Optional[str] = None,
+    ) -> bool:
+        """v9.34: تحديث حالة الاتصال الحية في قاعدة البيانات (فشل-آمن —
+        التتبع لا يُسقط عملية حية أبداً). status: connected/disconnected/
+        error/pending."""
+        if status not in ("connected", "disconnected", "error", "pending"):
+            return False
+        try:
+            cur = await self._execute(
+                "UPDATE dashboard_accounts SET status = ?, last_error = ?, "
+                "updated_at = CURRENT_TIMESTAMP WHERE prefix = ?",
+                (status, (str(last_error)[:300] if last_error else None), str(prefix).strip()),
+            )
+            await self._commit()
+            return bool(cur.rowcount)
+        except Exception as e:
+            logger.debug(f"set_dashboard_account_status skipped: {e}")
+            return False
+
+    async def mark_dashboard_account_connected(self, prefix: str) -> bool:
+        """v9.34: نجاح اتصال — status=connected + وقت آخر اتصال + مسح آخر خطأ."""
+        try:
+            cur = await self._execute(
+                "UPDATE dashboard_accounts SET status = 'connected', last_error = NULL, "
+                "last_connected_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP "
+                "WHERE prefix = ?",
+                (str(prefix).strip(),),
+            )
+            await self._commit()
+            return bool(cur.rowcount)
+        except Exception as e:
+            logger.debug(f"mark_dashboard_account_connected skipped: {e}")
+            return False
+
+    async def mark_dashboard_account_activity(self, prefix: str) -> bool:
+        """v9.34: ختم آخر نشاط (fire-and-forget من مسار الرسائل — لا يُبطئ أبداً)."""
+        try:
+            await self._execute(
+                "UPDATE dashboard_accounts SET last_activity_at = CURRENT_TIMESTAMP "
+                "WHERE prefix = ?",
+                (str(prefix).strip(),),
+            )
+            await self._commit()
+            return True
+        except Exception as e:
+            logger.debug(f"mark_dashboard_account_activity skipped: {e}")
             return False
 
 
