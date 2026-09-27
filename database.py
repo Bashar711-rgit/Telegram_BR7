@@ -849,6 +849,32 @@ class EnhancedDatabase:
             );
             CREATE UNIQUE INDEX IF NOT EXISTS idx_dashboard_accounts_prefix
                 ON dashboard_accounts (prefix);
+            CREATE TABLE IF NOT EXISTS filter_decisions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                msg_hash TEXT,
+                chat_id INTEGER NOT NULL,
+                sender_id INTEGER NOT NULL,
+                sender_name TEXT DEFAULT '',
+                account_name TEXT DEFAULT '',
+                text TEXT DEFAULT '',
+                decision TEXT NOT NULL DEFAULT 'ignore',
+                confidence REAL DEFAULT 0.0,
+                score REAL DEFAULT 0.0,
+                keyword TEXT DEFAULT '',
+                intent_verb TEXT DEFAULT '',
+                academic_object TEXT DEFAULT '',
+                subject TEXT DEFAULT '',
+                type_tag TEXT DEFAULT '',
+                urgent INTEGER DEFAULT 0,
+                reasons TEXT DEFAULT '',
+                feedback INTEGER NOT NULL DEFAULT 0,
+                feedback_note TEXT DEFAULT '',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_filter_decisions_created
+                ON filter_decisions (created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_filter_decisions_decision
+                ON filter_decisions (decision);
         """
         for stmt in stmts.split(";"):
             s = stmt.strip()
@@ -2788,6 +2814,155 @@ class EnhancedDatabase:
         except Exception as e:
             logger.debug(f"set_dashboard_user_enabled skipped: {e}")
             return False
+
+    # ─────────────── v10.0: سجل قرارات الفلترة (filter_decisions) ───────────────
+
+    async def save_filter_decision(self, rec: Dict[str, Any]) -> bool:
+        """v10.0: حفظ قرار فلترة واحد (رسالة وصلت لمرحلة الكلمات المفتاحية).
+
+        يُكتب مباشرة (بلا دفعة) لأنه مطلوب فوراً في «معمل الفلترة»، وكمية
+        الصفوف محدودة طبيعياً (رسائل ذات كلمات مفتاحية فقط). فشل-آمن دائماً:
+        أي خطأ لا يرفع استثناءً — مراقبة الرسائل أهم من السجل.
+        """
+        try:
+            await self._execute(
+                """
+                INSERT INTO filter_decisions
+                    (msg_hash, chat_id, sender_id, sender_name, account_name,
+                     text, decision, confidence, score, keyword, intent_verb,
+                     academic_object, subject, type_tag, urgent, reasons)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(rec.get("msg_hash") or ""),
+                    int(rec.get("chat_id") or 0),
+                    int(rec.get("sender_id") or 0),
+                    str(rec.get("sender_name") or "")[:120],
+                    str(rec.get("account_name") or "")[:60],
+                    str(rec.get("text") or "")[:600],
+                    str(rec.get("decision") or "ignore")[:20],
+                    float(rec.get("confidence") or 0.0),
+                    float(rec.get("score") or 0.0),
+                    str(rec.get("keyword") or "")[:80],
+                    str(rec.get("intent_verb") or "")[:80],
+                    str(rec.get("academic_object") or "")[:80],
+                    str(rec.get("subject") or "")[:60],
+                    str(rec.get("type_tag") or "")[:60],
+                    1 if rec.get("urgent") else 0,
+                    str(rec.get("reasons") or "")[:400],
+                ),
+            )
+            await self._commit()
+            return True
+        except Exception as e:
+            logger.debug(f"save_filter_decision skipped: {e}")
+            return False
+
+    async def get_filter_decisions(self, limit: int = 60,
+                                   decision: Optional[str] = None) -> List[Dict[str, Any]]:
+        """v10.0: أحدث قرارات الفلترة — فشل-آمن (قائمة فارغة)."""
+        try:
+            lim = max(1, min(int(limit), 300))
+            if decision:
+                rows = await self._fetchall(
+                    "SELECT * FROM filter_decisions WHERE decision = ? "
+                    "ORDER BY id DESC LIMIT ?",
+                    (str(decision)[:20], lim),
+                )
+            else:
+                rows = await self._fetchall(
+                    "SELECT * FROM filter_decisions ORDER BY id DESC LIMIT ?",
+                    (lim,),
+                )
+            out = []
+            for r in rows:
+                d = dict(r)
+                d["urgent"] = bool(d.get("urgent"))
+                out.append(d)
+            return out
+        except Exception as e:
+            logger.debug(f"get_filter_decisions skipped: {e}")
+            return []
+
+    async def set_filter_decision_feedback(self, decision_id: int, correct: bool,
+                                           note: str = "") -> Optional[Dict[str, Any]]:
+        """v10.0: تغذية راجعة بشرية على قرار — تعيد الصف المحدَّث أو None."""
+        try:
+            cur = await self._execute(
+                "UPDATE filter_decisions SET feedback = ?, feedback_note = ? WHERE id = ?",
+                (1 if correct else -1, str(note or "")[:200], int(decision_id)),
+            )
+            await self._commit()
+            if not getattr(cur, "rowcount", 0):
+                return None
+            return await self._fetchone(
+                "SELECT * FROM filter_decisions WHERE id = ?", (int(decision_id),)
+            )
+        except Exception as e:
+            logger.debug(f"set_filter_decision_feedback skipped: {e}")
+            return None
+
+    async def filter_decision_stats(self, hours: int = 24) -> Dict[str, Any]:
+        """v10.0: إحصاءات القرارات (عدد/متوسط ثقة/حسب المادة/أعلى كلمات).
+
+        فشل-آمن: أي خطأ يعيد هيكلاً فارغاً.
+        """
+        empty = {"total": 0, "accepted": 0, "review": 0, "ignored": 0,
+                 "feedback_positive": 0, "feedback_negative": 0,
+                 "avg_confidence": 0.0, "subjects": [], "top_keywords": []}
+        try:
+            cutoff = time.time() - max(1, int(hours)) * 3600
+            # قابلية نقل: مقارنة نصية بصيغة CURRENT_TIMESTAMP تعمل في SQLite
+            # وPostgreSQL معاً (v10.0) بدل datetime('unixepoch') الخاص بـ SQLite.
+            cutoff_str = datetime.utcfromtimestamp(cutoff).strftime("%Y-%m-%d %H:%M:%S")
+            row = await self._fetchone(
+                """
+                SELECT COUNT(*) AS total,
+                       SUM(CASE WHEN decision='accept' THEN 1 ELSE 0 END) AS accepted,
+                       SUM(CASE WHEN decision='review' THEN 1 ELSE 0 END) AS review,
+                       SUM(CASE WHEN decision='ignore' THEN 1 ELSE 0 END) AS ignored,
+                       SUM(CASE WHEN feedback=1 THEN 1 ELSE 0 END) AS fb_pos,
+                       SUM(CASE WHEN feedback=-1 THEN 1 ELSE 0 END) AS fb_neg,
+                       AVG(confidence) AS avg_conf
+                FROM filter_decisions
+                WHERE created_at >= ?
+                """,
+                (cutoff_str,),
+            )
+            if not row:
+                return empty
+            subjects = await self._fetchall(
+                """
+                SELECT subject AS name, COUNT(*) AS count FROM filter_decisions
+                WHERE created_at >= ?
+                      AND subject IS NOT NULL AND subject != ''
+                GROUP BY subject ORDER BY count DESC LIMIT 8
+                """,
+                (cutoff_str,),
+            )
+            keywords = await self._fetchall(
+                """
+                SELECT keyword AS name, COUNT(*) AS count FROM filter_decisions
+                WHERE created_at >= ?
+                      AND keyword IS NOT NULL AND keyword != ''
+                GROUP BY keyword ORDER BY count DESC LIMIT 10
+                """,
+                (cutoff_str,),
+            )
+            return {
+                "total": int(row.get("total") or 0),
+                "accepted": int(row.get("accepted") or 0),
+                "review": int(row.get("review") or 0),
+                "ignored": int(row.get("ignored") or 0),
+                "feedback_positive": int(row.get("fb_pos") or 0),
+                "feedback_negative": int(row.get("fb_neg") or 0),
+                "avg_confidence": round(float(row.get("avg_conf") or 0.0), 3),
+                "subjects": [dict(s) for s in subjects],
+                "top_keywords": [dict(k) for k in keywords],
+            }
+        except Exception as e:
+            logger.debug(f"filter_decision_stats skipped: {e}")
+            return empty
 
     # ─────────────── v9.33: سجل الحسابات من اللوحة (dashboard_accounts) ───────────────
 

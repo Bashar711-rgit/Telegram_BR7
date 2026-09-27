@@ -376,6 +376,18 @@ class LoginVerifyPassword(BaseModel):
     password: str
 
 
+class FilterFeedback(BaseModel):
+    """v10.0: تغذية راجعة بشرية على قرار فلترة (معمل الفلترة)."""
+    id: int
+    correct: bool
+    note: str = ""
+
+
+class FilterTestRequest(BaseModel):
+    """v10.0: فحص نص عبر محرك الفلترة + التصنيف (معمل الفلترة)."""
+    text: str
+
+
 # =============================================================================
 # v9.29 P4 RBAC — مستخدمو اللوحة بأدوار وصلاحيات دقيقة (Master Prompt 8/9)
 # =============================================================================
@@ -4272,6 +4284,95 @@ async def start_dashboard(host: str = "0.0.0.0", port: int = 8080):
     config = uvicorn.Config(app, host=host, port=port, log_level="info", loop=loop)
     server = uvicorn.Server(config)
     await server.serve()
+
+
+# =============================================================================
+# v10.0: معمل الفلترة — فحص حي + سجل القرارات + تغذية راجعة تُغذّي الأوزان
+# =============================================================================
+@app.get("/api/filter/recent", dependencies=[Depends(require_permission("keywords.read"))])  # v10.0
+async def filter_recent(request: Request, limit: int = 60, decision: Optional[str] = None):
+    """أحدث قرارات الفلترة (رسائل وصلت لمرحلة الكلمات المفتاحية) مع تصنيفها."""
+    db = request.app.state.db
+    try:
+        rows = await db.get_filter_decisions(limit=limit, decision=decision)
+        return JSONResponse({"success": True, "decisions": rows})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {str(e)[:200]}")
+
+
+@app.get("/api/filter/stats", dependencies=[Depends(require_permission("keywords.read"))])  # v10.0
+async def filter_stats(request: Request, hours: int = 24):
+    """إحصاءات القرارات: الأعداد، متوسط الثقة، المواد، أعلى الكلمات."""
+    db = request.app.state.db
+    try:
+        hours = max(1, min(int(hours), 24 * 30))
+        st = await db.filter_decision_stats(hours=hours)
+        return JSONResponse({"success": True, "hours": hours, **st})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {str(e)[:200]}")
+
+
+@app.post("/api/filter/feedback", dependencies=[Depends(require_permission("keywords.write"))])  # v10.0
+async def filter_feedback(request: Request, data: FilterFeedback):
+    """تغذية راجعة بشرية على قرار: ✅ صحيح / ❌ خطأ.
+
+    تحدّث الصف ثم تُغذّي الأوزان التكيفية (EMA) لمفردات القرار
+    (فعل النية + المفعول الأكاديمي) — فتتعلم الفلترة من مراجعتك.
+    """
+    db = request.app.state.db
+    row = await db.set_filter_decision_feedback(data.id, data.correct, data.note)
+    if row is None:
+        raise HTTPException(status_code=404, detail="القرار غير موجود")
+    learned: List[str] = []
+    bot = getattr(request.app.state, "bot_ref", None)
+    flt = getattr(bot, "filter", None) if bot else None
+    if flt is not None and hasattr(flt, "record_feedback"):
+        try:
+            if row.get("intent_verb"):
+                await flt.record_feedback(row["intent_verb"], "intent", data.correct)
+                learned.append(f"intent:{row['intent_verb']}")
+            if row.get("academic_object"):
+                await flt.record_feedback(row["academic_object"], "academic", data.correct)
+                learned.append(f"academic:{row['academic_object']}")
+        except Exception as e:
+            logger.debug(f"filter feedback adaptive update skipped: {e}")
+    try:
+        await _audit(request, "filter.feedback",
+                     object_type="decision", object_id=str(data.id),
+                     new_value="correct" if data.correct else "incorrect")
+    except Exception:
+        pass
+    return JSONResponse({"success": True, "decision": row, "learned": learned})
+
+
+@app.post("/api/filter/test", dependencies=[Depends(require_permission("keywords.read"))])  # v10.0
+async def filter_test(request: Request, data: FilterTestRequest):
+    """فحص نص حي عبر محرك الفلترة: القرار + درجات كل إشارة + التصنيف."""
+    text = (data.text or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="أدخل نصاً للفحص")
+    bot = getattr(request.app.state, "bot_ref", None)
+    flt = getattr(bot, "filter", None) if bot else None
+    if flt is None or not hasattr(flt, "analyze"):
+        raise HTTPException(status_code=503, detail="محرك الفلترة غير متاح — البوت غير موصول")
+    try:
+        analysis = await flt.analyze(text)
+        from classifier import classify_text
+        cls = classify_text(text)
+        analysis.pop("original_text", None)
+        return JSONResponse({
+            "success": True,
+            "analysis": analysis,
+            "classification": cls,
+            "thresholds": {
+                "accept": float(getattr(CFG, "CONFIDENCE_ACCEPT_THRESHOLD", 0.65)),
+                "review": float(getattr(CFG, "CONFIDENCE_REVIEW_THRESHOLD", 0.40)),
+            },
+        })
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {str(e)[:200]}")
 
 
 # =============================================================================

@@ -1021,7 +1021,20 @@ class EnhancedAccountMonitor:
         rule_tag = (analysis or {}).get("rule_tag") if isinstance(analysis, dict) else None
         if rule_tag:
             rule_tag_html = f'<blockquote dir="rtl">🏷 قاعدة: {InputSanitizer.escape_html(str(rule_tag))}</blockquote>\n\n'
-        alert = (f"{rule_tag_html}<b>الرسالة:</b>\n{message_html}\n\n👤: {sender_link}\n\n{group_card}")
+        # ── v10.0: سطر التصنيف الدقيق أعلى التنبيه ──
+        # #المادة • نوع المطلوب • ⚡ عاجل • الثقة٪ — من classifier (فشل-آمن).
+        classification_html = ""
+        try:
+            from classifier import classification_line as _cls_line
+            _cls_text = _cls_line(analysis if isinstance(analysis, dict) else {})
+            if _cls_text:
+                classification_html = (
+                    f'<blockquote dir="rtl">🎯 التصنيف: '
+                    f'{InputSanitizer.escape_html(_cls_text)}</blockquote>\n\n'
+                )
+        except Exception:
+            classification_html = ""
+        alert = (f"{rule_tag_html}{classification_html}<b>الرسالة:</b>\n{message_html}\n\n👤: {sender_link}\n\n{group_card}")
         # v9.11: الأزرار الثلاثة المطلوبة في صفّين:
         #   [ عرض الرسالة ] [ تواصل مع المرسل ]
         #   [ مراسلة ] [ 📋 نسخ النص ]
@@ -1937,6 +1950,20 @@ class EnhancedAccountMonitor:
             except Exception as _rule_err:
                 logger.debug(f"rule engine skipped [{self.account['name']}]: {_rule_err}")
 
+        # ── v10.0: التصنيف الدقيق (المادة + نوع المطلوب) ──
+        # طبقة إثراء فوق قرار الفلترة — لا تغيّر القرار إطلاقاً (فشل-آمن).
+        # التصنيف يظهر في التنبيه (#المادة • النوع • الثقة%) وفي سجل القرارات.
+        if validated_text and analysis.get("keyword") is not None:
+            try:
+                from classifier import classify_text as _classify_text
+                _cls = _classify_text(validated_text)
+                analysis["subject"] = _cls.get("subject", "")
+                analysis["subject_key"] = _cls.get("subject_key", "")
+                analysis["type_tag"] = _cls.get("type", "")
+                analysis["classified"] = bool(_cls.get("classified"))
+            except Exception as _cls_err:
+                logger.debug(f"classify skipped [{self.account['name']}]: {_cls_err}")
+
         # ====== الإصلاح الجوهري: التأكد من أن القرار النهائي هو "accept" فقط ======
         decision = analysis.get("decision", "ignore")
         is_valid = (
@@ -1945,6 +1972,32 @@ class EnhancedAccountMonitor:
             or (rule_result is not None and rule_result.get("action") == "allow")
         )
         # =========================================================================
+        # ── v10.0: سجل قرارات الفلترة — كل رسالة وصلت لمرحلة الكلمات ──
+        # (accept/review/ignore-بكلمة) تُسجَّل مع تصنيفها لتظهر في «معمل
+        # الفلترة» مع تغذية راجعة بشرية تُغذّي الأوزان التكيفية. فشل-آمن.
+        if validated_text and analysis.get("keyword") is not None:
+            try:
+                _sender_name = f"{data.get('sender_first_name') or ''} {data.get('sender_last_name') or ''}".strip()
+                await self.db.save_filter_decision({
+                    "msg_hash": msg_hash,
+                    "chat_id": chat_id_rule,
+                    "sender_id": sender_id,
+                    "sender_name": _sender_name,
+                    "account_name": data.get("account_name", self.account.get("name", "")),
+                    "text": validated_text,
+                    "decision": decision,
+                    "confidence": float(analysis.get("confidence") or 0.0),
+                    "score": float(analysis.get("score") or 0.0) if isinstance(analysis.get("score"), (int, float)) else 0.0,
+                    "keyword": str(analysis.get("keyword") or ""),
+                    "intent_verb": str(analysis.get("intent_verb") or ""),
+                    "academic_object": str(analysis.get("academic_object") or ""),
+                    "subject": str(analysis.get("subject") or ""),
+                    "type_tag": str(analysis.get("type_tag") or ""),
+                    "urgent": bool(analysis.get("urgent")),
+                    "reasons": "; ".join(str(r) for r in (analysis.get("reasons") or [])[:8]),
+                })
+            except Exception as _fd_err:
+                logger.debug(f"filter decision log skipped [{self.account['name']}]: {_fd_err}")
         try: await self.db.update_sender_reputation(sender_id, is_valid)
         except Exception as e: logger.warning(f"update_sender_reputation failed [{self.account['name']}]: {e}")
         if is_valid and await self.db.can_send_alert(sender_id):

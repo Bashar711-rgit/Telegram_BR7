@@ -926,6 +926,9 @@ body { font-family: var(--sans); background: var(--bg); color: var(--text); font
     <div class="nav-item" data-page="keywords" onclick="showTab('keywords')">
       <span class="ni">🏷</span> الكلمات المفتاحية
     </div>
+    <div class="nav-item" data-page="filterlab" onclick="showTab('filterlab')">
+      <span class="ni">🧪</span> معمل الفلترة
+    </div>
     <div class="nav-item" data-page="blocked" onclick="showTab('blocked')">
       <span class="ni">🚫</span> الحظر
     </div>
@@ -1546,6 +1549,7 @@ const PAGE_META = {
     accounts:  { title: 'الحسابات', sub: 'حسابات المراقبة وحالتها' },
     messages:  { title: 'الرسائل', sub: 'آخر الرسائل المعالجة' },
     keywords:  { title: 'الكلمات المفتاحية', sub: 'إدارة قوائم الفلترة — حفظ مباشر في قاعدة البيانات' },
+    filterlab: { title: 'معمل الفلترة', sub: 'فحص حي + سجل القرارات + تغذية راجعة تُعلّم المحرك (v10.0)' },
     blocked:   { title: 'الحظر', sub: 'المستخدمون والمجموعات المحظورة' },
     settings:  { title: 'الإعدادات', sub: 'ضبط البوت — يُحفظ مباشرة في قاعدة البيانات' },
     logs:      { title: 'السجلات', sub: 'أحداث النظام المباشرة' },
@@ -1567,6 +1571,155 @@ function renderPage(tab) {
 
 function loadPageData(tab) {
     if (PAGES[tab] && PAGES[tab].load) PAGES[tab].load();
+}
+
+
+
+// ================================================================
+// PAGE: FILTER LAB (v10.0) — فحص حي + سجل قرارات + تغذية راجعة
+// ================================================================
+const FL_DEC_PILL = { accept: 'green', review: 'yellow', ignore: 'red' };
+const FL_DEC_AR = { accept: '✅ مقبول', review: '🕵️ مراجعة', ignore: '⏺ تجاهل' };
+
+function _flTime(ts) {
+    // created_at بصيغة YYYY-MM-DD HH:MM:SS (UTC) — عرض مختصر
+    const s = String(ts || '');
+    return s.length >= 16 ? s.slice(5, 10) + ' ' + s.slice(11, 16) : s;
+}
+
+function _flBar(pct, color) {
+    const w = Math.max(0, Math.min(100, Math.round(pct)));
+    return `<div style="background:var(--bg3);border-radius:6px;height:8px;width:100%">
+        <div style="background:var(--${color});height:8px;border-radius:6px;width:${w}%"></div></div>`;
+}
+
+async function loadFilterStats() {
+    const ids = ['fl-total', 'fl-accepted', 'fl-review', 'fl-fbtotal', 'fl-fbpos', 'fl-fbneg'];
+    try {
+        const st = await apiFetch('/api/filter/stats?hours=24');
+        const el = id => document.getElementById(id);
+        if (el('fl-total')) el('fl-total').textContent = st.total ?? 0;
+        if (el('fl-accepted')) el('fl-accepted').textContent = st.accepted ?? 0;
+        if (el('fl-review')) el('fl-review').textContent = st.review ?? 0;
+        const fb = (st.feedback_positive || 0) + (st.feedback_negative || 0);
+        if (el('fl-fbtotal')) el('fl-fbtotal').textContent = fb;
+        if (el('fl-fbpos')) el('fl-fbpos').textContent = st.feedback_positive || 0;
+        if (el('fl-fbneg')) el('fl-fbneg').textContent = st.feedback_negative || 0;
+        const subj = document.getElementById('fl-subjects');
+        if (subj) {
+            const items = st.subjects || [];
+            subj.innerHTML = items.length ? items.map(s => `
+                <div style="display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid var(--bg2)">
+                    <span>${esc(s.name)}</span><span class="pill blue">${s.count}</span>
+                </div>`).join('') : '<div class="empty">لا بيانات بعد.</div>';
+        }
+        const kw = document.getElementById('fl-keywords');
+        if (kw) {
+            const items = st.top_keywords || [];
+            kw.innerHTML = items.length ? items.map(k => `
+                <div style="display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid var(--bg2)">
+                    <span dir="rtl">${esc(k.name)}</span><span class="pill yellow">${k.count}</span>
+                </div>`).join('') : '<div class="empty">لا بيانات بعد.</div>';
+        }
+        const q = document.getElementById('fl-quality');
+        if (q) {
+            const avg = Math.round((st.avg_confidence || 0) * 100);
+            const prec = fb ? Math.round(100 * (st.feedback_positive || 0) / fb) : null;
+            q.innerHTML = `
+                <div style="padding:6px 0">متوسط الثقة (24س): <b>${avg}%</b></div>
+                ${_flBar(avg, 'accent')}
+                <div style="padding:10px 0 6px">دقة التقييم البشري: <b>${prec === null ? '—' : prec + '%'}</b></div>
+                ${_flBar(prec === null ? 0 : prec, 'green')}
+                <div style="padding-top:10px;font-size:11px;color:var(--text2)">حد القبول الافتراضي ≥ 65% — عدّل العتبات من الإعدادات ← الفلترة (تُطبَّق فوراً دون إعادة تشغيل).</div>`;
+        }
+    } catch (e) {
+        ids.forEach(id => { const el = document.getElementById(id); if (el) el.textContent = '—'; });
+    }
+}
+
+async function loadFilterRecent() {
+    const body = document.querySelector('#fl-table tbody');
+    if (!body) return;
+    try {
+        const data = await apiFetch('/api/filter/recent?limit=60');
+        const rows = data.decisions || [];
+        if (!rows.length) {
+            body.innerHTML = '<tr><td colspan="6" class="empty">لا قرارات مسجلة بعد — ستظهر هنا تلقائياً مع نشاط المجموعة.</td></tr>';
+            return;
+        }
+        body.innerHTML = rows.map(r => {
+            const cls = [r.subject, r.type_tag].filter(Boolean).map(x => `<span class="pill blue" style="font-size:10px">${esc(x)}</span>`).join(' ') || '<span style="color:var(--text2)">—</span>';
+            const fbBtn = (correct) => {
+                const active = (correct && r.feedback === 1) || (!correct && r.feedback === -1);
+                return `<button class="tb-btn ${active ? (correct ? 'primary' : 'danger') : ''}" style="padding:2px 8px;font-size:12px"
+                    onclick="sendFilterFeedback(${r.id}, ${correct})" title="${correct ? 'قرار صحيح — عزّز هذه الكلمات' : 'قرار خاطئ — خفّض هذه الكلمات'}">${correct ? '👍' : '👎'}</button>`;
+            };
+            return `<tr>
+                <td style="white-space:nowrap;font-size:11px;color:var(--text2)">${_flTime(r.created_at)}</td>
+                <td dir="rtl" style="max-width:280px"><div style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(r.text || '')}">${esc((r.text || '').slice(0, 90))}</div></td>
+                <td><span class="pill ${FL_DEC_PILL[r.decision] || ''}" style="font-size:10px">${FL_DEC_AR[r.decision] || esc(r.decision)}</span>${r.urgent ? ' ⚡' : ''}</td>
+                <td>${cls}</td>
+                <td style="font-size:12px">${Math.round((r.confidence || 0) * 100)}%</td>
+                <td style="white-space:nowrap">${fbBtn(true)} ${fbBtn(false)}</td>
+            </tr>`;
+        }).join('');
+    } catch (e) {
+        body.innerHTML = '<tr><td colspan="6" class="empty">فشل تحميل السجل.</td></tr>';
+    }
+}
+
+async function sendFilterTest() {
+    const box = document.getElementById('fl-text');
+    const out = document.getElementById('fl-test-result');
+    if (!box || !out) return;
+    const text = (box.value || '').trim();
+    if (!text) { showToast('اكتب نصاً للفحص أولاً', 'wrn'); return; }
+    out.innerHTML = '<div class="empty">جارٍ الفحص…</div>';
+    try {
+        const data = await apiFetch('/api/filter/test', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ text })
+        });
+        const a = data.analysis || {};
+        const c = data.classification || {};
+        const d = a.decision || 'ignore';
+        const conf = Math.round((a.confidence || 0) * 100);
+        const thr = data.thresholds || {};
+        const reasons = (a.reasons || []).map(r => `<span class="pill" style="font-size:10px;margin:2px">${esc(r)}</span>`).join(' ');
+        const sd = a.score_details || {};
+        const sdRows = Object.entries(sd).map(([k, v]) =>
+            `<div style="display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid var(--bg2)">
+                <span style="color:var(--text2);font-size:11px">${esc(k)}</span><b style="font-size:11px">${esc(String(v))}</b></div>`).join('');
+        const clsLine = [c.subject ? '#' + c.subject : '', c.type, (c.subject_matches || []).slice(0, 3).map(m => '«' + m + '»').join(' ')]
+            .filter(Boolean).join(' • ') || '—';
+        out.innerHTML = `
+            <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:8px">
+                <span class="pill ${FL_DEC_PILL[d] || ''}">${FL_DEC_AR[d] || esc(d)}</span>
+                <b style="font-size:16px">${conf}%</b>
+                <span style="color:var(--text2);font-size:11px">(قبول ≥ ${Math.round((thr.accept || 0) * 100)}% • مراجعة ≥ ${Math.round((thr.review || 0) * 100)}%)</span>
+            </div>
+            ${_flBar(conf, FL_DEC_PILL[d] === 'green' ? 'green' : FL_DEC_PILL[d] === 'yellow' ? 'yellow' : 'red')}
+            <div style="padding:8px 0">🎯 التصنيف: <b>${esc(clsLine)}</b></div>
+            <div style="padding-bottom:6px">${reasons}</div>
+            ${sdRows ? `<details><summary style="cursor:pointer;font-size:12px;color:var(--text2)">تفاصيل الدرجة</summary><div style="padding:6px">${sdRows}</div></details>` : ''}`;
+    } catch (e) {
+        out.innerHTML = '<div class="empty">فشل الفحص — تأكد أن البوت متصل.</div>';
+    }
+}
+
+async function sendFilterFeedback(id, correct) {
+    try {
+        const res = await apiFetch('/api/filter/feedback', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ id, correct })
+        });
+        const learned = (res.learned || []).length;
+        showToast(correct ? `✓ سُجّل القرار صحيحاً${learned ? ' — عُزّزت ' + learned + ' مفردة' : ''}`
+                          : `✓ سُجّل القرار خاطئاً${learned ? ' — خُفّضت ' + learned + ' مفردة' : ''}`, 'ok');
+        loadFilterRecent(); loadFilterStats();
+    } catch (e) {
+        showToast('فشل إرسال التقييم', 'err');
+    }
 }
 
 
@@ -2066,6 +2219,73 @@ function renderRecentAlertsFeed(alerts) {
 }
 
 const PAGES = {
+    filterlab: {
+        render() {
+            return `
+            <div class="kpi-row" id="fl-kpis">
+                <div class="kpi blue">
+                    <div class="kpi-label">🧮 قرارات 24 ساعة</div>
+                    <div class="kpi-val blue" id="fl-total">0</div>
+                    <div class="kpi-sub">وصلت لمحرك الفلترة</div>
+                    <div class="kpi-icon">🧮</div>
+                </div>
+                <div class="kpi green">
+                    <div class="kpi-label">✅ مقبولة</div>
+                    <div class="kpi-val green" id="fl-accepted">0</div>
+                    <div class="kpi-sub">أُرسل تنبيه لها</div>
+                    <div class="kpi-icon">✅</div>
+                </div>
+                <div class="kpi yellow">
+                    <div class="kpi-label">🕵️ للمراجعة</div>
+                    <div class="kpi-val yellow" id="fl-review">0</div>
+                    <div class="kpi-sub">ثقة متوسطة — لا تنبيه تلقائي</div>
+                    <div class="kpi-icon">🕵️</div>
+                </div>
+                <div class="kpi purple">
+                    <div class="kpi-label">⭐ تغذية راجعة</div>
+                    <div class="kpi-val purple" id="fl-fbtotal">0</div>
+                    <div class="kpi-sub">👍 <b id="fl-fbpos">0</b> • 👎 <b id="fl-fbneg">0</b></div>
+                    <div class="kpi-icon">⭐</div>
+                </div>
+            </div>
+
+            <div class="panel" style="margin-bottom:14px">
+                <div class="panel-head">🧪 فحص نص حي عبر المحرك</div>
+                <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px">
+                    <textarea id="fl-text" rows="2" dir="rtl" placeholder="اكتب نص الطلب هنا… مثال: ابغي احد يحل واجب رياضيات ضروري اليوم"
+                        style="flex:1;min-width:240px;background:var(--bg2);border:1px solid var(--bg3);border-radius:8px;color:var(--text);padding:10px;font-size:13px;resize:vertical"></textarea>
+                    <button class="tb-btn primary" onclick="sendFilterTest()" style="align-self:flex-start">🔍 فحص</button>
+                </div>
+                <div id="fl-test-result"></div>
+            </div>
+
+            <div class="grid3" style="margin-bottom:14px">
+                <div class="panel">
+                    <div class="panel-head">📚 المواد الأكثر طلباً</div>
+                    <div id="fl-subjects"><div class="empty">لا بيانات بعد.</div></div>
+                </div>
+                <div class="panel">
+                    <div class="panel-head">🔑 أعلى الكلمات الملتقطة</div>
+                    <div id="fl-keywords"><div class="empty">لا بيانات بعد.</div></div>
+                </div>
+                <div class="panel">
+                    <div class="panel-head">📈 جودة القرارات</div>
+                    <div id="fl-quality"><div class="empty">لا بيانات بعد.</div></div>
+                </div>
+            </div>
+
+            <div class="panel">
+                <div class="panel-head">📜 سجل القرارات — قيّم كل قرار ليتعلم المحرك</div>
+                <div style="overflow-x:auto;max-height:480px;overflow-y:auto">
+                    <table class="tbl" id="fl-table">
+                        <thead><tr><th>الوقت</th><th>النص</th><th>القرار</th><th>التصنيف</th><th>الثقة</th><th>التقييم</th></tr></thead>
+                        <tbody><tr><td colspan="6" class="empty">جارٍ التحميل…</td></tr></tbody>
+                    </table>
+                </div>
+            </div>`;
+        },
+        load() { loadFilterStats(); loadFilterRecent(); },
+    },
     dashboard: {
         render() {
             return `
