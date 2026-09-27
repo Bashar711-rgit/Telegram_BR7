@@ -540,14 +540,45 @@ class EnhancedTelegramBot:
 
     async def add_runtime_monitor(self, acc: Dict[str, Any]) -> Dict[str, Any]:
         """v9.34: إنشاء مراقب حي لحساب من اللوحة (نفس مسار الإقلاع حرفياً:
-        EnhancedAccountMonitor + set_bot + connect). يرفض التكرار بالبادئة."""
+        EnhancedAccountMonitor + set_bot + connect).
+
+        v9.36 (حرج — السبب الجذري لـ«الحساب مفعّل لكن لا يراقب»): مراقب حي
+        فعلاً يُحترم (لا إعادة بناء بلا داعٍ)، أما المراقب القديم المعطوب أو
+        غير المتصل (النمط الفعلي: مُنشأ عند الإقلاع بلا جلسة لأن *_SESSION_STRING
+        لم تكن موجودة بعد) فسابقاً كان يُجمّد كل محاولات التوصيل اللاحقة
+        للأبد — تسجيل دخول ناجح يحفظ الجلسة في DB + Render ثم يستدعي هذا
+        التابع فيجد المراقب القديم فيعيد «already + خطأ No session القديم»
+        دون أي اتصال بالجلسة الجديدة. الإصلاح: المراقب المعطوب يُقطع اتصاله
+        ويُزال ويُبنى مراقب جديد بالجلسة الطازجة بنفس مسار الإقلاع — ويفشل
+        الاتصال الجديد لسبب حقيقي فيظهر الخطأ الحقيقي الجديد لا القديم."""
         prefix = str((acc or {}).get("prefix") or "").strip().upper()
         if not prefix:
             return {"ok": False, "error": "prefix مفقود"}
         existing = self.get_monitor_by_prefix(prefix)
         if existing is not None:
-            return {"ok": bool(existing.is_connected), "already": True,
-                    "error": None if existing.is_connected else (existing._last_connect_error or "غير متصل")}
+            alive = bool(
+                existing.is_connected
+                and existing.client is not None
+                and EnhancedAccountMonitor._is_client_alive(existing.client)
+            )
+            if alive:
+                return {"ok": True, "already": True}
+            stale_reason = str(existing._last_connect_error or "غير متصل")
+            try:
+                await existing.disconnect()
+            except Exception as e:
+                logger.warning(
+                    f"add_runtime_monitor: stale disconnect failed [{prefix}]: "
+                    f"{type(e).__name__}: {e}"
+                )
+            try:
+                self.monitors.remove(existing)
+            except ValueError:
+                pass
+            logger.info(
+                f"add_runtime_monitor: replacing stale monitor [{prefix}] "
+                f"(previous state: {stale_reason[:120]})"
+            )
         try:
             mon = EnhancedAccountMonitor(acc, self.db, self.filter, self.main_client)
             mon.set_bot(self)
