@@ -2037,6 +2037,101 @@ async def test_account(prefix: str, request: Request):
                 pass
 
 
+@app.post("/api/accounts/{prefix}/target-check", dependencies=[Depends(require_permission("accounts.read"))])  # v10.1
+async def target_check(prefix: str, request: Request):
+    """تشخيص حي شامل لسبب فشل الإرسال للمجموعة الهدف (v10.1).
+
+    يفحص عبر عميل حي (المراقب أولاً — بلا مخاطر AuthKeyDuplicated):
+    1) هوية الحساب (get_me)
+    2) نوع الهدف: قناة بث أم مجموعة خارقة + العنوان
+    3) صلاحيات الحساب: admin_rights / creator / banned_rights
+    4) default_banned_rights.send_messages → هل «فقط المشرفون يكتبون» مفعّل
+    5) اختياري spambot=true: رسالة /start لـ @SpamBot وقراءة الرد —
+       الفحص الحاسم لحظر/تقييد السبام (يشرح ChatAdminRequired الجماعي).
+    قراءة فقط عدا رسالة @SpamBot الاختيارية — لا يغيّر أي حالة."""
+    p = prefix.strip().upper()
+    merged = await _merged_accounts(request)
+    acc = _find_merged_account(merged, p)
+    if acc is None:
+        raise HTTPException(status_code=404, detail=f"الحساب {p} غير موجود")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    check_spambot = bool((body or {}).get("spambot", False))
+
+    client = None
+    tested_via = None
+    temp_client = None
+    bot = getattr(request.app.state, "bot_ref", None)
+    if bot is not None:
+        mon = bot.get_monitor_by_prefix(p)
+        if mon is not None and mon.is_connected and mon.client is not None:
+            client = mon.client
+            tested_via = "live_monitor"
+    if client is None:
+        session_string = (acc.get("session_string") or "").strip()
+        if not session_string:
+            return JSONResponse({"success": False, "tested": "no_session",
+                                 "message": "لا توجد جلسة لهذا الحساب"}, status_code=200)
+        temp_client = TelegramClient(StringSession(session_string), int(acc.get("api_id") or 0),
+                                     str(acc.get("api_hash") or ""), device_model="BR7-Diag",
+                                     system_version="Linux", app_version="v10.1")
+        await asyncio.wait_for(temp_client.connect(), timeout=30)
+        if not await temp_client.is_user_authorized():
+            return JSONResponse({"success": False, "tested": "temp_client_unauthorized",
+                                 "message": "الجلسة منتهية أو ملغاة"}, status_code=200)
+        client = temp_client
+        tested_via = "temp_client"
+
+    out: Dict[str, Any] = {"success": True, "tested_via": tested_via, "prefix": p}
+    try:
+        me = await client.get_me()
+        out["me"] = {"id": me.id, "username": getattr(me, "username", None),
+                     "name": (me.first_name or "") + ((" " + me.last_name) if me.last_name else "")}
+        # ── فحص الهدف ──
+        target = getattr(CFG, "TARGET_GROUP_ID", None)
+        out["target_id"] = target
+        if not target:
+            out["target_error"] = "TARGET_GROUP_ID غير مضبوط"
+        else:
+            try:
+                ent = await client.get_entity(int(target))
+                broadcast = bool(getattr(ent, "broadcast", False))
+                megagroup = bool(getattr(ent, "megagroup", False))
+                out["target"] = {
+                    "title": getattr(ent, "title", None),
+                    "kind": "channel" if broadcast else ("megagroup" if megagroup else type(ent).__name__),
+                    "creator": bool(getattr(ent, "creator", False)),
+                    "has_admin_rights": bool(getattr(ent, "admin_rights", None)),
+                    "admin_rights_detail": str(getattr(ent, "admin_rights", None))[:200],
+                    "banned_rights": str(getattr(ent, "banned_rights", None))[:200],
+                }
+                dbr = getattr(ent, "default_banned_rights", None)
+                if dbr is not None:
+                    out["target"]["default_send_allowed"] = not bool(getattr(dbr, "send_messages", False))
+                    out["target"]["default_banned_rights_raw"] = str(dbr)[:200]
+            except Exception as e:
+                out["target_error"] = f"{type(e).__name__}: {str(e)[:200]}"
+        # ── فحص SpamBot (اختياري — الحاسم لحظر السبام) ──
+        if check_spambot:
+            try:
+                sb = await client.get_entity("SpamBot")
+                await client.send_message(sb, "/start")
+                await asyncio.sleep(5)
+                msgs = await client.get_messages(sb, limit=1)
+                out["spambot_reply"] = (msgs[0].message[:500] if (msgs and msgs[0]) else "لا يوجد رد")
+            except Exception as e:
+                out["spambot_error"] = f"{type(e).__name__}: {str(e)[:200]}"
+        return JSONResponse(out)
+    finally:
+        if temp_client is not None:
+            try:
+                await temp_client.disconnect()
+            except Exception:
+                pass
+
+
 @app.get("/api/messages", dependencies=[Depends(require_permission("messages.read"))])  # v9.32
 async def get_messages(
     request: Request,
