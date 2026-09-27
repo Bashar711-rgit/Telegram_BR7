@@ -122,6 +122,9 @@ from telethon.errors import (
     FloodWaitError,
     SessionPasswordNeededError,
     AuthKeyDuplicatedError,
+    ChatWriteForbiddenError,
+    ChannelPrivateError,
+    UserBannedInChannelError,
 )
 from telethon.tl.types import (
     MessageMediaPhoto,
@@ -2040,18 +2043,50 @@ class EnhancedAccountMonitor:
         await self._update_avg_time(processing_time)
 
 
+    async def _resolve_send_clients(self) -> List[TelegramClient]:
+        """v10.2: قائمة مرشحي الإرسال بالترتيب — كلهم أحياء وبلا تكرار.
+
+        الترتيب:
+        1) alert_sender_client — آخر عميل نجح فعلياً في إرسال تنبيه
+           (ذاكرة لاصقة على مستوى البوت: بعد أول نجاح تلتزم كل الإرسالات
+           به العميل ما بقي حياً — صفر تكلفة تدوير على التنبيهات التالية).
+        2) main_client — العميل الرئيسي.
+        3) عميل هذا المراقب نفسه.
+        4) عملاء بقية المراقبين الحيين.
+
+        السبب (تشخيص 23:44 UTC): لا يوجد حساب is_main → main_client =
+        أول متصل عند الإقلاع (Account 2 ثم failover إلى Account 3) —
+        وهما ليسا مشرفين في قناة الهدف → ChatAdminRequiredError على كل
+        تنبيه منذ 20:29. التدوير على المرشحين يجد تلقائياً أي عميل لديه
+        صلاحية النشر مهما كان هوية main_client."""
+        ref = self._bot_ref
+        ordered: List[TelegramClient] = []
+        sticky = getattr(ref, "alert_sender_client", None) if ref else None
+        if sticky is not None and self._is_client_alive(sticky):
+            ordered.append(sticky)
+        mc = ref.main_client if ref else None
+        if mc and self._is_client_alive(mc):
+            ordered.append(mc)
+        if self.client and self._is_client_alive(self.client):
+            ordered.append(self.client)
+        if ref:
+            for mon in ref.monitors:
+                if mon is self:
+                    continue
+                if mon.client and mon.is_connected and self._is_client_alive(mon.client):
+                    ordered.append(mon.client)
+        seen: Set[int] = set()
+        uniq: List[TelegramClient] = []
+        for c in ordered:
+            if id(c) not in seen:
+                seen.add(id(c))
+                uniq.append(c)
+        return uniq
+
     async def _resolve_send_client(self) -> Optional[TelegramClient]:
-        candidates = []
-        mc = self._bot_ref.main_client if self._bot_ref else None
-        if mc and self._is_client_alive(mc): candidates.append(mc)
-        if self.client and self._is_client_alive(self.client): candidates.append(self.client)
-        if self._bot_ref:
-            for mon in self._bot_ref.monitors:
-                if mon is self: continue
-                if mon.client and mon.is_connected and self._is_client_alive(mon.client): candidates.append(mon.client)
-        for c in candidates:
-            if self._is_client_alive(c): return c
-        return None
+        """توافق خلفي — أول مرشح من القائمة."""
+        clients = await self._resolve_send_clients()
+        return clients[0] if clients else None
 
 
     @staticmethod
@@ -2086,7 +2121,8 @@ class EnhancedAccountMonitor:
         sender_last_name = data.get("sender_last_name"); sender_access_hash = data.get("sender_access_hash")
         chat_access_hash = data.get("chat_access_hash"); chat_username = data.get("chat_username")
         display_name = f"{sender_first_name or ''} {sender_last_name or ''}".strip() or f"مستخدم ({sender_id})"
-        send_client = await self._resolve_send_client()
+        send_clients = await self._resolve_send_clients()
+        send_client = send_clients[0] if send_clients else None
         if not send_client:
             logger.error(f"No available client to send alert [{account_name}]"); await self._inc_stat("send_errors"); return
         # ── v9.10: حاجز منع تكرار التنبيهات ──
@@ -2147,32 +2183,65 @@ class EnhancedAccountMonitor:
         sender = {"id": sender_id, "display": display_name, "username": sender_username, "access_hash": sender_access_hash}
         alert_text, buttons = self._build_alert(sender, chat_info, keyword, text, analysis)
         user_media = data.get("media_object")
-        async def do_send():
-            sent = False
-            sent_msg = None
+        async def _try_send_with(c: TelegramClient):
+            """v10.2: محاولة إرسال واحدة عبر عميل محدد (وسائط → صورة → نص)."""
             if user_media is not None:
                 try:
-                    sent_msg = await send_client.send_file(CFG.TARGET_GROUP_ID, file=user_media, caption=alert_text, buttons=buttons, parse_mode="html", link_preview=False)
-                    sent = True
-                except Exception as e: logger.debug(f"User media send failed: {e}")
+                    return await c.send_file(CFG.TARGET_GROUP_ID, file=user_media, caption=alert_text, buttons=buttons, parse_mode="html", link_preview=False)
+                except FloodWaitError:
+                    raise
+                except Exception as e:
+                    logger.debug(f"User media send failed: {e}")
             # v9.12 (audit H-02): the group-photo fallback is now opt-in via
             # CFG.ATTACH_GROUP_PHOTO. The default is False — text alerts go
             # out as a single send_message call (half the API requests, far
             # less FloodWait exposure). Set ATTACH_GROUP_PHOTO=true to
             # restore the legacy two-call path with the attached photo.
-            if not sent and CFG.ATTACH_GROUP_PHOTO:
+            if CFG.ATTACH_GROUP_PHOTO:
                 chat_entity = chat_info.get("entity")
                 if chat_entity and getattr(chat_entity, 'id', 0) != 0:
                     try:
-                        result = await send_client.get_profile_photos(chat_entity, limit=1)
+                        result = await c.get_profile_photos(chat_entity, limit=1)
                         if result and hasattr(result, 'photos') and len(result.photos) > 0:
-                            sent_msg = await send_client.send_file(CFG.TARGET_GROUP_ID, file=result.photos[0], caption=alert_text, buttons=buttons, parse_mode="html", link_preview=False)
-                            sent = True
+                            return await c.send_file(CFG.TARGET_GROUP_ID, file=result.photos[0], caption=alert_text, buttons=buttons, parse_mode="html", link_preview=False)
+                    except FloodWaitError:
+                        raise
                     except Exception as e:
                         logger.debug(f"Chat photo fallback send failed [{account_name}]: {e}")
-            if not sent:
-                sent_msg = await send_client.send_message(CFG.TARGET_GROUP_ID, alert_text, buttons=buttons, parse_mode="html", link_preview=False)
-            return sent_msg
+            return await c.send_message(CFG.TARGET_GROUP_ID, alert_text, buttons=buttons, parse_mode="html", link_preview=False)
+
+        async def do_send():
+            """v10.2: تدوير مرشحي الإرسال — أول عميل ينجح يلتزم الإرسال.
+
+            يجيب تلقائياً على سيناريو 20:29 UTC: main_client ليس مشرفاً
+            في قناة الهدف → المحاولة الأولى تفشل (صلاحيات/كيان) → ننتقل
+            للمرشح التالي حتى ينجح أحدهم، ثم يُلاصق (alert_sender_client)
+            فلا تكلفة تدوير على التنبيهات التالية."""
+            last_exc: Optional[Exception] = None
+            for idx, c in enumerate(send_clients):
+                try:
+                    sent_msg = await _try_send_with(c)
+                    if self._bot_ref is not None:
+                        try:
+                            self._bot_ref.alert_sender_client = c
+                        except Exception:
+                            pass
+                    if idx > 0:
+                        logger.info(
+                            f"✅ Alert send succeeded with candidate #{idx + 1} "
+                            f"[{account_name}] after rotation (sticky sender updated)"
+                        )
+                    return sent_msg
+                except (FloodWaitError, CircuitBreakerOpen):
+                    raise  # احترام حدود التقييم/القاطع — المسار الخارجي يعالجها
+                except Exception as e:
+                    # أي فشل إرسال (صلاحيات/كيان/حدود) يجرب المرشح التالي
+                    last_exc = e
+                    logger.warning(
+                        f"Send candidate #{idx + 1} failed [{account_name}]: "
+                        f"{type(e).__name__}: {str(e)[:120]} — trying next client"
+                    )
+            raise last_exc if last_exc else RuntimeError("no send candidate succeeded")
         def _retry_payload() -> Dict[str, Any]:
             payload = dict(data)
             payload["_dlq_kind"] = "alert_resend"
@@ -2218,10 +2287,40 @@ class EnhancedAccountMonitor:
         except Exception as e:
             logger.error(f"Send alert error [{account_name}]: {e} - trying fallback")
             fallback_sent_msg = None
+            # v10.2: fallback يستخدم أفضل عميل متاح (اللاصق إن وجد)
+            fb_client = None
+            if self._bot_ref is not None and self._is_client_alive(getattr(self._bot_ref, "alert_sender_client", None)):
+                fb_client = self._bot_ref.alert_sender_client
+            elif send_clients:
+                fb_client = send_clients[0]
             try:
-                fallback_sent_msg = await send_client.send_message(CFG.TARGET_GROUP_ID, alert_text, buttons=buttons, parse_mode=None, link_preview=False)
+                if fb_client is None:
+                    raise RuntimeError("لا يوجد عميل متاح للإرسال الاحتياطي")
+                fallback_sent_msg = await fb_client.send_message(CFG.TARGET_GROUP_ID, alert_text, buttons=buttons, parse_mode=None, link_preview=False)
             except Exception as fe:
                 logger.error(f"Fallback failed [{account_name}]: {fe}")
+                # ── v10.2: الملاذ الأخير — تسليم التنبيه لخاص الإدارة ──
+                # إذا فشلت القناة الهدف بكل المرشحين (صلاحيات/حذف/حظر)،
+                # تصل التنبيهات للإدارة رسالة خاصة بدل ضياعها كلياً.
+                admin_id = getattr(CFG, "ADMIN_CHAT_ID", None)
+                admin_client = fb_client
+                if admin_id and admin_client is not None:
+                    try:
+                        admin_text = (
+                            "⚠️ <b>تنبيه — تعذّر النشر في القناة الهدف</b>\n"
+                            "(فشل الإرسال من كل الحسابات — راجع صلاحيات القناة)\n"
+                            "─────────────────\n"
+                            f"{alert_text}"
+                        )
+                        await admin_client.send_message(int(admin_id), admin_text, parse_mode=None, link_preview=False)
+                        logger.warning(
+                            f"✉️ Alert delivered to ADMIN DM instead [{account_name}] "
+                            "(all target-channel candidates failed)"
+                        )
+                        await self._inc_stat("send_errors")
+                        return
+                    except Exception as ae:
+                        logger.error(f"Admin DM fallback failed [{account_name}]: {ae}")
                 # v9.12 (audit M-05): unified DLQ push path — same helper
                 # as the FloodWait branch. Releases dedup, pushes the
                 # retry payload, bumps send_errors.

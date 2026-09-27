@@ -882,9 +882,9 @@ class Config:
         return cls.build()
 
 # =============================================================================
-# Bot version — single source of truth (v10.0 Precision Edition)
+# Bot version — single source of truth (v10.2 Send Rotation)
 # =============================================================================
-BOT_VERSION: Final = "10.1.0"
+BOT_VERSION: Final = "10.2.0"
 BOT_CODENAME: Final = "Precision"
 
 # =============================================================================

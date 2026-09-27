@@ -323,6 +323,10 @@ class EnhancedTelegramBot:
         )
         self.memory_monitor = MemoryMonitor()
         self.main_client: Optional[TelegramClient] = None
+        # v10.2: المُرسِل اللاصق — آخر عميل نجح فعلياً في إرسال تنبيه للقناة
+        # الهدف. _resolve_send_clients تفضّله أولاً فيظهر الإرسال مستقراً
+        # حتى لو كان main_client حساباً بلا صلاحية نشر في القناة.
+        self.alert_sender_client: Optional[TelegramClient] = None
         self.monitors: List[EnhancedAccountMonitor] = []
         self.is_running = False
         self._start_time = time.monotonic()
