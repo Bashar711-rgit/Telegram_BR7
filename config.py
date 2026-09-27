@@ -446,6 +446,18 @@ class _ConfigData:
     DEDUP_ENABLED: bool
     DEDUP_WINDOW_SECONDS: int
 
+    # ── v10.0 Precision: clause re-scoring (تقييم البنود المستقلة) ──
+    CLAUSE_RESCORE_ENABLED: bool
+
+    # ── v10.0 Precision: similarity gate (منع إعادة الصياغة المتقاربة) ──
+    SIMILARITY_ENABLED: bool
+    SIMILARITY_THRESHOLD: float
+    SIMILARITY_WINDOW_SECONDS: int
+
+    # ── v10.0 Precision: daily digest (تقرير يومي للإدارة) ──
+    DIGEST_ENABLED: bool
+    DIGEST_HOUR_UTC: int
+
     # ── Sender Intelligence / Resolver (backend-only enrichment, v9.9) ──
     SENDER_INTEL_ENABLED: bool
     SENDER_ENTITY_CACHE_SIZE: int
@@ -780,6 +792,17 @@ class Config:
             # للتعديل الحي من لوحة التحكم (DEDUP_ENABLED / DEDUP_WINDOW_SECONDS).
             DEDUP_ENABLED=SecretManager.get_bool("DEDUP_ENABLED", True),
             DEDUP_WINDOW_SECONDS=SecretManager.get_int("DEDUP_WINDOW_SECONDS", 86400, required=False),
+            # v10.0 Precision: تقييم البنود المستقلة — يرفع الرسائل متعددة
+            # الأفكار عندما يحقق بند قوي ثقة القبول (فشل-آمن، قابل للتعطيل).
+            CLAUSE_RESCORE_ENABLED=SecretManager.get_bool("CLAUSE_RESCORE_ENABLED", True),
+            # v10.0 Precision: حاجز التشابه — يمنع التنبيه المزدوج لإعادة
+            # الصياغة من نفس المرسل (عتبة محافظة 0.88 = شبه-مطابقة فقط).
+            SIMILARITY_ENABLED=SecretManager.get_bool("SIMILARITY_ENABLED", True),
+            SIMILARITY_THRESHOLD=SecretManager.get_float("SIMILARITY_THRESHOLD", 0.88, required=False),
+            SIMILARITY_WINDOW_SECONDS=SecretManager.get_int("SIMILARITY_WINDOW_SECONDS", 3600, required=False),
+            # v10.0 Precision: التقرير اليومي للإدارة — الساعة بتوقيت UTC.
+            DIGEST_ENABLED=SecretManager.get_bool("DIGEST_ENABLED", True),
+            DIGEST_HOUR_UTC=SecretManager.get_int("DIGEST_HOUR_UTC", 20, required=False),
             # Sender Intelligence: passive, failure-safe backend enrichment
             # (never changes alert output). Kill switch: SENDER_INTEL_ENABLED=false.
             SENDER_INTEL_ENABLED=SecretManager.get_bool("SENDER_INTEL_ENABLED", True),
@@ -857,6 +880,12 @@ class Config:
         load_dotenv(PROJECT_DIR / "accounts.env", override=True)
         cls._instance = None
         return cls.build()
+
+# =============================================================================
+# Bot version — single source of truth (v10.0 Precision Edition)
+# =============================================================================
+BOT_VERSION: Final = "10.0.0"
+BOT_CODENAME: Final = "Precision"
 
 # =============================================================================
 # Pre-built config instance

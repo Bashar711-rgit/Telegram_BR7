@@ -73,7 +73,7 @@ import sys
 import time
 import tracemalloc
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Deque, Dict, List, Optional, Set
 
 # محاولة استيراد uvloop بشكل آمن (قد لا يكون مثبتاً في Pydroid 3)
@@ -1127,6 +1127,112 @@ class EnhancedTelegramBot:
                 except asyncio.CancelledError:
                     break
 
+    async def _digest_loop(self) -> None:
+        """v10.0 Precision: التقرير اليومي للإدارة.
+
+        يفحص كل 10 دقائق؛ عندما تكون ساعة UTC الحالية == DIGEST_HOUR_UTC
+        ولم يُرسل تقرير هذا اليوم بعد، يُرسل ملخصاً يومياً إلى الإدارة:
+        قرارات الفلترة 24 ساعة (قبول/مراجعة/تجاهل/ثقة/المواد/الكلمات)،
+        حواجز dedup والتشابه، وحالة الحسابات. فشل-آمن بالكامل.
+        """
+        try:
+            if not getattr(CFG, "DIGEST_ENABLED", True):
+                return
+            last_sent_date: Optional[str] = None
+            while self.is_running:
+                try:
+                    await asyncio.sleep(600)  # كل 10 دقائق
+                    now_utc = datetime.now(timezone.utc)
+                    target_hour = max(0, min(23, int(getattr(CFG, "DIGEST_HOUR_UTC", 20))))
+                    if now_utc.hour != target_hour:
+                        continue
+                    today = now_utc.strftime("%Y-%m-%d")
+                    if last_sent_date == today:
+                        continue
+                    last_sent_date = today
+                    await self._send_daily_digest()
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    logger.debug(f"Digest loop skipped: {e}")
+                    try:
+                        await asyncio.sleep(120)
+                    except asyncio.CancelledError:
+                        break
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.error(f"Digest loop crashed: {e}")
+
+    async def _send_daily_digest(self) -> None:
+        """يبني التقرير اليومي ويرسله للإدارة — كل قسم مستقل فشل-آمن."""
+        try:
+            lines: List[str] = ["📊 <b>التقرير اليومي — ملخص الأداء (24 ساعة)</b>", ""]
+
+            # 1) قرارات الفلترة — المصدر الأهم
+            try:
+                fd = await self.db.filter_decision_stats(hours=24)
+                if fd and fd.get("total", 0) > 0:
+                    lines += [
+                        "🎯 <b>قرارات الفلترة:</b>",
+                        f"• رسائل مقيّمة: {fd.get('total', 0):,}",
+                        f"• ✅ قبول: {fd.get('accepted', 0):,} | 🔍 مراجعة: {fd.get('review', 0):,} | ❌ تجاهل: {fd.get('ignored', 0):,}",
+                        f"• متوسط الثقة: {int(round(float(fd.get('avg_confidence', 0.0)) * 100))}%",
+                    ]
+                    subjects = fd.get("subjects") or []
+                    if subjects:
+                        top3 = "، ".join(
+                            f"{s.get('name', '?')} ({s.get('count', 0)})" for s in subjects[:3]
+                        )
+                        lines.append(f"• المواد الأكثر: {top3}")
+                    fb_pos = fd.get("feedback_positive", 0)
+                    fb_neg = fd.get("feedback_negative", 0)
+                    if fb_pos or fb_neg:
+                        lines.append(f"• التغذية الراجعة: 👍 {fb_pos} | 👎 {fb_neg}")
+                    lines.append("")
+                else:
+                    lines += ["🎯 قرارات الفلترة: لا بيانات خلال 24 ساعة", ""]
+            except Exception as e:
+                logger.debug(f"Digest: filter stats skipped: {e}")
+
+            # 2) الإجماليات العامة + الحواجز
+            try:
+                stats = await self.db.get_stats()
+                lines += [
+                    "📨 <b>الإجماليات:</b>",
+                    f"• رسائل معالَجة: {stats.get('total_messages', 0):,} | تنبيهات مرسلة: {stats.get('alerts_sent', 0):,}",
+                ]
+            except Exception as e:
+                logger.debug(f"Digest: global stats skipped: {e}")
+            try:
+                from dedup import get_dedup_snapshot
+                ds = get_dedup_snapshot()
+                if ds.get("blocked", 0):
+                    lines.append(f"• ♻️ تنبيهات مكررة منعت (dedup): {ds.get('blocked', 0):,}")
+            except Exception:
+                pass
+            try:
+                from similarity import get_similarity_snapshot
+                ss = get_similarity_snapshot()
+                if ss.get("blocked", 0):
+                    lines.append(f"• 🔁 تنبيهات متشابهة منعت: {ss.get('blocked', 0):,}")
+            except Exception:
+                pass
+
+            # 3) حالة الحسابات
+            try:
+                connected = sum(1 for m in self.monitors if getattr(m, "is_connected", False))
+                lines += ["", f"👥 الحسابات المتصلة: {connected}/{len(self.monitors)}"]
+            except Exception:
+                pass
+
+            lines += ["", f"🤖 BR7 v{CFG.BOT_VERSION} {getattr(CFG, 'BOT_CODENAME', '')} — تقرير آلي يومي"]
+            text = "\n".join(lines)
+            await self.main_client.send_message(CFG.ADMIN_CHAT_ID, text, parse_mode="html")
+            logger.info("Daily digest sent to admin")
+        except Exception as e:
+            logger.error(f"Daily digest send failed: {e}")
+
     async def _health_check_loop(self) -> None:
         while self.is_running:
             try:
@@ -1518,6 +1624,9 @@ class EnhancedTelegramBot:
         self._cleanup_task = self._track_task(self._cleanup_loop(), "cleanup")
         # v9.12 (audit H-08): dedicated short-cadence dedup cleanup task.
         self._dedup_cleanup_task = self._track_task(self._dedup_cleanup_loop(), "dedup_cleanup")
+        # v10.0 Precision: التقرير اليومي للإدارة
+        if getattr(CFG, "DIGEST_ENABLED", True):
+            self._digest_task = self._track_task(self._digest_loop(), "daily_digest")
         self._health_task = self._track_task(self._health_check_loop(), "health")
         self._memory_task = self._track_task(self._memory_monitor_loop(), "memory")
         self._main_client_watchdog_task = self._track_task(

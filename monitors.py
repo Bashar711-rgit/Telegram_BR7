@@ -133,6 +133,7 @@ from config import CFG, InputSanitizer, fast_hash
 from database import EnhancedDatabase, MessageRecord, AlertRecord, DeadLetterRecord
 from filter_engine import EnhancedFilter
 from dedup import content_fingerprint, get_deduplicator  # v9.10 cross-account dedup
+from similarity import get_similarity_gate  # v10.0 Precision: near-duplicate gate
 from antispam import get_antispam  # v9.11 anti-spam (Watch List → Permanent Ignore)
 from sender_resolver import (
     extract_flat as _sender_extract_flat,
@@ -1021,6 +1022,14 @@ class EnhancedAccountMonitor:
         rule_tag = (analysis or {}).get("rule_tag") if isinstance(analysis, dict) else None
         if rule_tag:
             rule_tag_html = f'<blockquote dir="rtl">🏷 قاعدة: {InputSanitizer.escape_html(str(rule_tag))}</blockquote>\n\n'
+        # ── v10.0 Precision: شارة ثقة المرسل بجانب الاسم ──
+        _trust_html = ""
+        try:
+            _trust = (analysis or {}).get("sender_trust") if isinstance(analysis, dict) else None
+            if _trust:
+                _trust_html = f' ✅ {InputSanitizer.escape_html(str(_trust))}'
+        except Exception:
+            _trust_html = ""
         # ── v10.0: سطر التصنيف الدقيق أعلى التنبيه ──
         # #المادة • نوع المطلوب • ⚡ عاجل • الثقة٪ — من classifier (فشل-آمن).
         classification_html = ""
@@ -1034,7 +1043,7 @@ class EnhancedAccountMonitor:
                 )
         except Exception:
             classification_html = ""
-        alert = (f"{rule_tag_html}{classification_html}<b>الرسالة:</b>\n{message_html}\n\n👤: {sender_link}\n\n{group_card}")
+        alert = (f"{rule_tag_html}{classification_html}<b>الرسالة:</b>\n{message_html}\n\n👤: {sender_link}{_trust_html}\n\n{group_card}")
         # v9.11: الأزرار الثلاثة المطلوبة في صفّين:
         #   [ عرض الرسالة ] [ تواصل مع المرسل ]
         #   [ مراسلة ] [ 📋 نسخ النص ]
@@ -1963,6 +1972,13 @@ class EnhancedAccountMonitor:
                 analysis["classified"] = bool(_cls.get("classified"))
             except Exception as _cls_err:
                 logger.debug(f"classify skipped [{self.account['name']}]: {_cls_err}")
+            # ── v10.0 Precision: استخراج الموعد النهائي (فشل-آمن) ──
+            # يُغذي شارة الأولوية في سطر التصنيف داخل التنبيه.
+            try:
+                from classifier import extract_deadline as _extract_deadline
+                analysis["deadline"] = _extract_deadline(validated_text)
+            except Exception as _dl_err:
+                logger.debug(f"deadline extract skipped [{self.account['name']}]: {_dl_err}")
 
         # ====== الإصلاح الجوهري: التأكد من أن القرار النهائي هو "accept" فقط ======
         decision = analysis.get("decision", "ignore")
@@ -2097,6 +2113,20 @@ class EnhancedAccountMonitor:
             await self._inc_stat("rate_limited")
             await get_deduplicator().release(dedup_fp)
             return
+        # ── v10.0 Precision: حاجز التشابه ──
+        # يمنع التنبيه المزدوج لإعادة الصياغة المتقاربة من نفس المرسل
+        # (بعد حاجز dedup الحرفي). نُبقي حجز dedup — الرسالة عولجت
+        # (مُنع عرضها فقط)، وإطلاقه يسمح بتكرار لاحق لنفس النص.
+        _sim_hit = get_similarity_gate().check_and_record(sender_id, text)
+        if _sim_hit is not None:
+            await self._inc_stat("similar_blocked")
+            logger.info(
+                f"Similar alert blocked [{account_name}] | msg_hash={msg_hash} | "
+                f"sender={sender_id} | score={_sim_hit.get('score')} | "
+                f"age={_sim_hit.get('age_seconds')}s | "
+                f"matched={str(_sim_hit.get('matched_excerpt', ''))[:40]}"
+            )
+            return
         chat_info = await self._chat_info(send_client, chat_id, message_id, chat_access_hash=chat_access_hash, chat_username=chat_username)
         # v9.10: بيانات الأزرار الديناميكية — _build_alert تبني [ مراسلة /
         # عرض الرسالة ] من المعرفات الخام نفسها المستخدمة في روابط النص.
@@ -2104,6 +2134,16 @@ class EnhancedAccountMonitor:
         chat_info["message_id"] = message_id
         chat_info["username"] = chat_username
         analysis["msg_hash"] = msg_hash
+        # ── v10.0 Precision: شارة ثقة المرسل (فشل-آمن) ──
+        # السمعة 0..100 في DB (افتراضي 50 لغير المعروف) — شارة عرض فقط.
+        try:
+            _rep = float(await self.db.get_sender_reputation(sender_id))
+            if _rep >= 80:
+                analysis["sender_trust"] = "موثوق"
+            elif _rep >= 55:
+                analysis["sender_trust"] = "نشيط"
+        except Exception:
+            pass
         sender = {"id": sender_id, "display": display_name, "username": sender_username, "access_hash": sender_access_hash}
         alert_text, buttons = self._build_alert(sender, chat_info, keyword, text, analysis)
         user_media = data.get("media_object")

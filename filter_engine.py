@@ -2001,6 +2001,21 @@ class EnhancedFilter:
             result.decision = "review"
             result.reasons.append("capped: resolution_with_new_request")
 
+        # ── v10.0 Precision: تقييم البنود المستقلة (clause re-scoring) ──
+        # عندما لا يصل القرار للقبول، نقيّم كل بند من بنود الرسالة قسماً
+        # مستقلاً — بند الطلب الحقيقي («بس عندي تقرير محتاج مساعدة») لم يعد
+        # يتلوث ببند الاسترسال («لقيت حل الواجب»). الترقية مشروطة:
+        # نية صريحة + ثقة وزنية ≥ عتبة القبول + ليس بنداً عارياً (≤2 كلمة).
+        if CFG.CLAUSE_RESCORE_ENABLED and result.decision != "accept":
+            _up = self._clause_rescore(cleaned)
+            if _up is not None:
+                up_conf, up_reasons = _up
+                if up_conf > result.confidence:
+                    result.confidence = min(1.0, up_conf)
+                    result.decision = "accept"
+                    result.reasons.extend(up_reasons)
+                    result.score_details["clause_rescore"] = round(up_conf, 4)
+
         # ===== الإصلاح الحاسم: مزامنة valid مع القرار النهائي =====
         result.valid = (result.decision == "accept")
         # =====================================================
@@ -2022,6 +2037,153 @@ class EnhancedFilter:
         result_dict = result.to_dict()
         result_dict["valid"] = result.valid
         return result_dict, stats_inc, elapsed_ms, elapsed_ms
+
+    # ── v10.0 Precision: clause re-scoring ────────────────────────────────
+    def _clause_rescore(
+        self, cleaned: str
+    ) -> Optional[Tuple[float, List[str]]]:
+        """يقيّم بنود الرسالة قسماً مستقلاً ويعيد أفضل ثقة بند مؤهلة للترقية.
+
+        شروط الترقية لكل بند (محافظة):
+          * ليس بند تحية/شكر/سبام (أشجار ignore/spam).
+          * يحمل نية صريحة (طلب مباشر أو fuzzy) وليس ضمنياً فقط.
+          * ليس نافياً محلياً («ما قدرت احله») وليس إعلانياً (> 0.5).
+          * ليس بنداً عارياً: يلزم (كلمات ≥ 3) أو (كلمتان + كائن أكاديمي).
+          * ليس سياق خبير غامضاً (نفس قاعدة calibration في المسار الرئيسي).
+          * الثقة الوزنية ≥ عتبة القبول.
+
+        Returns:
+            None أو (confidence, reasons) — فشل-آمن: أي استثناء ⇒ None.
+        """
+        try:
+            from clauses import split_clauses  # استيراد كسول (بلا دورة)
+
+            parts = split_clauses(cleaned)
+            if len(parts) <= 1:
+                return None
+
+            accept_th = _cfg("CONFIDENCE_ACCEPT_THRESHOLD", 0.65)
+            best_conf = 0.0
+            best_reasons: List[str] = []
+
+            for clause in parts:
+                try:
+                    if not clause or len(clause) < 4:
+                        continue
+                    # بنود التحية/الشكر/السبام لا تُرقّى أبداً
+                    if (
+                        self._search_first_valid(self._ignore_strong_trie, clause)
+                        or self._search_first_valid(self._spam_trie, clause)
+                        or self._search_first_valid(self._ignore_trie, clause)
+                    ):
+                        continue
+
+                    c_match = self._search_best(
+                        self._request_trie,
+                        clause,
+                        lambda t: self._adaptive_intent.get(
+                            t, self._intent_weights.get(t, 0.7)
+                        ),
+                    )
+                    if c_match is None:
+                        c_match = self._fuzzy_intent_fallback(clause)
+                    if c_match is None:
+                        continue  # بلا نية صريحة — لا ترقية من بند ضمني
+
+                    c_intent_word = c_match[0]
+                    c_intent_pos = c_match[2]
+                    # الوزن الفعلي من المطابقة (نفس منهجية المسار الرئيسي —
+                    # قد يكون 1.5 لكلمات عالية الثقة وليس 0.7 الافتراضي)
+                    c_intent_weight = (
+                        self._adaptive_intent.get(c_intent_word, c_match[1])
+                        if not c_match[1] or c_match[1] <= 1.0
+                        else c_match[1]
+                    )
+
+                    # نفي محلي — بند النفي لا يرقّى ولا يلوّن غيره
+                    c_neg, c_neg_score, _ = self._detect_negation(clause, c_intent_pos)
+                    if c_neg and c_neg_score > 0.5:
+                        continue
+
+                    # إعلانات محلية
+                    c_ad, _ = self._detect_advertisement(clause)
+                    if c_ad > 0.5:
+                        continue
+
+                    c_academic, c_ctx = self._search_best_context(clause, c_intent_pos)
+                    c_acad_word = c_academic[0] if c_academic else None
+                    c_acad_weight = (
+                        self._adaptive_academic.get(c_acad_word, 0.7)
+                        if c_acad_word else 0.0
+                    )
+
+                    # سياق خبير غامض — نفس قاعدة المسار الرئيسي
+                    if (
+                        c_acad_word in getattr(self, "_expert_words", set())
+                        and not (self._academic_weights.get(c_acad_word, 0.0) >= 0.75)
+                    ):
+                        continue
+
+                    c_grammar = 1.0 if (
+                        self._search_first_valid(self._subject_markers_trie, clause)
+                        or self._search_first_valid(self._action_verbs_trie, clause)
+                    ) else 0.0
+
+                    if c_intent_pos is not None and c_academic is not None:
+                        c_distance = self._calculate_distance_score(
+                            c_intent_pos, c_academic[2], len(clause)
+                        )
+                    else:
+                        c_distance = 0.5
+
+                    c_urgent = self._search_first_valid(self._urgency_trie, clause) is not None
+                    c_ctx_comp = min(len(c_ctx) / 3.0, 1.0)
+
+                    weight_sum = (
+                        CFG.SCORE_WEIGHT_INTENT + CFG.SCORE_WEIGHT_ACADEMIC
+                        + CFG.SCORE_WEIGHT_GRAMMAR + CFG.SCORE_WEIGHT_DISTANCE
+                        + CFG.SCORE_WEIGHT_URGENCY + CFG.SCORE_WEIGHT_CONTEXT
+                    ) or 1.0
+
+                    conf = (
+                        c_intent_weight * CFG.SCORE_WEIGHT_INTENT
+                        + c_acad_weight * CFG.SCORE_WEIGHT_ACADEMIC
+                        + c_grammar * CFG.SCORE_WEIGHT_GRAMMAR
+                        + c_distance * CFG.SCORE_WEIGHT_DISTANCE
+                        + (1.0 if c_urgent else 0.0) * CFG.SCORE_WEIGHT_URGENCY
+                        + c_ctx_comp * CFG.SCORE_WEIGHT_CONTEXT
+                    ) / weight_sum
+                    conf = max(0.0, min(1.0, conf))
+
+                    c_tokens = len(clause.split())
+                    c_len_mod = self._get_length_modifier(c_tokens)
+                    if c_acad_word:
+                        relief = max(0.0, min(1.0, (c_acad_weight - 0.5) / 0.5))
+                        c_len_mod = c_len_mod + (1.0 - c_len_mod) * relief
+                    conf *= c_len_mod
+                    conf *= 1.0 - c_ad * 0.9
+                    conf = max(0.0, min(1.0, conf))
+
+                    # حارس البند العاري: كلمات ≤ 2 بلا كائن أكاديمي لا يرقّى
+                    if c_tokens <= 2 and not c_acad_word:
+                        continue
+
+                    if conf >= accept_th and conf > best_conf:
+                        best_conf = conf
+                        best_reasons = [
+                            f"clause_rescore: {clause[:40]}",
+                            f"clause_intent: {c_intent_word}",
+                        ]
+                        if c_acad_word:
+                            best_reasons.append(f"clause_object: {c_acad_word}")
+                except Exception:
+                    continue
+
+            if best_conf > 0.0 and best_reasons:
+                return best_conf, best_reasons
+            return None
+        except Exception:
+            return None
 
     async def record_feedback(self, term: str, term_kind: str, was_correct: bool) -> float:
         if term_kind == "intent":

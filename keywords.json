@@ -1,13 +1,13 @@
 {
   "_meta": {
-    "version": "15.3.2",
-    "codename": "IntentEngine-NLP-Templates-Hardened-AuditPass1",
+    "version": "16.0.0",
+    "codename": "Precision-Clauses-v10.0",
     "target": "telegram_group_filter",
     "dialect": "saudi_arabic_multilingual",
     "intent": "student_help_requests",
-    "updated": "2026-09-07",
-    "engine_compatibility": "filter_engine.py v14.1 / config.py v13.1 / database.py v9.0 / monitors.py v9.7 / main.py v13.1",
-    "architecture": "NLP Pipeline — Tokenization → Entity Extraction → Negation Analysis → Dependency Analysis → Distance Scoring → Ad Detection → Confidence Engine → Explainability",
+    "updated": "2026-09-28",
+    "engine_compatibility": "filter_engine.py v14.5+clause_rescore / config.py v13.2+BOT_VERSION / database.py v9.0 / monitors.py v10.0 / main.py v13.2+digest",
+    "architecture": "NLP Pipeline — Tokenization → Entity Extraction → Negation Analysis → Dependency Analysis → Distance Scoring → Ad Detection → Confidence Engine → Explainability → v10.0: + Clause Re-scoring (clauses.py) + Similarity Gate (similarity.py) + Deadline/Priority (classifier)",
     "pipeline_stages": [
       "1. pre_processing",
       "2. tokenization",
@@ -33,7 +33,7 @@
       "CRITICAL (v15.2, new finding): the same AS-IS rule applies to English tokens. _clean() lower-cases the INPUT text before every trie search, but keyword entries are matched as-is with no case-folding on the keywords side. Any keyword entry containing an uppercase Latin character (e.g. the previous 'PowerPoint', 'Excel', 'Mind Map') can never match lower-cased input and is silently dead weight — identical failure class to the Arabic-normalization bug, just for Latin script. Every English keyword in this file is now lower-case only (see fixes_changelog v15.2 item 1).",
       "CRITICAL (v15.2, new finding): a message-sharing link is not inherently commercial. ad_blockers previously hard-blocked generic 'http://'/'https://'/'www.' prefixes and academic file-sharing domains (Google Drive/Docs, YouTube, Dropbox, OneDrive) that students routinely paste when sharing lecture files or assignment briefs. Because ad_blocker_trie is an early short-circuit in analyze() (any match -> immediate 'ignore'), this was silently rejecting legitimate academic messages that happened to include a file link. ad_blockers is now scoped to redirect/shortener/social/messaging-app domains only (see fixes_changelog v15.2 item 2).",
       "IMPORTANT (v15.2): this file's design-target confidence thresholds are now kept in sync with config.py's actual runtime defaults (CONFIDENCE_ACCEPT_THRESHOLD=0.65 / CONFIDENCE_REVIEW_THRESHOLD=0.40) instead of documenting an aspirational 0.78/0.55 pair the runtime never applied. If accounts.env is ever changed to override those two env vars, confidence_thresholds_design_target below must be updated in the same change (see fixes_changelog v15.2 item 3).",
-      "KNOWN LIMITATION (documented, not fixable from this file alone): resolution_trie.search_first() returns a match anywhere in the message and, at score>=0.7, short-circuits the whole message to 'ignore' — there is no clause-level scoping in filter_engine.py v14.1. A message that both resolves an old request and raises a new one in the same text (e.g. 'لقيت حل للواجب لكن عندي تقرير ثاني محتاج مساعدة فيه') will currently be mis-classified as ignore. Mitigated here by keeping resolution_phrases as long, low-ambiguity exact phrases rather than short generic ones, but a real fix requires clause-level resolution detection in filter_engine.py (tracked for a future engine version, not a data-only fix).",
+      "RESOLVED in v10.0 Precision: filter_engine.py now performs clause-level re-scoring (CLAUSE_RESCORE_ENABLED) — each clause (split on punctuation/contrast words via clauses.py) is scored independently, so a new request in a later clause is no longer suppressed by an earlier resolution clause. Historical note: resolution_trie.search_first() used to return a match anywhere in the message and, at score>=0.7, short-circuits the whole message to 'ignore' — there is no clause-level scoping in filter_engine.py v14.1. A message that both resolves an old request and raises a new one in the same text (e.g. 'لقيت حل للواجب لكن عندي تقرير ثاني محتاج مساعدة فيه') will currently be mis-classified as ignore. Mitigated here by keeping resolution_phrases as long, low-ambiguity exact phrases rather than short generic ones, the real fix (clause-level resolution detection) shipped in v10.0 Precision.",
       "KNOWN LIMITATION (documented): template_boost is a fixed +0.25 confidence add-on hard-coded in filter_engine.py's analyze() and is NOT gated on academic_object/university_context presence at the engine level. Generic template combinations (e.g. '<availability> <person>' -> 'مين يساعد') can therefore earn the same +0.25 boost whether or not the message is academic. Mitigated here by keeping the template word banks (person/availability/action/expert) oriented toward help-seeking phrasing rather than fully generic terms, but true context-gating requires an engine change (recommended follow-up, not implemented in this data file).",
       "test_cases.*.text are deliberately left in natural/raw Arabic spelling (with ة, hamzas, etc.) because they represent simulated RAW user input that itself passes through the normalization pipeline during a test run — normalizing them here would test something other than production behavior."
     ],
@@ -2180,8 +2180,8 @@
       },
       {
         "text": "لقيت شخص يحل الواجب لكن عندي تقرير ثاني محتاج مساعدة فيه",
-        "expected": "review",
-        "_covers": "resolution phrase + new request in one message — known engine limitation (see design_principles); documented here as a target for future clause-level resolution scoring rather than a currently-guaranteed accept"
+        "expected": "accept",
+        "_covers": "resolution phrase + new request in one message — FIXED in v10.0 Precision (clause-level re-scoring in filter_engine): the new-request clause is scored independently and legitimately reaches accept. Previously documented as a known limitation targeted at a future engine version; that version is now shipped"
       },
       {
         "text": "السلام عليكم، انا طالبة هندسة صناعية في السنة الرابعة، اشتغل حاليا على مشروع التخرج وهو عبارة عن تحسين خط انتاج في مصنع محلي، وعندي جزء من التحليل الاحصائي للبيانات ما زلت متعثرة فيه، جربت اكثر من طريقة بس النتائج ما طلعت متسقة، وياليت احد عنده خبرة في spss او minitab يقدر يوجهني او يراجع معي الجزء هذا قبل يوم المناقشة اللي باقي عليه اسبوع تقريبا، وجزاكم الله خير مقدما",

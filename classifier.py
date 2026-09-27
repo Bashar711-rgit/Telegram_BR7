@@ -179,6 +179,88 @@ _COMPILED_TYPES: List[Tuple[str, str, re.Pattern]] = [
 _GENERIC_SUBJECT_HINTS = {"عربي", "حساب"}
 
 
+# ---------------------------------------------------------------------------
+# v10.0 Precision: استخراج المواعيد النهائية ودرجات الأولوية
+# المطلوب: ترتيب تنبيهات القناة — الأقرب موعداً يظهر بأعلى شارة.
+# فشل-آمن: أي استثناء يعيد مستوى "none".
+# ---------------------------------------------------------------------------
+DEADLINE_LEVELS: List[Tuple[str, str, List[str]]] = [
+    # (المستوى، التسمية، أنماط) — الأكثر إلحاحاً أولاً
+    ("critical", "🔥 عاجل جداً", [
+        "الان", "الان نفسها", "حالا", "هسة", "دحين",
+        "اللحين", "بعد ساعه", "بعد ساعتين", "بعد نصف ساعه", "خلال ساعه",
+        "الوقت ضيق", "الوقت دايم", "بسرعه جدا", "مستعجل جدا",
+        "remaining hours", "باقي ساعه", "باكي ساعه", "وينقص الوقت",
+    ]),
+    ("today", "⚡ اليوم", [
+        "اليوم", "اليومه", "الليله", "هالليله", "قبل نهايه اليوم", "باجر",
+        "بكره", "بكرا", "باكر", "صباح باكر", "فجر باكر", "هالاسبوع ينتهي",
+        "before midnight", "today",
+    ]),
+    ("soon", "📌 قريب", [
+        "هالاسبوع", "هذا الاسبوع", "الاسبوع الجاي", "بعد باجر", "بعد بكرة",
+        "قريب", "before weekend", "هالشهر",
+    ]),
+]
+
+_DEADLINE_COMPILED: List[Tuple[str, str, re.Pattern]] = [
+    # word_boundary=True: «هلا» لا تطابق داخل «اهلا وسهلا» و«الوقت» لا تطابق
+    # داخل كلمات أخرى — المطابقة على كلمات/عبارات كاملة فقط.
+    (key, label, _mk_pattern(terms, word_boundary=True))
+    for key, label, terms in DEADLINE_LEVELS
+]
+
+
+def extract_deadline(text: str) -> Dict[str, Any]:
+    """يستخرج الموعد النهائي من نص الطلب.
+
+    يعيد: {"level": critical|today|soon|none, "label": تسمية عربية أو "",
+           "marker": الكلمة المطابقة أو ""}
+    فشل-آمن: أي استثناء ⇒ {"level": "none", "label": "", "marker": ""}.
+    """
+    empty = {"level": "none", "label": "", "marker": ""}
+    try:
+        if not isinstance(text, str) or not text.strip():
+            return empty
+        n = normalize_light(text)
+        for key, label, pattern in _DEADLINE_COMPILED:
+            try:
+                matches = pattern.findall(n)
+            except Exception:
+                continue
+            if matches:
+                first = matches[0] if isinstance(matches[0], str) else ""
+                return {"level": key, "label": label, "marker": first.strip()}
+        return empty
+    except Exception:
+        return empty
+
+
+def priority_tier(analysis: Dict[str, Any]) -> str:
+    """يحدد شارة الأولوية المعروضة في التنبيه (أعلى شارة تحكم).
+
+    الترتيب: موعد حرج > موعد اليوم > عاجل من المحرك > ثقة مرتفعة > عادي.
+    """
+    try:
+        a = analysis or {}
+        dl = a.get("deadline") if isinstance(a.get("deadline"), dict) else {}
+        level = dl.get("level", "none")
+        if level == "critical":
+            return "🔥 عاجل جداً"
+        if level == "today":
+            return "⚡ اليوم"
+        if a.get("urgent"):
+            return "⚡ عاجل"
+        if level == "soon":
+            return "📌 قريب"
+        conf = a.get("confidence")
+        if isinstance(conf, (int, float)) and conf >= 0.85:
+            return "⭐ طلب واضح"
+        return ""
+    except Exception:
+        return ""
+
+
 def _count_hits(pattern: re.Pattern, text: str) -> List[str]:
     try:
         return [m.group(1) for m in pattern.finditer(text) if m.group(1)]
@@ -249,7 +331,12 @@ def classification_line(analysis: Dict[str, Any]) -> str:
             parts.append(f"#{subject}")
         if type_tag:
             parts.append(str(type_tag))
-        if urgent:
+        # v10.0 Precision: شارة الأولوية (موعد نهائي/عاجل/ثقة) — تحل محل
+        # شارة العاجل القديمة عند وجود أولوية أعلى.
+        tier = priority_tier(analysis)
+        if tier:
+            parts.append(tier)
+        elif urgent:
             parts.append("⚡ عاجل")
         if isinstance(conf, (int, float)) and conf > 0:
             parts.append(f"الثقة {int(round(float(conf) * 100))}%")
