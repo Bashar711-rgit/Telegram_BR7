@@ -1025,28 +1025,11 @@ class EnhancedAccountMonitor:
         rule_tag = (analysis or {}).get("rule_tag") if isinstance(analysis, dict) else None
         if rule_tag:
             rule_tag_html = f'<blockquote dir="rtl">🏷 قاعدة: {InputSanitizer.escape_html(str(rule_tag))}</blockquote>\n\n'
-        # ── v10.0 Precision: شارة ثقة المرسل بجانب الاسم ──
-        _trust_html = ""
-        try:
-            _trust = (analysis or {}).get("sender_trust") if isinstance(analysis, dict) else None
-            if _trust:
-                _trust_html = f' ✅ {InputSanitizer.escape_html(str(_trust))}'
-        except Exception:
-            _trust_html = ""
-        # ── v10.0: سطر التصنيف الدقيق أعلى التنبيه ──
-        # #المادة • نوع المطلوب • ⚡ عاجل • الثقة٪ — من classifier (فشل-آمن).
-        classification_html = ""
-        try:
-            from classifier import classification_line as _cls_line
-            _cls_text = _cls_line(analysis if isinstance(analysis, dict) else {})
-            if _cls_text:
-                classification_html = (
-                    f'<blockquote dir="rtl">🎯 التصنيف: '
-                    f'{InputSanitizer.escape_html(_cls_text)}</blockquote>\n\n'
-                )
-        except Exception:
-            classification_html = ""
-        alert = (f"{rule_tag_html}{classification_html}<b>الرسالة:</b>\n{message_html}\n\n👤: {sender_link}{_trust_html}\n\n{group_card}")
+        # ── v10.3: استعادة تنسيق v9.37 المستقر حرفياً ──
+        # حذف سطر «🎯 التصنيف» وشارة «✅ موثوق» اللذين أضافهما v10.0 —
+        # المستخدم يريد شكل الرسالة السابق: الرسالة + المرسل + بطاقة
+        # المجموعة فقط (مع سطر القاعدة التاريخي كما كان).
+        alert = (f"{rule_tag_html}<b>الرسالة:</b>\n{message_html}\n\n👤: {sender_link}\n\n{group_card}")
         # v9.11: الأزرار الثلاثة المطلوبة في صفّين:
         #   [ عرض الرسالة ] [ تواصل مع المرسل ]
         #   [ مراسلة ] [ 📋 نسخ النص ]
@@ -2170,16 +2153,7 @@ class EnhancedAccountMonitor:
         chat_info["message_id"] = message_id
         chat_info["username"] = chat_username
         analysis["msg_hash"] = msg_hash
-        # ── v10.0 Precision: شارة ثقة المرسل (فشل-آمن) ──
-        # السمعة 0..100 في DB (افتراضي 50 لغير المعروف) — شارة عرض فقط.
-        try:
-            _rep = float(await self.db.get_sender_reputation(sender_id))
-            if _rep >= 80:
-                analysis["sender_trust"] = "موثوق"
-            elif _rep >= 55:
-                analysis["sender_trust"] = "نشيط"
-        except Exception:
-            pass
+        # v10.3: أُزيلت شارة ثقة المرسل (v10.0) — التنسيق عاد لـ v9.37 المستقر
         sender = {"id": sender_id, "display": display_name, "username": sender_username, "access_hash": sender_access_hash}
         alert_text, buttons = self._build_alert(sender, chat_info, keyword, text, analysis)
         user_media = data.get("media_object")
