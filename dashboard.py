@@ -215,6 +215,32 @@ def _otp_delivery_info(sent_code: Any) -> Tuple[str, str]:
         return ("unknown", "وسيلة توصيل غير معروفة")
 
 
+def _qr_svg(url: str) -> str:
+    """v9.37: توليد صورة QR بصيغة SVG لرابط tg://login — فشل-آمن:
+    أي خلل يعيد نصاً فارغاً والواجهة تعرض الرابط القابل للنقر فقط."""
+    try:
+        import qrcode
+        import qrcode.image.svg
+        img = qrcode.make(url, image_factory=qrcode.image.svg.SvgPathImage,
+                          box_size=12, border=2)
+        return img.to_string(encoding="unicode")
+    except Exception as e:
+        logger.debug(f"qr svg generation failed: {type(e).__name__}: {e}")
+        return ""
+
+
+def _qr_expires_in(qr: Any) -> int:
+    """v9.37: الثواني المتوقعة لانتهاء صلاحية رمز QR (تقديري آمن ≥ 0)."""
+    try:
+        import datetime as _dt
+        exp = getattr(qr, "expires", None)
+        if isinstance(exp, _dt.datetime):
+            return max(0, int((exp - _dt.datetime.now(tz=_dt.timezone.utc)).total_seconds()))
+    except Exception:
+        pass
+    return 30
+
+
 OTP_UNAVAILABLE_AR = (
     "تيليجرام رفض إرسال رمز التحقق لهذا الرقم الآن (SEND_CODE_UNAVAILABLE — "
     "جميع وسائل التوصيل المتاحة لنوع هذا الرقم استُخدمت). الحل الموثوق: "
@@ -337,6 +363,7 @@ class SettingsBody(BaseModel):
 
 class LoginSendCode(BaseModel):
     prefix: str
+    force_sms: bool = False  # v9.37: توجيه تيليجرام لإرسال الرمز SMS للشريحة مباشرة
 
 
 class LoginVerifyCode(BaseModel):
@@ -3209,39 +3236,51 @@ class LoginManager:
         self._pending: Dict[str, Dict[str, Any]] = {}
         self._lock = asyncio.Lock()
 
+    async def _drop_entry(self, entry: Optional[Dict[str, Any]]) -> None:
+        """v9.37: تنظيف موحّد لعملية معلّقة — إلغاء منتظر QR (إن وجد) ثم
+        قطع اتصال العميل بأمان. آمن على عمليات OTP العادية (بلا منتظر)."""
+        if not entry:
+            return
+        waiter = entry.get("waiter")
+        if waiter is not None:
+            try:
+                waiter.cancel()
+            except Exception:
+                pass
+        client = entry.get("client")
+        if client:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+
     async def _purge_old(self) -> None:
         now = time.time()
         for prefix in list(self._pending.keys()):
             entry = self._pending.get(prefix)
             if entry and now - entry.get("ts", 0) > 600:
-                client = entry.get("client")
-                if client:
-                    try:
-                        await client.disconnect()
-                    except Exception:
-                        pass
+                await self._drop_entry(entry)
                 self._pending.pop(prefix, None)
 
-    async def start(self, prefix: str, api_id: int, api_hash: str, phone: str) -> Dict[str, Any]:
+    async def start(self, prefix: str, api_id: int, api_hash: str, phone: str,
+                    force_sms: bool = False) -> Dict[str, Any]:
         async with self._lock:
             await self._purge_old()
-            old = self._pending.pop(prefix, None)
-            if old and old.get("client"):
-                try:
-                    await old["client"].disconnect()
-                except Exception:
-                    pass
+            await self._drop_entry(self._pending.pop(prefix, None))
             client = TelegramClient(
                 StringSession(), api_id=api_id, api_hash=api_hash,
                 device_model="Render Cloud", system_version="Linux", app_version="13.1",
                 timeout=30, connection_retries=3,
             )
             await client.connect()
-            sent = await client.send_code_request(phone)
+            # v9.37: force_sms يوجّه تيليجرام لإرسال الرمز كرسالة نصية إلى
+            # الشريحة مباشرة — الحل الحاسم حين لا تصلك رسائل التطبيق
+            # (جلسات قديمة على أجهزة غير موجودة تستلمها بدلاً منك).
+            sent = await client.send_code_request(phone, force_sms=bool(force_sms))
             delivery, delivery_hint = _otp_delivery_info(sent)
             # v9.35: تسجيل وسيلة التوصيل فقط (بدون أي بيانات حساسة) — هذا
             # السطر هو ما يكشف لماذا «لا يصل الرمز» (مثلاً: flash-call).
-            logger.info(f"send-code [{prefix}]: delivery={delivery}")
+            logger.info(f"send-code [{prefix}]: delivery={delivery} force_sms={bool(force_sms)}")
             self._pending[prefix] = {
                 "client": client,
                 "phone": phone,
@@ -3288,6 +3327,99 @@ class LoginManager:
             "user_id": me.id,
             "session_string": session_string,
         }
+
+    # ── v9.37: تسجيل دخول QR — بديل مباشر لا يعتمد على رمز OTP إطلاقاً ──
+    # المستخدم يفتح الرابط من تطبيق الحساب نفسه (المؤكد دخوله) أو يمسح
+    # صورة QR فيُصرَّح للجلسة الجديدة فوراً — بلا رمز وبلا SMS.
+
+    async def start_qr(self, prefix: str, api_id: int, api_hash: str) -> Dict[str, Any]:
+        """بدء عملية دخول QR: عميل جديد غير مُصرَّح يطلب رمز رابط (token).
+        مهم (توثيق Telethon): wait() يجب أن تعمل أثناء فتح الرابط/المسح —
+        لذا تُشغَّل كمهمة خلفية داخل العملية المعلّقة نفسها."""
+        async with self._lock:
+            await self._purge_old()
+            await self._drop_entry(self._pending.pop(prefix, None))
+            client = TelegramClient(
+                StringSession(), api_id=api_id, api_hash=api_hash,
+                device_model="Render Cloud", system_version="Linux", app_version="13.1",
+                timeout=30, connection_retries=3,
+            )
+            await client.connect()
+            qr = await client.qr_login()
+            entry: Dict[str, Any] = {
+                "type": "qr", "client": client, "qr": qr,
+                "phone": None, "phone_code_hash": None, "ts": time.time(),
+                "status": "waiting", "result": None, "waiter": None,
+            }
+            self._pending[prefix] = entry
+            entry["waiter"] = asyncio.create_task(self._qr_waiter(entry))
+            logger.info(f"qr-login [{prefix}]: token issued (expires in {_qr_expires_in(qr)}s)")
+            return {"url": qr.url, "expires_in": _qr_expires_in(qr)}
+
+    async def _qr_waiter(self, entry: Dict[str, Any]) -> None:
+        """ينتظر تأكيد الرابط من جهاز مؤكد الدخول. النتيجة تُخزَّن في
+        entry — النجاح يحفظ session_string، والأخطاء تُصنَّف للتجديد أو 2FA.
+        أي فشل لا يُرفع أبداً (مهمة خلفية)."""
+        try:
+            me = await entry["qr"].wait()
+            if me is None:
+                me = await entry["client"].get_me()
+            entry["result"] = {
+                "done": True,
+                "user": (f"@{me.username}" if getattr(me, "username", None)
+                         else (getattr(me, "first_name", None) or str(me.id))),
+                "user_id": me.id,
+                "session_string": entry["client"].session.save(),
+            }
+            entry["status"] = "authorized"
+        except asyncio.CancelledError:
+            raise
+        except SessionPasswordNeededError:
+            entry["status"] = "need_password"
+        except Exception as e:
+            # انتهاء صلاحية الرمز (TimeoutError) أو غيره — تُصنَّف للتجديد
+            entry["status"] = "expired"
+            entry["error"] = f"{type(e).__name__}"
+
+    async def qr_status(self, prefix: str) -> Dict[str, Any]:
+        """استطلاع حالة عملية QR: النتيجة عند النجاح (مع تنظيف العملية)،
+        طلب كلمة المرور عند 2FA، أو رابط مجدَّد تلقائياً عند انتهاء الصلاحية.
+        رمز QR قصير العمر (~30-60 ثانية) فيُجدَّد شفافاً مع كل استطلاع متأخر."""
+        async with self._lock:
+            entry = await self._get(prefix)
+            if entry.get("type") != "qr":
+                return {"mode": "code"}  # عملية OTP عادية جارية — لا علاقة لـQR
+            st = entry.get("status")
+            if st == "authorized":
+                result = dict(entry.get("result") or {})
+                await self._drop_entry(entry)
+                self._pending.pop(prefix, None)
+                return {"authorized": True, "result": result}
+            if st == "need_password":
+                entry["ts"] = time.time()
+                return {"need_password": True}
+            if st == "expired":
+                try:
+                    await entry["qr"].recreate()
+                except Exception as e:
+                    await self._drop_entry(entry)
+                    self._pending.pop(prefix, None)
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(f"انتهت جلسة QR نهائياً — ابدأ العملية من جديد "
+                                f"({type(e).__name__})"))
+                entry["status"] = "waiting"
+                entry["ts"] = time.time()
+                entry["waiter"] = asyncio.create_task(self._qr_waiter(entry))
+                logger.info(f"qr-login [{prefix}]: token recreated after expiry")
+                return {"waiting": True, "recreated": True,
+                        "url": entry["qr"].url,
+                        "expires_in": _qr_expires_in(entry["qr"]),
+                        "svg": _qr_svg(entry["qr"].url)}
+            entry["ts"] = time.time()
+            return {"waiting": True, "url": entry["qr"].url,
+                    "expires_in": _qr_expires_in(entry["qr"]),
+                    "svg": _qr_svg(entry["qr"].url)}
 
 
 login_manager = LoginManager()
@@ -3544,7 +3676,8 @@ async def login_send_code(data: LoginSendCode, request: Request):
     if not acc:
         raise HTTPException(status_code=404, detail=f"الحساب {prefix} غير موجود في الإعدادات")
     try:
-        result = await login_manager.start(prefix, acc["api_id"], acc["api_hash"], acc["phone"])
+        result = await login_manager.start(prefix, acc["api_id"], acc["api_hash"], acc["phone"],
+                                           force_sms=bool(getattr(data, "force_sms", False)))
         return JSONResponse({"success": True, "phone_masked": _mask_phone(acc["phone"]), **result})
     except ApiIdInvalidError:
         raise HTTPException(status_code=400, detail="API_ID / API_HASH غير صالحة")
@@ -3604,6 +3737,48 @@ async def login_verify_password(data: LoginVerifyPassword):
         logger.error(f"verify-password error [{prefix}]: {type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {str(e)[:200]}")
     return await _login_success_response(prefix, result)
+
+
+@app.post("/api/login/qr-start", dependencies=[Depends(require_permission("accounts.write"))])  # v9.37
+async def login_qr_start(data: LoginSendCode, request: Request):
+    """بدء دخول QR — الطريقة المباشرة بدون أي رمز OTP:
+    يعيد رابط tg://login + صورة QR؛ المستخدم يفتح الرابط من تطبيق الحساب
+    نفسه (أو يمسح QR من الإعدادات ← الأجهزة) فيُصرَّح للجلسة فوراً.
+    الرمز قصير العمر — الواجهة تستطلم qr-wait ويُجدَّد تلقائياً."""
+    prefix = data.prefix.strip().upper()
+    merged = await _merged_accounts(request)
+    acc = next((a for a in merged if a.get("prefix") == prefix), None)
+    if not acc:
+        raise HTTPException(status_code=404, detail=f"الحساب {prefix} غير موجود في الإعدادات")
+    try:
+        result = await login_manager.start_qr(prefix, acc["api_id"], acc["api_hash"])
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"qr-start error [{prefix}]: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {str(e)[:200]}")
+    return JSONResponse({"success": True, "phone_masked": _mask_phone(acc["phone"]),
+                         "svg": _qr_svg(result.get("url", "")), **result})
+
+
+@app.post("/api/login/qr-wait", dependencies=[Depends(require_permission("accounts.write"))])  # v9.37
+async def login_qr_wait(data: LoginSendCode, request: Request):
+    """استطلاع حالة عملية QR (تستدعيه الواجهة كل 4 ثوانٍ):
+    - authorized → نفس مسار نجاح verify-code بالضبط (حفظ Render + DB + اتصال حي)
+    - need_password → الواجهة تعرض حقل 2FA
+    - waiting → الرابط/الصورة الحالية (مع تجديد تلقائي عند انتهاء الصلاحية)"""
+    prefix = data.prefix.strip().upper()
+    try:
+        st = await login_manager.qr_status(prefix)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"qr-wait error [{prefix}]: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {str(e)[:200]}")
+    if st.get("authorized"):
+        result = dict(st.get("result") or {})
+        return await _login_success_response(prefix, result)
+    return JSONResponse({"success": True, **st})
 
 
 async def _connect_after_login(prefix: str, session_string: str) -> None:
@@ -3807,6 +3982,19 @@ a { color:#38bdf8; }
 <label>اختر الحساب</label>
 <select id="prefix"></select>
 <button id="btnSend" onclick="sendCode()">📨 إرسال رمز التحقق</button>
+<button id="btnSms" onclick="sendCode(true)" style="background:#0e7490;margin-top:6px">📱 إرسال الرمز عبر SMS (للشريحة مباشرة)</button>
+<button id="btnQr" onclick="startQr()" style="background:#b45309;margin-top:6px">⚡ دخول فوري بدون أي رمز (QR / رابط)</button>
+
+<div id="qrBox" class="hidden" style="margin-top:14px;padding:12px;border:1px solid #334155;border-radius:10px;background:#0f172a">
+<h3 style="margin:0 0 8px;font-size:15px;color:#fbbf24">⚡ تأكيد الدخول بدون رمز</h3>
+<p style="font-size:13px;color:#94a3b8;line-height:1.9;margin:0 0 10px">
+افتح تطبيق تيليجرام <b>لهذا الحساب نفسه</b> واضغط الزر البرتقالي بالأسفل ليفتح تيليجرام ويطلب منك التأكيد — أو من التطبيق:<br>
+<b>الإعدادات ← الأجهزة ← ربط جهاز سطح المكتب</b> ثم امسح صورة QR.
+</p>
+<div id="qrSvg" style="text-align:center;background:#fff;border-radius:8px;padding:8px;margin-bottom:10px"></div>
+<a id="qrLink" href="#" style="display:block;text-align:center;padding:12px;background:#b45309;color:#fff;border-radius:8px;font-weight:700;text-decoration:none;font-size:15px">🔗 افتح الرابط في تيليجرام الآن</a>
+<div id="qrStatus" style="text-align:center;font-size:13px;color:#94a3b8;margin-top:8px">⏳ بانتظار التأكيد من التطبيق… (يُجدَّد الرمز تلقائياً)</div>
+</div>
 </div>
 
 <div id="stepCode" class="hidden">
@@ -3890,23 +4078,68 @@ async function loadAccounts() {
     if (warn) warn.classList.toggle('hidden', d.monitoring_ready !== false);
   } catch (e) { show('err', 'تعذر تحميل الحسابات: ' + e.message); }
 }
-async function sendCode() {
+async function sendCode(forceSms) {
   currentPrefix = $('prefix').value;
   if (!currentPrefix) return;
-  $('btnSend').disabled = true;
-  show('info', '⏳ جاري إرسال رمز التحقق عبر تيليجرام...');
+  stopQrPoll();
+  $('btnSend').disabled = true; $('btnSms').disabled = true;
+  show('info', forceSms ? '⏳ جاري إرسال الرمز كرسالة SMS إلى الشريحة مباشرة...' : '⏳ جاري إرسال رمز التحقق عبر تيليجرام...');
   try {
-    const d = await api('/api/login/send-code', { prefix: currentPrefix });
+    const d = await api('/api/login/send-code', { prefix: currentPrefix, force_sms: !!forceSms });
     let msg = `📨 تم إرسال الطلب إلى ${esc(d.phone_masked)}`;
     if (d.delivery_hint) msg += `<br>📬 طريقة التوصيل التي اختارها تيليجرام: <b>${esc(d.delivery_hint)}</b>`;
-    msg += `<br>افتح تيليجرام وانسخ الرمز ثم أدخله هنا.`;
+    if (forceSms) {
+      msg += `<br>📱 افتح <b>رسائل الهاتف (Messages/SMS)</b> — الرمز سيصل كرسالة نصية من تيليجرام، ثم أدخله هنا.`;
+    } else {
+      msg += `<br>افتح تيليجرام وانسخ الرمز ثم أدخله هنا.`;
+      msg += `<br>💡 لم يصلك رمز؟ استخدم <b>📱 SMS</b> (للشريحة) أو <b>⚡ دخول بدون رمز</b> بالأعلى.`;
+    }
     if (d.delivery && d.delivery !== 'app' && d.delivery !== 'sms') {
-      msg += `<br>⚠️ تيليجرام اختار مكالمة لتوصيل الرمز — غالباً لن تصلك رسالة في تيليجرام. إن لم تتلقَ المكالمة استخدم <b>تسجيل بجلسة جاهزة</b> بالأسفل.`;
+      msg += `<br>⚠️ تيليجرام اختار مكالمة لتوصيل الرمز — غالباً لن تصلك رسالة في تيليجرام. استخدم <b>📱 SMS</b> أو <b>⚡ الدخول بدون رمز</b>.`;
     }
     show('ok', msg);
     setStep(2);
   } catch (e) { show('err', '❌ ' + e.message); }
-  $('btnSend').disabled = false;
+  $('btnSend').disabled = false; $('btnSms').disabled = false;
+}
+
+let qrPollTimer = null;
+function renderQr(d) {
+  if (d.svg) $('qrSvg').innerHTML = d.svg;
+  if (d.url) $('qrLink').href = d.url;
+}
+function stopQrPoll() {
+  if (qrPollTimer) { clearInterval(qrPollTimer); qrPollTimer = null; }
+  $('qrBox').classList.add('hidden');
+}
+async function startQr() {
+  currentPrefix = $('prefix').value;
+  if (!currentPrefix) return;
+  const btn = $('btnQr'); btn.disabled = true;
+  show('info', '⏳ جاري توليد رمز الدخول السريع...');
+  try {
+    const d = await api('/api/login/qr-start', { prefix: currentPrefix });
+    $('qrBox').classList.remove('hidden');
+    renderQr(d);
+    show('ok', `⚡ جاهز! اضغط الزر البرتقالي من تطبيق تيليجرام <b>لهذا الحساب (${esc(d.phone_masked)})</b> ووافق على الدخول — سيتم التفعيل والمراقبة فوراً بدون أي رمز.`);
+    stopQrPollTimerOnly();
+    qrPollTimer = setInterval(pollQr, 4000);
+  } catch (e) { show('err', '❌ ' + e.message); }
+  btn.disabled = false;
+}
+function stopQrPollTimerOnly() { if (qrPollTimer) { clearInterval(qrPollTimer); qrPollTimer = null; } }
+async function pollQr() {
+  if (!currentPrefix) { stopQrPoll(); return; }
+  try {
+    const d = await api('/api/login/qr-wait', { prefix: currentPrefix });
+    if (d.done) { stopQrPoll(); finishLogin(d); return; }
+    if (d.need_password) { stopQrPoll(); show('info', '🔐 هذا الحساب يستخدم التحقق بخطوتين - أدخل كلمة المرور السحابية.'); setStep(3); return; }
+    if (d.mode === 'code') { stopQrPoll(); return; }
+    if (d.waiting) {
+      renderQr(d);
+      if (d.recreated) $('qrStatus').textContent = '🔄 تم تجديد الرمز — افتح الرابط / امسح الصورة الجديدة.';
+    }
+  } catch (e) { stopQrPoll(); show('err', '❌ انتهت جلسة الدخول السريع: ' + e.message); }
 }
 async function verifyCode() {
   $('btnVerify').disabled = true;

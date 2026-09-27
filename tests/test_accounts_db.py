@@ -176,7 +176,7 @@ class TestSendCodeFromDb:
         await client.post("/api/accounts", json=_acc(), headers={**AUTH, **_ip(10)})
         calls = {}
 
-        async def _fake_start(prefix, api_id, api_hash, phone):
+        async def _fake_start(prefix, api_id, api_hash, phone, force_sms=False):
             calls.update(prefix=prefix, api_id=api_id,
                          api_hash=api_hash, phone=phone)
             return {"sent": True, "code_type": "AppCode"}

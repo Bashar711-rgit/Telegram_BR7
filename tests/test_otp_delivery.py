@@ -116,7 +116,7 @@ class TestSendCodeErrors:
     async def test_send_code_returns_delivery_info(self, client, monkeypatch):
         await client.post("/api/accounts", json=_acc(), headers={**AUTH, **_ip(20)})
 
-        async def _fake_start(prefix, api_id, api_hash, phone):
+        async def _fake_start(prefix, api_id, api_hash, phone, force_sms=False):
             return {"sent": True, "code_type": "AppCode",
                     "delivery": "app", "delivery_hint": "رسالة داخل تطبيق تيليجرام"}
 
@@ -134,7 +134,7 @@ class TestSendCodeErrors:
         رسالة عربية + بديل، لا 500 إنجليزي خام."""
         await client.post("/api/accounts", json=_acc(), headers={**AUTH, **_ip(21)})
 
-        async def _boom(prefix, api_id, api_hash, phone):
+        async def _boom(prefix, api_id, api_hash, phone, force_sms=False):
             raise dash.SendCodeUnavailableError(request=object())
 
         monkeypatch.setattr(dash.login_manager, "start", _boom)
@@ -163,7 +163,7 @@ class TestSendCodeErrors:
     async def test_send_code_phone_unoccupied(self, client, monkeypatch):
         await client.post("/api/accounts", json=_acc(), headers={**AUTH, **_ip(23)})
 
-        async def _boom(prefix, api_id, api_hash, phone):
+        async def _boom(prefix, api_id, api_hash, phone, force_sms=False):
             raise dash.PhoneNumberUnoccupiedError(request=object())
 
         monkeypatch.setattr(dash.login_manager, "start", _boom)
