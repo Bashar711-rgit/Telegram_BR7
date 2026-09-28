@@ -2,6 +2,8 @@
 accounts.env
 .env
 .secret_key
+# Local agent worklog (contains operational notes & credentials — NEVER public)
+WORKLOG.md
 
 # ========== Telegram Sessions ==========
 *.session
