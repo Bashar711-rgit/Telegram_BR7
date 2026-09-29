@@ -1291,6 +1291,18 @@ async def health_full(request: Request):
         antispam = get_antispam_snapshot()
     except Exception:
         antispam = {"enabled": False, "available": False}
+    # v10.4 mention intelligence: mention-fix store sizes (additive).
+    try:
+        from sender_resolver import get_mention_intel_snapshot
+        mention_intel = get_mention_intel_snapshot()
+    except Exception:
+        mention_intel = {"mention_fix_enabled": False, "available": False}
+    # v10.4 alert delivery latency percentiles (additive, logs/health only).
+    try:
+        from monitors import alert_latency
+        alert_latency_snap = alert_latency.snapshot()
+    except Exception:
+        alert_latency_snap = {"samples": 0}
     return JSONResponse({
         "status": "ok" if (db_ok and db_healthy) else "degraded",
         "database": "ok" if db_ok else "down",
@@ -1302,6 +1314,8 @@ async def health_full(request: Request):
         "accounts_total": len(ACCOUNTS),
         "fast_capture": fast_capture,
         "sender_intel": sender_intel,
+        "mention_intel": mention_intel,
+        "alert_latency": alert_latency_snap,
         "dedup": dedup,
         "antispam": antispam,
         "uptime": uptime,
