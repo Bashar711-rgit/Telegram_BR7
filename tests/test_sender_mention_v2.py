@@ -51,6 +51,7 @@ from sender_resolver import (
     sender_url_forms,
 )
 from telethon.extensions import html as tg_html
+from telethon.tl.types import MessageEntityMentionName
 
 
 # ───────────────────────────── helpers ─────────────────────────────
@@ -93,14 +94,23 @@ def _iu(hash_: Optional[int] = GOOD_HASH, user_id: int = SENDER_ID):
 
 
 class FakeClient:
-    """Minimal TelegramClient stand-in for the send path."""
+    """Minimal TelegramClient stand-in for the send path.
 
-    def __init__(self, name: str, bad_hash: Optional[int] = None, fail_all_mentions: bool = False):
+    v10.7: الرد يحمل كيانات MessageEntityMentionName (كما يفعل السيرفر
+    الحقيقي) ليُطلب التحقق الإلزامي بعد الإرسال. drop_entities=True يحاكي
+    الحالة النادرة التي يُرسل فيها التنبيه بلا كيان الmention (فحص
+    التصعيد إلى forward). forward_messages تُسجّل استدعاءاتها للمستوى 4.
+    """
+
+    def __init__(self, name: str, bad_hash: Optional[int] = None, fail_all_mentions: bool = False,
+                 drop_entities: bool = False):
         self.name = name
         self.is_connected = True
         self.bad_hash = bad_hash
         self.fail_all_mentions = fail_all_mentions
+        self.drop_entities = drop_entities
         self.calls: List[Dict[str, Any]] = []
+        self.forward_calls: List[Dict[str, Any]] = []
         self._chat_entities: Dict[int, Any] = {}
         self._user_entities: Dict[str, Any] = {}
 
@@ -124,6 +134,19 @@ class FakeClient:
         raise ValueError("unresolvable")
 
     # send fakes --------------------------------------------------------------
+    def _response_entities(self, kwargs: Dict[str, Any]) -> List[Any]:
+        """خدعة السيرفر الحقيقي: كيان الطلب InputMessageEntityMentionName
+        (user_id = InputUser) يعود في الرد MessageEntityMentionName (user_id
+        = int). drop_entities يحاكي حذف الكيان (التحقق يفشل)."""
+        if self.drop_entities:
+            return []
+        out: List[Any] = []
+        for e in kwargs.get("formatting_entities") or []:
+            if isinstance(e, InputMessageEntityMentionName):
+                iu = e.user_id
+                out.append(MessageEntityMentionName(offset=0, length=1, user_id=int(getattr(iu, "user_id", 0) or 0)))
+        return out
+
     def _maybe_raise(self, kwargs: Dict[str, Any]) -> None:
         ents = kwargs.get("formatting_entities")
         if ents is None:
@@ -139,12 +162,16 @@ class FakeClient:
     async def send_message(self, entity, message, **kwargs):
         self._maybe_raise(kwargs)
         self.calls.append({"kind": "message", "text": message, **kwargs})
-        return SimpleNamespace(id=999, chat_id=entity)
+        return SimpleNamespace(id=999, chat_id=entity, entities=self._response_entities(kwargs))
 
     async def send_file(self, entity, file=None, caption=None, **kwargs):
         self._maybe_raise(kwargs)
         self.calls.append({"kind": "file", "text": caption, **kwargs})
-        return SimpleNamespace(id=998, chat_id=entity)
+        return SimpleNamespace(id=998, chat_id=entity, entities=self._response_entities(kwargs))
+
+    async def forward_messages(self, entity, message_id, *, from_peer=None, **kwargs):
+        self.forward_calls.append({"to": entity, "msg_id": message_id, "from_peer": from_peer})
+        return SimpleNamespace(id=1000 + len(self.forward_calls), chat_id=entity)
 
 
 def _monitor(db, name: str = "Account 1", client: Optional[FakeClient] = None) -> EnhancedAccountMonitor:

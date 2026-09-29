@@ -104,6 +104,52 @@ v9.10 (this pass) — Cross-Account Dedup + Dynamic Alert Buttons:
   * المسار الكامل: Event → Extract → msg_hash dedup (DB) → فلترة →
     rate-limit → **content dedup (هنا)** → بناء التنبيه + الأزرار → إرسال.
 
+v10.7 (this pass) — SENDER ACCESS REGISTRY: كل اسم مرسل قابل للنقر والوصول
+بالمستويات الأربعة (اختصار المواصفة التقنية المطلوبة حرفياً):
+  * المبدأ: access_hash خاص بكل حساب — الـhash الذي رآه الحساب A لا يصلح
+    للإرسال من الحساب B. الحل الوحيد الموثوق: Text Mention
+    (InputMessageEntityMentionName) بـ user_id + access_hash يُرسل من نفس
+    الحساب الذي استلم الرسالة (السيرفر يتحقق من الـhash).
+  * §1 جمع بيانات المرسل (_event_to_dict): sender = await event.get_sender()
+    مع مهلة محدودة + inp = await event.get_input_sender() (InputPeerUser فيه
+    user_id + access_hash الصحيحان لهذا الحساب). مفاتيح جديدة (إضافية فقط):
+    sender_access_hash (من inp أولاً) / owner_account / sender_type
+    (user|channel|none) / sender_phone / sender_usernames (username + كل
+    usernames النشطة). المرسل Channel (أدمن مجهول/قناة) أو sender_id فارغ →
+    لا Text Mention — المستوى 4 (رابط الرسالة + forward).
+  * §2 قاعدة البيانات: جدول sender_access(sender_id, account_name,
+    access_hash, updated_at) مفتاح أساسي (sender_id, account_name) —
+    upsert عند كل رسالة؛ أي حساب رأى المستخدم يستطيع إرسال الـmention
+    لاحقاً. sender_contacts يكمل أعمدة owner_account (phone/usernames
+    موجودة مسبقاً). إصلاح: msg_link/group_link كانا يُحفظان NULL — يُمرَّران
+    الآن من chat_info. ترحيل آمن ALTER TABLE داخل try/except لكل من SQLite
+    وPostgreSQL (database.py).
+  * §3 سلسلة المستويات عند الإرسال (توقف عند أول نجاح مُتحقَّق منه):
+    المستوى 1: username → <a href="https://t.me/USERNAME">الاسم</a> (أضمن
+      رابط، التنسيق الذهبي حرفياً) — لا حاجة لأي mention.
+    المستوى 2: Text Mention من الحساب المالك: InputUser(sender_id,
+      access_hash_هذا_الحساب) + InputMessageEntityMentionName على موضع
+      الاسم بالضبط (كيانات Telethon نفسها — الإزاحات UTF-16 داخل
+      html.parse) عبر formatting_entities (بلا parse_mode html للاسم).
+    المستوى 3: فشل الحساب المالك (ليس عضواً/ChatWriteForbidden/hash غير
+      صالح) → بقية الحسابات المسجلة في sender_access لهذا المرسل واحداً
+      واحداً، كل واحد بـhash الخاص به (تدوير المرشحين القائم + درجة
+      account_hash لكل عميل).
+    المستوى 4 (شبكة الأمان): فشلت كل الحسابات أو المرسل قناة → التنبيه
+      بلا mention مع رابط الرسالة الأصلية ثم client.forward_messages
+      (TARGET_GROUP_ID, message_id, from_peer=chat) ليظهر اسم المرسل
+      الأصلي أعلى الرسالة.
+  * §4 التحقق بعد الإرسال (إلزامي): بعد send_message نفحص msg.entities:
+    هل يوجد MessageEntityMentionName بـuser_id المطلوب؟ إن لم يوجد نسجّل
+    السبب في اللوج وننتقل لضمان الوصول عبر forward (بلا إعادة إرسال
+    التنبيه — لا تكرار). يُخزَّن في alerts: contact_method = username |
+    mention | forward | link (عمود جديد، ترحيل آمن).
+  * §5 شروط بيئية: فحص عند الإقلاع يسجل تحذيراً لكل حساب غير عضو في
+    TARGET_GROUP_ID. أزيلت Button.inline/Button.url من التنبيه — حسابات
+    المستخدمين لا ترسل أزراراً (تظهر فقط عند البوتات)؛ الاعتماد لروابط
+    النص. البناء الكامل للأزرار محفوظ خلف ALERT_BUTTONS_ENABLED (افتراضي
+    false). منطق الفلترة والـrate limiter لم يُمَسّا.
+
 See the accompanying engineering report for the full list of changes,
 the retry_count propagation fix (process_event_from_queue / _send_alert),
 and documented FOLLOW-UP items for other files.
@@ -142,6 +188,10 @@ from telethon.tl.types import (
     InputPeerUser,
     InputPeerUserFromMessage,
     InputUser,
+    # v10.7: sender-type detection + post-send mention verification
+    Channel as TgChannel,
+    User as TgUser,
+    MessageEntityMentionName,
 )
 from config import CFG, InputSanitizer, fast_hash
 from database import EnhancedDatabase, MessageRecord, AlertRecord, DeadLetterRecord
@@ -215,6 +265,29 @@ def build_telegram_links(chat_id: int, message_id: int, username: str = None) ->
         links["group"] = f"https://t.me/c/{inner}"
         links["message"] = f"https://t.me/c/{inner}/{message_id}"
     return links
+
+
+def _verify_mention_entity(sent_msg: Any, sender_id: int) -> Tuple[bool, str]:
+    """v10.7 §4 — التحقق الإلزامي بعد الإرسال.
+
+    بعد send_message نفحص msg.entities: هل يوجد MessageEntityMentionName
+    بـ user_id المطلوب؟ (كيانات الرد هي MessageEntityMentionName — بصيغة
+    int — بينما كيانات الطلب InputMessageEntityMentionName بصيغة InputUser).
+    يعيد (True, "") عند التحقق، وإلا (False, سبب) — السبب يُسجَّل في اللوج
+    ويقرر الانتقال للمستوى التالي. لا يرفع استثناء أبداً."""
+    try:
+        ents = getattr(sent_msg, "entities", None) or []
+        for e in ents:
+            try:
+                if isinstance(e, MessageEntityMentionName) and int(getattr(e, "user_id", 0) or 0) == int(sender_id):
+                    return True, ""
+            except Exception:
+                continue
+        if not ents:
+            return False, "no_entities_in_response"
+        return False, "mention_entity_missing"
+    except Exception as e:
+        return False, f"verify_error:{type(e).__name__}"
 
 
 # ============================================================================
@@ -526,6 +599,9 @@ _early_delivery_dedup: LRUCache = LRUCache(maxsize=_EARLY_DELIVERY_DEDUP_SIZE)
 _RECENT_INPUT_SENDERS_MAX = 500
 _recent_input_senders: "OrderedDict[Tuple[int, int], Dict[str, Any]]" = OrderedDict()
 _post_capable_accounts: Set[str] = set()
+# v10.7 §5: accounts already warned about missing TARGET_GROUP_ID membership
+# this boot — the check re-runs on reconnects but warns only once.
+_target_membership_warned: Set[str] = set()
 
 
 class AlertLatencyTracker:
@@ -1155,7 +1231,12 @@ class EnhancedAccountMonitor:
         # CFG.ALERT_WITH_COPY_BUTTON، وزر التواصل قابل للتعطيل عبر
         # CFG.ALERT_WITH_CONTACT_BUTTON (كلاهما حي من لوحة التحكم).
         buttons = None
-        if CFG.ALERT_WITH_BUTTONS:
+        # ══ v10.7 §5: أزيلت Button.inline/Button.url من التنبيه ══
+        # حسابات المستخدمين لا ترسل أزراراً (تظهر فقط عند البوتات) —
+        # التنبيهات تعتمد روابط النص (اسم المرسل/المجموعة/عرض الرسالة).
+        # البناء الكامل للأزرار محفوظ هنا خلف ALERT_BUTTONS_ENABLED
+        # (افتراضي false — مفتاح قتل حي من البيئة) كي لا تُحذف أي ميزة.
+        if getattr(CFG, "ALERT_BUTTONS_ENABLED", False) and CFG.ALERT_WITH_BUTTONS:
             dynamic = build_dynamic_buttons(
                 sender={
                     "id": sender_id,
@@ -1227,6 +1308,14 @@ class EnhancedAccountMonitor:
                     await self._register_handler()  # تسجيل المعالج
                     await self._reconnect.start()
                     self._start_session_rotation()
+                    # v10.7 §5: فحص عضوية قناة الهدف عند الإقلاع (وكل إعادة
+                    # اتصال) — تحذير واحد لكل حساب: الحساب غير العضو سيفشل
+                    # في إرسال التنبيهات وفي الـmention من أساسه.
+                    if getattr(CFG, "TARGET_MEMBERSHIP_CHECK", True):
+                        try:
+                            asyncio.create_task(self.check_target_membership())
+                        except Exception:
+                            pass
                     return True
                 except SessionPasswordNeededError:
                     logger.error(f"2FA required for {account['name']} - skipping")
@@ -1482,7 +1571,57 @@ class EnhancedAccountMonitor:
 
 
     async def _event_to_dict(self, event: events.NewMessage.Event) -> Dict[str, Any]:
+        # ══ v10.7 §1: جمع بيانات المرسل لضمان قابلية النقر ══
+        # sender = await event.get_sender(): يعيد event.sender فوراً عندما
+        # يكون موجوداً بالكاش؛ عند غيابه (نادر) محاولة واحدة بمهلة قصيرة
+        # (حد T1 محصور — وإلا يتكفل الإثراء في الworker كما في v9.12).
+        # inp = await event.get_input_sender(): يعيد InputPeerUser فيه
+        # user_id + access_hash الصحيحان لهذا الحساب تحديداً — السيرفر
+        # يتحقق من الـhash عند الـmention ولا يصلح hash لحساب آخر.
         sender = event.sender
+        if sender is None and bool(getattr(event, "sender_id", None)):
+            try:
+                sender = await asyncio.wait_for(event.get_sender(), timeout=1.2)
+            except Exception:
+                sender = event.sender  # يحفظ السلوك القديم — الworker يكمل
+        _inp = None
+        try:
+            _inp = await asyncio.wait_for(event.get_input_sender(), timeout=0.75)
+        except Exception:
+            _inp = None
+        # v10.7: hash من الـInputPeer أولاً (رؤية هذا الحساب المثبتة من
+        # السيرفر) مع سقوط آمن إلى رؤية event.sender السابقة.
+        _inp_hash: Optional[int] = None
+        if isinstance(_inp, InputPeerUser):
+            _ih = getattr(_inp, "access_hash", None)
+            if isinstance(_ih, int) and _ih != 0:
+                _inp_hash = _ih
+        _sender_hash = _inp_hash if _inp_hash is not None else getattr(sender, "access_hash", None)
+        # v10.7: نوع المرسل — المستخدم mention-able؛ الـChannel (أدمن مجهول
+        # أو قناة) لا يُذكر بـText Mention (المستوى 4: رابط + forward).
+        _sender_type = "none"
+        if sender is not None:
+            if isinstance(sender, TgUser):
+                _sender_type = "user"
+            elif isinstance(sender, TgChannel) or (
+                not hasattr(sender, "first_name") and hasattr(sender, "title")
+            ):
+                _sender_type = "channel"
+        # v10.7: username + كل usernames النشطة (حسابات premium/MTProto 4.x)
+        _sender_usernames: Optional[List[str]] = None
+        if sender is not None:
+            try:
+                _ul: List[str] = []
+                _u0 = (getattr(sender, "username", None) or "").strip().lstrip("@")
+                if _u0:
+                    _ul.append(_u0)
+                for _ru in (getattr(sender, "usernames", None) or []):
+                    _rn = (getattr(_ru, "username", None) or "").strip().lstrip("@")
+                    if _rn and getattr(_ru, "active", True) and _rn not in _ul:
+                        _ul.append(_rn)
+                _sender_usernames = _ul or None
+            except Exception:
+                _sender_usernames = None
         # v9.9: the fast capture has ALREADY protected text+sender synchronously
         # before this point, so one deduplicated resolver lookup here is safe:
         # it only enriches AFTER the save-first guarantee.
@@ -1519,7 +1658,7 @@ class EnhancedAccountMonitor:
             "chat_id": event.chat_id, "message_id": event.message.id,
             "sender_id": getattr(event, "sender_id", 0) or 0,
             "sender_username": getattr(sender, "username", None), "sender_first_name": getattr(sender, "first_name", None),
-            "sender_last_name": getattr(sender, "last_name", None), "sender_access_hash": getattr(sender, "access_hash", None),
+            "sender_last_name": getattr(sender, "last_name", None), "sender_access_hash": _sender_hash,
             "chat_access_hash": getattr(chat, "access_hash", None), "chat_username": chat_username,
             "chat_title": getattr(chat, "title", None),  # v10.5: group-card fallback when entity resolution fails
             "text": full_text, "has_text": bool(full_text), "has_media": has_media, "media_type": media_type,
@@ -1538,6 +1677,16 @@ class EnhancedAccountMonitor:
                 event_data.update(_sender_extract_flat(sender))
             except Exception as e:
                 logger.debug(f"sender_flat_extract [{self.account['name']}]: {type(e).__name__}")
+        # ══ v10.7 §1: حقول قابلية الوصول للمرسل — تُطبَّق أخيراً كي تبقى
+        # هي المرجع (usernames هنا تشمل username + كل usernames النشطة،
+        # وsender_type يفرّق المستخدم عن القناة/الأدمن المجهول). إضافية
+        # بالكامل ولا تلمس أي مفتاح سابق.
+        event_data.update({
+            "owner_account": self.account["name"],
+            "sender_type": _sender_type,
+            "sender_phone": getattr(sender, "phone", None) if _sender_type == "user" else None,
+            "sender_usernames": _sender_usernames,
+        })
         return event_data
 
 
@@ -2185,10 +2334,24 @@ class EnhancedAccountMonitor:
             # v9.9: persist the FULL sender snapshot (identity + metadata)
             # into sender_contacts. Identity fields follow the COALESCE
             # policy in database.py: new non-null → update, null → keep.
+            # v10.7 §2: msg_link/group_link كانا يُحفظان NULL دائماً —
+            # يُمرَّران الآن من chat_info (_send_alert يضبطهما في data)
+            # أو من الروابط القانونية المحسوبة محلياً؛ phone/usernames/
+            # owner_account تُخزَّن أيضاً لكل مرسل.
+            _fb_links = build_telegram_links(
+                data.get("chat_id"), data.get("message_id"), username=data.get("chat_username")
+            )
+            _msg_link = data.get("_alert_msg_link") or _fb_links.get("message") or "#"
+            _group_link = data.get("_alert_group_link") or _fb_links.get("group") or "#"
             contact = {
                 "sender_id": sender_id, "access_hash": data.get("sender_access_hash"),
                 "username": data.get("sender_username"), "first_name": data.get("sender_first_name"),
                 "last_name": data.get("sender_last_name"), "chat_id": data["chat_id"], "message_id": data["message_id"],
+                "msg_link": _msg_link if _msg_link != "#" else None,
+                "group_link": _group_link if _group_link != "#" else None,
+                "phone": data.get("sender_phone"),
+                "usernames": data.get("sender_usernames"),
+                "owner_account": data.get("owner_account") or data.get("account_name", self.account["name"]),
             }
             if CFG.SENDER_INTEL_ENABLED:
                 contact.update(_sender_meta_to_contact(data))
@@ -2196,6 +2359,20 @@ class EnhancedAccountMonitor:
                 # later, hence stored, never trusted for delivery decisions)
             await self.db.upsert_sender_contact(contact)
         except Exception as e: logger.warning(f"upsert_sender_contact failed [{self.account['name']}]: {e}")
+        # ══ v10.7 §2: سجل وصول المرسل — upsert عند كل رسالة ══
+        # جدول sender_access (sender_id, account_name) → access_hash:
+        # أي حساب رأى المستخدم يخزّن hash رؤيته الخاصة، فلاحقاً يمكن
+        # لأي حساب منهم بناء Text Mention صالح (المستوى 3 من السلّم).
+        try:
+            _sa_hash = data.get("sender_access_hash")
+            if sender_id and isinstance(_sa_hash, int) and _sa_hash != 0:
+                await self.db.upsert_sender_access(
+                    int(sender_id),
+                    data.get("owner_account") or data.get("account_name", self.account["name"]),
+                    int(_sa_hash),
+                )
+        except Exception as e:
+            logger.debug(f"upsert_sender_access failed [{self.account['name']}]: {type(e).__name__}")
         processing_time = (time.perf_counter() - start_time) * 1000
         await self._update_avg_time(processing_time)
 
@@ -2399,6 +2576,64 @@ class EnhancedAccountMonitor:
             return bool(attr() if callable(attr) else attr)
         except Exception: return False
 
+    def _capturing_client(self, data: Optional[Dict[str, Any]] = None) -> Optional[TelegramClient]:
+        """v10.7: عميل الحساب الملتقط للرسالة (عضو مضمون في مجموعة المصدر)
+        — يُستخدم أولاً في forward supplement لأنه يرى الرسالة الأصلية."""
+        ref = self._bot_ref
+        src = (data or {}).get("account_name")
+        if ref is not None and src:
+            for mon in getattr(ref, "monitors", []) or []:
+                if mon.account.get("name") == src and mon.client is not None and self._is_client_alive(mon.client):
+                    return mon.client
+        if self._is_client_alive(self.client):
+            return self.client
+        return None
+
+    async def check_target_membership(self) -> Optional[str]:
+        """v10.7 §5 — فحص عضوية الحساب في TARGET_GROUP_ID عند الإقلاع.
+
+        كل حساب مراقبة يجب أن يكون عضواً في قناة الهدف: غير العضو سيفشل
+        في النشر (ChatWriteForbidden) ولن يستطيع بناء mention من رؤيته.
+        يسجل تحذيراً واحداً لكل حساب غير عضو في هذا الإقلاع (المجموعة
+        _target_membership_warned). فشل الفحص نفسه لا يرفع استثناء أبداً.
+        يعيد: "ok" | "missing" | "timeout" | "error" | None (تخطي)."""
+        name = self.account.get("name", "?")
+        if name in _target_membership_warned:
+            return None
+        if not self.client or not self._is_client_alive(self.client) or not CFG.TARGET_GROUP_ID:
+            return None
+        result: Optional[str]
+        try:
+            perms = await asyncio.wait_for(
+                self.client.get_permissions(CFG.TARGET_GROUP_ID, "me"), timeout=20
+            )
+            is_member = bool(getattr(perms, "is_member", True))
+            if is_member:
+                logger.info(f"✅ target-membership ok [{name}] — الحساب عضو في قناة الهدف")
+                result = "ok"
+            else:
+                logger.warning(
+                    f"⚠️ target-membership MISSING [{name}] — الحساب ليس عضواً في "
+                    f"TARGET_GROUP_ID ({CFG.TARGET_GROUP_ID}): انشر تنبيهات هذا الحساب "
+                    "سيفشل (ChatWriteForbidden) ولا يمكنه بناء mention للمرسلين — "
+                    "أضف الحساب إلى قناة الهدف."
+                )
+                result = "missing"
+        except asyncio.TimeoutError:
+            logger.debug(f"target-membership check timeout [{name}]")
+            result = "timeout"
+        except Exception as e:
+            # ChannelPrivateError/UserNotParticipantError = غير عضو فعلاً؛
+            # أي خطأ آخر يُسجّل تحذيراً عاماً — كلاهما لا يوقف التشغيل.
+            logger.warning(
+                f"⚠️ target-membership check failed [{name}]: {type(e).__name__}: "
+                f"{str(e)[:120]} — إذا كان الحساب غير عضو في TARGET_GROUP_ID فستفشل تنبيهاته"
+            )
+            result = "error"
+        finally:
+            _target_membership_warned.add(name)
+        return result
+
 
     async def _send_alert(
         self,
@@ -2497,6 +2732,21 @@ class EnhancedAccountMonitor:
                   "username": nav_sender_username or sender_username,
                   "access_hash": sender_access_hash}
         alert_text, buttons = self._build_alert(sender, chat_info, keyword, text, analysis)
+        # ══ v10.7 §2: تمرير روابط الرسالة/المجموعة إلى upsert ══
+        # sender_contacts في _analyze_and_alert (كانا يُحفظان NULL دائماً).
+        try:
+            _ml = chat_info.get("msg_link"); _gl = chat_info.get("group_link")
+            if _ml and _ml != "#": data["_alert_msg_link"] = _ml
+            if _gl and _gl != "#": data["_alert_group_link"] = _gl
+        except Exception:
+            pass
+        # ══ v10.7 §1: قواعد قابلية الـmention ══
+        # المرسل Channel (أدمن مجهول أو قناة) أو sender_id فارغ → لا Text
+        # Mention — المستوى 4 مباشرة (رابط الرسالة + forward).
+        sender_type = (data.get("sender_type") or "").strip().lower()
+        mention_allowed = bool(sender_id) and sender_type != "channel"
+        # ══ v10.7 §4: مخرجات الإرسال — تُسجَّل في alerts.contact_method ══
+        outcome: Dict[str, Any] = {"method": None, "forward_done": False, "verify_fail_reason": None}
         # ══ v10.6: تصلب مرساة المرسل لمسار الإرسال الاحتياطي ══
         # عندما يفشل سلّم mention بالكامل، تيليجرام يحذف كيان tg://user
         # صامتاً (_replace_with_mention) فيتحول اسم المرسل لنص غير قابل
@@ -2564,38 +2814,125 @@ class EnhancedAccountMonitor:
                 return await c.send_message(CFG.TARGET_GROUP_ID, wire_text, buttons=buttons, formatting_entities=wire_ents, link_preview=False)
             return await c.send_message(CFG.TARGET_GROUP_ID, wire_text, buttons=buttons, parse_mode="html", link_preview=False)
 
-        async def do_send():
-            """v10.2: تدوير مرشحي الإرسال — أول عميل ينجح يلتزم الإرسال.
-
-            يجيب تلقائياً على سيناريو 20:29 UTC: main_client ليس مشرفاً
-            في قناة الهدف → المحاولة الأولى تفشل (صلاحيات/كيان) → ننتقل
-            للمرشح التالي حتى ينجح أحدهم، ثم يُلاصق (alert_sender_client)
-            فلا تكلفة تدوير على التنبيهات التالية.
-
-            v10.4: داخل كل مرشح يعمل سلّم mention — نبني الكيانات عبر
-            محلل HTML تيليجرام نفسه ونستبدل اسم المرسل فقط بكيان mention
-            حقيقي صالح لحساب الإرسال. عند USER_ID_INVALID /
-            ENTITY_MENTION_USER_INVALID ننتقل للدرجة التالية فوراً (بلا
-            retry على نفسها)، وإذا فشل السلّم كله نُرسل بالمسار الأصلي
-            parse_mode="html" — الناتج على السلك مطابق لـv10.3 حرفياً.
-            FloodWait/أي خطأ آخر يتصاعد للمسار الخارجي كما هو."""
-            last_exc: Optional[Exception] = None
-            for idx, c in enumerate(send_clients):
+        def _sticky(c: TelegramClient) -> None:
+            """يلتصق أول عميل ناجح بالإرسال (عقد v10.2 — صفر تكلفة تدوير)."""
+            if self._bot_ref is not None:
                 try:
-                    sent_msg: Any = None
-                    mention_used: Optional[str] = None
+                    self._bot_ref.alert_sender_client = c
+                except Exception:
+                    pass
+            self._note_post_capable(c)
+
+        async def _forward_supplement(preferred: Optional[TelegramClient]) -> bool:
+            """══ المستوى 4 (شبكة الأمان) — v10.7 §3 ══
+
+            إعادة توجيه الرسالة الأصلية إلى قناة الهدف: يظهر اسم/صورة
+            المرسل الأصلي أعلى النسخة المعاد توجيهها فيصل أي مشرف لملفه
+            باللمس على الصورة — حتى بلا username وبلا hash صالح. تُجرّب
+            محاولة واحدة على عميلين كحد أقصى (عميل الإرسال أولاً ثم الحساب
+            الملتقط لأنه عضو مضمون في مجموعة المصدر). FloodWait يُسجّل ولا
+            ينام — التنبيه الرئيسي وصل فعلاً. لا ترفع استثناء أبداً."""
+            if not getattr(CFG, "ALERT_FORWARD_FALLBACK", True):
+                return False
+            if not chat_id or not message_id:
+                return False
+            tried: List[TelegramClient] = []
+            if preferred is not None and self._is_client_alive(preferred):
+                tried.append(preferred)
+            cap_client = self._capturing_client(data)
+            if cap_client is not None and all(cap_client is not c for c in tried):
+                tried.append(cap_client)
+            for c in tried[:2]:
+                try:
+                    await c.forward_messages(CFG.TARGET_GROUP_ID, message_id, from_peer=int(chat_id))
+                    logger.info(
+                        f"📤 forward supplement sent [{account_name}] (sender={sender_id}) — "
+                        "original message forwarded to target so the sender profile is reachable"
+                    )
+                    return True
+                except (FloodWaitError, CircuitBreakerOpen) as fw:
+                    logger.warning(f"forward supplement throttled [{account_name}]: {type(fw).__name__}: {fw}")
+                    return False
+                except Exception as fe:
+                    logger.debug(
+                        f"forward supplement failed [{account_name}]: {type(fe).__name__}: {str(fe)[:120]}"
+                    )
+            return False
+
+        async def do_send():
+            """══ v10.7 §3: سلسلة المستويات — توقف عند أول نجاح مُتحقَّق منه ══
+
+            المستوى 1: username → t.me/USERNAME (أضمن رابط — التنسيق الذهبي
+            حرفياً عبر parse_mode="html"، بلا أي mention).
+            المستوى 2: Text Mention من الحساب المالك (InputUser بـhash رؤيته
+            هو) عبر formatting_entities + InputMessageEntityMentionName.
+            المستوى 3: فشل الحساب المالك (ليس عضواً/ChatWriteForbidden/hash
+            غير صالح) → بقية الحسابات المسجلة في sender_access واحداً
+            واحداً، كل واحد بـhash الخاص به (تدوير المرشحين + درجة
+            account_hash لكل عميل).
+            المستوى 4: فشلت كل الحسابات أو المرسل قناة → تنبيه بلا mention
+            مع رابط الرسالة ثم forward supplement.
+
+            §4 التحقق الإلزامي: بعد كل إرسال بmention نفحص msg.entities؛
+            الكيان غير موجود → نسجل السبب ونضمن الوصول عبر forward بلا
+            إعادة إرسال التنبيه (لا تكرار).
+            FloodWait/أي خطأ حرج يتصاعد للمسار الخارجي كما هو."""
+            last_exc: Optional[Exception] = None
+
+            # ── المستوى 1: username ──
+            if sender.get("username"):
+                for idx, c in enumerate(send_clients):
                     try:
-                        mention_users = await self._resolve_mention_input_users(c, data)
-                    except Exception as mu_err:
-                        logger.debug(f"mention plan error [{account_name}]: {type(mu_err).__name__}")
-                        mention_users = []
-                    for tier_name, input_user in mention_users:
-                        built = _build_mention_entities(alert_text, sender_id, input_user)
-                        if built is None:
-                            continue
+                        sent_msg = await _send_alert_payload(c, None)
+                        _sticky(c)
+                        outcome["method"] = "username"
+                        if idx > 0:
+                            logger.info(
+                                f"✅ Alert send succeeded with candidate #{idx + 1} "
+                                f"[{account_name}] after rotation (sticky sender updated)"
+                            )
+                        return sent_msg
+                    except (FloodWaitError, CircuitBreakerOpen):
+                        raise  # احترام حدود التقييم/القاطع — المسار الخارجي يعالجها
+                    except Exception as e:
+                        # أي فشل إرسال (صلاحيات/كيان/حدود) يجرب المرشح التالي
+                        last_exc = e
+                        logger.warning(
+                            f"Send candidate #{idx + 1} failed [{account_name}]: "
+                            f"{type(e).__name__}: {str(e)[:120]} — trying next client"
+                        )
+                raise last_exc if last_exc else RuntimeError("no send candidate succeeded")
+
+            # ── المستوى 2+3: mention عبر الحسابات ──
+            escalate_msg: Any = None
+            escalate_via: Optional[TelegramClient] = None
+            if mention_allowed and CFG.SENDER_MENTION_FIX_ENABLED:
+                escalate = False
+                for idx, c in enumerate(send_clients):
+                    if escalate:
+                        break
+                    try:
                         try:
-                            sent_msg = await _send_alert_payload(c, built)
-                            mention_used = tier_name
+                            mention_users = await self._resolve_mention_input_users(c, data)
+                        except Exception as mu_err:
+                            logger.debug(f"mention plan error [{account_name}]: {type(mu_err).__name__}")
+                            mention_users = []
+                        for tier_name, input_user in mention_users:
+                            built = _build_mention_entities(alert_text, sender_id, input_user)
+                            if built is None:
+                                continue
+                            try:
+                                sent_msg = await _send_alert_payload(c, built)
+                            except _MENTION_INVALID_ERRORS as mie:
+                                # الدرجة غير صالحة لهذا الحساب → الدرجة التالية فوراً
+                                mention_negative.mark(
+                                    self._account_name_for_client(c) or "?", sender_id, tier_name
+                                )
+                                logger.info(
+                                    f"mention tier '{tier_name}' invalid for [{account_name}] "
+                                    f"sender={sender_id}: {type(mie).__name__} — next tier"
+                                )
+                                continue
                             # العنوان تم حلّه فعلياً لهذا الحساب — ذخّر الـhash
                             # الناتج عن درجة username (لئلا يُحل مرة أخرى).
                             if tier_name == "username" and getattr(input_user, "access_hash", None):
@@ -2606,49 +2943,81 @@ class EnhancedAccountMonitor:
                                 asyncio.create_task(
                                     self._persist_account_hash(sender_id, int(getattr(input_user, "access_hash")))
                                 )
+                            # ── §4 التحقق الإلزامي بعد الإرسال ──
+                            verified, why = _verify_mention_entity(sent_msg, sender_id)
+                            _sticky(c)
+                            if verified:
+                                outcome["method"] = "mention"
+                                logger.info(
+                                    f"🔗 real mention entity VERIFIED [{account_name}] "
+                                    f"via tier={tier_name} (sender={sender_id}) — visual format unchanged"
+                                )
+                                return sent_msg
+                            # أُرسلت الرسالة لكن كيان الmention غير موجود بالرد:
+                            # لا نعيد إرسال التنبيه (لا تكرار!) — نسجل السبب
+                            # ونضمن الوصول عبر forward (مقطع المستوى 4 أدناه).
+                            outcome["verify_fail_reason"] = f"{tier_name}:{why}"
+                            outcome["method"] = "link"
+                            escalate_msg = sent_msg
+                            escalate_via = c
+                            escalate = True
+                            logger.warning(
+                                f"⚠️ mention entity NOT verified after send [{account_name}] "
+                                f"tier={tier_name} sender={sender_id}: {why} — escalating to forward supplement"
+                            )
                             break
-                        except _MENTION_INVALID_ERRORS as mie:
-                            # الدرجة غير صالحة لهذا الحساب → الدرجة التالية فوراً
-                            mention_negative.mark(
-                                self._account_name_for_client(c) or "?", sender_id, tier_name
-                            )
-                            logger.info(
-                                f"mention tier '{tier_name}' invalid for [{account_name}] "
-                                f"sender={sender_id}: {type(mie).__name__} — next tier"
-                            )
-                            sent_msg = None
-                            continue
-                    if sent_msg is None:
-                        # لا درجات (أو فشلت كلها بmention-invalid) → المسار
-                        # الأصلي حرفياً (parse_mode="html") — نفس سلوك v10.3.
-                        sent_msg = await _send_alert_payload(c, None)
-                    if self._bot_ref is not None:
-                        try:
-                            self._bot_ref.alert_sender_client = c
-                        except Exception:
-                            pass
-                    self._note_post_capable(c)
-                    if mention_used:
-                        logger.info(
-                            f"🔗 real mention entity sent [{account_name}] "
-                            f"via tier={mention_used} (sender={sender_id}) — visual format unchanged"
+                        # كل درجات هذا الحساب رُفضت (mention-invalid) → الحساب
+                        # التالي (المستوى 3: حسابات sender_access الأخرى)
+                    except (FloodWaitError, CircuitBreakerOpen):
+                        raise
+                    except Exception as e:
+                        # فشل إرسال حقيقي (صلاحيات/كيان/حدود) → المرشح التالي
+                        last_exc = e
+                        logger.warning(
+                            f"Send candidate #{idx + 1} failed [{account_name}]: "
+                            f"{type(e).__name__}: {str(e)[:120]} — trying next client"
                         )
-                    if idx > 0:
-                        logger.info(
-                            f"✅ Alert send succeeded with candidate #{idx + 1} "
-                            f"[{account_name}] after rotation (sticky sender updated)"
-                        )
-                    return sent_msg
+                if escalate:
+                    # التصعيد بعد نجاح إرسال غير مُتحقَّق — forward فقط ثم العودة
+                    if await _forward_supplement(escalate_via):
+                        outcome["method"] = "forward"
+                        outcome["forward_done"] = True
+                    return escalate_msg
+
+            # ── المستوى 4: تنبيه بلا mention + forward ──
+            sent_msg: Any = None
+            sent_via: Optional[TelegramClient] = None
+            html_exc: Optional[Exception] = None
+            for idx, c in enumerate(send_clients):
+                try:
+                    sent_msg = await _send_alert_payload(c, None)
+                    sent_via = c
+                    _sticky(c)
+                    if outcome["method"] is None:
+                        outcome["method"] = "link"
+                    break
                 except (FloodWaitError, CircuitBreakerOpen):
-                    raise  # احترام حدود التقييم/القاطع — المسار الخارجي يعالجها
+                    raise
                 except Exception as e:
-                    # أي فشل إرسال (صلاحيات/كيان/حدود) يجرب المرشح التالي
+                    html_exc = e
                     last_exc = e
                     logger.warning(
                         f"Send candidate #{idx + 1} failed [{account_name}]: "
                         f"{type(e).__name__}: {str(e)[:120]} — trying next client"
                     )
-            raise last_exc if last_exc else RuntimeError("no send candidate succeeded")
+            if sent_msg is None:
+                raise html_exc if html_exc else RuntimeError("no send candidate succeeded")
+            # الاسم ليس مضموناً قابلاً للنقر هنا (لا username ولا mention
+            # مُتحقَّق) → forward supplement يضمن الوصول لملف المرسل.
+            if await _forward_supplement(sent_via):
+                outcome["method"] = "forward"
+                outcome["forward_done"] = True
+            if idx > 0:
+                logger.info(
+                    f"✅ Alert send succeeded with candidate #{idx + 1} "
+                    f"[{account_name}] after rotation (sticky sender updated)"
+                )
+            return sent_msg
         def _retry_payload() -> Dict[str, Any]:
             payload = dict(data)
             payload["_dlq_kind"] = "alert_resend"
@@ -2682,7 +3051,8 @@ class EnhancedAccountMonitor:
         try:
             sent_msg = await self._send_cb.call(do_send)
             await self._record_sent_alert(
-                sent_msg, data, msg_hash, account_name, keyword, alert_text, chat_id, sender_id, display_name
+                sent_msg, data, msg_hash, account_name, keyword, alert_text, chat_id, sender_id, display_name,
+                contact_method=(outcome.get("method") or "link"),
             )
         except (FloodWaitError, CircuitBreakerOpen) as e:
             logger.warning(
@@ -2703,7 +3073,17 @@ class EnhancedAccountMonitor:
             try:
                 if fb_client is None:
                     raise RuntimeError("لا يوجد عميل متاح للإرسال الاحتياطي")
-                fallback_sent_msg = await fb_client.send_message(CFG.TARGET_GROUP_ID, alert_text, buttons=buttons, parse_mode=None, link_preview=False)
+                # v10.7: المسار الاحتياطي يحافظ على روابط النص — النص المُصلّب
+                # (مرساة المرسل = رابط الرسالة) بصيغة html أولاً (نفس محرك
+                # المسار الرئيسي)؛ السلوك القديم parse_mode=None بقي كمحاولة
+                # أخيرة كي لا تضيع التنبيهات أبداً.
+                try:
+                    fallback_sent_msg = await fb_client.send_message(CFG.TARGET_GROUP_ID, _hardened_alert_text(), buttons=buttons, parse_mode="html", link_preview=False)
+                except Exception as _fb_html_err:
+                    logger.debug(f"Fallback html send failed [{account_name}]: {type(_fb_html_err).__name__} — plain-text fallback")
+                    fallback_sent_msg = await fb_client.send_message(CFG.TARGET_GROUP_ID, alert_text, buttons=buttons, parse_mode=None, link_preview=False)
+                if outcome.get("method") is None:
+                    outcome["method"] = "link"
             except Exception as fe:
                 logger.error(f"Fallback failed [{account_name}]: {fe}")
                 # ── v10.2: الملاذ الأخير — تسليم التنبيه لخاص الإدارة ──
@@ -2742,6 +3122,7 @@ class EnhancedAccountMonitor:
             await self._record_sent_alert(
                 fallback_sent_msg, data, msg_hash, account_name, keyword, alert_text,
                 chat_id, sender_id, display_name,
+                contact_method=(outcome.get("method") or "link"),
             )
 
     async def _record_sent_alert(
@@ -2755,6 +3136,7 @@ class EnhancedAccountMonitor:
         chat_id: int,
         sender_id: int,
         display_name: str,
+        contact_method: str = "",
     ) -> None:
         """Unified post-send bookkeeping (audit H-05).
 
@@ -2762,7 +3144,8 @@ class EnhancedAccountMonitor:
         Records the alert in DB (for the copy button + stats), notes the
         alert message id (for the reply-button fallback path), marks the
         FastCapture entry as alerted, and bumps the alerts_sent counter.
-        """
+        v10.7: contact_method records HOW the sender name was made
+        reachable — username | mention | forward | link (spec §4)."""
         if _capture.enabled:
             _capture.mark_alerted(data.get("chat_id"), data.get("message_id"))
         # v10.4: T2 — alert-sent latency (message.date → sent). Logs/health
@@ -2782,14 +3165,18 @@ class EnhancedAccountMonitor:
         if isinstance(safe_keyword, (tuple, list)): safe_keyword = safe_keyword[0] if safe_keyword else ""
         if not isinstance(safe_keyword, str): safe_keyword = str(safe_keyword) if safe_keyword is not None else ""
         await self.db.add_alert(AlertRecord(message_hash=msg_hash, chat_id=chat_id, sender_id=sender_id,
-            account_name=account_name, keyword=safe_keyword, alert_text=alert_text, timestamp=time.time()))
+            account_name=account_name, keyword=safe_keyword, alert_text=alert_text, timestamp=time.time(),
+            contact_method=(contact_method or "")[:20]))
         # v9.12 (audit H-01): invalidate can_send_alert cache so the next
         # message from this sender sees the new last_alert_time immediately.
         try:
             self.db._invalidate_can_send_alert(sender_id)  # noqa: SLF001
         except Exception:
             pass
-        logger.info(f"Alert sent by {account_name} | kw={keyword!r} | sender={display_name}")
+        logger.info(
+            f"Alert sent by {account_name} | kw={keyword!r} | sender={display_name} | "
+            f"contact_method={contact_method or 'link'}"
+        )
 
 
     async def disconnect(self):

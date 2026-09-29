@@ -428,17 +428,27 @@ class TestFrozenBuilderIntegration:
 
     async def test_alert_from_enriched_chat_info(self, monitor):
         """التنبيه النهائي من بيانات مُحلّى: بطاقة مجموعة كاملة + أزرار صحيحة
-        — الشكل المجمد حرفياً (نفس الحقول/الترتيب/الصيغ)."""
-        sender = {"id": 777000111, "display": "أحمد", "username": "ahmed_99", "access_hash": None}
-        chat = {"entity": None, "title": "مجموعة الطلاب", "id": -1001234567890,
-                "message_id": 789, "username": "mygroup",
-                "group_link": "https://t.me/mygroup", "msg_link": "https://t.me/mygroup/789"}
-        alert, buttons = monitor._build_alert(sender, chat, "واجب", "نص التنبيه", {"msg_hash": "h1"})
-        assert '<a href="https://t.me/ahmed_99">أحمد</a>' in alert
-        assert '<a href="https://t.me/mygroup">مجموعة الطلاب</a>' in alert
-        assert '<a href="https://t.me/mygroup/789"><b>عرض الرسالة الأصلية</b></a>' in alert
-        urls = [s for row in buttons or [] for s in _all_specs(row)]
-        assert "https://t.me/mygroup/789" in urls  # زر عرض الرسالة
+        — الشكل المجمد حرفياً (نفس الحقول/الترتيب/الصيغ).
+
+        v10.7 §5: الأزرار معطلة افتراضياً على تنبيهات حسابات المستخدمين
+        (ALERT_BUTTONS_ENABLED=False) — الاختبار يفعّلها صراحة للتحقق من
+        الشكل التاريخي، وروابط النص نفسها موجودة دائماً في التنبيه."""
+        from config import CFG as _CFG
+        old = getattr(_CFG, "ALERT_BUTTONS_ENABLED", False)
+        try:
+            object.__setattr__(_CFG, "ALERT_BUTTONS_ENABLED", True)
+            sender = {"id": 777000111, "display": "أحمد", "username": "ahmed_99", "access_hash": None}
+            chat = {"entity": None, "title": "مجموعة الطلاب", "id": -1001234567890,
+                    "message_id": 789, "username": "mygroup",
+                    "group_link": "https://t.me/mygroup", "msg_link": "https://t.me/mygroup/789"}
+            alert, buttons = monitor._build_alert(sender, chat, "واجب", "نص التنبيه", {"msg_hash": "h1"})
+            assert '<a href="https://t.me/ahmed_99">أحمد</a>' in alert
+            assert '<a href="https://t.me/mygroup">مجموعة الطلاب</a>' in alert
+            assert '<a href="https://t.me/mygroup/789"><b>عرض الرسالة الأصلية</b></a>' in alert
+            urls = [s for row in buttons or [] for s in _all_specs(row)]
+            assert "https://t.me/mygroup/789" in urls  # زر عرض الرسالة
+        finally:
+            object.__setattr__(_CFG, "ALERT_BUTTONS_ENABLED", old)
 
     async def test_no_username_uses_recovered_db_username(self, monitor):
         """مرسل بلا username في الحدث لكن له اسم محفوظ → الرابط t.me بدل

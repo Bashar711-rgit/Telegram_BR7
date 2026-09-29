@@ -161,7 +161,22 @@ def monitor():
 
 
 class TestAlertRegression:
-    """EXPECTED_ALERT == ACTUAL_ALERT at 100% (brief #41)."""
+    """EXPECTED_ALERT == ACTUAL_ALERT at 100% (brief #41).
+
+    v10.7 §5: حسابات المستخدمين لا ترسل أزراراً — _build_alert يعيد
+    buttons=None افتراضياً (ALERT_BUTTONS_ENABLED=False). بناء الأزرار
+    الكامل محفوظ خلف المفتاح: هذه الاختبارات تُفعّله صراحة للتحقق من أن
+    الشكل الذهبي للأزرار لم يتغير، مع اختبار جديد يؤكد السلوك الافتراضي
+    (لا أزرار على التنبيهات).
+    """
+
+    @pytest.fixture(autouse=True)
+    def _buttons_enabled(self):
+        """فعّل الأزرار فقط لاختبارات الشكل الذهبي التاريخية."""
+        old = getattr(CFG, "ALERT_BUTTONS_ENABLED", False)
+        object.__setattr__(CFG, "ALERT_BUTTONS_ENABLED", True)
+        yield
+        object.__setattr__(CFG, "ALERT_BUTTONS_ENABLED", old)
 
     @pytest.mark.asyncio
     async def test_s1_username_chat(self, monitor):
@@ -224,8 +239,32 @@ class TestAlertRegression:
         assert alert == GOLDEN["S1_username_chat"]["alert"]
 
     @pytest.mark.asyncio
-    async def test_buttons_contract_config(self):
-        """The alert-button contract flags must be consistent (v9.11)."""
-        assert CFG.ALERT_WITH_BUTTONS is True
-        assert CFG.ALERT_WITH_COPY_BUTTON is True
-        assert CFG.ALERT_WITH_CONTACT_BUTTON is True
+    async def test_alerts_ship_without_buttons_by_default(self, monitor):
+        """v10.7 §5: حسابات المستخدمين لا ترسل أزراراً (تظهر فقط للبوتات)
+        — التنبيهات تعتمد روابط النص افتراضياً (ALERT_BUTTONS_ENABLED=False).
+        هذا الاختبار يطفئ المفتاح صراحة كي لا يتأثر بـfixture الشكل الذهبي."""
+        old = getattr(CFG, "ALERT_BUTTONS_ENABLED", False)
+        try:
+            object.__setattr__(CFG, "ALERT_BUTTONS_ENABLED", False)
+            sender = {"id": 555000111, "display": "أحمد محمد", "username": "ahmed_99", "access_hash": 7234567890123}
+            chat = {
+                "group_link": "https://t.me/mygroup", "title": "مجموعة الطلاب", "msg_link": "https://t.me/mygroup/123",
+                "id": -1001234567890, "message_id": 123, "username": "mygroup",
+            }
+            alert, buttons = monitor._build_alert(sender, chat, "واجب", TEXT, {"msg_hash": "abc123"})
+            # النص الذهبي كما هو حرفياً — روابط النص داخل التنبيه بديل الأزرار
+            assert alert == GOLDEN["S1_username_chat"]["alert"]
+            assert buttons is None
+        finally:
+            object.__setattr__(CFG, "ALERT_BUTTONS_ENABLED", old)
+
+
+@pytest.mark.asyncio
+async def test_buttons_contract_config():
+    """The alert-button contract flags must be consistent (v9.11).
+    v10.7: ALERT_BUTTONS_ENABLED default False — no inline buttons on
+    user-account alerts; the legacy flags stay available behind it."""
+    assert getattr(CFG, "ALERT_BUTTONS_ENABLED", None) is False
+    assert CFG.ALERT_WITH_BUTTONS is True
+    assert CFG.ALERT_WITH_COPY_BUTTON is True
+    assert CFG.ALERT_WITH_CONTACT_BUTTON is True

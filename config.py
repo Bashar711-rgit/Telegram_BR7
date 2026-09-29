@@ -401,6 +401,19 @@ class _ConfigData:
     ALERT_MAX_TEXT_LEN: int
     ALERT_WITH_COPY_BUTTON: bool
     ALERT_WITH_CONTACT_BUTTON: bool
+    # v10.7: user ACCOUNTS cannot send inline buttons (Telegram only renders
+    # them for bots) — alerts therefore ship as TEXT links only. The whole
+    # button assembly (build_dynamic_buttons + copy/contact rows) is kept
+    # intact but gated behind this master switch, default OFF per spec §5.
+    ALERT_BUTTONS_ENABLED: bool
+    # v10.7 Level-4 safety net: when no username and no mention hash works
+    # (or the sender is a channel/anonymous admin), the alert is followed by
+    # a forward of the ORIGINAL message so the sender's name/avatar rides on
+    # top of the forwarded copy. Kill switch: ALERT_FORWARD_FALLBACK=false.
+    ALERT_FORWARD_FALLBACK: bool
+    # v10.7 §5: warn at boot for every monitoring account that is NOT a
+    # member of TARGET_GROUP_ID (its alerts + mentions would keep failing).
+    TARGET_MEMBERSHIP_CHECK: bool
 
     # ── Anti-Spam (المرحلة الثانية: Watch List → Confirmation → Permanent Ignore) ──
     ANTISPAM_ENABLED: bool
@@ -758,6 +771,12 @@ class Config:
             ADMIN_BOT_TOKEN=SecretManager.get("ADMIN_BOT_TOKEN", None, required=False),
             # ========== التنبيهات ==========
             ALERT_WITH_BUTTONS=SecretManager.get_bool("ALERT_WITH_BUTTONS", True),
+            # v10.7 §5: حسابات المستخدمين لا ترسل أزراراً (تظهر فقط للبوتات) —
+            # التنبيهات تعتمد روابط النص. الأزرار القديمة محفوظة كاملة خلف
+            # هذا المفتاح (افتراضياً OFF) إن احتاجها أحد مستقبلاً.
+            ALERT_BUTTONS_ENABLED=SecretManager.get_bool("ALERT_BUTTONS_ENABLED", False),
+            ALERT_FORWARD_FALLBACK=SecretManager.get_bool("ALERT_FORWARD_FALLBACK", True),
+            TARGET_MEMBERSHIP_CHECK=SecretManager.get_bool("TARGET_MEMBERSHIP_CHECK", True),
             ALERT_SHOW_SCORE=SecretManager.get_bool("ALERT_SHOW_SCORE", True),
             ALERT_MAX_TEXT_LEN=SecretManager.get_int("ALERT_MAX_TEXT_LEN", 350, required=False),
             ALERT_WITH_COPY_BUTTON=SecretManager.get_bool("ALERT_WITH_COPY_BUTTON", True),

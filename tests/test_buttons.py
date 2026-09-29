@@ -171,7 +171,20 @@ class TestBuildDynamicButtons:
 
 
 class TestBuildAlertButtons:
-    """التكامل عبر _build_alert — الصف الثاني يشمل زر النسخ الاختياري."""
+    """التكامل عبر _build_alert — الصف الثاني يشمل زر النسخ الاختياري.
+
+    v10.7 §5: الأزرار محذوفة من التنبيهات افتراضياً (ALERT_BUTTONS_ENABLED=
+    False — حسابات المستخدمين لا ترسل أزراراً). البناء الكامل محفوظ خلف
+    المفتاح: هذه الاختبارات تُفعّله صراحة للتحقق من الشكل التاريخي، مع
+    اختبار جديد يؤكد السلوك الافتراضي (لا أزرار).
+    """
+
+    @pytest.fixture(autouse=True)
+    def _buttons_enabled(self):
+        old = getattr(CFG, "ALERT_BUTTONS_ENABLED", False)
+        object.__setattr__(CFG, "ALERT_BUTTONS_ENABLED", True)
+        yield
+        object.__setattr__(CFG, "ALERT_BUTTONS_ENABLED", old)
 
     @pytest.mark.asyncio
     async def test_full_rows_with_copy(self, monitor):
@@ -185,6 +198,24 @@ class TestBuildAlertButtons:
         assert specs[0][1] == ("callback", "تواصل مع المرسل", "cnt_xyz")
         assert specs[1][0] == ("url", "مراسلة", "https://t.me/ahmed_99")
         assert specs[1][1] == ("callback", "📋 نسخ النص", "copy_xyz")  # ميزة قائمة
+
+    @pytest.mark.asyncio
+    async def test_no_buttons_by_default_v10_7(self, monitor):
+        """v10.7 §5: بدون ALERT_BUTTONS_ENABLED لا أزرار على التنبيه إطلاقاً —
+        الاعتماد على روابط النص (حسابات المستخدمين لا ترسل أزراراً)."""
+        old = getattr(CFG, "ALERT_BUTTONS_ENABLED", False)
+        try:
+            object.__setattr__(CFG, "ALERT_BUTTONS_ENABLED", False)
+            sender = {"id": 555000111, "display": "أ", "username": "ahmed_99", "access_hash": None}
+            chat = {"group_link": "https://t.me/g", "title": "ت", "msg_link": "https://t.me/g/7",
+                    "id": -100123, "message_id": 7, "username": "g"}
+            alert, buttons = monitor._build_alert(sender, chat, "ك", "نص", {"msg_hash": "x"})
+            assert buttons is None
+            # روابط النص داخل التنبيه سليمة (بديل الأزرار)
+            assert 'href="https://t.me/ahmed_99"' in alert
+            assert 'href="https://t.me/g/7"' in alert
+        finally:
+            object.__setattr__(CFG, "ALERT_BUTTONS_ENABLED", old)
 
     @pytest.mark.asyncio
     async def test_buttons_disabled_via_cfg(self, monitor):

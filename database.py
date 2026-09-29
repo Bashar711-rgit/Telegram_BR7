@@ -4,6 +4,22 @@ database.py – Unified Async Database Layer v9.0 (HARDENED EDITION)
 Supports: SQLite (aiosqlite) and PostgreSQL (asyncpg)
 Compatible with: config.py v13.1, monitors.py v9.7, filter_engine.py v14.1
 
+v10.7 (this pass) — Sender Access Registry + contact_method + owner_account:
+  * NEW TABLE sender_access (sender_id, account_name, access_hash, updated_at)
+    PRIMARY KEY (sender_id, account_name): any monitoring account that has
+    SEEN a sender persists ITS OWN view of that sender's access_hash, so a
+    later alert can build a server-valid Text Mention
+    (InputMessageEntityMentionName) from whichever account actually
+    delivers it. Legacy rows from the v10.4 sender_account_hashes table
+    are COPIED in (the old table is never dropped).
+  * alerts.contact_method TEXT column: how the sender name was ACTUALLY
+    made reachable for each alert — username | mention | forward | link.
+  * sender_contacts.owner_account TEXT column: which monitoring account
+    last captured this contact.
+  * All migrations are ADDITIVE (ADD COLUMN / CREATE TABLE IF NOT EXISTS)
+    inside per-statement try/except for BOTH SQLite and PostgreSQL —
+    idempotent on every boot, zero data loss.
+
 v9.0 (this pass) — full audit fix, database.py ONLY:
 
   FIXED #1  — Blocking I/O in _backup_loop: all Path.read_bytes(),
@@ -191,6 +207,9 @@ class AlertRecord:
     academic_object: Optional[str] = None
     negation_detected: int = 0
     advert_score: float = 0.0
+    # v10.7: how the sender name was made reachable in THIS alert —
+    # username | mention | forward | link ("" for legacy rows).
+    contact_method: str = ""
 
 
 @dataclass(slots=True)
@@ -499,6 +518,7 @@ class EnhancedDatabase:
             await self._migrate_sender_intel()
             await self._migrate_dashboard_account_status()  # v9.34
             await self._migrate_sender_account_hashes()  # v10.4
+            await self._migrate_sender_access()  # v10.7
             await self._create_indexes()
             self.is_connected = True
             await self.start_writer()
@@ -648,7 +668,8 @@ class EnhancedDatabase:
                 intent_verb TEXT,
                 academic_object TEXT,
                 negation_detected INTEGER DEFAULT 0,
-                advert_score REAL DEFAULT 0.0
+                advert_score REAL DEFAULT 0.0,
+                contact_method TEXT DEFAULT ''
             );
             CREATE TABLE IF NOT EXISTS sender_stats (
                 sender_id INTEGER PRIMARY KEY,
@@ -1660,7 +1681,7 @@ class EnhancedDatabase:
         "phone, is_bot, is_verified, is_premium, is_scam, is_fake, "
         "is_restricted, is_deleted, is_contact, is_mutual_contact, "
         "photo_available, restriction_reason, lang_code, status, usernames, "
-        "last_seen, last_updated"
+        "last_seen, last_updated, owner_account"
     )
 
     def _contact_params(self, s: Dict[str, Any]) -> tuple:
@@ -1676,6 +1697,7 @@ class EnhancedDatabase:
             s.get("is_mutual_contact"), s.get("photo_available"),
             s.get("restriction_reason"), s.get("lang_code"), s.get("status"),
             s.get("usernames"), s.get("last_seen"), s.get("last_updated"),
+            s.get("owner_account"),
         )
 
     async def upsert_sender_contact(self, sender_data: Dict[str, Any]) -> None:
@@ -1718,6 +1740,7 @@ class EnhancedDatabase:
                     "status = COALESCE(excluded.status, sender_contacts.status), "
                     "usernames = COALESCE(excluded.usernames, sender_contacts.usernames), "
                     "last_seen = COALESCE(excluded.last_seen, sender_contacts.last_seen), "
+                    "owner_account = COALESCE(excluded.owner_account, sender_contacts.owner_account), "
                     "last_updated = excluded.last_updated, "
                     "updated_at = CURRENT_TIMESTAMP"
                 )
@@ -1755,6 +1778,7 @@ class EnhancedDatabase:
                     "status = COALESCE(EXCLUDED.status, sender_contacts.status), "
                     "usernames = COALESCE(EXCLUDED.usernames, sender_contacts.usernames), "
                     "last_seen = COALESCE(EXCLUDED.last_seen, sender_contacts.last_seen), "
+                    "owner_account = COALESCE(EXCLUDED.owner_account, sender_contacts.owner_account), "
                     "last_updated = EXCLUDED.last_updated, "
                     "updated_at = CURRENT_TIMESTAMP"
                 )
@@ -1811,47 +1835,173 @@ class EnhancedDatabase:
             logger.warning(f"sender_account_hashes migration skipped: {type(e).__name__}: {str(e)[:120]}")
 
     async def upsert_sender_account_hash(self, account_name: str, sender_id: int, access_hash: int) -> bool:
-        """Persist one (account, sender) → access_hash observation.
-        Write-behind only when the value is NEW/CHANGED (caller gates via
-        AccountAccessHashStore.record). Never raises."""
+        """v10.4 legacy name — now persisted into the unified sender_access
+        registry (v10.7). Same signature/semantics; never raises."""
+        return await self.upsert_sender_access(sender_id, account_name, access_hash)
+
+    async def get_sender_account_hash(self, account_name: str, sender_id: int) -> Optional[int]:
+        """v10.4 legacy name — now read from the unified sender_access
+        registry (v10.7). Same signature/semantics."""
+        return await self.get_sender_access_hash(account_name, sender_id)
+
+    # ─── v10.7: sender_access — the per-account sender access registry ────
+    # access_hash is PER-ACCOUNT knowledge (the hash account A saw cannot be
+    # used to send from account B — the server verifies it). Any account that
+    # receives a message from sender X upserts ITS OWN hash here, so a later
+    # alert can build a server-valid Text Mention from whichever account
+    # actually delivers it. Legacy v10.4 rows (sender_account_hashes) are
+    # copied in at migration time; the legacy table is kept for rollback but
+    # the two accessor methods below now read/write sender_access only.
+    async def _migrate_sender_access(self) -> None:
+        """v10.7 — additive, idempotent, zero-data-loss:
+          1. CREATE TABLE IF NOT EXISTS sender_access
+             (sender_id, account_name, access_hash, updated_at)
+             PRIMARY KEY (sender_id, account_name)
+          2. Copy legacy sender_account_hashes rows (ON CONFLICT DO NOTHING).
+          3. ALTER TABLE alerts ADD COLUMN contact_method TEXT DEFAULT ''.
+          4. ALTER TABLE sender_contacts ADD COLUMN owner_account TEXT.
+        Each statement is individually wrapped in try/except for BOTH
+        SQLite and PostgreSQL (SQLite lacks ADD COLUMN IF NOT EXISTS, so
+        the column existence is pragma-checked first)."""
+        # ── 1) the registry table ──
         try:
-            if not account_name or not sender_id or not isinstance(access_hash, int) or access_hash == 0:
-                return False
+            await self._execute(
+                "CREATE TABLE IF NOT EXISTS sender_access ("
+                "sender_id BIGINT NOT NULL, "
+                "account_name TEXT NOT NULL, "
+                "access_hash BIGINT NOT NULL, "
+                "updated_at DOUBLE PRECISION NOT NULL, "
+                "PRIMARY KEY (sender_id, account_name))"
+            )
+        except Exception as e:
+            logger.warning(f"sender_access table migration skipped: {type(e).__name__}: {str(e)[:120]}")
+        # ── 2) copy legacy v10.4 rows (best-effort, never fatal) ──
+        try:
             if self.db_type == "postgresql":
                 await self._execute(
-                    "INSERT INTO sender_account_hashes (account_name, sender_id, access_hash, updated_at) "
-                    "VALUES ($1, $2, $3, $4) "
-                    "ON CONFLICT (account_name, sender_id) DO UPDATE SET "
-                    "access_hash = EXCLUDED.access_hash, updated_at = EXCLUDED.updated_at",
-                    (str(account_name), int(sender_id), int(access_hash), time.time()),
+                    "INSERT INTO sender_access (sender_id, account_name, access_hash, updated_at) "
+                    "SELECT sender_id, account_name, access_hash, updated_at "
+                    "FROM sender_account_hashes "
+                    "ON CONFLICT (sender_id, account_name) DO NOTHING"
                 )
             else:
                 await self._execute(
-                    "INSERT INTO sender_account_hashes (account_name, sender_id, access_hash, updated_at) "
+                    "INSERT OR IGNORE INTO sender_access (sender_id, account_name, access_hash, updated_at) "
+                    "SELECT sender_id, account_name, access_hash, updated_at "
+                    "FROM sender_account_hashes"
+                )
+            await self._commit()
+        except Exception as e:
+            # sender_account_hashes may not exist on a brand-new DB — harmless.
+            logger.debug(f"sender_access legacy copy skipped: {type(e).__name__}")
+        # ── 3) sender-side lookup index ──
+        try:
+            await self._execute(
+                "CREATE INDEX IF NOT EXISTS idx_sender_access_sender "
+                "ON sender_access (sender_id)"
+            )
+        except Exception:
+            pass  # index is an optimization only
+        # ── 4) alerts.contact_method ──
+        try:
+            if self.db_type == "postgresql":
+                rows = await self._fetchall(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_name = 'alerts'", ()
+                )
+                if rows and "contact_method" not in {r["column_name"] for r in rows}:
+                    await self._execute("ALTER TABLE alerts ADD COLUMN contact_method TEXT DEFAULT ''")
+                    await self._commit()
+            else:
+                rows = await self._fetchall("PRAGMA table_info(alerts)", ())
+                if rows and "contact_method" not in {r["name"] for r in rows}:
+                    await self._execute("ALTER TABLE alerts ADD COLUMN contact_method TEXT DEFAULT ''")
+                    await self._commit()
+        except Exception as e:
+            logger.warning(f"alerts.contact_method migration skipped: {type(e).__name__}: {str(e)[:120]}")
+        # ── 5) sender_contacts.owner_account ──
+        try:
+            if self.db_type == "postgresql":
+                rows = await self._fetchall(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_name = 'sender_contacts'", ()
+                )
+                if rows and "owner_account" not in {r["column_name"] for r in rows}:
+                    await self._execute("ALTER TABLE sender_contacts ADD COLUMN owner_account TEXT")
+                    await self._commit()
+            else:
+                rows = await self._fetchall("PRAGMA table_info(sender_contacts)", ())
+                if rows and "owner_account" not in {r["name"] for r in rows}:
+                    await self._execute("ALTER TABLE sender_contacts ADD COLUMN owner_account TEXT")
+                    await self._commit()
+        except Exception as e:
+            logger.warning(f"sender_contacts.owner_account migration skipped: {type(e).__name__}: {str(e)[:120]}")
+        logger.debug("sender_access registry ready (v10.7)")
+
+    async def upsert_sender_access(self, sender_id: int, account_name: str, access_hash: int) -> bool:
+        """Upsert one (sender_id, account_name) → access_hash observation.
+        Called on EVERY analyzed message (spec v10.7 §2) so the registry
+        stays fresh even when no alert fires. Never raises."""
+        try:
+            if not sender_id or not account_name or not isinstance(access_hash, int) or access_hash == 0:
+                return False
+            if self.db_type == "postgresql":
+                await self._execute(
+                    "INSERT INTO sender_access (sender_id, account_name, access_hash, updated_at) "
+                    "VALUES ($1, $2, $3, $4) "
+                    "ON CONFLICT (sender_id, account_name) DO UPDATE SET "
+                    "access_hash = EXCLUDED.access_hash, updated_at = EXCLUDED.updated_at",
+                    (int(sender_id), str(account_name), int(access_hash), time.time()),
+                )
+            else:
+                await self._execute(
+                    "INSERT INTO sender_access (sender_id, account_name, access_hash, updated_at) "
                     "VALUES (?, ?, ?, ?) "
-                    "ON CONFLICT (account_name, sender_id) DO UPDATE SET "
+                    "ON CONFLICT (sender_id, account_name) DO UPDATE SET "
                     "access_hash = excluded.access_hash, updated_at = excluded.updated_at",
-                    (str(account_name), int(sender_id), int(access_hash), time.time()),
+                    (int(sender_id), str(account_name), int(access_hash), time.time()),
                 )
             await self._commit()
             return True
         except Exception as e:
-            logger.debug(f"upsert_sender_account_hash error: {type(e).__name__}")
+            logger.debug(f"upsert_sender_access error: {type(e).__name__}")
             return False
 
-    async def get_sender_account_hash(self, account_name: str, sender_id: int) -> Optional[int]:
-        """Stored access_hash for THIS account's view of the sender (or None)."""
+    async def get_sender_access_hash(self, account_name: str, sender_id: int) -> Optional[int]:
+        """THIS account's stored view of the sender's access_hash (or None)."""
         try:
             row = await self._fetchone(
-                "SELECT access_hash FROM sender_account_hashes "
+                "SELECT access_hash FROM sender_access "
                 "WHERE account_name = ? AND sender_id = ?",
                 (str(account_name), int(sender_id)),
             )
             if row and isinstance(row.get("access_hash"), int):
                 return int(row["access_hash"])
         except Exception as e:
-            logger.debug(f"get_sender_account_hash error: {type(e).__name__}")
+            logger.debug(f"get_sender_access_hash error: {type(e).__name__}")
         return None
+
+    async def get_sender_access_accounts(self, sender_id: int, limit: int = 8) -> List[Dict[str, Any]]:
+        """All accounts that have a stored hash for this sender, freshest
+        first — the spec's Level-3 fallback list. Bounded and never raises."""
+        try:
+            rows = await self._fetchall(
+                "SELECT account_name, access_hash FROM sender_access "
+                "WHERE sender_id = ? ORDER BY updated_at DESC LIMIT ?",
+                (int(sender_id), max(1, min(int(limit), 16))),
+            )
+            out: List[Dict[str, Any]] = []
+            for r in rows or []:
+                try:
+                    ah = int(r.get("access_hash"))
+                    if ah != 0 and r.get("account_name"):
+                        out.append({"account_name": str(r["account_name"]), "access_hash": ah})
+                except Exception:
+                    continue
+            return out
+        except Exception as e:
+            logger.debug(f"get_sender_access_accounts error: {type(e).__name__}")
+            return []
 
     async def recent_chat_ids(self, limit: int = 30) -> List[int]:
         """Most-recently-seen source chat ids (cache warm-up, bounded)."""
@@ -2311,6 +2461,8 @@ class EnhancedDatabase:
                 rec.academic_object,
                 rec.negation_detected,
                 rec.advert_score,
+                # v10.7: how the sender was made reachable (username/mention/forward/link)
+                (rec.contact_method or "")[:20],
             ))
         return True
 
@@ -4001,14 +4153,15 @@ class EnhancedDatabase:
                     values.append(
                         f"(${idx}, ${idx+1}, ${idx+2}, ${idx+3}, ${idx+4}, "
                         f"${idx+5}, ${idx+6}, ${idx+7}, ${idx+8}, ${idx+9}, "
-                        f"${idx+10}, ${idx+11}, ${idx+12}, ${idx+13})"
+                        f"${idx+10}, ${idx+11}, ${idx+12}, ${idx+13}, ${idx+14})"
                     )
                     params.extend(data)
-                    idx += 14
+                    idx += 15
                 sql = (
                     "INSERT INTO alerts "
                     "(message_hash, chat_id, sender_id, account_name, keyword, alert_text, timestamp, "
-                    " decision, confidence, reasons, intent_verb, academic_object, negation_detected, advert_score) "
+                    " decision, confidence, reasons, intent_verb, academic_object, negation_detected, advert_score, "
+                    " contact_method) "
                     f"VALUES {','.join(values)} ON CONFLICT (message_hash) DO NOTHING"
                 )
                 await self._pool.execute(sql, *params)
@@ -4043,8 +4196,9 @@ class EnhancedDatabase:
                 sql = (
                     "INSERT OR IGNORE INTO alerts "
                     "(message_hash, chat_id, sender_id, account_name, keyword, alert_text, timestamp, "
-                    " decision, confidence, reasons, intent_verb, academic_object, negation_detected, advert_score) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                    " decision, confidence, reasons, intent_verb, academic_object, negation_detected, advert_score, "
+                    " contact_method) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
                 )
                 params_list = [tuple(data) for data in alerts_data]
                 await self._executemany(sql, params_list)
