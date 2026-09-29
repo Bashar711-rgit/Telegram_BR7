@@ -161,12 +161,19 @@ from sender_resolver import (
     input_user_from_message_context as _input_user_from_message_context,
     get_mention_intel_snapshot,
 )
+from nav_resolver import nav_resolver as _nav_resolver  # v10.5 navigation multi-strategy resolver
+from nav_resolver import is_valid_username as _nav_valid_username      # v10.5 link validation
+from nav_resolver import private_supergroup_inner_id as _nav_inner_id  # v10.5 -100 id guard
 
 
 # (نفس الدوال المساعدة من النسخة الأصلية: resolve_chat_entity, build_telegram_links)
 # v9.10: get_dedup_snapshot مُصدَّر من هنا للوحة/health عبر dedup.get_dedup_snapshot
 async def resolve_chat_entity(client: TelegramClient, data: Dict[str, Any]) -> Any:
-    username = data.get("username") or data.get("sender_username") or data.get("chat_username")
+    # v10.5 (navigation correctness): the username chain here must contain
+    # CHAT usernames only. The old `or data.get("sender_username")` fallback
+    # was a latent wrong-entity bug — a caller passing raw event data could
+    # resolve the SENDER and use it as the originating chat.
+    username = data.get("username") or data.get("chat_username")
     if username:
         try:
             return await client.get_entity(username)
@@ -241,8 +248,14 @@ def build_dynamic_buttons(sender: dict, chat: dict, msg_hash: str = None) -> lis
     if chat_uname and message_id:
         msg_url = f"https://t.me/{chat_uname}/{message_id}"
     elif chat_id and message_id:
-        inner = str(chat_id).replace("-100", "", 1)
-        msg_url = f"https://t.me/c/{inner}/{message_id}"
+        # v10.5 (link-construction fix): t.me/c/{inner} exists ONLY for
+        # -100<inner> supergroup/channel ids. The old replace("-100", "", 1)
+        # produced dead links like t.me/c/-1234567/… for basic groups and
+        # t.me/c//… for the -100 edge id. Basic groups have NO message
+        # links in Telegram — the button is now honestly omitted instead.
+        inner = _nav_inner_id(chat_id)
+        if inner:
+            msg_url = f"https://t.me/c/{inner}/{message_id}"
     if msg_url:
         row1.append(Button.url("عرض الرسالة", msg_url))
 
@@ -1498,6 +1511,7 @@ class EnhancedAccountMonitor:
             "sender_username": getattr(sender, "username", None), "sender_first_name": getattr(sender, "first_name", None),
             "sender_last_name": getattr(sender, "last_name", None), "sender_access_hash": getattr(sender, "access_hash", None),
             "chat_access_hash": getattr(chat, "access_hash", None), "chat_username": chat_username,
+            "chat_title": getattr(chat, "title", None),  # v10.5: group-card fallback when entity resolution fails
             "text": full_text, "has_text": bool(full_text), "has_media": has_media, "media_type": media_type,
             "account_name": self.account["name"], "timestamp": time.time(),
             "msg_date_ts": _msg_ts, "receive_lag_ms": _recv_lag,
@@ -1953,6 +1967,15 @@ class EnhancedAccountMonitor:
                 logger.debug(f"deferred sender enrich skipped [{self.account['name']}]: {e}")
             # Always also try the DB fallback in case the resolver didn't
             # find anything but a contact row exists from a previous run.
+            try:
+                await self._enrich_sender_from_db(data)
+            except Exception:
+                pass
+        elif data.get("sender_id") and not data.get("sender_username"):
+            # v10.5 navigation: a sender whose event view lacked a username
+            # (min entity / privacy) may still have one persisted from ANY
+            # earlier message — that username turns a dead tg:// anchor into
+            # a universally-clickable t.me link and feeds mention tier-5.
             try:
                 await self._enrich_sender_from_db(data)
             except Exception:
@@ -2440,8 +2463,29 @@ class EnhancedAccountMonitor:
         chat_info["message_id"] = message_id
         chat_info["username"] = chat_username
         analysis["msg_hash"] = msg_hash
+        # ══ v10.5 Alert Navigation Resolver ══
+        # سلّم استراتيجيات مركزي للإجراءات الثلاثة (المرسل/المجموعة/عرض
+        # الرسالة): اسم المرسل (حدث ← كاش الكيانات ← DB) ثم روابط المجموعة
+        # (كيان ← username الحدث ← صيغة c/‏-100 ← exportMessageLink كآخر
+        # ملذ، مُخزَّن لكل محادثة) ثم بوابة تحقق نهائية ترفض أي رابط غير
+        # صالح قبل بناء التنبيه. فشل أي استراتيجية لا يوقف البقية، وفشل
+        # المُحلّل كله يترك المخرجات كما كانت حرفياً (فشل-آمن).
+        nav_sender_username: Optional[str] = None
+        try:
+            nav_sender_username = await _nav_resolver.enrich_alert_navigation(
+                monitor=self, data=data, chat_info=chat_info,
+                event_chat_username=chat_username, send_client=send_client,
+            )
+        except Exception as nav_err:
+            logger.debug(f"nav_resolver skipped [{account_name}]: {type(nav_err).__name__}")
+            try:
+                _nav_resolver.verify_navigation(chat_info, sender_username, sender_id)
+            except Exception:
+                pass
         # v10.3: أُزيلت شارة ثقة المرسل (v10.0) — التنسيق عاد لـ v9.37 المستقر
-        sender = {"id": sender_id, "display": display_name, "username": sender_username, "access_hash": sender_access_hash}
+        sender = {"id": sender_id, "display": display_name,
+                  "username": nav_sender_username or sender_username,
+                  "access_hash": sender_access_hash}
         alert_text, buttons = self._build_alert(sender, chat_info, keyword, text, analysis)
         user_media = data.get("media_object")
         async def _send_alert_payload(

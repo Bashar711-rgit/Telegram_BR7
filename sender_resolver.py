@@ -753,6 +753,26 @@ class SenderResolver:
         self._inc("sender_resolve_failure")
         return ResolveResult(reason=reason, attempts=attempts)
 
+    def cached_username(self, sender_id: Any) -> Optional[str]:
+        """v10.5 navigation helper: username from the shared entity cache.
+
+        A username is GLOBAL truth (valid from any account's view), so a
+        cached entity resolved by a different account is safe to use FOR
+        LINK BUILDING ONLY. access_hash is per-account knowledge and is
+        deliberately NOT exposed here — cross-account hashes must never be
+        reused as API input (the mention ladder's per-account store owns
+        that path). Pure in-memory read; never raises; never hits network.
+        """
+        try:
+            if not sender_id:
+                return None
+            ent = self._entity_cache.get(int(sender_id))
+            if ent is not None:
+                return _clean_username(getattr(ent, "username", None))
+        except Exception:
+            pass
+        return None
+
     async def fetch_event_sender(self, event: Any, client: TelegramClient) -> Optional[Any]:
         """
         Resolve the User entity for a NewMessage whose .sender is None.

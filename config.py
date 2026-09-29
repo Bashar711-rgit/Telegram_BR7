@@ -473,6 +473,11 @@ class _ConfigData:
     SENDER_MENTION_FIX_ENABLED: bool
     MENTION_NEG_TTL_SECONDS: int
     MENTION_MAX_TIERS_PER_CANDIDATE: int
+
+    # ── v10.5 Alert Navigation Resolver (backend-only — alert format FROZEN) ──
+    # الحلّ متعدد الاستراتيجيات للأزرار الثلاثة (المرسل/المجموعة/عرض الرسالة).
+    # يقرر فقط البيانات التي تُغذّي البانِر المتجمّد — لا يغيّر الشكل أبداً.
+    NAV_EXPORT_LINK_ENABLED: bool
     # Telethon client: replay missed updates after reconnect + parallel updates
     TELEGRAM_CATCH_UP: bool
     # حدثي: استيقاظ حلقة الطابور فور الإدراج بدل polling ثابت
@@ -831,6 +836,8 @@ class Config:
             SENDER_MENTION_FIX_ENABLED=SecretManager.get_bool("SENDER_MENTION_FIX_ENABLED", True),
             MENTION_NEG_TTL_SECONDS=SecretManager.get_int("MENTION_NEG_TTL_SECONDS", 300, required=False),
             MENTION_MAX_TIERS_PER_CANDIDATE=SecretManager.get_int("MENTION_MAX_TIERS_PER_CANDIDATE", 3, required=False),
+            # ── v10.5 Alert Navigation Resolver (فشل-آمن؛ الإيقاف يترك الروابط كما كانت) ──
+            NAV_EXPORT_LINK_ENABLED=SecretManager.get_bool("NAV_EXPORT_LINK_ENABLED", True),
             TELEGRAM_CATCH_UP=SecretManager.get_bool("TELEGRAM_CATCH_UP", True),
             QUEUE_EVENT_WAKE=SecretManager.get_bool("QUEUE_EVENT_WAKE", True),
             ALERT_LATENCY_LOG_EVERY=SecretManager.get_int("ALERT_LATENCY_LOG_EVERY", 100, required=False),
