@@ -495,9 +495,9 @@ async def test_do_send_advances_to_next_tier_on_invalid(db):
     assert ius and ius[0].user_id == data["sender_id"]
     # the winning tier must NOT carry the hash the account rejected
     assert getattr(ius[0], "access_hash", None) != GOOD_HASH
-    # wire text is the parsed frozen message: same content & field order
-    assert "أحمد" in final["text"] and "الرسالة:" in final["text"]
-    assert "👤:" in final["text"]
+    # wire text is the parsed v10.8 message: same content & field order
+    assert "أحمد" in final["text"] and "المرسل : ID 555000201" in final["text"]
+    assert "👤" in final["text"]
 
 
 @pytest.mark.asyncio
@@ -636,7 +636,9 @@ async def test_add_to_queue_signals_wakeup_event(db):
 @pytest.mark.asyncio
 async def test_alert_builder_output_is_mention_fixable(db):
     """The REAL _build_alert output must be fixable by the mention builder
-    without any text change — the frozen contract, verified end-to-end."""
+    without any text change — the frozen contract, verified end-to-end.
+    v10.8: النمط الجديد — مرساة tg://user?id= تبقى في سطر 👤 فيُعيد
+    build_mention_entities استبدالها بـmention حقيقي."""
     m = _monitor(db, "Account 1", FakeClient("Account 1"))
     sender = {"id": SENDER_ID, "display": "أحمد", "username": None, "access_hash": GOOD_HASH}
     chat = {"entity": None, "title": "مجموعة", "group_link": "#", "msg_link": "#",
@@ -649,9 +651,8 @@ async def test_alert_builder_output_is_mention_fixable(db):
     mentions = _entities_by_type(out[1], InputMessageEntityMentionName)
     assert len(mentions) == 1
     assert mentions[0].user_id.access_hash == GOOD_HASH
-    # the group card blockquote survived untouched
-    from telethon.tl.types import MessageEntityBlockquote
-    assert _entities_by_type(out[1], MessageEntityBlockquote)
+    # v10.8: النمط الجديد بلا blockquote — الاسم نفسه صار الـmention
+    assert "أحمد" in out[0]
 
 
 @pytest.mark.asyncio

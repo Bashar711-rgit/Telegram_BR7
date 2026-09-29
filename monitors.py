@@ -150,6 +150,37 @@ v10.7 (this pass) — SENDER ACCESS REGISTRY: كل اسم مرسل قابل لل
     النص. البناء الكامل للأزرار محفوظ خلف ALERT_BUTTONS_ENABLED (افتراضي
     false). منطق الفلترة والـrate limiter لم يُمَسّا.
 
+v10.8 (this pass) — ALERT BOT + النمط الجديد للتنبيهات (الشكل المطلوب
+حرفياً في المواصفة والصورة):
+  * شكل جديد (parse_mode=HTML) لكل تنبيه يصل TARGET_GROUP_ID:
+      سطر 1: 👤 {SENDER}        — username: <a href="https://t.me/U">@U</a>
+                                 بدونه: <a href="tg://user?id=ID">الاسم</a>
+      سطر 2: <b>المرسل :</b> ID {sender_id}
+      (سطر فارغ) <b>نص الرسالة :</b>\n{text escape_html + truncate(400)}
+      <b>رابط الرسالة :</b> {t.me/{u}/{id} | t.me/c/{inner}/{id} | غير متاح}
+  * الإرسال كله يمر عبر alert_bot.AlertBot.send(data, analysis) من
+    _send_alert: Bot API sendMessage بـ aiohttp — chat_id=TARGET_GROUP_ID,
+    parse_mode="HTML", link_preview_options={"is_disabled": true},
+    reply_markup={"inline_keyboard": [[زر المرسل، جروب]]} (صف واحد).
+    زر «جروب» يُحذف إن لم يوجد رابط؛ زر المرسل @USERNAME أو الاسم
+    (tg://user?id=). المراقبون يستمعون ويبنون البيانات فقط.
+  * معالجة أخطاء البوت: 429 → انتظار retry_after وإعادة (≤3)؛
+    BUTTON_USER_INVALID/BUTTON_USER_PRIVACY_RESTRICTED → إعادة بدون زر
+    المرسل (الرابط يبقى في النص وزر «جروب» يبقى)؛ أي فشل آخر أو غياب
+    ALERT_BOT_TOKEN → fallback لمسار حسابات المستخدمين بنفس نص التنبيه
+    بدون أزرار مع تسجيل السبب (rate_limiter/circuit breaker كما هم).
+  * alerts.contact_method (عمود v10.7 نفسه): username | mention_button |
+    text_only لمسار البوت، والقيم السابقة (username | mention | forward |
+    link) لمسار الـfallback.
+  * فحص عضوية بوت التنبيهات في TARGET_GROUP_ID عند الإقلاع (getChatMember
+    في main.py) — تحذير واضح إن لم يكن عضواً (يفضل أدمن).
+  * حذف Button.inline/Button.url (cnt_/copy_) من بناء التنبيه بالكامل —
+    معالجاتها في main.py تبقى (ميزة الرد اليدوي لم تُحذف). جمع بيانات
+    المرسل من v10.7 (get_sender/usernames المتعددة/تمرير msg_link و
+    group_link إلى upsert_sender_contact) كما هو دون أي مساس.
+  * build_dynamic_buttons كدالة ميزة محفوظة لم يُحذف — لم يعد يُستخدم في
+    مسار التنبيهات. الفلترة والـrate limiter لم يُمَسّا.
+
 See the accompanying engineering report for the full list of changes,
 the retry_count propagation fix (process_event_from_queue / _send_alert),
 and documented FOLLOW-UP items for other files.
@@ -215,6 +246,7 @@ from nav_resolver import nav_resolver as _nav_resolver  # v10.5 navigation multi
 from nav_resolver import is_valid_username as _nav_valid_username      # v10.5 link validation
 from nav_resolver import private_supergroup_inner_id as _nav_inner_id  # v10.5 -100 id guard
 from nav_resolver import harden_sender_anchor as _nav_harden_anchor    # v10.6 guaranteed-reachable anchor
+from alert_bot import build_alert_html as _build_alert_v108            # v10.8 alert format + AlertBot buttons
 
 
 # (نفس الدوال المساعدة من النسخة الأصلية: resolve_chat_entity, build_telegram_links)
@@ -1197,66 +1229,44 @@ class EnhancedAccountMonitor:
 
 
     def _build_alert(self, sender: Dict, chat: Dict, keyword: str, text: str, analysis: Dict = None) -> Tuple[str, Optional[List]]:
-        safe_text = InputSanitizer.escape_html(InputSanitizer.truncate(text, 400))
-        sender_id = sender.get("id", 0); display_name = sender.get("display", "مستخدم")
-        username = sender.get("username", None); access_hash = sender.get("access_hash", None)
-        message_html = safe_text; sender_link = display_name
-        if username:
-            clean_uname = username.lstrip('@'); sender_link = f'<a href="https://t.me/{clean_uname}">{display_name}</a>'
-        elif sender_id:
-            if access_hash: sender_link = f'<a href="tg://openmessage?user_id={sender_id}">{display_name}</a>'
-            else: sender_link = f'<a href="tg://user?id={sender_id}">{display_name}</a>'
-        group_link = chat.get("group_link", "#"); chat_title = chat.get("title"); msg_link = chat.get("msg_link", "#")
-        if chat_title and chat_title != "غير معروف" and group_link != "#":
-            group_html = f'<a href="{group_link}">{chat_title}</a>'
-            msg_html = f'<a href="{msg_link}"><b>عرض الرسالة الأصلية</b></a>' if msg_link != "#" else "الرابط غير متاح"
-            group_card = f'<blockquote dir="rtl">{group_html}\n\n{msg_html}</blockquote>'
-        else:
-            msg_html = f'<a href="{msg_link}"><b>عرض الرسالة الأصلية</b></a>' if msg_link != "#" else "الرابط غير متاح"
-            group_card = f'<blockquote dir="rtl">{msg_html}</blockquote>'
-        rule_tag_html = ""
-        rule_tag = (analysis or {}).get("rule_tag") if isinstance(analysis, dict) else None
-        if rule_tag:
-            rule_tag_html = f'<blockquote dir="rtl">🏷 قاعدة: {InputSanitizer.escape_html(str(rule_tag))}</blockquote>\n\n'
-        # ── v10.3: استعادة تنسيق v9.37 المستقر حرفياً ──
-        # حذف سطر «🎯 التصنيف» وشارة «✅ موثوق» اللذين أضافهما v10.0 —
-        # المستخدم يريد شكل الرسالة السابق: الرسالة + المرسل + بطاقة
-        # المجموعة فقط (مع سطر القاعدة التاريخي كما كان).
-        alert = (f"{rule_tag_html}<b>الرسالة:</b>\n{message_html}\n\n👤: {sender_link}\n\n{group_card}")
-        # v9.11: الأزرار الثلاثة المطلوبة في صفّين:
-        #   [ عرض الرسالة ] [ تواصل مع المرسل ]
-        #   [ مراسلة ] [ 📋 نسخ النص ]
-        # الزر الذي تفتقر بياناته لا يُعرض إطلاقاً (لا أزرار مكسورة).
-        # زر النسخ (ميزة قائمة) يُضاف للصف الثاني عند تفعيل
-        # CFG.ALERT_WITH_COPY_BUTTON، وزر التواصل قابل للتعطيل عبر
-        # CFG.ALERT_WITH_CONTACT_BUTTON (كلاهما حي من لوحة التحكم).
-        buttons = None
-        # ══ v10.7 §5: أزيلت Button.inline/Button.url من التنبيه ══
-        # حسابات المستخدمين لا ترسل أزراراً (تظهر فقط عند البوتات) —
-        # التنبيهات تعتمد روابط النص (اسم المرسل/المجموعة/عرض الرسالة).
-        # البناء الكامل للأزرار محفوظ هنا خلف ALERT_BUTTONS_ENABLED
-        # (افتراضي false — مفتاح قتل حي من البيئة) كي لا تُحذف أي ميزة.
-        if getattr(CFG, "ALERT_BUTTONS_ENABLED", False) and CFG.ALERT_WITH_BUTTONS:
-            dynamic = build_dynamic_buttons(
-                sender={
-                    "id": sender_id,
-                    "username": username,
-                },
-                chat={
-                    "id": chat.get("id"),
-                    "message_id": chat.get("message_id"),
-                    "username": chat.get("username"),
-                },
-                msg_hash=(analysis or {}).get("msg_hash"),
-            )
-            rows = [list(r) for r in dynamic] if dynamic else []
-            if CFG.ALERT_WITH_COPY_BUTTON and rows:
-                rows[-1].append(Button.inline("📋 نسخ النص", f"copy_{(analysis or {}).get('msg_hash', '')}"))
-            elif CFG.ALERT_WITH_COPY_BUTTON:
-                rows.append([Button.inline("📋 نسخ النص", f"copy_{(analysis or {}).get('msg_hash', '')}")])
-            if rows:
-                buttons = rows
-        return alert, buttons
+        """══ v10.8 — النمط الجديد المطلوب حرفياً (parse_mode=HTML) ══
+
+            سطر 1:  👤 {SENDER}
+            سطر 2:  <b>المرسل :</b> ID {sender_id}
+            (سطر فارغ)
+            <b>نص الرسالة :</b>
+            {text}        <- escape_html + truncate(400)
+            <b>رابط الرسالة :</b> {msg_link}  <- أو «غير متاح»
+
+        SENDER: username → <a href="https://t.me/U">@U</a>؛ بدونه
+        <a href="tg://user?id=ID">الاسم الكامل</a>.
+
+        العائد دائماً (نص, None): حسابات المستخدمين لا ترسل أزراراً —
+        الأزرار [المرسل][جروب] (inline URL في صف واحد) يبنيها ويرسلها بوت
+        التنبيهات (alert_bot.AlertBot) في مسار الإرسال عبر Bot API. زر
+        «جروب» يُحذف إن لم يوجد رابط. حُذف من هذا البانِر Button.inline/
+        Button.url (cnt_/copy_) بالكامل حسب المواصفة (معالجات main.py
+        بقيت لميزة الرد اليدوي). سطر «🏷 قاعدة» (محرك القواعد — ميزة
+        قائمة) يُلاحق عند وجوده فقط في نهاية التنبيه.
+        """
+        data_view = {
+            "sender_id": sender.get("id", 0) or 0,
+            "sender_username": sender.get("username"),
+            "sender_usernames": sender.get("usernames"),
+            "sender_display": sender.get("display"),
+            "text": text,
+            "chat_id": chat.get("id"),
+            "message_id": chat.get("message_id"),
+            "chat_username": chat.get("username"),
+        }
+        built = _build_alert_v108(
+            data_view, analysis,
+            msg_link=chat.get("msg_link"),
+            group_link=chat.get("group_link"),
+        )
+        # v10.8: الأزرار من حسابات المستخدمين محذوفة — Bot API فقط.
+        # (بناء الأزرار القديم محفوظ في build_dynamic_buttons كدالة ميزة.)
+        return built["text"], None
 
 
     async def connect(self) -> bool:
@@ -2730,7 +2740,9 @@ class EnhancedAccountMonitor:
         # v10.3: أُزيلت شارة ثقة المرسل (v10.0) — التنسيق عاد لـ v9.37 المستقر
         sender = {"id": sender_id, "display": display_name,
                   "username": nav_sender_username or sender_username,
-                  "access_hash": sender_access_hash}
+                  "access_hash": sender_access_hash,
+                  # v10.8: كل usernames المرسل النشطة (تغذي زر/رابط t.me)
+                  "usernames": data.get("sender_usernames")}
         alert_text, buttons = self._build_alert(sender, chat_info, keyword, text, analysis)
         # ══ v10.7 §2: تمرير روابط الرسالة/المجموعة إلى upsert ══
         # sender_contacts في _analyze_and_alert (كانا يُحفظان NULL دائماً).
@@ -2858,6 +2870,47 @@ class EnhancedAccountMonitor:
                         f"forward supplement failed [{account_name}]: {type(fe).__name__}: {str(fe)[:120]}"
                     )
             return False
+
+        # ══ v10.8: بوت التنبيهات — الإرسال عبر Bot API (النمط الجديد) ══
+        # الإرسال كله يمر عبر AlertBot.send(data, analysis): رسالة التنبيه
+        # مرّت فعلاً عبر dedup + rate_limiter + similarity أعلاه (كما هي)،
+        # ومسار الـfallback التالي يمر عبر circuit breaker (_send_cb) كما
+        # هو. الحسابات تستمع وتبني البيانات فقط — الأزرار [المرسل][جروب]
+        # تصل عبر البوت. أي فشل/غياب توكن → الـfallback بنفس النص بدون
+        # أزرار مع تسجيل السبب (شرط القبول 6).
+        alert_bot = getattr(self._bot_ref, "alert_bot", None) if self._bot_ref is not None else None
+        if alert_bot is not None and getattr(alert_bot, "enabled", False):
+            try:
+                _ok, _method, _reason = await alert_bot.send(
+                    data, analysis,
+                    msg_link=chat_info.get("msg_link"),
+                    group_link=chat_info.get("group_link"),
+                    chat_username=chat_username,
+                    sender_username=sender.get("username"),
+                )
+                if _ok:
+                    logger.info(
+                        f"🤖 Alert delivered via AlertBot [{account_name}] | "
+                        f"sender={sender_id} | contact_method={_method}"
+                    )
+                    # الوسائط لا تُرسل عبر sendMessage — forward supplement
+                    # (ميزة v10.7 القائمة) يضمن وصول الوسائط لقناة الهدف.
+                    if user_media is not None:
+                        await _forward_supplement(None)
+                    await self._record_sent_alert(
+                        None, data, msg_hash, account_name, keyword, alert_text,
+                        chat_id, sender_id, display_name, contact_method=_method,
+                    )
+                    return
+                logger.warning(
+                    f"AlertBot failed → user-account fallback [{account_name}] "
+                    f"(msg_hash={msg_hash}): {_reason}"
+                )
+            except Exception as _ab_err:
+                logger.warning(
+                    f"AlertBot error → user-account fallback [{account_name}]: "
+                    f"{type(_ab_err).__name__}: {str(_ab_err)[:150]}"
+                )
 
         async def do_send():
             """══ v10.7 §3: سلسلة المستويات — توقف عند أول نجاح مُتحقَّق منه ══

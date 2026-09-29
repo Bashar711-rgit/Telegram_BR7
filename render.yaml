@@ -487,6 +487,21 @@ services:
         value: "true"
 
       # ════════════════════════════════════════════════════════════
+      # v10.8 — بوت التنبيهات (@alzariqi711r_bot)
+      # 1) البوت: @alzariqi711r_bot
+      # 2) أضف البوت إلى TARGET_GROUP_ID (يفضل رفعه أدمن) كي يرسل التنبيهات
+      # 3) ضع التوكن في لوحة تحكم Render > Environment (sync: false):
+      #    ALERT_BOT_TOKEN = توكن @alzariqi711r_bot من BotFather
+      # غياب التوكن أو فشل البوت → fallback تلقائي لحسابات المستخدمين
+      # بنفس نص التنبيه بدون أزرار (بلا أعطال).
+      # ════════════════════════════════════════════════════════════
+      - key: ALERT_BOT_TOKEN
+        sync: false
+
+      - key: ALERT_BOT_ENABLED
+        value: "true"
+
+      # ════════════════════════════════════════════════════════════
       # Anti-Spam (v9.11 — Watch List → Confirmation → Permanent Ignore)
       # ════════════════════════════════════════════════════════════
       - key: ANTISPAM_ENABLED

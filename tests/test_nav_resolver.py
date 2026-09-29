@@ -427,28 +427,21 @@ class TestFrozenBuilderIntegration:
         assert "https://t.me/c/1234567890/456" in urls
 
     async def test_alert_from_enriched_chat_info(self, monitor):
-        """التنبيه النهائي من بيانات مُحلّى: بطاقة مجموعة كاملة + أزرار صحيحة
-        — الشكل المجمد حرفياً (نفس الحقول/الترتيب/الصيغ).
+        """التنبيه النهائي من بيانات مُحلّى: رابط المرسل + رابط الرسالة
+        المحلَّل يظهران في النمط الجديد (v10.8).
 
-        v10.7 §5: الأزرار معطلة افتراضياً على تنبيهات حسابات المستخدمين
-        (ALERT_BUTTONS_ENABLED=False) — الاختبار يفعّلها صراحة للتحقق من
-        الشكل التاريخي، وروابط النص نفسها موجودة دائماً في التنبيه."""
-        from config import CFG as _CFG
-        old = getattr(_CFG, "ALERT_BUTTONS_ENABLED", False)
-        try:
-            object.__setattr__(_CFG, "ALERT_BUTTONS_ENABLED", True)
-            sender = {"id": 777000111, "display": "أحمد", "username": "ahmed_99", "access_hash": None}
-            chat = {"entity": None, "title": "مجموعة الطلاب", "id": -1001234567890,
-                    "message_id": 789, "username": "mygroup",
-                    "group_link": "https://t.me/mygroup", "msg_link": "https://t.me/mygroup/789"}
-            alert, buttons = monitor._build_alert(sender, chat, "واجب", "نص التنبيه", {"msg_hash": "h1"})
-            assert '<a href="https://t.me/ahmed_99">أحمد</a>' in alert
-            assert '<a href="https://t.me/mygroup">مجموعة الطلاب</a>' in alert
-            assert '<a href="https://t.me/mygroup/789"><b>عرض الرسالة الأصلية</b></a>' in alert
-            urls = [s for row in buttons or [] for s in _all_specs(row)]
-            assert "https://t.me/mygroup/789" in urls  # زر عرض الرسالة
-        finally:
-            object.__setattr__(_CFG, "ALERT_BUTTONS_ENABLED", old)
+        v10.8: النمط الجديد — username كرابط @U، رابط الرسالة المحلَّل
+        يظهر كسطر «رابط الرسالة :»، والأزرار من بوت التنبيهات فقط
+        (buttons=None من حسابات المستخدمين)."""
+        sender = {"id": 777000111, "display": "أحمد", "username": "ahmed_99", "access_hash": None}
+        chat = {"entity": None, "title": "مجموعة الطلاب", "id": -1001234567890,
+                "message_id": 789, "username": "mygroup",
+                "group_link": "https://t.me/mygroup", "msg_link": "https://t.me/mygroup/789"}
+        alert, buttons = monitor._build_alert(sender, chat, "واجب", "نص التنبيه", {"msg_hash": "h1"})
+        assert '<a href="https://t.me/ahmed_99">@ahmed_99</a>' in alert
+        # رابط الرسالة المحلَّل (بوابة v10.5) يظهر كسطر الرابط
+        assert '<b>رابط الرسالة :</b> <a href="https://t.me/mygroup/789">https://t.me/mygroup/789</a>' in alert
+        assert buttons is None  # الأزرار من بوت التنبيهات فقط
 
     async def test_no_username_uses_recovered_db_username(self, monitor):
         """مرسل بلا username في الحدث لكن له اسم محفوظ → الرابط t.me بدل
@@ -458,7 +451,7 @@ class TestFrozenBuilderIntegration:
                 "message_id": 456, "username": None,
                 "group_link": "https://t.me/c/1234567890", "msg_link": "https://t.me/c/1234567890/456"}
         alert, _ = monitor._build_alert(sender, chat, "ك", "نص", {"msg_hash": "h2"})
-        assert '<a href="https://t.me/recovered_user">سارة</a>' in alert
+        assert '<a href="https://t.me/recovered_user">@recovered_user</a>' in alert
 
 
 # ═══════════════════════════════════════════════════════════════════════════

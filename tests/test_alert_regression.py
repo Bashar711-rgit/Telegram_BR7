@@ -1,30 +1,35 @@
 """Alert regression tests (engineering brief requirement #41).
 
 🚨 THE CONTRACT: the user-facing alert output must be stable across
-deploys. These tests pin the EXACT expected strings/buttons produced by
+deploys. These tests pin the EXACT expected text/buttons produced by
 the current code.
 
-⚠️ v9.11 (2026-09) — GOLDEN UPDATED BY EXPLICIT USER REQUEST (المرحلة الأولى):
-الأزرار تغيّرت من صف واحد
-    [ 💬 مراسلة ] [ 📨 عرض الرسالة ] [ 📋 نسخ النص ]
-إلى صفّين بالتسميات المطلوبة حرفياً:
-    الصف 1: [ عرض الرسالة ] [ تواصل مع المرسل ]
-    الصف 2: [ مراسلة ] [ 📋 نسخ النص ]
-بقواعد:
-  * عرض الرسالة: t.me/{chat}/{msg} عامة أو t.me/c/{inner}/{msg} خاصة
-  * تواصل مع المرسل: inline callback (cnt_{msg_hash}) → قائمة الرسائل الجاهزة
-  * مراسلة: t.me/{username} عند توفره، وإلا tg://openmessage?user_id=
-  * الزر الذي تفتقر بياناته لا يُعرض إطلاقاً (لا أزرار مكسورة)
-  * زر النسخ (ميزة قائمة من v9.10) انتقل للصف الثاني — لم يُحذف
-نص التنبيه HTML نفسه لم يتغير إطلاقاً (نفس الحقول، نفس الترتيب، نفس
-الروابط داخل النص).
+⚠️ v10.8 (2026-09) — GOLDEN UPDATED BY EXPLICIT USER REQUEST (النمط الجديد):
+شكل التنبيه تغيّر بالكامل إلى الصيغة المطلوبة حرفياً (parse_mode=HTML):
+
+    سطر 1:  👤 {SENDER}
+    سطر 2:  <b>المرسل :</b> ID {sender_id}
+    (سطر فارغ)
+    <b>نص الرسالة :</b>
+    {text}        <- escape_html + truncate(400)
+    <b>رابط الرسالة :</b> {msg_link}   <- أو النص "غير متاح" إن لم يوجد رابط
+
+SENDER:
+  - username:  <a href="https://t.me/USERNAME">@USERNAME</a>
+  - بدونه:     <a href="tg://user?id=ID">الاسم الكامل</a>
+
+msg_link:
+  - قروب عام:  https://t.me/{username}/{message_id}
+  - قروب خاص:  https://t.me/c/{inner}/{message_id}
+  - غير ذلك:   «غير متاح»
+
+الأزرار (v10.8): حسابات المستخدمين لا ترسل أزراراً — _build_alert يعيد
+buttons=None دائماً. زرا [المرسل][جروب] (inline URL في صف واحد) يبنيهما
+alert_bot.build_alert_html ويرسلهما بوت التنبيهات عبر Bot API — اختبارات
+الذهب للأزرار هنا تثبّت بناء البوت.
 
 If ANY of these tests fail, the alert format changed and the release
-must be considered broken. Labels, order, URLs and callback data are
-all verified.
-
-ملاحظة توافق: مساعد مواصفات الأزرار يعمل مع Telethon القديم
-(KeyboardButtonUrl/KeyboardButtonCallback) والجديد (KeyboardInlineButton).
+must be considered broken. Labels, order and URLs are all verified.
 """
 
 import os
@@ -35,115 +40,70 @@ PROJECT_DIR = Path(__file__).resolve().parent.parent
 if str(PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR))
 
-from telethon import Button  # noqa: E402
-
 from config import CFG  # noqa: E402
 from monitors import EnhancedAccountMonitor  # noqa: E402
+from alert_bot import build_alert_html  # noqa: E402
 
 import pytest  # noqa: E402
 
 
-def _btn_spec(b):
-    """(kind, text, url-or-data) — version-agnostic across Telethon generations."""
-    t = getattr(b, "type", None)
-    if t is not None and hasattr(t, "url") and getattr(t, "url", None):
-        return ("url", b.text, t.url)
-    if t is not None and hasattr(t, "data"):
-        d = t.data
-        return ("callback", b.text, d.decode() if isinstance(d, bytes) else d)
-    if getattr(b, "url", None):
-        return ("url", b.text, b.url)
-    d = getattr(b, "data", None)
-    if d is not None:
-        return ("callback", b.text, d.decode() if isinstance(d, bytes) else d)
-    return (type(b).__name__, getattr(b, "text", None), None)
-
-
-def _button_specs(buttons):
-    """[(kind, text, url, callback-data)] for every row, order-preserved."""
-    specs = []
-    for row in buttons or []:
-        specs.append([_btn_spec(b) for b in row])
-    return specs
-
-
-# ── GOLDEN OUTPUT (v9.11 three requested buttons — two rows) ────────────
+# ── GOLDEN OUTPUT (v10.8 — النمط الجديد المطلوب حرفياً) ────────────────
 GOLDEN = {
     "S1_username_chat": {
         "alert": (
-            '<b>الرسالة:</b>\nأبي مساعدة في واجب الاحصاء ضروري\n\n'
-            '👤: <a href="https://t.me/ahmed_99">أحمد محمد</a>\n\n'
-            '<blockquote dir="rtl"><a href="https://t.me/mygroup">مجموعة الطلاب</a>\n\n'
-            '<a href="https://t.me/mygroup/123"><b>عرض الرسالة الأصلية</b></a></blockquote>'
+            '👤 <a href="https://t.me/ahmed_99">@ahmed_99</a>\n'
+            '<b>المرسل :</b> ID 555000111\n'
+            '\n'
+            '<b>نص الرسالة :</b>\n'
+            'أبي مساعدة في واجب الاحصاء ضروري\n'
+            '<b>رابط الرسالة :</b> <a href="https://t.me/mygroup/123">https://t.me/mygroup/123</a>'
         ),
-        # username + مجموعة عامة → الصفان الكاملان
-        "buttons": [
-            [
-                ("url", "عرض الرسالة", "https://t.me/mygroup/123"),
-                ("callback", "تواصل مع المرسل", "cnt_abc123"),
-            ],
-            [
-                ("url", "مراسلة", "https://t.me/ahmed_99"),
-                ("callback", "📋 نسخ النص", "copy_abc123"),
-            ],
+        # أزرار بوت التنبيهات: [زر المرسل][جروب] في صف واحد
+        "bot_buttons": [
+            {"text": "@ahmed_99", "url": "https://t.me/ahmed_99"},
+            {"text": "جروب", "url": "https://t.me/mygroup"},
         ],
     },
     "S2_private_chat": {
         "alert": (
-            '<b>الرسالة:</b>\nأبي مساعدة في واجب الاحصاء ضروري\n\n'
-            '👤: <a href="tg://user?id=777000222">سارة</a>\n\n'
-            '<blockquote dir="rtl"><a href="https://t.me/c/1234567890">مجموعة خاصة</a>\n\n'
-            '<a href="https://t.me/c/1234567890/456"><b>عرض الرسالة الأصلية</b></a></blockquote>'
+            '👤 <a href="tg://user?id=777000222">سارة</a>\n'
+            '<b>المرسل :</b> ID 777000222\n'
+            '\n'
+            '<b>نص الرسالة :</b>\n'
+            'أبي مساعدة في واجب الاحصاء ضروري\n'
+            '<b>رابط الرسالة :</b> <a href="https://t.me/c/1234567890/456">https://t.me/c/1234567890/456</a>'
         ),
-        # لا username → مراسلة تقود الآن (v10.6) لرابط الرسالة المصدر
-        # (HTTPS مضمون على كل العملاء → لمس صورة المرسل يفتح ملفه)،
-        # بدل openmessage الذي يعمل على ديسكتوب فقط. النص مجمد حرفياً.
-        "buttons": [
-            [
-                ("url", "عرض الرسالة", "https://t.me/c/1234567890/456"),
-                ("callback", "تواصل مع المرسل", "cnt_abc123"),
-            ],
-            [
-                ("url", "مراسلة", "https://t.me/c/1234567890/456"),
-                ("callback", "📋 نسخ النص", "copy_abc123"),
-            ],
+        "bot_buttons": [
+            {"text": "سارة", "url": "tg://user?id=777000222"},
+            {"text": "جروب", "url": "https://t.me/c/1234567890"},
         ],
     },
     "S3_no_username_hash": {
         "alert": (
-            '<b>الرسالة:</b>\nأبي مساعدة في واجب الاحصاء ضروري\n\n'
-            '👤: <a href="tg://openmessage?user_id=888000333">خالد</a>\n\n'
-            '<blockquote dir="rtl">الرابط غير متاح</blockquote>'
+            '👤 <a href="tg://user?id=888000333">خالد</a>\n'
+            '<b>المرسل :</b> ID 888000333\n'
+            '\n'
+            '<b>نص الرسالة :</b>\n'
+            'أبي مساعدة في واجب الاحصاء ضروري\n'
+            '<b>رابط الرسالة :</b> غير متاح'
         ),
-        # بيانات ناقصة: لا chat_id/message_id → زر العرض لا يُعرض إطلاقاً
-        # (لا أزرار مكسورة) — يبقى التواصل + مراسلة + النسخ.
-        "buttons": [
-            [
-                ("callback", "تواصل مع المرسل", "cnt_abc123"),
-            ],
-            [
-                ("url", "مراسلة", "tg://openmessage?user_id=888000333"),
-                ("callback", "📋 نسخ النص", "copy_abc123"),
-            ],
+        # لا رابط قروب → زر جروب يُحذف؛ زر المرسل يبقى
+        "bot_buttons": [
+            {"text": "خالد", "url": "tg://user?id=888000333"},
         ],
     },
     "S4_unknown_title": {
         "alert": (
-            '<b>الرسالة:</b>\nأبي مساعدة في واجب الاحصاء ضروري\n\n'
-            '👤: <a href="https://t.me/user_x">مستخدم</a>\n\n'
-            '<blockquote dir="rtl"><a href="https://t.me/eng_group/789">'
-            '<b>عرض الرسالة الأصلية</b></a></blockquote>'
+            '👤 <a href="https://t.me/user_x">@user_x</a>\n'
+            '<b>المرسل :</b> ID 999000444\n'
+            '\n'
+            '<b>نص الرسالة :</b>\n'
+            'أبي مساعدة في واجب الاحصاء ضروري\n'
+            '<b>رابط الرسالة :</b> <a href="https://t.me/eng_group/789">https://t.me/eng_group/789</a>'
         ),
-        # username + مجموعة عامة → الصفان الكاملان (حتى مع title="غير معروف")
-        "buttons": [
-            [
-                ("url", "عرض الرسالة", "https://t.me/eng_group/789"),
-                ("callback", "تواصل مع المرسل", "cnt_abc123"),
-            ],
-            [
-                ("url", "مراسلة", "https://t.me/user_x"),
-                ("callback", "📋 نسخ النص", "copy_abc123"),
-            ],
+        "bot_buttons": [
+            {"text": "@user_x", "url": "https://t.me/user_x"},
+            {"text": "جروب", "url": "https://t.me/eng_group"},
         ],
     },
 }
@@ -160,23 +120,20 @@ def monitor():
     return EnhancedAccountMonitor(account, db=None, flt=None)
 
 
+def _sender_button_of(built):
+    return built["sender_button"]
+
+
+def _group_button_of(built):
+    return built["group_button"]
+
+
 class TestAlertRegression:
     """EXPECTED_ALERT == ACTUAL_ALERT at 100% (brief #41).
 
-    v10.7 §5: حسابات المستخدمين لا ترسل أزراراً — _build_alert يعيد
-    buttons=None افتراضياً (ALERT_BUTTONS_ENABLED=False). بناء الأزرار
-    الكامل محفوظ خلف المفتاح: هذه الاختبارات تُفعّله صراحة للتحقق من أن
-    الشكل الذهبي للأزرار لم يتغير، مع اختبار جديد يؤكد السلوك الافتراضي
-    (لا أزرار على التنبيهات).
+    v10.8: النمط الجديد عبر alert_bot.build_alert_html. حسابات المستخدمين
+    لا ترسل أزراراً إطلاقاً (buttons=None) — الأزرار من بوت التنبيهات.
     """
-
-    @pytest.fixture(autouse=True)
-    def _buttons_enabled(self):
-        """فعّل الأزرار فقط لاختبارات الشكل الذهبي التاريخية."""
-        old = getattr(CFG, "ALERT_BUTTONS_ENABLED", False)
-        object.__setattr__(CFG, "ALERT_BUTTONS_ENABLED", True)
-        yield
-        object.__setattr__(CFG, "ALERT_BUTTONS_ENABLED", old)
 
     @pytest.mark.asyncio
     async def test_s1_username_chat(self, monitor):
@@ -189,7 +146,13 @@ class TestAlertRegression:
         }
         alert, buttons = monitor._build_alert(sender, chat, "واجب", TEXT, {"msg_hash": "abc123"})
         assert alert == GOLDEN["S1_username_chat"]["alert"]
-        assert _button_specs(buttons) == GOLDEN["S1_username_chat"]["buttons"]
+        assert buttons is None
+        built = build_alert_html(
+            {"sender_id": 555000111, "sender_username": "ahmed_99", "sender_display": "أحمد محمد", "text": TEXT,
+             "chat_id": -1001234567890, "message_id": 123, "chat_username": "mygroup"},
+            msg_link="https://t.me/mygroup/123", group_link="https://t.me/mygroup",
+        )
+        assert [_sender_button_of(built), _group_button_of(built)] == GOLDEN["S1_username_chat"]["bot_buttons"]
 
     @pytest.mark.asyncio
     async def test_s2_private_chat(self, monitor):
@@ -200,7 +163,13 @@ class TestAlertRegression:
         }
         alert, buttons = monitor._build_alert(sender, chat, "واجب", TEXT, {"msg_hash": "abc123"})
         assert alert == GOLDEN["S2_private_chat"]["alert"]
-        assert _button_specs(buttons) == GOLDEN["S2_private_chat"]["buttons"]
+        assert buttons is None
+        built = build_alert_html(
+            {"sender_id": 777000222, "sender_username": None, "sender_display": "سارة", "text": TEXT,
+             "chat_id": -1001234567890, "message_id": 456, "chat_username": None},
+            msg_link="https://t.me/c/1234567890/456", group_link="https://t.me/c/1234567890",
+        )
+        assert [_sender_button_of(built), _group_button_of(built)] == GOLDEN["S2_private_chat"]["bot_buttons"]
 
     @pytest.mark.asyncio
     async def test_s3_no_username_hash(self, monitor):
@@ -208,7 +177,13 @@ class TestAlertRegression:
         chat = {"group_link": "#", "title": None, "msg_link": "#"}
         alert, buttons = monitor._build_alert(sender, chat, "واجب", TEXT, {"msg_hash": "abc123"})
         assert alert == GOLDEN["S3_no_username_hash"]["alert"]
-        assert _button_specs(buttons) == GOLDEN["S3_no_username_hash"]["buttons"]
+        assert buttons is None
+        # بلا chat_id/message_id في chat → لا رابط قروب → لا زر جروب
+        built = build_alert_html(
+            {"sender_id": 888000333, "sender_username": None, "sender_display": "خالد", "text": TEXT},
+        )
+        buttons_row = [b for b in (_sender_button_of(built), _group_button_of(built)) if b]
+        assert buttons_row == GOLDEN["S3_no_username_hash"]["bot_buttons"]
 
     @pytest.mark.asyncio
     async def test_s4_unknown_title(self, monitor):
@@ -219,7 +194,13 @@ class TestAlertRegression:
         }
         alert, buttons = monitor._build_alert(sender, chat, "واجب", TEXT, {"msg_hash": "abc123"})
         assert alert == GOLDEN["S4_unknown_title"]["alert"]
-        assert _button_specs(buttons) == GOLDEN["S4_unknown_title"]["buttons"]
+        assert buttons is None
+        built = build_alert_html(
+            {"sender_id": 999000444, "sender_username": "user_x", "sender_display": "مستخدم", "text": TEXT,
+             "chat_id": -1009876543210, "message_id": 789, "chat_username": "eng_group"},
+            msg_link="https://t.me/eng_group/789", group_link="https://t.me/eng_group",
+        )
+        assert [_sender_button_of(built), _group_button_of(built)] == GOLDEN["S4_unknown_title"]["bot_buttons"]
 
     @pytest.mark.asyncio
     async def test_sender_intel_does_not_leak_into_alert(self, monitor):
@@ -239,32 +220,76 @@ class TestAlertRegression:
         assert alert == GOLDEN["S1_username_chat"]["alert"]
 
     @pytest.mark.asyncio
-    async def test_alerts_ship_without_buttons_by_default(self, monitor):
-        """v10.7 §5: حسابات المستخدمين لا ترسل أزراراً (تظهر فقط للبوتات)
-        — التنبيهات تعتمد روابط النص افتراضياً (ALERT_BUTTONS_ENABLED=False).
-        هذا الاختبار يطفئ المفتاح صراحة كي لا يتأثر بـfixture الشكل الذهبي."""
+    async def test_alerts_never_carry_buttons_from_user_accounts(self, monitor):
+        """v10.8: حُذف Button.inline/Button.url (cnt_/copy_) من بناء
+        التنبيه بالكامل — حسابات المستخدمين لا ترسل أزراراً مهما كانت
+        المفاتيح (الأزرار حصراً من بوت التنبيهات عبر Bot API)."""
         old = getattr(CFG, "ALERT_BUTTONS_ENABLED", False)
         try:
-            object.__setattr__(CFG, "ALERT_BUTTONS_ENABLED", False)
+            object.__setattr__(CFG, "ALERT_BUTTONS_ENABLED", True)
             sender = {"id": 555000111, "display": "أحمد محمد", "username": "ahmed_99", "access_hash": 7234567890123}
             chat = {
                 "group_link": "https://t.me/mygroup", "title": "مجموعة الطلاب", "msg_link": "https://t.me/mygroup/123",
                 "id": -1001234567890, "message_id": 123, "username": "mygroup",
             }
-            alert, buttons = monitor._build_alert(sender, chat, "واجب", TEXT, {"msg_hash": "abc123"})
-            # النص الذهبي كما هو حرفياً — روابط النص داخل التنبيه بديل الأزرار
-            assert alert == GOLDEN["S1_username_chat"]["alert"]
+            alert, buttons = monitor._build_alert(
+                sender, chat, "واجب", TEXT,
+                {"msg_hash": "abc123", "rule_tag": "قاعدة"},
+            )
             assert buttons is None
+            assert "cnt_abc123" not in alert
+            assert "copy_abc123" not in alert
+            # سطر القاعدة (ميزة محفوظة) يُلاحق في النهاية
+            assert "🏷 قاعدة: قاعدة" in alert
         finally:
             object.__setattr__(CFG, "ALERT_BUTTONS_ENABLED", old)
+
+    @pytest.mark.asyncio
+    async def test_bot_api_payload_shape(self, monitor):
+        """حمولة Bot API: parse_mode=HTML + link_preview_options disabled
+        + صف أزرار واحد [المرسل][جروب] (طريقة الإرسال المطلوبة حرفياً)."""
+        from alert_bot import AlertBot
+
+        class _CaptureBot(AlertBot):
+            def __init__(self):
+                super().__init__(token="1:t", chat_id=int(CFG.TARGET_GROUP_ID))
+                self.captured = None
+
+            async def _post(self, method, payload):
+                self.captured = (method, payload)
+                return 200, {"ok": True}
+
+        bot = _CaptureBot()
+        ok, method, reason = await bot.send(
+            {"sender_id": 555000111, "sender_username": "ahmed_99", "sender_display": "أحمد محمد",
+             "text": TEXT, "chat_id": -1001234567890, "message_id": 123, "chat_username": "mygroup"},
+            msg_link="https://t.me/mygroup/123", group_link="https://t.me/mygroup",
+        )
+        assert ok is True and method == "username" and reason == ""
+        m, payload = bot.captured
+        assert m == "sendMessage"
+        assert payload["chat_id"] == int(CFG.TARGET_GROUP_ID)
+        assert payload["parse_mode"] == "HTML"
+        assert payload["link_preview_options"] == {"is_disabled": True}
+        kb = payload["reply_markup"]["inline_keyboard"]
+        assert len(kb) == 1 and kb[0] == GOLDEN["S1_username_chat"]["bot_buttons"]
 
 
 @pytest.mark.asyncio
 async def test_buttons_contract_config():
     """The alert-button contract flags must be consistent (v9.11).
-    v10.7: ALERT_BUTTONS_ENABLED default False — no inline buttons on
-    user-account alerts; the legacy flags stay available behind it."""
+    v10.8: الأزرار عبر بوت التنبيهات — مفاتيح الأزرار القديمة محفوظة
+    بقيمها التاريخية (تؤثر فقط على build_dynamic_buttons المحفوظ)."""
     assert getattr(CFG, "ALERT_BUTTONS_ENABLED", None) is False
     assert CFG.ALERT_WITH_BUTTONS is True
     assert CFG.ALERT_WITH_COPY_BUTTON is True
     assert CFG.ALERT_WITH_CONTACT_BUTTON is True
+
+
+@pytest.mark.asyncio
+async def test_alert_bot_config_contract():
+    """v10.8: مفاتيح بوت التنبيهات — التوكن اختياري والمفتاح الافتراضي
+    مفعّل (غياب التوكن = fallback فقط، بلا أعطال)."""
+    assert getattr(CFG, "ALERT_BOT_TOKEN", None) is None  # لا توكن في بيئة الاختبار
+    assert getattr(CFG, "ALERT_BOT_ENABLED", None) is True
+    assert getattr(CFG, "ALERT_BOT_MAX_RETRIES", None) == 3

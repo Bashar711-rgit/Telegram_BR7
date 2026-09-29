@@ -108,6 +108,7 @@ from dedup import get_dedup_snapshot, init_deduplicator
 from antispam import get_antispam, setup_antispam, get_antispam_snapshot
 from filter_engine import EnhancedFilter
 from monitors import EnhancedAccountMonitor, HealthMonitor, get_capture_snapshot, alert_latency
+from alert_bot import AlertBot  # v10.8: إرسال التنبيهات عبر Bot API
 from sender_resolver import get_sender_intel_snapshot, get_mention_intel_snapshot
 
 # Import Dashboard
@@ -327,6 +328,17 @@ class EnhancedTelegramBot:
         # الهدف. _resolve_send_clients تفضّله أولاً فيظهر الإرسال مستقراً
         # حتى لو كان main_client حساباً بلا صلاحية نشر في القناة.
         self.alert_sender_client: Optional[TelegramClient] = None
+        # ══ v10.8: بوت التنبيهات (اسم البوت: @alzariqi711r_bot) ══
+        # إرسال التنبيهات إلى TARGET_GROUP_ID عبر Bot API بأزرار
+        # [المرسل][جروب] في صف واحد. التوكن اختياري: بدونه (أو مع أي فشل)
+        # يعمل مسار حسابات المستخدمين (fallback) بنفس نص التنبيه بدون
+        # أزرار كما في v10.7 — بلا أعطال.
+        self.alert_bot = AlertBot(
+            token=getattr(CFG, "ALERT_BOT_TOKEN", None),
+            chat_id=getattr(CFG, "TARGET_GROUP_ID", 0),
+            timeout=getattr(CFG, "ALERT_BOT_TIMEOUT", 12.0),
+            max_retries=getattr(CFG, "ALERT_BOT_MAX_RETRIES", 3),
+        )
         self.monitors: List[EnhancedAccountMonitor] = []
         self.is_running = False
         self._start_time = time.monotonic()
@@ -1635,6 +1647,19 @@ class EnhancedTelegramBot:
 
         self.memory_monitor.start()
 
+        # ══ v10.8: فحص عضوية بوت التنبيهات في قناة الهدف عند الإقلاع ══
+        # getMe (تحقق التوكن + هوية البوت) ثم getChatMember — تحذير واضح
+        # إن لم يكن البوت عضواً (يفضل أدمن) في TARGET_GROUP_ID. لا يوقف
+        # الإقلاع أبداً — غير العضو سيفشل إرساله وسيعمل الـfallback تلقائياً.
+        if self.alert_bot.enabled and getattr(CFG, "ALERT_BOT_ENABLED", True):
+            logger.info("🤖 AlertBot مفعّل — فحص العضوية في TARGET_GROUP_ID عند الإقلاع")
+            self._track_task(self._alert_bot_boot_check(), "alert_bot_boot_check")
+        else:
+            logger.info(
+                "🤖 AlertBot غير مفعّل (لا ALERT_BOT_TOKEN أو ALERT_BOT_ENABLED=false) "
+                "— التنبيهات تُرسل من حسابات المستخدمين بدون أزرار (fallback)"
+            )
+
         await self._register_admin_commands()
         await self._register_copy_handler()
         # v9.11: معالجات زر «تواصل مع المرسل» + مسار الرد البديل
@@ -1660,6 +1685,30 @@ class EnhancedTelegramBot:
 
         logger.info("✅ Initialization complete (Render Edition, hardened)")
         return True
+
+    async def _alert_bot_boot_check(self) -> None:
+        """══ v10.8: فحص بوت التنبيهات عند الإقلاع ══
+
+        getMe أولاً (تحقق التوكن + هوية البوت) ثم getChatMember على
+        TARGET_GROUP_ID: البوت غير العضو (يفضل أن يكون أدمن) سيفشل كل
+        sendMessage — تحذير واضح في اللوج مع الخطوة المطلوبة. الفحص
+        لا يوقف الإقلاع أبداً (فشل-آمن — fallback يعمل تلقائياً)."""
+        try:
+            me = await self.alert_bot.get_me()
+            if me is None:
+                logger.warning(
+                    "⚠️ فشل التحقق من ALERT_BOT_TOKEN (getMe) — بوت التنبيهات "
+                    "معطّل وستُرسل التنبيهات من حسابات المستخدمين (fallback) "
+                    "بدون أزرار حتى يُصحَّح التوكن"
+                )
+                return
+            logger.info(
+                f"🤖 AlertBot ready: @{self.alert_bot.bot_username} "
+                f"(id={self.alert_bot.bot_id})"
+            )
+            await self.alert_bot.check_membership()
+        except Exception as e:
+            logger.debug(f"alert_bot boot check skipped: {type(e).__name__}: {e}")
 
     async def _warmup_chat_caches(self) -> None:
         """v10.4: prefetch the entities of recently-seen source chats into

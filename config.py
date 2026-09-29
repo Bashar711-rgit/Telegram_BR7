@@ -415,6 +415,19 @@ class _ConfigData:
     # member of TARGET_GROUP_ID (its alerts + mentions would keep failing).
     TARGET_MEMBERSHIP_CHECK: bool
 
+    # ── v10.8 Alert Bot (إرسال التنبيهات عبر Bot API بأزرار inline URL) ──
+    # توكن بوت تنبيهات مخصص (اسم البوت: @alzariqi711r_bot). اختياري:
+    # بدونه تعمل الحسابات بالاستماع وبناء البيانات فقط، والإرسال يمر عبر
+    # AlertBot.send → sendMessage بأزرار [المرسل][جروب] في صف واحد.
+    # غياب التوكن أو أي فشل → fallback لمسار حسابات المستخدمين بنفس نص
+    # التنبيه بدون أزرار (كما في v10.7) مع تسجيل السبب في اللوج.
+    ALERT_BOT_TOKEN: Optional[str]
+    # مفتاح إيقاف حي — false يعطل بوت التنبيهات كلياً (fallback فقط).
+    ALERT_BOT_ENABLED: bool
+    # مهلة كل طلب HTTP للبوت API (ثوانٍ) وعدد المحاولات القصوى لـ429.
+    ALERT_BOT_TIMEOUT: float
+    ALERT_BOT_MAX_RETRIES: int
+
     # ── Anti-Spam (المرحلة الثانية: Watch List → Confirmation → Permanent Ignore) ──
     ANTISPAM_ENABLED: bool
     # v9.21: محرك القواعد وقائمة السماح (مفاتيح تشغيل — تبديل لاحق من اللوحة)
@@ -777,6 +790,12 @@ class Config:
             ALERT_BUTTONS_ENABLED=SecretManager.get_bool("ALERT_BUTTONS_ENABLED", False),
             ALERT_FORWARD_FALLBACK=SecretManager.get_bool("ALERT_FORWARD_FALLBACK", True),
             TARGET_MEMBERSHIP_CHECK=SecretManager.get_bool("TARGET_MEMBERSHIP_CHECK", True),
+            # ══ v10.8 Alert Bot (@alzariqi711r_bot) ══
+            # توكن اختياري من بيئة Render — غيابه يعمل الـfallback بلا أعطال.
+            ALERT_BOT_TOKEN=SecretManager.get("ALERT_BOT_TOKEN", None, required=False),
+            ALERT_BOT_ENABLED=SecretManager.get_bool("ALERT_BOT_ENABLED", True),
+            ALERT_BOT_TIMEOUT=SecretManager.get_float("ALERT_BOT_TIMEOUT", 12.0, required=False),
+            ALERT_BOT_MAX_RETRIES=SecretManager.get_int("ALERT_BOT_MAX_RETRIES", 3, required=False),
             ALERT_SHOW_SCORE=SecretManager.get_bool("ALERT_SHOW_SCORE", True),
             ALERT_MAX_TEXT_LEN=SecretManager.get_int("ALERT_MAX_TEXT_LEN", 350, required=False),
             ALERT_WITH_COPY_BUTTON=SecretManager.get_bool("ALERT_WITH_COPY_BUTTON", True),

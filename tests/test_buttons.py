@@ -171,54 +171,47 @@ class TestBuildDynamicButtons:
 
 
 class TestBuildAlertButtons:
-    """التكامل عبر _build_alert — الصف الثاني يشمل زر النسخ الاختياري.
-
-    v10.7 §5: الأزرار محذوفة من التنبيهات افتراضياً (ALERT_BUTTONS_ENABLED=
-    False — حسابات المستخدمين لا ترسل أزراراً). البناء الكامل محفوظ خلف
-    المفتاح: هذه الاختبارات تُفعّله صراحة للتحقق من الشكل التاريخي، مع
-    اختبار جديد يؤكد السلوك الافتراضي (لا أزرار).
+    """v10.8: حُذف Button.inline/Button.url (cnt_/copy_) من مسار التنبيه
+    بالكامل — _build_alert يعيد buttons=None دائماً (حسابات المستخدمين
+    لا ترسل أزراراً). أزرار [المرسل][جروب] تُبنى في alert_bot وتُرسل عبر
+    بوت التنبيهات (Bot API). دالة build_dynamic_buttons محفوظة كدالة
+    ميزة (تُختبر في TestBuildDynamicButtons أعلاه) ولم تعد تُستدعى من
+    مسار التنبيهات.
     """
 
-    @pytest.fixture(autouse=True)
-    def _buttons_enabled(self):
-        old = getattr(CFG, "ALERT_BUTTONS_ENABLED", False)
-        object.__setattr__(CFG, "ALERT_BUTTONS_ENABLED", True)
-        yield
-        object.__setattr__(CFG, "ALERT_BUTTONS_ENABLED", old)
-
     @pytest.mark.asyncio
-    async def test_full_rows_with_copy(self, monitor):
-        sender = {"id": 555000111, "display": "أ", "username": "ahmed_99", "access_hash": None}
-        chat = {"group_link": "https://t.me/g", "title": "ت", "msg_link": "https://t.me/g/7",
-                "id": -100123, "message_id": 7, "username": "g"}
-        alert, buttons = monitor._build_alert(sender, chat, "ك", "نص", {"msg_hash": "xyz"})
-        specs = _specs(buttons)
-        assert len(specs) == 2  # صفّان
-        assert specs[0][0] == ("url", "عرض الرسالة", "https://t.me/g/7")
-        assert specs[0][1] == ("callback", "تواصل مع المرسل", "cnt_xyz")
-        assert specs[1][0] == ("url", "مراسلة", "https://t.me/ahmed_99")
-        assert specs[1][1] == ("callback", "📋 نسخ النص", "copy_xyz")  # ميزة قائمة
-
-    @pytest.mark.asyncio
-    async def test_no_buttons_by_default_v10_7(self, monitor):
-        """v10.7 §5: بدون ALERT_BUTTONS_ENABLED لا أزرار على التنبيه إطلاقاً —
-        الاعتماد على روابط النص (حسابات المستخدمين لا ترسل أزراراً)."""
+    async def test_no_buttons_even_when_enabled(self, monitor):
+        """حتى مع ALERT_BUTTONS_ENABLED=true لا أزرار من حسابات المستخدمين
+        (v10.8 — الإرسال عبر بوت التنبيهات حصراً)."""
         old = getattr(CFG, "ALERT_BUTTONS_ENABLED", False)
         try:
-            object.__setattr__(CFG, "ALERT_BUTTONS_ENABLED", False)
+            object.__setattr__(CFG, "ALERT_BUTTONS_ENABLED", True)
             sender = {"id": 555000111, "display": "أ", "username": "ahmed_99", "access_hash": None}
             chat = {"group_link": "https://t.me/g", "title": "ت", "msg_link": "https://t.me/g/7",
                     "id": -100123, "message_id": 7, "username": "g"}
-            alert, buttons = monitor._build_alert(sender, chat, "ك", "نص", {"msg_hash": "x"})
+            alert, buttons = monitor._build_alert(sender, chat, "ك", "نص", {"msg_hash": "xyz"})
             assert buttons is None
-            # روابط النص داخل التنبيه سليمة (بديل الأزرار)
-            assert 'href="https://t.me/ahmed_99"' in alert
-            assert 'href="https://t.me/g/7"' in alert
+            assert "cnt_xyz" not in alert and "copy_xyz" not in alert
         finally:
             object.__setattr__(CFG, "ALERT_BUTTONS_ENABLED", old)
 
     @pytest.mark.asyncio
+    async def test_no_buttons_by_default_v10_8(self, monitor):
+        """v10.8: بدون أزرار على تنبيهات الحسابات — روابط النص داخل
+        التنبيه هي بديل الأزرار (رابط المرسل + رابط الرسالة)."""
+        sender = {"id": 555000111, "display": "أ", "username": "ahmed_99", "access_hash": None}
+        chat = {"group_link": "https://t.me/g", "title": "ت", "msg_link": "https://t.me/g/7",
+                "id": -100123, "message_id": 7, "username": "g"}
+        alert, buttons = monitor._build_alert(sender, chat, "ك", "نص", {"msg_hash": "x"})
+        assert buttons is None
+        # روابط النص داخل التنبيه سليمة (بديل الأزرار)
+        assert 'href="https://t.me/ahmed_99"' in alert
+        assert 'href="https://t.me/g/7"' in alert
+
+    @pytest.mark.asyncio
     async def test_buttons_disabled_via_cfg(self, monitor):
+        """المفتاح القديم محفوظ بقيمته — لكن لم يعد يؤثر على مسار التنبيه
+        (الأزرار حصراً من بوت التنبيهات)."""
         sender = {"id": 1, "display": "أ", "username": "u", "access_hash": None}
         chat = {"id": -1001, "message_id": 2, "username": "g"}
         try:
@@ -229,29 +222,31 @@ class TestBuildAlertButtons:
             object.__setattr__(CFG, "ALERT_WITH_BUTTONS", True)
 
     @pytest.mark.asyncio
-    async def test_copy_button_disabled_via_cfg(self, monitor):
+    async def test_copy_button_flag_preserved(self, monitor):
+        """ميزة زر النسخ (CFG.ALERT_WITH_COPY_BUTTON) محفوظة كعلامة —
+        لا أزرار نسخ في مسار الحسابات (v10.8)؛ زر المرسل في مسار البوت."""
         sender = {"id": 1, "display": "أ", "username": "u", "access_hash": None}
         chat = {"id": -1001, "message_id": 2, "username": "g"}
-        try:
-            object.__setattr__(CFG, "ALERT_WITH_COPY_BUTTON", False)
-            _, buttons = monitor._build_alert(sender, chat, "ك", "نص", {"msg_hash": "x"})
-            specs = _specs(buttons)
-            assert len(specs) == 2
-            assert len(specs[1]) == 1  # مراسلة فقط — بدون النسخ
-            assert all(t != "📋 نسخ النص" for _, t, _ in specs[1])
-        finally:
-            object.__setattr__(CFG, "ALERT_WITH_COPY_BUTTON", True)
+        _, buttons = monitor._build_alert(sender, chat, "ك", "نص", {"msg_hash": "x"})
+        assert buttons is None
 
     @pytest.mark.asyncio
-    async def test_contact_button_disabled_via_cfg(self, monitor):
+    async def test_contact_button_flag_preserved(self, monitor):
+        """ميزة زر التواصل (CFG.ALERT_WITH_CONTACT_BUTTON) محفوظة كعلامة —
+        لا أزرار تواصل inline في مسار الحسابات (v10.8)."""
         sender = {"id": 1, "display": "أ", "username": "u", "access_hash": None}
         chat = {"id": -1001, "message_id": 2, "username": "g"}
-        try:
-            object.__setattr__(CFG, "ALERT_WITH_CONTACT_BUTTON", False)
-            _, buttons = monitor._build_alert(sender, chat, "ك", "نص", {"msg_hash": "x"})
-            specs = _specs(buttons)
-            assert len(specs) == 2
-            assert len(specs[0]) == 1  # عرض الرسالة فقط — بدون التواصل
-            assert all(t != "تواصل مع المرسل" for _, t, _ in specs[0])
-        finally:
-            object.__setattr__(CFG, "ALERT_WITH_CONTACT_BUTTON", True)
+        _, buttons = monitor._build_alert(sender, chat, "ك", "نص", {"msg_hash": "x"})
+        assert buttons is None
+
+    @pytest.mark.asyncio
+    async def test_bot_path_buttons_in_one_row(self, monitor):
+        """زرا [المرسل][جروب] inline URL في صف واحد عبر بناء البوت."""
+        from alert_bot import build_alert_html
+        built = build_alert_html(
+            {"sender_id": 555000111, "sender_username": "ahmed_99", "sender_display": "أ",
+             "text": "نص", "chat_id": -100123, "message_id": 7, "chat_username": "g"},
+            msg_link="https://t.me/g/7", group_link="https://t.me/g",
+        )
+        assert built["sender_button"] == {"text": "@ahmed_99", "url": "https://t.me/ahmed_99"}
+        assert built["group_button"] == {"text": "جروب", "url": "https://t.me/g"}

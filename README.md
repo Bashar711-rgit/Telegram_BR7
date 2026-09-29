@@ -2,6 +2,17 @@
 
 نظام متقدم لمراقبة مجموعات تيليجرام واصطياد طلبات المساعدة الطلابية، مهيأ للتشغيل **24/7 على Render المجاني** كـ Web Service.---
 
+## 🆕 v10.8 — بوت التنبيهات + النمط الجديد للتنبيهات (الشكل المطلوب حرفياً)
+
+1. **الشكل الجديد (parse_mode=HTML) لكل تنبيه يصل TARGET_GROUP_ID:**
+   `👤 {SENDER}` ثم `<b>المرسل :</b> ID {sender_id}` ثم سطر فارغ ثم `<b>نص الرسالة :</b>` + النص (escape_html + truncate 400) ثم `<b>رابط الرسالة :</b>` (رابط قابل للنقر أو «غير متاح»). المرسل: `<a href="https://t.me/USERNAME">@USERNAME</a>` عند وجود username وإلا `<a href="tg://user?id=ID">الاسم الكامل</a>`. رابط الرسالة: قروب عام `t.me/{username}/{id}`، خاص `t.me/c/{inner}/{id}`، غير ذلك «غير متاح».
+2. **الإرسال كله عبر بوت التنبيهات (ملف جديد alert_bot.py):** `AlertBot.send(data, analysis)` يُستدعى من `_send_alert` — Bot API `sendMessage` بـ aiohttp: `chat_id=TARGET_GROUP_ID`, `parse_mode="HTML"`, `link_preview_options={"is_disabled": true}`, وصف أزرار واحد inline URL: **[زر المرسل][جروب]** (زر @USERNAME أو الاسم بـ tg://user?id؛ زر «جروب» يُحذف إن لم يوجد رابط). الحسابات تستمع وتبني البيانات فقط، والرسالة تمر على dedup + rate_limiter + similarity كما هي.
+3. **معالجة الأخطاء:** 429 → انتظار `retry_after` وإعادة المحاولة (بحد أقصى 3). `BUTTON_USER_INVALID` / `BUTTON_USER_PRIVACY_RESTRICTED` → إعادة الإرسال **بدون زر المرسل** (رابط الاسم يبقى في النص وزر «جروب» يبقى). أي فشل آخر أو غياب `ALERT_BOT_TOKEN` → **fallback** لمسار حسابات المستخدمين بنفس نص التنبيه بدون أزرار مع تسجيل السبب (circuit breaker كما هو).
+4. **العضوية عند الإقلاع:** `getMe` + `getChatMember` — تحذير واضح إذا كان بوت التنبيهات (`@alzariqi711r_bot`) ليس عضواً (يفضل أدمن) في TARGET_GROUP_ID. غير العضو سيفشل إرساله ويعمل الـfallback تلقائياً.
+5. **التسجيل:** `alerts.contact_method` (عمود v10.7 نفسه) يسجل لمسار البوت: `username | mention_button | text_only`، وللمسار الاحتياطي القيم السابقة (`username | mention | forward | link`).
+6. **حُذف من مسار التنبيه:** Button.inline/Button.url (cnt_/copy_) بالكامل — معالجاتها في main.py بقيت (ميزة الرد اليدوي). جمع بيانات المرسل من v10.7 (get_sender، usernames المتعددة، تمرير msg_link/group_link إلى upsert_sender_contact) كما هو، والفلترة والـrate limiter لم يُمسّا.
+7. **الإعداد:** `ALERT_BOT_TOKEN` (اختياري، sync:false في render.yaml — ضع توكن @alzariqi711r_bot من لوحة Render > Environment)، `ALERT_BOT_ENABLED` (true)، `ALERT_BOT_TIMEOUT` (12)، `ALERT_BOT_MAX_RETRIES` (3). **34 اختباراً جديداً/محدَّثاً** (test_alert_bot_v10_8.py + ذهبي جديد) — **762 اختباراً إجمالاً**.
+
 ## 🆕 v10.7 — سجل وصول المرسل: كل اسم مرسل قابل للنقر بالمستويات الأربعة (المواصفة التقنية الحرفية)
 
 1. **المبدأ التقني المطبَّق:** access_hash خاص بكل حساب — الـhash الذي رآه الحساب A لا يصلح للإرسال من الحساب B. الحل الوحيد الموثوق: **Text Mention** (`InputMessageEntityMentionName`) بـ user_id + access_hash يُرسل من نفس الحساب الذي استلم الرسالة (السيرفر يتحقق من الـhash). لا اعتماد على `tg://user?id=` داخل HTML.
@@ -267,6 +278,7 @@ Permanent Ignore (Cross-Group Spam / Mass Poster)
 | `RENDER_SERVICE_ID` | معرف الخدمة `srv-...` |
 | `{PREFIX}_API_ID / _API_HASH / _PHONE / _SESSION_NAME` | بيانات كل حساب (MAIN, ACCOUNT_1..5) |
 | `{PREFIX}_SESSION_STRING` | تُملأ تلقائياً عبر `/login` أو يدوياً |
+| `ALERT_BOT_TOKEN` | (v10.8 اختياري) توكن بوت التنبيهات `@alzariqi711r_bot` — أضف البوت إلى TARGET_GROUP_ID (يفضل أدمن). غيابه = إرسال من حسابات المستخدمين بدون أزرار |
 
 متغيرات IntentEngine والأداء لها قيم افتراضية جاهزة (انظر `render.yaml`).
 
