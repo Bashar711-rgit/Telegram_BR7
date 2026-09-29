@@ -467,6 +467,21 @@ class _ConfigData:
     SENDER_RESOLVE_BACKOFF_MAX: float
     SENDER_FLOOD_MAX_SLEEP: int
 
+    # ── v10.4 Sender Mention Intelligence (backend-only — alert format FROZEN) ──
+    # يبني mention entity حقيقي (InputMessageEntityMentionName) لاسم المرسل
+    # عند الإرسال فقط — النص/الشكل/الروابط كما هي حرفياً (عقد متجمّد).
+    SENDER_MENTION_FIX_ENABLED: bool
+    MENTION_NEG_TTL_SECONDS: int
+    MENTION_MAX_TIERS_PER_CANDIDATE: int
+    # Telethon client: replay missed updates after reconnect + parallel updates
+    TELEGRAM_CATCH_UP: bool
+    # حدثي: استيقاظ حلقة الطابور فور الإدراج بدل polling ثابت
+    QUEUE_EVENT_WAKE: bool
+    # قياس زمن التنبيه (message.date → استلام → إرسال) — logs/health فقط
+    ALERT_LATENCY_LOG_EVERY: int
+    # تسخين كاش كيانات المجموعات عند الإقلاع
+    WARMUP_CHAT_CACHE: bool
+
     # ── Prefilter ──
     PREFILTER_ENABLED: bool
     PREFILTER_MIN_WORDS: int
@@ -812,6 +827,14 @@ class Config:
             SENDER_RESOLVE_BACKOFF_BASE=SecretManager.get_float("SENDER_RESOLVE_BACKOFF_BASE", 0.5, required=False),
             SENDER_RESOLVE_BACKOFF_MAX=SecretManager.get_float("SENDER_RESOLVE_BACKOFF_MAX", 8.0, required=False),
             SENDER_FLOOD_MAX_SLEEP=SecretManager.get_int("SENDER_FLOOD_MAX_SLEEP", 5, required=False),
+            # ── v10.4 Sender Mention Intelligence (backend-only) ──
+            SENDER_MENTION_FIX_ENABLED=SecretManager.get_bool("SENDER_MENTION_FIX_ENABLED", True),
+            MENTION_NEG_TTL_SECONDS=SecretManager.get_int("MENTION_NEG_TTL_SECONDS", 300, required=False),
+            MENTION_MAX_TIERS_PER_CANDIDATE=SecretManager.get_int("MENTION_MAX_TIERS_PER_CANDIDATE", 3, required=False),
+            TELEGRAM_CATCH_UP=SecretManager.get_bool("TELEGRAM_CATCH_UP", True),
+            QUEUE_EVENT_WAKE=SecretManager.get_bool("QUEUE_EVENT_WAKE", True),
+            ALERT_LATENCY_LOG_EVERY=SecretManager.get_int("ALERT_LATENCY_LOG_EVERY", 100, required=False),
+            WARMUP_CHAT_CACHE=SecretManager.get_bool("WARMUP_CHAT_CACHE", True),
             # ========== Prefilter ==========
             PREFILTER_ENABLED=SecretManager.get_bool("PREFILTER_ENABLED", True),
             # v14.4 filter: 1 (was 2) — short high-signal requests ("محتاج",
@@ -884,8 +907,8 @@ class Config:
 # =============================================================================
 # Bot version — single source of truth (v10.2 Send Rotation)
 # =============================================================================
-BOT_VERSION: Final = "10.3.0"
-BOT_CODENAME: Final = "Precision"
+BOT_VERSION: Final = "10.4.0"
+BOT_CODENAME: Final = "Sender Intelligence"
 
 # =============================================================================
 # Pre-built config instance

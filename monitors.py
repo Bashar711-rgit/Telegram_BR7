@@ -126,11 +126,22 @@ from telethon.errors import (
     ChannelPrivateError,
     UserBannedInChannelError,
 )
+try:
+    # v10.4: RPC errors raised when a mention InputUser is not valid for
+    # the SENDING account — the mention ladder advances immediately.
+    from telethon.errors import UserIDInvalidError, EntityMentionUserInvalidError
+except Exception:  # pragma: no cover — extremely old Telethon fallback
+    class UserIDInvalidError(Exception): pass
+    class EntityMentionUserInvalidError(Exception): pass
+_MENTION_INVALID_ERRORS = (UserIDInvalidError, EntityMentionUserInvalidError)
 from telethon.tl.types import (
     MessageMediaPhoto,
     MessageMediaDocument,
     MessageMediaWebPage,
     InputPeerChannel,
+    InputPeerUser,
+    InputPeerUserFromMessage,
+    InputUser,
 )
 from config import CFG, InputSanitizer, fast_hash
 from database import EnhancedDatabase, MessageRecord, AlertRecord, DeadLetterRecord
@@ -143,6 +154,12 @@ from sender_resolver import (
     extract_sender as _sender_extract,
     meta_to_contact_fields as _sender_meta_to_contact,
     sender_intel,
+    account_hash_store,
+    mention_negative,
+    build_mention_entities as _build_mention_entities,
+    input_user_from_input_peer as _input_user_from_input_peer,
+    input_user_from_message_context as _input_user_from_message_context,
+    get_mention_intel_snapshot,
 )
 
 
@@ -464,6 +481,77 @@ try:
 except Exception:
     _EARLY_DELIVERY_DEDUP_SIZE = 8000
 _early_delivery_dedup: LRUCache = LRUCache(maxsize=_EARLY_DELIVERY_DEDUP_SIZE)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# v10.4 — Sender Mention Intelligence state (backend-only; alert format
+# FROZEN). Three pieces of shared state live here:
+#
+#   1. _recent_input_senders — (chat_id, msg_id) → capture context recorded
+#      synchronously from the NewMessage handler of the CAPTURING account
+#      (local-only get_input_sender, never an RPC). Used by mention tier 1/2
+#      when the sending client IS the capturing client.
+#   2. _post_capable_accounts — account names that have PROVEN they can post
+#      to the target channel (a successful alert send). The send-candidate
+#      ordering prefers the capturing account only when it is known-capable,
+#      so the v10.2 rotation guarantees (admin-capable sender first) are
+#      never weakened.
+#   3. alert_latency — bounded percentiles of message.date → received →
+#      alert-sent. Logs + /health only (brief: what is not measured cannot
+#      be improved; nothing here changes any alert).
+# ═══════════════════════════════════════════════════════════════════════════
+_RECENT_INPUT_SENDERS_MAX = 500
+_recent_input_senders: "OrderedDict[Tuple[int, int], Dict[str, Any]]" = OrderedDict()
+_post_capable_accounts: Set[str] = set()
+
+
+class AlertLatencyTracker:
+    """Bounded percentiles for alert delivery latency (logs/health only).
+
+    T1 = now − message.date at handler entry (receive lag).
+    T2 = now − message.date at alert-send success (total lag)."""
+
+    def __init__(self, maxlen: int = 2000):
+        self._recv: "deque[float]" = __import__("collections").deque(maxlen=maxlen)
+        self._total: "deque[float]" = __import__("collections").deque(maxlen=maxlen)
+        self._n = 0
+
+    def record(self, receive_lag_ms: Any, msg_date_ts: Any) -> None:
+        try:
+            if receive_lag_ms is not None:
+                self._recv.append(max(0.0, float(receive_lag_ms)))
+            if msg_date_ts:
+                self._total.append(max(0.0, (time.time() - float(msg_date_ts)) * 1000.0))
+            self._n += 1
+            every = int(getattr(CFG, "ALERT_LATENCY_LOG_EVERY", 100) or 0)
+            if every > 0 and self._n % every == 0:
+                logger.info(f"⏱️ alert latency percentiles (n={self._n}) | {self.snapshot()}")
+        except Exception:
+            pass
+
+    @staticmethod
+    def _pcts(values: "deque") -> Dict[str, float]:
+        if not values:
+            return {}
+        ordered = sorted(values)
+        n = len(ordered)
+
+        def pct(p: float) -> float:
+            idx = min(n - 1, max(0, int(round(p * (n - 1)))))
+            return round(ordered[idx], 1)
+
+        return {"p50": pct(0.50), "p90": pct(0.90), "p99": pct(0.99)}
+
+    def snapshot(self) -> Dict[str, Any]:
+        out: Dict[str, Any] = {"samples": self._n}
+        if self._recv:
+            out["receive_lag_ms"] = self._pcts(self._recv)
+        if self._total:
+            out["total_lag_ms"] = self._pcts(self._total)
+        return out
+
+
+alert_latency = AlertLatencyTracker()
 
 
 def get_capture_snapshot() -> Dict[str, Any]:
@@ -949,6 +1037,12 @@ class EnhancedAccountMonitor:
             device_model="Render Cloud", system_version="Linux", app_version="13.0",
             timeout=CFG.CONNECTION_TIMEOUT, connection_retries=5, retry_delay=5,
             auto_reconnect=False,
+            # v10.4: parallel update dispatch (Telethon default) stays OFF the
+            # strict-sequential mode, and missed updates are replayed after a
+            # reconnect so a brief drop never loses group traffic. The
+            # started_at + early-dedup guards already make replay safe.
+            sequential_updates=False,
+            catch_up=bool(getattr(CFG, "TELEGRAM_CATCH_UP", True)),
         )
 
 
@@ -1222,6 +1316,39 @@ class EnhancedAccountMonitor:
                     await self._inc_stat("duplicates")
                     return
                 _early_delivery_dedup[early_key] = True
+                # ══ v10.4: التقاط هوية المرسل لكل حساب (mention intelligence) ══
+                # (أ) hash خاص بالحساب: event.sender هنا رؤية حسابنا أنت —
+                #     تُخزَّن بمفتاح (account, sender_id) حصراً.
+                # (ب) input_sender: يُلتقط فقط عندما يكون حلاً محلياً مضموناً
+                #     (from_id من نوع InputPeerUser/FromMessage) — صفر RPC
+                #     على المسار السريع، مع مهلة 0.5s وقفل استثناءات.
+                if CFG.SENDER_MENTION_FIX_ENABLED:
+                    try:
+                        _snd = getattr(event, "sender", None)
+                        _sid = getattr(event, "sender_id", None)
+                        if _snd is not None and _sid and not bool(getattr(_snd, "min", False)):
+                            _ah = getattr(_snd, "access_hash", None)
+                            if isinstance(_ah, int) and _ah != 0:
+                                if account_hash_store.record(self.account["name"], int(_sid), _ah):
+                                    asyncio.create_task(
+                                        self._persist_account_hash(int(_sid), _ah)
+                                    )
+                    except Exception as cap_err:
+                        logger.debug(f"account_hash capture [{self.account['name']}]: {type(cap_err).__name__}")
+                    try:
+                        _fid = getattr(event.message, "from_id", None)
+                        if isinstance(_fid, (InputPeerUser, InputPeerUserFromMessage)):
+                            _ins = await asyncio.wait_for(event.get_input_sender(), timeout=0.5)
+                            if _ins is not None:
+                                _recent_input_senders[(event.chat_id, event.message.id)] = {
+                                    "account": self.account["name"],
+                                    "input_sender": _ins,
+                                    "ts": time.time(),
+                                }
+                                while len(_recent_input_senders) > _RECENT_INPUT_SENDERS_MAX:
+                                    _recent_input_senders.popitem(last=False)
+                    except Exception as ins_err:
+                        logger.debug(f"input_sender capture [{self.account['name']}]: {type(ins_err).__name__}")
                 event_data = await self._event_to_dict(event)
                 if event_data.get("has_media"):
                     # Media is offloaded to a tracked background task instead
@@ -1352,6 +1479,19 @@ class EnhancedAccountMonitor:
         media = event.message.media; media_type = self._get_media_type(media)
         has_media = media_type in ("photo", "document")
         chat_username = getattr(chat, "username", None) if chat else None
+        # v10.4: additive latency keys — message.date → received (T1). The
+        # send-side total (T2) is recorded in _record_sent_alert. Purely
+        # additive: downstream alert rendering ignores unknown keys.
+        _msg_date = getattr(event.message, "date", None)
+        _msg_ts = None
+        _recv_lag = None
+        try:
+            if _msg_date is not None:
+                _msg_ts = _msg_date.timestamp()
+                _recv_lag = round(max(0.0, (time.time() - _msg_ts) * 1000.0), 1)
+        except Exception:
+            _msg_ts = None
+            _recv_lag = None
         event_data = {
             "chat_id": event.chat_id, "message_id": event.message.id,
             "sender_id": getattr(event, "sender_id", 0) or 0,
@@ -1360,6 +1500,7 @@ class EnhancedAccountMonitor:
             "chat_access_hash": getattr(chat, "access_hash", None), "chat_username": chat_username,
             "text": full_text, "has_text": bool(full_text), "has_media": has_media, "media_type": media_type,
             "account_name": self.account["name"], "timestamp": time.time(),
+            "msg_date_ts": _msg_ts, "receive_lag_ms": _recv_lag,
             # v9.12 (audit H-03): flag tells the worker whether the inline
             # path skipped enrichment (sender was None); the worker then
             # runs the resolver in the background.
@@ -2026,7 +2167,136 @@ class EnhancedAccountMonitor:
         await self._update_avg_time(processing_time)
 
 
-    async def _resolve_send_clients(self) -> List[TelegramClient]:
+    # ── v10.4: mention-intelligence helpers (backend-only) ─────────────
+    def _account_name_for_client(self, client: Optional[TelegramClient]) -> Optional[str]:
+        """Map a client back to its account name (bot_ref monitors + self)."""
+        if client is None:
+            return None
+        if client is self.client:
+            return self.account["name"]
+        ref = self._bot_ref
+        if ref is not None:
+            for mon in getattr(ref, "monitors", []) or []:
+                if getattr(mon, "client", None) is client:
+                    return mon.account["name"]
+        return None
+
+    def _note_post_capable(self, client: Optional[TelegramClient]) -> None:
+        """Record that this account PROVABLY posted to the target channel
+        (a successful alert send). Used for capability-aware candidate
+        ordering — never weakens the v10.2 rotation guarantees."""
+        name = self._account_name_for_client(client)
+        if name:
+            _post_capable_accounts.add(name)
+
+    async def _persist_account_hash(self, sender_id: int, access_hash: int) -> None:
+        """Write-behind: persist this account's fresh access_hash view.
+        Fire-and-forget from the capture hot path; never raises."""
+        try:
+            if self.db is not None:
+                await self.db.upsert_sender_account_hash(self.account["name"], int(sender_id), int(access_hash))
+        except Exception as e:
+            logger.debug(f"persist_account_hash [{self.account['name']}]: {type(e).__name__}")
+
+    async def _resolve_mention_input_users(
+        self, c: TelegramClient, data: Dict[str, Any]
+    ) -> List[Tuple[str, Any]]:
+        """سلّم حل المرسل (مرتب حسب الأولوية) لعميل الإرسال c:
+
+        1. event.sender (min=False) → InputUser(id, access_hash) — عبر
+           sender_access_hash المحفوظ في event_data عند الحساب المُلتقط نفسه.
+        2. get_input_sender الملتقط أثناء الوصول (محلي) → InputPeerUser أو
+           InputPeerUserFromMessage → InputUser/FromMessage.
+        3. InputUserFromMessage من زاوية عميل الإرسال نفسه (peer المجموعة +
+           message_id + user_id) — تيليجرام يحلّ المرسل من سياق الرسالة.
+        4. الـaccess_hash المخزّن لنفس الحساب — المفتاح (account, sender_id)
+           (الذاكرة ثم جدول sender_account_hashes).
+        5. get_input_entity(username).
+
+        كل درجة تُتجاهل إذا كانت في الـnegative cache بعد USER_ID_INVALID /
+        ENTITY_MENTION_USER_INVALID (بلا retry على نفسها)، والحد الأقصى
+        MENTION_MAX_TIERS_PER_CANDIDATE درجات لكل مرشح إرسال."""
+        out: List[Tuple[str, Any]] = []
+        if not CFG.SENDER_MENTION_FIX_ENABLED:
+            return out
+        sender_id = int(data.get("sender_id") or 0)
+        if not sender_id:
+            return out
+        sending_account = self._account_name_for_client(c) or ""
+        src_account = data.get("account_name") or ""
+        max_tiers = max(1, int(getattr(CFG, "MENTION_MAX_TIERS_PER_CANDIDATE", 3)))
+
+        def _ok(tier: str) -> bool:
+            return not mention_negative.blocked(sending_account or "?", sender_id, tier)
+
+        def _add(tier: str, iu: Any) -> None:
+            if iu is not None and _ok(tier):
+                out.append((tier, iu))
+
+        # Tier 1: the capturing account's own sender view (min=False)
+        if sending_account == src_account:
+            ah = data.get("sender_access_hash")
+            if isinstance(ah, int) and ah != 0:
+                try:
+                    _add("event_sender_hash", InputUser(user_id=sender_id, access_hash=ah))
+                except Exception:
+                    pass
+
+        # Tier 2: locally-captured input sender of the CAPTURING account
+        cap_entry = _recent_input_senders.get((data.get("chat_id"), data.get("message_id")))
+        if cap_entry and cap_entry.get("account") == src_account and sending_account == src_account:
+            isp = cap_entry.get("input_sender")
+            iu = _input_user_from_input_peer(isp)
+            if iu is not None:
+                _add("captured_input_sender", iu)
+            elif isinstance(isp, InputPeerUserFromMessage):
+                _add(
+                    "captured_input_from_message",
+                    _input_user_from_message_context(isp.peer, getattr(isp, "msg_id", data.get("message_id")), sender_id),
+                )
+
+        # Tier 3: InputUserFromMessage from the SENDING client's own view of
+        # the source chat (all monitors are members of the source groups).
+        chat_id = data.get("chat_id")
+        message_id = data.get("message_id")
+        if chat_id and message_id and _ok("own_view_from_message"):
+            try:
+                peer = await asyncio.wait_for(c.get_input_entity(int(chat_id)), timeout=1.5)
+                _add("own_view_from_message", _input_user_from_message_context(peer, message_id, sender_id))
+            except Exception as e:
+                logger.debug(f"mention tier3 [{sending_account}]: {type(e).__name__}")
+
+        # Tier 4: per-account stored hash (memory → DB)
+        ah4 = account_hash_store.get(sending_account, sender_id)
+        if ah4 is None and self.db is not None and sending_account:
+            try:
+                ah4 = await asyncio.wait_for(
+                    self.db.get_sender_account_hash(sending_account, sender_id), timeout=1.0
+                )
+            except Exception:
+                ah4 = None
+        if isinstance(ah4, int) and ah4 != 0:
+            try:
+                _add("account_hash", InputUser(user_id=sender_id, access_hash=ah4))
+            except Exception:
+                pass
+
+        # Tier 5: username on the sending client (session entity cache)
+        uname = data.get("sender_username")
+        if uname and _ok("username"):
+            try:
+                ent = await asyncio.wait_for(
+                    c.get_input_entity("@" + str(uname).lstrip("@")), timeout=1.5
+                )
+                iu = _input_user_from_input_peer(ent)
+                if iu is not None:
+                    _add("username", iu)
+            except Exception as e:
+                logger.debug(f"mention tier5 [{sending_account}]: {type(e).__name__}")
+
+        return out[:max_tiers]
+
+    async def _resolve_send_clients(self, data: Optional[Dict[str, Any]] = None) -> List[TelegramClient]:
         """v10.2: قائمة مرشحي الإرسال بالترتيب — كلهم أحياء وبلا تكرار.
 
         الترتيب:
@@ -2047,6 +2317,23 @@ class EnhancedAccountMonitor:
         sticky = getattr(ref, "alert_sender_client", None) if ref else None
         if sticky is not None and self._is_client_alive(sticky):
             ordered.append(sticky)
+        # v10.4: prefer the CAPTURING account right after the sticky sender
+        # — but ONLY when it has PROVEN target-post capability (a prior
+        # successful send). The sticky sender stays first (zero rotation
+        # cost, v10.2 contract intact); the capturing account merely jumps
+        # ahead among known-capable senders so its freshest sender-hash view
+        # is used for the mention whenever possible.
+        if data and ref:
+            src = data.get("account_name")
+            if src and src in _post_capable_accounts:
+                for mon in getattr(ref, "monitors", []) or []:
+                    if (
+                        mon.account.get("name") == src
+                        and mon.client is not None
+                        and self._is_client_alive(mon.client)
+                    ):
+                        ordered.append(mon.client)
+                        break
         mc = ref.main_client if ref else None
         if mc and self._is_client_alive(mc):
             ordered.append(mc)
@@ -2104,7 +2391,7 @@ class EnhancedAccountMonitor:
         sender_last_name = data.get("sender_last_name"); sender_access_hash = data.get("sender_access_hash")
         chat_access_hash = data.get("chat_access_hash"); chat_username = data.get("chat_username")
         display_name = f"{sender_first_name or ''} {sender_last_name or ''}".strip() or f"مستخدم ({sender_id})"
-        send_clients = await self._resolve_send_clients()
+        send_clients = await self._resolve_send_clients(data)
         send_client = send_clients[0] if send_clients else None
         if not send_client:
             logger.error(f"No available client to send alert [{account_name}]"); await self._inc_stat("send_errors"); return
@@ -2157,10 +2444,24 @@ class EnhancedAccountMonitor:
         sender = {"id": sender_id, "display": display_name, "username": sender_username, "access_hash": sender_access_hash}
         alert_text, buttons = self._build_alert(sender, chat_info, keyword, text, analysis)
         user_media = data.get("media_object")
-        async def _try_send_with(c: TelegramClient):
-            """v10.2: محاولة إرسال واحدة عبر عميل محدد (وسائط → صورة → نص)."""
+        async def _send_alert_payload(
+            c: TelegramClient,
+            entities: Optional[Tuple[str, List[Any]]],
+        ):
+            """محاولة إرسال فيزيائية واحدة عبر عميل محدد (وسائط → صورة → نص).
+
+            entities=None  → مسار v10.3 الحرفي (parse_mode="html") — عقد متجمد.
+            entities=(t,e) → نفس المحتوى نصياً لكن بكيانات جاهزة حيث اسم
+                             المرسل mention حقيقي (InputMessageEntityMentionName)
+                             صالح لحساب الإرسال — تنسيق مرئي مطابق 100%."""
+            if entities is not None:
+                wire_text, wire_ents = entities
+            else:
+                wire_text, wire_ents = alert_text, None
             if user_media is not None:
                 try:
+                    if wire_ents is not None:
+                        return await c.send_file(CFG.TARGET_GROUP_ID, file=user_media, caption=wire_text, buttons=buttons, formatting_entities=wire_ents, link_preview=False)
                     return await c.send_file(CFG.TARGET_GROUP_ID, file=user_media, caption=alert_text, buttons=buttons, parse_mode="html", link_preview=False)
                 except FloodWaitError:
                     raise
@@ -2177,11 +2478,15 @@ class EnhancedAccountMonitor:
                     try:
                         result = await c.get_profile_photos(chat_entity, limit=1)
                         if result and hasattr(result, 'photos') and len(result.photos) > 0:
+                            if wire_ents is not None:
+                                return await c.send_file(CFG.TARGET_GROUP_ID, file=result.photos[0], caption=wire_text, buttons=buttons, formatting_entities=wire_ents, link_preview=False)
                             return await c.send_file(CFG.TARGET_GROUP_ID, file=result.photos[0], caption=alert_text, buttons=buttons, parse_mode="html", link_preview=False)
                     except FloodWaitError:
                         raise
                     except Exception as e:
                         logger.debug(f"Chat photo fallback send failed [{account_name}]: {e}")
+            if wire_ents is not None:
+                return await c.send_message(CFG.TARGET_GROUP_ID, wire_text, buttons=buttons, formatting_entities=wire_ents, link_preview=False)
             return await c.send_message(CFG.TARGET_GROUP_ID, alert_text, buttons=buttons, parse_mode="html", link_preview=False)
 
         async def do_send():
@@ -2190,16 +2495,69 @@ class EnhancedAccountMonitor:
             يجيب تلقائياً على سيناريو 20:29 UTC: main_client ليس مشرفاً
             في قناة الهدف → المحاولة الأولى تفشل (صلاحيات/كيان) → ننتقل
             للمرشح التالي حتى ينجح أحدهم، ثم يُلاصق (alert_sender_client)
-            فلا تكلفة تدوير على التنبيهات التالية."""
+            فلا تكلفة تدوير على التنبيهات التالية.
+
+            v10.4: داخل كل مرشح يعمل سلّم mention — نبني الكيانات عبر
+            محلل HTML تيليجرام نفسه ونستبدل اسم المرسل فقط بكيان mention
+            حقيقي صالح لحساب الإرسال. عند USER_ID_INVALID /
+            ENTITY_MENTION_USER_INVALID ننتقل للدرجة التالية فوراً (بلا
+            retry على نفسها)، وإذا فشل السلّم كله نُرسل بالمسار الأصلي
+            parse_mode="html" — الناتج على السلك مطابق لـv10.3 حرفياً.
+            FloodWait/أي خطأ آخر يتصاعد للمسار الخارجي كما هو."""
             last_exc: Optional[Exception] = None
             for idx, c in enumerate(send_clients):
                 try:
-                    sent_msg = await _try_send_with(c)
+                    sent_msg: Any = None
+                    mention_used: Optional[str] = None
+                    try:
+                        mention_users = await self._resolve_mention_input_users(c, data)
+                    except Exception as mu_err:
+                        logger.debug(f"mention plan error [{account_name}]: {type(mu_err).__name__}")
+                        mention_users = []
+                    for tier_name, input_user in mention_users:
+                        built = _build_mention_entities(alert_text, sender_id, input_user)
+                        if built is None:
+                            continue
+                        try:
+                            sent_msg = await _send_alert_payload(c, built)
+                            mention_used = tier_name
+                            # العنوان تم حلّه فعلياً لهذا الحساب — ذخّر الـhash
+                            # الناتج عن درجة username (لئلا يُحل مرة أخرى).
+                            if tier_name == "username" and getattr(input_user, "access_hash", None):
+                                account_hash_store.record(
+                                    self._account_name_for_client(c) or "", sender_id,
+                                    int(getattr(input_user, "access_hash")),
+                                )
+                                asyncio.create_task(
+                                    self._persist_account_hash(sender_id, int(getattr(input_user, "access_hash")))
+                                )
+                            break
+                        except _MENTION_INVALID_ERRORS as mie:
+                            # الدرجة غير صالحة لهذا الحساب → الدرجة التالية فوراً
+                            mention_negative.mark(
+                                self._account_name_for_client(c) or "?", sender_id, tier_name
+                            )
+                            logger.info(
+                                f"mention tier '{tier_name}' invalid for [{account_name}] "
+                                f"sender={sender_id}: {type(mie).__name__} — next tier"
+                            )
+                            sent_msg = None
+                            continue
+                    if sent_msg is None:
+                        # لا درجات (أو فشلت كلها بmention-invalid) → المسار
+                        # الأصلي حرفياً (parse_mode="html") — نفس سلوك v10.3.
+                        sent_msg = await _send_alert_payload(c, None)
                     if self._bot_ref is not None:
                         try:
                             self._bot_ref.alert_sender_client = c
                         except Exception:
                             pass
+                    self._note_post_capable(c)
+                    if mention_used:
+                        logger.info(
+                            f"🔗 real mention entity sent [{account_name}] "
+                            f"via tier={mention_used} (sender={sender_id}) — visual format unchanged"
+                        )
                     if idx > 0:
                         logger.info(
                             f"✅ Alert send succeeded with candidate #{idx + 1} "
@@ -2332,6 +2690,12 @@ class EnhancedAccountMonitor:
         """
         if _capture.enabled:
             _capture.mark_alerted(data.get("chat_id"), data.get("message_id"))
+        # v10.4: T2 — alert-sent latency (message.date → sent). Logs/health
+        # only; zero effect on the alert itself.
+        try:
+            alert_latency.record(data.get("receive_lag_ms"), data.get("msg_date_ts"))
+        except Exception:
+            pass
         if sent_msg is not None and self._bot_ref is not None:
             try:
                 note = getattr(self._bot_ref, "_note_alert_message", None)

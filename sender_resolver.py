@@ -69,7 +69,7 @@ from telethon.tl.types import InputPeerUser
 
 from config import CFG
 
-__version__ = "1.0.0"
+__version__ = "2.0.0"
 
 
 # =============================================================================
@@ -859,6 +859,241 @@ class SenderResolver:
             self._inc("message_resolve_failure")
             self._time("resolve_message", None, chat_id, message_id, 1, started, "fail", reason)
             return ResolveResult(reason=reason, attempts=1)
+
+
+# =============================================================================
+# v10.4 — Mention entity builder (alert format FROZEN — entity-level fix only)
+# =============================================================================
+# CORE PRINCIPLE (engineering brief):
+#   The sender name in the alert opens the sender *for everyone in the
+#   target channel* only when it carries a REAL mention entity stored on
+#   Telegram's server — not a textual tg://user?id= anchor. Telethon's
+#   HTML parser keeps tg:// anchors as MessageEntityTextUrl and its send
+#   path DELETES the entity entirely when the SENDING account cannot
+#   resolve the user from its own entity cache (_replace_with_mention →
+#   del msg_entities[i]). We therefore pre-parse the alert with Telethon's
+#   own HTML parser (identical text output to parse_mode="html") and
+#   replace ONLY the sender-name anchor with InputMessageEntityMentionName
+#   backed by a valid InputUser for the SENDING account.
+#
+#   The rendered message is visually IDENTICAL: same text, same name,
+#   same position — the mention simply becomes real instead of being
+#   silently dropped. All other entities (t.me links, blockquotes) pass
+#   through untouched.
+#
+#   ⚠ We deliberately use the explicit `telethon.extensions.html.parse`
+#   module function rather than `client._parse_mode.parse()`: the client
+#   DEFAULT parse mode is Markdown, while the alert wire format is HTML
+#   (send_message(..., parse_mode="html")). html.parse is exactly what
+#   parse_mode="html" uses internally.
+from telethon.tl.types import (  # noqa: E402
+    InputMessageEntityMentionName,
+    InputUser,
+    InputUserFromMessage,
+    MessageEntityMentionName,
+    MessageEntityTextUrl,
+)
+
+
+def sender_url_forms(sender_id: int) -> Tuple[str, str]:
+    """The exact anchor URLs _build_alert can emit for the sender name
+    (v9.37 format): the generic tg://user form and the openmessage form
+    used when an access_hash is present. Nothing else is ever replaced."""
+    sid = int(sender_id or 0)
+    return (f"tg://user?id={sid}", f"tg://openmessage?user_id={sid}")
+
+
+def input_user_from_entity(entity: Any) -> Optional[InputUser]:
+    """InputUser(id, access_hash) only for REAL (non-min) hashes.
+    access_hash == 0 means a min/incomplete view — never usable for a
+    server-side mention (requirement: never guess a hash)."""
+    try:
+        uid = getattr(entity, "id", None)
+        ah = getattr(entity, "access_hash", None)
+        if isinstance(uid, int) and uid and isinstance(ah, int) and ah != 0:
+            return InputUser(user_id=uid, access_hash=ah)
+    except Exception:
+        pass
+    return None
+
+
+def input_user_from_input_peer(peer: Any) -> Optional[InputUser]:
+    """InputPeerUser → InputUser (same rule: non-zero hash only).
+    NOTE: InputPeerUser exposes user_id/access_hash (not id)."""
+    if isinstance(peer, InputPeerUser):
+        try:
+            uid = getattr(peer, "user_id", None)
+            ah = getattr(peer, "access_hash", None)
+            if isinstance(uid, int) and uid and isinstance(ah, int) and ah != 0:
+                return InputUser(user_id=uid, access_hash=ah)
+        except Exception:
+            pass
+    return None
+
+
+def input_user_from_message_context(peer: Any, msg_id: Any, sender_id: int) -> Optional[InputUserFromMessage]:
+    """InputUserFromMessage(peer, msg_id, user_id) — tier-3 of the ladder.
+    Pure construction (no API call): Telegram resolves the user from the
+    message context at send time, so this works cross-account as long as
+    the sending account can see the source chat and the message exists."""
+    try:
+        mid = int(msg_id or 0)
+        sid = int(sender_id or 0)
+        if peer is None or not mid or not sid:
+            return None
+        return InputUserFromMessage(peer=peer, msg_id=mid, user_id=sid)
+    except Exception:
+        return None
+
+
+def build_mention_entities(alert_html: str, sender_id: int, input_user: Any) -> Optional[Tuple[str, List[Any]]]:
+    """Parse alert HTML with Telethon's own HTML parser and replace ONLY
+    the sender-name anchor with a real InputMessageEntityMentionName.
+
+    Returns (text, entities) ready for
+    send_message(..., formatting_entities=...) — or None when nothing was
+    replaced (caller MUST then use the original parse_mode="html" path so
+    the wire output stays byte-identical to the frozen v10.3 format).
+
+    Mirrors Telethon's own post-parse cleanups (0-length entity strip,
+    #3884) so the entity list we produce is exactly what Telethon would
+    have produced — except the sender mention is now REAL instead of
+    silently deleted.
+    """
+    if not alert_html or not sender_id or input_user is None:
+        return None
+    try:
+        from telethon.extensions import html as _tg_html
+        text, ents = _tg_html.parse(alert_html)
+        urls = sender_url_forms(sender_id)
+        fixed: List[Any] = []
+        replaced = 0
+        for e in ents:
+            try:
+                if not getattr(e, "length", 0):
+                    continue  # mirror Telethon #3884: 0-length entities invalid
+                hit = False
+                if isinstance(e, MessageEntityMentionName) and int(getattr(e, "user_id", 0) or 0) == int(sender_id):
+                    hit = True
+                elif isinstance(e, MessageEntityTextUrl) and getattr(e, "url", "") in urls:
+                    hit = True
+                if hit:
+                    fixed.append(InputMessageEntityMentionName(int(e.offset), int(e.length), input_user))
+                    replaced += 1
+                else:
+                    fixed.append(e)
+            except Exception:
+                fixed.append(e)
+        if not replaced:
+            return None
+        return text, fixed
+    except Exception:
+        return None
+
+
+class AccountAccessHashStore:
+    """(account_name, sender_id) → access_hash — the spec's tier-4 store.
+
+    access_hash is PER-ACCOUNT knowledge: account A may hold a valid hash
+    for user X while account B cannot resolve X at all. Keyed by account
+    (NOT sender_id alone), bounded, LRU. record() returns True when the
+    value is new/changed so the caller can write-behind to the
+    sender_account_hashes table without an INSERT per message."""
+
+    def __init__(self, maxsize: int = 20000):
+        self._data: "OrderedDict[Tuple[str, int], int]" = OrderedDict()
+        self._maxsize = max(100, int(maxsize))
+        self.records = 0
+
+    def record(self, account_name: Optional[str], sender_id: Any, access_hash: Any) -> bool:
+        try:
+            if not account_name or not sender_id or not isinstance(access_hash, int) or access_hash == 0:
+                return False
+            key = (str(account_name), int(sender_id))
+            old = self._data.get(key)
+            if old == access_hash:
+                self._data.move_to_end(key)
+                return False
+            self._data[key] = access_hash
+            self._data.move_to_end(key)
+            while len(self._data) > self._maxsize:
+                self._data.popitem(last=False)
+            self.records += 1
+            return True
+        except Exception:
+            return False
+
+    def get(self, account_name: Optional[str], sender_id: Any) -> Optional[int]:
+        try:
+            if not account_name or not sender_id:
+                return None
+            val = self._data.get((str(account_name), int(sender_id)))
+            if val is not None:
+                self._data.move_to_end((str(account_name), int(sender_id)))
+            return val
+        except Exception:
+            return None
+
+    def size(self) -> int:
+        return len(self._data)
+
+
+class MentionNegativeCache:
+    """(account_name, sender_id, tier) marked after USER_ID_INVALID /
+    ENTITY_MENTION_USER_INVALID — the tier is skipped for TTL seconds
+    (brief: advance to the next tier immediately, no retry on itself).
+    Bounded LRU with lazy expiry."""
+
+    def __init__(self, ttl_seconds: int = 300, maxsize: int = 5000):
+        self._ttl = max(10, int(ttl_seconds))
+        self._maxsize = max(100, int(maxsize))
+        self._data: "OrderedDict[Tuple[str, int, str], float]" = OrderedDict()
+
+    def mark(self, account_name: Optional[str], sender_id: Any, tier: str) -> None:
+        try:
+            if not account_name or not sender_id or not tier:
+                return
+            key = (str(account_name), int(sender_id), str(tier))
+            self._data[key] = time.time()
+            self._data.move_to_end(key)
+            while len(self._data) > self._maxsize:
+                self._data.popitem(last=False)
+        except Exception:
+            pass
+
+    def blocked(self, account_name: Optional[str], sender_id: Any, tier: str) -> bool:
+        try:
+            if not account_name or not sender_id or not tier:
+                return False
+            key = (str(account_name), int(sender_id), str(tier))
+            ts = self._data.get(key)
+            if ts is None:
+                return False
+            if time.time() - ts > self._ttl:
+                self._data.pop(key, None)
+                return False
+            return True
+        except Exception:
+            return False
+
+    def size(self) -> int:
+        return len(self._data)
+
+
+# Module-level stores shared by all account monitors (same pattern as
+# sender_intel). account_hash_store is write-behind persisted by monitors
+# into the sender_account_hashes DB table.
+account_hash_store = AccountAccessHashStore()
+mention_negative = MentionNegativeCache(getattr(CFG, "MENTION_NEG_TTL_SECONDS", 300))
+
+
+def get_mention_intel_snapshot() -> Dict[str, Any]:
+    """Bounded diagnostics for /health (additive keys only)."""
+    return {
+        "mention_fix_enabled": bool(getattr(CFG, "SENDER_MENTION_FIX_ENABLED", True)),
+        "account_hash_store_size": account_hash_store.size(),
+        "negative_cache_size": mention_negative.size(),
+    }
 
 
 # =============================================================================
