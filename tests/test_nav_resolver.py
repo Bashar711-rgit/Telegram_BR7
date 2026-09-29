@@ -427,20 +427,20 @@ class TestFrozenBuilderIntegration:
         assert "https://t.me/c/1234567890/456" in urls
 
     async def test_alert_from_enriched_chat_info(self, monitor):
-        """التنبيه النهائي من بيانات مُحلّى: رابط المرسل + رابط الرسالة
-        المحلَّل يظهران في النمط الجديد (v10.8).
+        """التنبيه النهائي من بيانات مُحلّى: رابط المرسل + بطاقة «نص
+        الرسالة:» الموحدة (v10.9) — والأزرار من بوت التنبيهات فقط.
 
-        v10.8: النمط الجديد — username كرابط @U، رابط الرسالة المحلَّل
-        يظهر كسطر «رابط الرسالة :»، والأزرار من بوت التنبيهات فقط
-        (buttons=None من حسابات المستخدمين)."""
+        v10.9: الروابط انتقلت من سطر «رابط الرسالة :» إلى زر «عرض
+        الرسالة»؛ النص بطاقة موحدة (blockquote) لكل التنبيهات."""
         sender = {"id": 777000111, "display": "أحمد", "username": "ahmed_99", "access_hash": None}
         chat = {"entity": None, "title": "مجموعة الطلاب", "id": -1001234567890,
                 "message_id": 789, "username": "mygroup",
                 "group_link": "https://t.me/mygroup", "msg_link": "https://t.me/mygroup/789"}
         alert, buttons = monitor._build_alert(sender, chat, "واجب", "نص التنبيه", {"msg_hash": "h1"})
         assert '<a href="https://t.me/ahmed_99">@ahmed_99</a>' in alert
-        # رابط الرسالة المحلَّل (بوابة v10.5) يظهر كسطر الرابط
-        assert '<b>رابط الرسالة :</b> <a href="https://t.me/mygroup/789">https://t.me/mygroup/789</a>' in alert
+        # القالب الموحد v10.9: البطاقة تُظهر النص الأصلي كاملاً
+        assert '<b>نص الرسالة:</b>\n<blockquote>نص التنبيه</blockquote>' in alert
+        assert "رابط الرسالة" not in alert  # الروابط في الأزرار الآن
         assert buttons is None  # الأزرار من بوت التنبيهات فقط
 
     async def test_no_username_uses_recovered_db_username(self, monitor):

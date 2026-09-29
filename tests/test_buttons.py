@@ -171,12 +171,13 @@ class TestBuildDynamicButtons:
 
 
 class TestBuildAlertButtons:
-    """v10.8: حُذف Button.inline/Button.url (cnt_/copy_) من مسار التنبيه
-    بالكامل — _build_alert يعيد buttons=None دائماً (حسابات المستخدمين
-    لا ترسل أزراراً). أزرار [المرسل][جروب] تُبنى في alert_bot وتُرسل عبر
-    بوت التنبيهات (Bot API). دالة build_dynamic_buttons محفوظة كدالة
-    ميزة (تُختبر في TestBuildDynamicButtons أعلاه) ولم تعد تُستدعى من
-    مسار التنبيهات.
+    """v10.8/v10.9: حُذف Button.inline/Button.url (cnt_/copy_) من مسار
+    التنبيه بالكامل — _build_alert يعيد buttons=None دائماً (حسابات
+    المستخدمين لا ترسل أزراراً). الأزرار الأربعة الموحدة
+    [مراسلة][عرض الرسالة][نسخ اليوزر][القروب ↗] تُبنى في alert_bot عبر
+    build_alert_buttons وتُرسل عبر بوت التنبيهات (Bot API). دالة
+    build_dynamic_buttons محفوظة كدالة ميزة (تُختبر في
+    TestBuildDynamicButtons أعلاه) ولم تعد تُستدعى من مسار التنبيهات.
     """
 
     @pytest.mark.asyncio
@@ -197,16 +198,17 @@ class TestBuildAlertButtons:
 
     @pytest.mark.asyncio
     async def test_no_buttons_by_default_v10_8(self, monitor):
-        """v10.8: بدون أزرار على تنبيهات الحسابات — روابط النص داخل
-        التنبيه هي بديل الأزرار (رابط المرسل + رابط الرسالة)."""
+        """v10.9: بدون أزرار على تنبيهات الحسابات — القالب الموحد (بطاقة
+        «نص الرسالة:») بلا سطر رابط؛ الروابط في أزرار البوت."""
         sender = {"id": 555000111, "display": "أ", "username": "ahmed_99", "access_hash": None}
         chat = {"group_link": "https://t.me/g", "title": "ت", "msg_link": "https://t.me/g/7",
                 "id": -100123, "message_id": 7, "username": "g"}
         alert, buttons = monitor._build_alert(sender, chat, "ك", "نص", {"msg_hash": "x"})
         assert buttons is None
-        # روابط النص داخل التنبيه سليمة (بديل الأزرار)
+        # القالب الموحد: رابط المرسل في الترويسة + البطاقة بلا سطر روابط
         assert 'href="https://t.me/ahmed_99"' in alert
-        assert 'href="https://t.me/g/7"' in alert
+        assert '<b>نص الرسالة:</b>\n<blockquote>نص</blockquote>' in alert
+        assert "رابط الرسالة" not in alert
 
     @pytest.mark.asyncio
     async def test_buttons_disabled_via_cfg(self, monitor):
@@ -241,12 +243,17 @@ class TestBuildAlertButtons:
 
     @pytest.mark.asyncio
     async def test_bot_path_buttons_in_one_row(self, monitor):
-        """زرا [المرسل][جروب] inline URL في صف واحد عبر بناء البوت."""
+        """الأزرار الأربعة الموحدة inline في صف واحد عبر بناء البوت
+        (v10.9 — الدالة المركزية build_alert_buttons)."""
         from alert_bot import build_alert_html
         built = build_alert_html(
             {"sender_id": 555000111, "sender_username": "ahmed_99", "sender_display": "أ",
              "text": "نص", "chat_id": -100123, "message_id": 7, "chat_username": "g"},
             msg_link="https://t.me/g/7", group_link="https://t.me/g",
         )
-        assert built["sender_button"] == {"text": "@ahmed_99", "url": "https://t.me/ahmed_99"}
-        assert built["group_button"] == {"text": "جروب", "url": "https://t.me/g"}
+        assert built["buttons"] == [[
+            {"text": "مراسلة", "url": "https://t.me/ahmed_99"},
+            {"text": "عرض الرسالة", "url": "https://t.me/g/7"},
+            {"text": "نسخ اليوزر", "copy_text": {"text": "@ahmed_99"}},
+            {"text": "القروب ↗", "url": "https://t.me/g"},
+        ]]

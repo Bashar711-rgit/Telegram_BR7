@@ -93,14 +93,10 @@ v9.10 (this pass) — Cross-Account Dedup + Dynamic Alert Buttons:
       - فشل-آمن: خطأ DB → الحماية بالذاكرة فقط والتنبيه الأول يمر.
       - DEDUP_ENABLED / DEDUP_WINDOW_SECONDS قابلان للتعديل حياً من اللوحة
         (تُقرأ من CFG عند كل claim — تطبيق فوري بدون إعادة تشغيل).
-  * الأزرار الديناميكية أسفل كل تنبيه (كود المستخدم المدمج حرفياً):
-      - build_dynamic_buttons(): [ 💬 مراسلة ] [ 📨 عرض الرسالة ] في صف
-        واحد. مراسلة: t.me/{username} أو tg://openmessage?user_id=؛
-        عرض الرسالة: t.me/{chat}/{msg} عامة أو t.me/c/{inner}/{msg} خاصة.
-      - الزر الذي تفتقر بياناته لا يُعرض إطلاقاً (لا أزرار مكسورة)، وزر
-        📋 نسخ النص يبقى مضافاً لنفس الصف عند ALERT_WITH_COPY_BUTTON.
-      - زر "👤 فتح الحساب" القديم حُذف (استُوعب بالكامل في "💬 مراسلة"
-        الذي يغطي نفس الحالتين بشكل أدق). نص التنبيه HTML نفسه لم يتغير.
+  * الأزرار الديناميكية (v10.9): أزيلت نهائياً من مسار التنبيهات —
+    الأزرار الأربعة الموحدة [مراسلة][عرض الرسالة][نسخ اليوزر][القروب ↗]
+    تُبنى حصراً عبر alert_bot.build_alert_buttons وتُرسل عبر بوت التنبيهات
+    (Bot API). build_dynamic_buttons كدالة ميزة محفوظة لم يُحذف.
   * المسار الكامل: Event → Extract → msg_hash dedup (DB) → فلترة →
     rate-limit → **content dedup (هنا)** → بناء التنبيه + الأزرار → إرسال.
 
@@ -150,25 +146,40 @@ v10.7 (this pass) — SENDER ACCESS REGISTRY: كل اسم مرسل قابل لل
     النص. البناء الكامل للأزرار محفوظ خلف ALERT_BUTTONS_ENABLED (افتراضي
     false). منطق الفلترة والـrate limiter لم يُمَسّا.
 
-v10.8 (this pass) — ALERT BOT + النمط الجديد للتنبيهات (الشكل المطلوب
-حرفياً في المواصفة والصورة):
-  * شكل جديد (parse_mode=HTML) لكل تنبيه يصل TARGET_GROUP_ID:
+v10.8 (سابقة) — ALERT BOT: الإرسال عبر Bot API (aiohttp) — انظر alert_bot.py.
+
+v10.9 (this pass) — نمط الواجهة الموحد للتنبيهات (الشكل المطلوب حرفياً في
+المواصفة والصورة المرجعية) — نفس التصميم لكل التنبيهات دون استثناء:
+  * القالب الموحد (parse_mode=HTML) لكل تنبيه يصل TARGET_GROUP_ID:
       سطر 1: 👤 {SENDER}        — username: <a href="https://t.me/U">@U</a>
                                  بدونه: <a href="tg://user?id=ID">الاسم</a>
       سطر 2: <b>المرسل :</b> ID {sender_id}
-      (سطر فارغ) <b>نص الرسالة :</b>\n{text escape_html + truncate(400)}
-      <b>رابط الرسالة :</b> {t.me/{u}/{id} | t.me/c/{inner}/{id} | غير متاح}
+      (سطر فارغ) <b>نص الرسالة:</b>
+      <blockquote>{النص الأصلي كاملاً — بطاقة منظمة بدعم RTL و preserve الأسطر}
+  * النص الأصلي كامل (لا truncate(400)) — التقصير الوحيد حاجز تيليجرام
+    4096 للرسالة كلها (يُلجأ إليه فقط عند التجاوز مع "…" وتحذير لوج).
+  * الأزرار الأربعة (Inline Keyboard — صف واحد أسفل كل تنبيه مباشرة،
+    ترتيب RTL: «مراسلة» في أقصى اليمين كما في الصورة):
+      [ مراسلة ] [ عرض الرسالة ] [ نسخ اليوزر ] [ القروب ↗ ]
+    تُبنى كلها حصراً عبر الدالة المركزية alert_bot.build_alert_buttons:
+      مراسلة = t.me/{username} أو tg://user?id= (يعمل فعلياً)؛
+      عرض الرسالة = رابط الرسالة الحقيقي (t.me/{u}/{id} | t.me/c/{inner}/{id})
+        وإلا أفضل آلية متاحة (رابط القروب) — لا روابط وهمية؛
+      نسخ اليوزر = زر copy_text رسمي (نسخ فعلي للحافظة: @username أو ID)؛
+      القروب ↗ = t.me/{u} أو t.me/c/{inner} أو رابط الدعوة.
+    الزر الذي تنعدم بياناته يُحذف كلياً (لا أزرار معطلة). الحسابات لا
+    ترسل أزراراً — الأزرار من بوت التنبيهات فقط (Bot API).
   * الإرسال كله يمر عبر alert_bot.AlertBot.send(data, analysis) من
     _send_alert: Bot API sendMessage بـ aiohttp — chat_id=TARGET_GROUP_ID,
     parse_mode="HTML", link_preview_options={"is_disabled": true},
-    reply_markup={"inline_keyboard": [[زر المرسل، جروب]]} (صف واحد).
-    زر «جروب» يُحذف إن لم يوجد رابط؛ زر المرسل @USERNAME أو الاسم
-    (tg://user?id=). المراقبون يستمعون ويبنون البيانات فقط.
+    reply_markup={"inline_keyboard": [[الأزرار الأربعة]]} (صف واحد).
+    المراقبون يستمعون ويبنون البيانات فقط.
   * معالجة أخطاء البوت: 429 → انتظار retry_after وإعادة (≤3)؛
     BUTTON_USER_INVALID/BUTTON_USER_PRIVACY_RESTRICTED → إعادة بدون زر
-    المرسل (الرابط يبقى في النص وزر «جروب» يبقى)؛ أي فشل آخر أو غياب
-    ALERT_BOT_TOKEN → fallback لمسار حسابات المستخدمين بنفس نص التنبيه
-    بدون أزرار مع تسجيل السبب (rate_limiter/circuit breaker كما هم).
+    «مراسلة» فقط (رابط الاسم يبقى في النص وتبقى بقية الأزرار)؛ أي فشل
+    آخر أو غياب ALERT_BOT_TOKEN → fallback لمسار حسابات المستخدمين
+    بنفس القالب الموحد بدون أزرار مع تسجيل السبب (rate_limiter/circuit
+    breaker كما هم).
   * alerts.contact_method (عمود v10.7 نفسه): username | mention_button |
     text_only لمسار البوت، والقيم السابقة (username | mention | forward |
     link) لمسار الـfallback.
@@ -1229,22 +1240,23 @@ class EnhancedAccountMonitor:
 
 
     def _build_alert(self, sender: Dict, chat: Dict, keyword: str, text: str, analysis: Dict = None) -> Tuple[str, Optional[List]]:
-        """══ v10.8 — النمط الجديد المطلوب حرفياً (parse_mode=HTML) ══
+        """══ v10.9 — القالب الموحد (parse_mode=HTML) ══
 
             سطر 1:  👤 {SENDER}
             سطر 2:  <b>المرسل :</b> ID {sender_id}
             (سطر فارغ)
-            <b>نص الرسالة :</b>
-            {text}        <- escape_html + truncate(400)
-            <b>رابط الرسالة :</b> {msg_link}  <- أو «غير متاح»
+            <b>نص الرسالة:</b>
+            <blockquote>{النص الأصلي كاملاً — بطاقة منظمة RTL}</blockquote>
 
         SENDER: username → <a href="https://t.me/U">@U</a>؛ بدونه
         <a href="tg://user?id=ID">الاسم الكامل</a>.
 
         العائد دائماً (نص, None): حسابات المستخدمين لا ترسل أزراراً —
-        الأزرار [المرسل][جروب] (inline URL في صف واحد) يبنيها ويرسلها بوت
-        التنبيهات (alert_bot.AlertBot) في مسار الإرسال عبر Bot API. زر
-        «جروب» يُحذف إن لم يوجد رابط. حُذف من هذا البانِر Button.inline/
+        الأزرار الأربعة الموحدة [مراسلة][عرض الرسالة][نسخ اليوزر][القروب ↗]
+        (صف واحد، ترتيب RTL) تبنيها الدالة المركزية
+        alert_bot.build_alert_buttons ويرسلها بوت التنبيهات
+        (alert_bot.AlertBot) في مسار الإرسال عبر Bot API. الزر الذي
+        تنعدم بياناته يُحذف كلياً. حُذف من هذا البانِر Button.inline/
         Button.url (cnt_/copy_) بالكامل حسب المواصفة (معالجات main.py
         بقيت لميزة الرد اليدوي). سطر «🏷 قاعدة» (محرك القواعد — ميزة
         قائمة) يُلاحق عند وجوده فقط في نهاية التنبيه.
@@ -2871,13 +2883,14 @@ class EnhancedAccountMonitor:
                     )
             return False
 
-        # ══ v10.8: بوت التنبيهات — الإرسال عبر Bot API (النمط الجديد) ══
+        # ══ v10.8/v10.9: بوت التنبيهات — الإرسال عبر Bot API (القالب الموحد) ══
         # الإرسال كله يمر عبر AlertBot.send(data, analysis): رسالة التنبيه
         # مرّت فعلاً عبر dedup + rate_limiter + similarity أعلاه (كما هي)،
         # ومسار الـfallback التالي يمر عبر circuit breaker (_send_cb) كما
-        # هو. الحسابات تستمع وتبني البيانات فقط — الأزرار [المرسل][جروب]
-        # تصل عبر البوت. أي فشل/غياب توكن → الـfallback بنفس النص بدون
-        # أزرار مع تسجيل السبب (شرط القبول 6).
+        # هو. الحسابات تستمع وتبني البيانات فقط — الأزرار الأربعة الموحدة
+        # [مراسلة][عرض الرسالة][نسخ اليوزر][القروب ↗] تصل عبر البوت (صف
+        # واحد عبر build_alert_buttons). أي فشل/غياب توكن → الـfallback
+        # بنفس القالب بدون أزرار مع تسجيل السبب (شرط القبول 6).
         alert_bot = getattr(self._bot_ref, "alert_bot", None) if self._bot_ref is not None else None
         if alert_bot is not None and getattr(alert_bot, "enabled", False):
             try:

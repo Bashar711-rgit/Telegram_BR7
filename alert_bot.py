@@ -1,47 +1,60 @@
 #!/usr/bin/env python3
 """
-alert_bot.py – v10.8 Alert Bot — إرسال التنبيهات إلى TARGET_GROUP_ID عبر
-Telegram Bot API (aiohttp) بالشكل الجديد المطلوب حرفياً.
+alert_bot.py – v10.9 Alert Bot — نمط الواجهة الموحد للتنبيهات (HTML) + الأزرار
+الأربعة في صف واحد، مرسل عبر Telegram Bot API (aiohttp).
 
-المهمة: تغيير شكل وطريقة إرسال التنبيهات إلى TARGET_GROUP_ID لتطابق
-النمط التالي بالضبط (parse_mode=HTML):
+القالب الموحد (parse_mode=HTML — نفس التصميم لكل التنبيهات دون استثناء):
 
     سطر 1:  👤 {SENDER}
     سطر 2:  <b>المرسل :</b> ID {sender_id}
     (سطر فارغ)
-    <b>نص الرسالة :</b>
-    {text}        <- escape_html + truncate(400)
-    <b>رابط الرسالة :</b> {msg_link}   <- أو النص "غير متاح" إن لم يوجد رابط
+    <b>نص الرسالة:</b>
+    <blockquote>{النص الأصلي كاملاً — escape_html — بلا حذف أجزاء}</blockquote>
 
-SENDER:
-  - إن وُجد username:  <a href="https://t.me/USERNAME">@USERNAME</a>
-  - بدونه:             <a href="tg://user?id=ID">الاسم الكامل</a>
+  * البطاقة: عنوان «نص الرسالة:» أعلى ومحتوى الرسالة الأصلي كاملاً أسفله
+    داخل <blockquote> (منطقة واضحة منظمة — أقرب نمط رسمي لبطاقة في
+    تيليجرام)، مع دعم العربية/RTL والحفاظ على الأسطر والفقرات.
+  * النص الأصلي يُحفظ كاملاً (لا truncate(400)) — التقصير الوحيد المسموح
+    هو حاجز حد تيليجرام 4096 حرفاً للرسالة كلها، يُلجأ إليه فقط عند
+    تجاوز النص+الترويسة ذلك الحد (مع "…" وتحذير في اللوج).
+  * SENDER: username → <a href="https://t.me/U">@U</a>؛ بدونه
+    <a href="tg://user?id=ID">الاسم الكامل</a>.
 
-msg_link:
-  - قروب عام (له username):  https://t.me/{username}/{message_id}
-  - قروب خاص (id يبدأ -100): https://t.me/c/{id بدون -100}/{message_id}
-  - غير ذلك: «غير متاح» (بدون رابط)
+الأزرار — Inline Keyboard في صف واحد أسفل كل تنبيه مباشرة (الدالة
+المركزية build_alert_buttons — لا يُبنى أي زر يدوياً في أي مكان آخر).
+الترتيب (RTL — «مراسلة» في أقصى اليمين كما في الصورة المرجعية):
 
-الأزرار (Inline URL buttons في صف واحد — تُرسل عبر البوت فقط):
-  - زر «جروب» → رابط القروب (t.me/username أو t.me/c/inner)؛ يُحذف الزر
-    إن لم يوجد رابط.
-  - زر المرسل:
-      * username موجود: نص الزر «@USERNAME» و url = https://t.me/USERNAME
-      * بدون username: نص الزر = اسمه و url = tg://user?id=ID
+    [ مراسلة ] [ عرض الرسالة ] [ نسخ اليوزر ] [ القروب ↗ ]
+
+  * مراسلة: فتح محادثة المستخدم فعلياً — username → https://t.me/U؛
+    بدونه أفضل رابط مباشر متاح (tg://user?id=ID). يُحذف الزر إن لم
+    يوجد أي منهما.
+  * عرض الرسالة: رابط الرسالة الحقيقي (t.me/{u}/{id} للعام،
+    t.me/c/{inner}/{id} للخاص) بحيث يصل المستخدم للرسالة نفسها؛ إن
+    تعذر رابط مباشر → أفضل آلية متاحة (رابط القروب) بدل رابط وهمي؛
+    بلا أي رابط → يُحذف الزر.
+  * نسخ اليوزر: نسخ فعلي إلى الحافظة عبر زر copy_text الرسمي
+    (Bot API ≥ 7.2): «@username» إن وُجد وإلا Telegram ID — الزر عملي
+    وليس نصياً. يُحذف فقط إن لم يوجد username ولا ID.
+  * القروب ↗: فتح المجموعة الأصلية (t.me/{u} أو t.me/c/{inner} أو رابط
+    الدعوة المتاح) — لا روابط وهمية أبداً؛ بلا رابط → يُحذف الزر.
+  * الألوان: inline buttons لا تقبل HEX رسمياً — يُستخدم نمط تيليجرام
+    الرسمي القريب كما هي (لا تحايل).
 
 طريقة الإرسال:
   POST https://api.telegram.org/bot{TOKEN}/sendMessage
   json: chat_id=TARGET_GROUP_ID, text, parse_mode="HTML",
         link_preview_options={"is_disabled": true},
-        reply_markup={"inline_keyboard": [[...]]}
+        reply_markup={"inline_keyboard": [[صف الأزرار الأربعة]]}
 
 معالجة الأخطاء:
   * 429 → انتظار retry_after ثم إعادة المحاولة (بحد أقصى 3).
-  * BUTTON_USER_INVALID أو BUTTON_USER_PRIVACY_RESTRICTED → إعادة الإرسال
-    بدون زر المرسل (يبقى رابط الاسم في النص ويبقى زر «جروب»).
+  * BUTTON_USER_INVALID أو BUTTON_USER_PRIVACY_RESTRICTED → إعادة
+    الإرسال بدون زر «مراسلة» فقط (يبقى رابط الاسم في النص وتبقى بقية
+    الأزرار) — الرسالة لا تضيع.
   * أي فشل آخر أو عدم وجود ALERT_BOT_TOKEN → العودة لمسار الإرسال من
-    حساب المستخدم (fallback في monitors.py) بنفس نص التنبيه بدون أزرار
-    مع تسجيل السبب في اللوج.
+    حساب المستخدم (fallback في monitors.py) بنفس القالب الموحد بدون
+    أزرار مع تسجيل السبب في اللوج.
 
 المراقبون (حسابات المستخدمين) يستمرون في الاستماع وبناء البيانات فقط —
 الإرسال كله يمر عبر AlertBot.send(data, analysis) من _send_alert، مع
@@ -52,14 +65,15 @@ check_membership() (getChatMember) تسجّل تحذيراً واضحاً عند
 لم يكن عضواً.
 
 تسجيل النتيجة: alerts.contact_method = username | mention_button |
-text_only (عمود موجودة منذ v10.7 — قيم جديدة بنفس العقد ≤20 حرفاً).
+text_only (عمود موجودة منذ v10.7 — قيم بنفس العقد ≤20 حرفاً).
 
 حفاظاً على الميزات: سطر «🏷 قاعدة: …» (محرك القواعد) يُلاحق في نهاية
-التنبيه عند وجوده فقط — لا يظهر في الشكل الافتراضي إطلاقاً.
+التنبيه عند وجوده فقط.
 """
 from __future__ import annotations
 
 import asyncio
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
@@ -68,14 +82,25 @@ from loguru import logger
 from config import InputSanitizer
 
 BOT_API_BASE = "https://api.telegram.org"
-# المواصفة حرفياً: نص الرسالة escape_html + truncate(400)
-ALERT_TEXT_TRUNCATE = 400
-MSG_LINK_UNAVAILABLE = "غير متاح"
-GROUP_BUTTON_TEXT = "جروب"
+# حد تيليجرام الأقصى لنص الرسالة — الحاجز الوحيد المسموح لتقصير المحتوى
+TELEGRAM_MAX_TEXT_LEN = 4096
 
-# أخطاء زر tg://user — يُعاد الإرسال بدون زر المرسل (زر «جروب» يبقى،
-# ورابط الاسم يبقى في النص حرفياً كما في المواصفة).
+# ══ القالب الموحد — نصوص ثابتة (لا تُغيَّر: عقد واجهة) ══
+CARD_TITLE_HTML = "<b>نص الرسالة:</b>"
+MSG_LINK_UNAVAILABLE = "غير متاح"  # محتفظ به للتوافق الخلفي (لم يعد في النص)
+
+# نصوص الأزرار الأربعة — بالصيغة العربية نفسها المطلوبة
+BTN_CONTACT = "مراسلة"
+BTN_VIEW = "عرض الرسالة"
+BTN_COPY = "نسخ اليوزر"
+BTN_GROUP = "القروب ↗"
+
+# أخطاء زر tg://user — يُعاد الإرسال بدون زر «مراسلة» فقط (بقية الأزرار
+# تبقى، ورابط الاسم يبقى في النص).
 BUTTON_USER_ERRORS = ("BUTTON_USER_INVALID", "BUTTON_USER_PRIVACY_RESTRICTED")
+
+_TG_URL = "https://t.me/"
+_PARTIAL_ENTITY_RE = re.compile(r"&[a-zA-Z#0-9]{0,10}$")
 
 
 def _clean_username(value: Any) -> str:
@@ -96,6 +121,112 @@ def _tme_inner_id(chat_id: Any) -> Optional[str]:
     return inner if inner.isdigit() else None
 
 
+def build_message_link(data: Dict[str, Any], chat_username: Optional[str] = None) -> Optional[str]:
+    """رابط الرسالة الحقيقي: عام → t.me/{u}/{id}؛ خاص -100 → t.me/c/{inner}/{id}."""
+    message_id = data.get("message_id")
+    if not message_id:
+        return None
+    uname = _clean_username(chat_username) or _clean_username(data.get("chat_username"))
+    if uname:
+        return f"{_TG_URL}{uname}/{message_id}"
+    inner = _tme_inner_id(data.get("chat_id"))
+    if inner:
+        return f"{_TG_URL}c/{inner}/{message_id}"
+    return None
+
+
+def build_group_link(data: Dict[str, Any], chat_username: Optional[str] = None,
+                     invite_link: Optional[str] = None) -> Optional[str]:
+    """رابط المجموعة: رابط دعوة متاح → t.me/{u} → t.me/c/{inner} — لا روابط وهمية."""
+    il = str(invite_link or "").strip()
+    if il and il != "#":
+        return il
+    uname = _clean_username(chat_username) or _clean_username(data.get("chat_username"))
+    if uname:
+        return f"{_TG_URL}{uname}"
+    inner = _tme_inner_id(data.get("chat_id"))
+    if inner:
+        return f"{_TG_URL}c/{inner}"
+    return None
+
+
+def build_alert_buttons(
+    sender_id: Any = 0,
+    sender_username: Any = None,
+    sender_name: str = "",
+    msg_link: Optional[str] = None,
+    group_link: Optional[str] = None,
+    include_user_button: bool = True,
+) -> List[List[Dict[str, Any]]]:
+    """══ الدالة المركزية الوحيدة لبناء أزرار التنبيه (v10.9) ══
+
+    صف واحد بترتيب RTL («مراسلة» تظهر في أقصى اليمين في عملاء تيليجرام
+    العربية كما في الصورة المرجعية):
+
+        [ مراسلة ] [ عرض الرسالة ] [ نسخ اليوزر ] [ القروب ↗ ]
+
+    * الأزرار متساوية/متقاربة العرض تلقائياً (تيليجرام يوزع الصف الواحد
+      على عرض التنبيه بالكامل — لا صفوف متعددة ولا أزرار عمودية).
+    * الزر الذي تنعدم بياناته يُحذف كلياً (لا أزرار معطلة ولا روابط وهمية).
+    * نسخ اليوزر زر copy_text رسمي — نسخ فعلي للحافظة وليس زر نصياً.
+    * include_user_button=False بعد رفض tg://user (خصوصية) — يُسقط زر
+      «مراسلة» فقط وتبقى بقية الأزرار.
+    * كل تنبيه جديد مستقبلاً يستخدم هذه الدالة تلقائياً — لا تُبنى أزرار
+      يدوياً في أي مسار آخر.
+    """
+    row: List[Dict[str, Any]] = []
+    username = _clean_username(sender_username)
+    try:
+        sid = int(sender_id or 0)
+    except Exception:
+        sid = 0
+
+    # 1) مراسلة — فتح محادثة المستخدم مباشرة (يمين الصف في عملاء RTL)
+    if include_user_button:
+        if username:
+            row.append({"text": BTN_CONTACT, "url": f"{_TG_URL}{username}"})
+        elif sid:
+            # أفضل رابط مباشر ممكن لمن لا يملك username
+            row.append({"text": BTN_CONTACT, "url": f"tg://user?id={sid}"})
+
+    # 2) عرض الرسالة — الرسالة نفسها لا الصفحة الرئيسية؛ بدون رابط مباشر
+    #    نستخدم أفضل آلية متاحة (رابط القروب) بدل رابط وهمي.
+    view_url = str(msg_link or "").strip()
+    if view_url in ("", "#"):
+        view_url = str(group_link or "").strip()
+    if view_url in ("", "#"):
+        view_url = ""
+    if view_url:
+        row.append({"text": BTN_VIEW, "url": view_url})
+
+    # 3) نسخ اليوزر — نسخ فعلي إلى الحافظة (Bot API copy_text)
+    if username:
+        row.append({"text": BTN_COPY, "copy_text": {"text": f"@{username}"}})
+    elif sid:
+        row.append({"text": BTN_COPY, "copy_text": {"text": str(sid)}})
+
+    # 4) القروب ↗ — المجموعة الأصلية فقط (t.me/username أو t.me/c/inner
+    #    أو رابط الدعوة) — بلا رابط حقيقي يُحذف الزر.
+    glink = str(group_link or "").strip()
+    if glink in ("", "#"):
+        glink = ""
+    if glink:
+        row.append({"text": BTN_GROUP, "url": glink})
+
+    return [row] if row else []
+
+
+def _has_tg_user_button(built: Dict[str, Any]) -> bool:
+    """هل صف الأزرار يحتوي زر «مراسلة» بنمط tg://user (القابل لرفض الخصوصية)."""
+    kb = built.get("buttons") or []
+    if not kb:
+        return False
+    return any(
+        str(b.get("url") or "").startswith("tg://user?id=")
+        for b in kb[0]
+    )
+
+
 def build_alert_html(
     data: Dict[str, Any],
     analysis: Optional[Dict[str, Any]] = None,
@@ -105,19 +236,20 @@ def build_alert_html(
     chat_username: Optional[str] = None,
     sender_username: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """يبني نص التنبيه بالصيغة الجديدة (HTML) + زري المرسل/الجروب.
+    """يبني القالب الموحد للتنبيه (HTML) + الأزرار الأربعة (صف واحد).
 
     يعيد dict:
-      text           — نص التنبيه الكامل (parse_mode="HTML")
-      sender_button  — {"text", "url"} | None (زر المرسل)
-      group_button   — {"text", "url"} | None (زر «جروب»)
+      text           — نص التنبيه الكامل (parse_mode="HTML") بالبطاقة
+      buttons        — Inline keyboard كامل: [[صف الأزرار الأربعة]] | []
+      button_kwargs  — معاملات build_alert_buttons (لإعادة البناء بدون
+                       زر «مراسلة» عند رفض tg://user)
       contact_method — username | mention_button | text_only
       msg_link       — رابط الرسالة المستخدم | None
       display        — الاسم المعروض للمرسل
 
     القيم الواردة من msg_link/group_link/chat_username/sender_username
     تتفوق على قيم data (هي نتيجة محلل v10.5 المُحسَّن). لا يرفع استثناء
-    أبداً — فشل-آمن: بيانات ناقصة تعني حقولاً بصدق («غير متاح»/بلا زر).
+    أبداً — فشل-آمن: بيانات ناقصة تعني أزراراً محذوفة بصدق.
     """
     try:
         sender_id = int(data.get("sender_id") or 0)
@@ -134,80 +266,75 @@ def build_alert_html(
                 username = _c
                 break
 
-    # ── الاسم المعروض ──
+    # ── الاسم المعروض (سقف 128 حرفاً — حماية حد 4096) ──
     display = (
         str(data.get("sender_display") or "").strip()
         or f"{data.get('sender_first_name') or ''} {data.get('sender_last_name') or ''}".strip()
         or (f"مستخدم ({sender_id})" if sender_id else "مستخدم")
     )
+    if len(display) > 128:
+        display = display[:127] + "…"
 
     # ── SENDER: سطر 1 ──
     if username:
-        sender_html = f'<a href="https://t.me/{username}">@{username}</a>'
-        sender_button: Optional[Dict[str, str]] = {
-            "text": f"@{username}",
-            "url": f"https://t.me/{username}",
-        }
+        sender_html = f'<a href="{_TG_URL}{username}">@{username}</a>'
         contact_method = "username"
     elif sender_id:
         sender_html = f'<a href="tg://user?id={sender_id}">{InputSanitizer.escape_html(display)}</a>'
-        sender_button = {"text": display, "url": f"tg://user?id={sender_id}"}
         contact_method = "mention_button"
     else:
         sender_html = InputSanitizer.escape_html(display)
-        sender_button = None
         contact_method = "text_only"
 
-    # ── msg_link: قروب عام → t.me/{u}/{id} | خاص -100 → t.me/c/{inner}/{id} ──
-    link = str(msg_link or "").strip()
-    if link in ("", "#"):
-        link = ""
-        chat_uname = _clean_username(chat_username) or _clean_username(data.get("chat_username"))
-        message_id = data.get("message_id")
-        if chat_uname and message_id:
-            link = f"https://t.me/{chat_uname}/{message_id}"
-        else:
-            inner = _tme_inner_id(data.get("chat_id"))
-            if inner and message_id:
-                link = f"https://t.me/c/{inner}/{message_id}"
-    msg_html = f'<a href="{link}">{link}</a>' if link else MSG_LINK_UNAVAILABLE
+    # ── سطر «🏷 قاعدة» (ميزة محرك القواعد) — عند وجوده فقط ──
+    rule_tag = (analysis or {}).get("rule_tag") if isinstance(analysis, dict) else None
+    rule_part = ""
+    if rule_tag:
+        rule_part = f"\n\n🏷 قاعدة: {InputSanitizer.escape_html(str(rule_tag))}"
 
-    # ── زر «جروب»: رابط القروب فقط — يُحذف الزر إن لم يوجد رابط ──
-    glink = str(group_link or "").strip()
-    if glink in ("", "#"):
-        chat_uname = _clean_username(chat_username) or _clean_username(data.get("chat_username"))
-        inner = _tme_inner_id(data.get("chat_id"))
-        if chat_uname:
-            glink = f"https://t.me/{chat_uname}"
-        elif inner:
-            glink = f"https://t.me/c/{inner}"
-        else:
-            glink = ""
-    group_button = {"text": GROUP_BUTTON_TEXT, "url": glink} if glink else None
-
-    # ── نص الرسالة: escape_html + truncate(400) — المواصفة حرفياً ──
-    safe_text = InputSanitizer.escape_html(
-        InputSanitizer.truncate(str(data.get("text") or ""), ALERT_TEXT_TRUNCATE)
-    )
-
-    lines: List[str] = [
+    # ── بطاقة نص الرسالة: المحتوى الأصلي كاملاً (لا حذف أجزاء) ──
+    # الحاجز الوحيد: حد تيليجرام 4096 للرسالة كلها — يُقص المتجاوز فقط
+    # مع "…" وتحذير لوج (لا نقسم كيان HTML نصف مكتمل).
+    header = "\n".join([
         f"👤 {sender_html}",
         f"<b>المرسل :</b> ID {sender_id}",
         "",
-        "<b>نص الرسالة :</b>",
-        safe_text,
-        f"<b>رابط الرسالة :</b> {msg_html}",
-    ]
-    # حفاظاً على ميزة محرك القواعد: سطر القاعدة يُلاحق عند وجوده فقط.
-    rule_tag = (analysis or {}).get("rule_tag") if isinstance(analysis, dict) else None
-    if rule_tag:
-        lines.append("")
-        lines.append(f"🏷 قاعدة: {InputSanitizer.escape_html(str(rule_tag))}")
+        CARD_TITLE_HTML,
+    ])
+    overhead = len(header) + len("<blockquote></blockquote>") + len(rule_part) + 1 + 16
+    budget = max(TELEGRAM_MAX_TEXT_LEN - overhead, 256)
+    safe_text = InputSanitizer.escape_html(str(data.get("text") or ""))
+    if len(safe_text) > budget:
+        cut = safe_text[: budget - 1].rstrip()
+        cut = _PARTIAL_ENTITY_RE.sub("", cut)
+        safe_text = cut + "…"
+        logger.warning(
+            f"⚠️ alert text truncated to Telegram 4096 limit "
+            f"(escaped_len={len(safe_text)} budget={budget})"
+        )
+    text = f"{header}\n<blockquote>{safe_text}</blockquote>{rule_part}"
+
+    # ── روابط الرسالة/القروب الحقيقية (قيم المحلّل أولاً ثم البناء) ──
+    link = str(msg_link or "").strip()
+    if link in ("", "#"):
+        link = build_message_link(data, chat_username) or ""
+    glink = str(group_link or "").strip()
+    if glink in ("", "#"):
+        glink = build_group_link(data, chat_username) or ""
+
+    button_kwargs: Dict[str, Any] = {
+        "sender_id": sender_id,
+        "sender_username": username or None,
+        "sender_name": display,
+        "msg_link": link or None,
+        "group_link": glink or None,
+    }
+    buttons = build_alert_buttons(**button_kwargs)
 
     return {
-        "text": "\n".join(lines),
-        "sender_button": sender_button,
-        "group_button": group_button,
+        "text": text,
+        "buttons": buttons,
+        "button_kwargs": button_kwargs,
         "contact_method": contact_method,
         "msg_link": link or None,
         "display": display,
@@ -219,9 +346,9 @@ class AlertBot:
 
     * بلا توكن → enabled=False → مسار حسابات المستخدمين (fallback) يعمل
       كما هو بلا أعطال (شرط القبول رقم 6).
-    * كل استدعاء send() يبني الحمولة من بيانات الرسالة نفسها ويُرسل
-      sendMessage بـ parse_mode="HTML" + link_preview_options معطّل +
-      صف أزرار inline URL واحد (المرسل ثم «جروب»).
+    * كل استدعاء send() يبني الحمولة من بيانات الرسالة نفسها عبر الدالة
+      المركزية build_alert_buttons ويُرسل sendMessage بـ parse_mode="HTML"
+      + link_preview_options معطّل + صف الأزرار الأربعة في صف واحد.
     """
 
     def __init__(
@@ -331,15 +458,14 @@ class AlertBot:
 
     # ── الإرسال ──
     def _build_payload(
-        self, built: Dict[str, Any], include_sender_button: bool = True
+        self, built: Dict[str, Any], include_user_button: bool = True
     ) -> Dict[str, Any]:
-        """حمولة sendMessage — صف أزرار واحد: [زر المرسل، جروب] (بالصورة
-        المطلوبة). زر بلا بيانات لا يُعرض إطلاقاً."""
-        kb: List[Dict[str, str]] = []
-        if built.get("sender_button") and include_sender_button:
-            kb.append(built["sender_button"])
-        if built.get("group_button"):
-            kb.append(built["group_button"])
+        """حمولة sendMessage — الدالة المركزية build_alert_buttons تبني
+        صف الأزرار الأربعة [مراسلة][عرض الرسالة][نسخ اليوزر][القروب ↗].
+        الزر بلا بيانات لا يُعرض إطلاقاً؛ include_user_button=False بعد
+        رفض tg://user (يسقط زر «مراسلة» فقط)."""
+        kwargs = dict(built.get("button_kwargs") or {})
+        kb = build_alert_buttons(include_user_button=include_user_button, **kwargs)
         payload: Dict[str, Any] = {
             "chat_id": self.chat_id,
             "text": built["text"],
@@ -347,7 +473,7 @@ class AlertBot:
             "link_preview_options": {"is_disabled": True},
         }
         if kb:
-            payload["reply_markup"] = {"inline_keyboard": [kb]}
+            payload["reply_markup"] = {"inline_keyboard": kb}
         return payload
 
     async def send(
@@ -360,15 +486,15 @@ class AlertBot:
         chat_username: Optional[str] = None,
         sender_username: Optional[str] = None,
     ) -> Tuple[bool, str, str]:
-        """يرسل تنبيهاً واحداً عبر Bot API.
+        """يرسل تنبيهاً واحداً عبر Bot API بالقالب الموحد.
 
         يعيد (ok, contact_method, reason):
           ok=True  → contact_method = username | mention_button | text_only
-                     (username: له معرف؛ mention_button: زر tg://user مُقبل؛
-                      text_only: أُعيد الإرسال بدون زر المرسل بسبب الخصوصية
-                      أو لا يوجد مرسول قابل للزر)
+                     (username: زر مراسلة t.me؛ mention_button: زر
+                      tg://user مُقبل؛ text_only: أُعيد الإرسال بدون زر
+                      «مراسلة» بسبب الخصوصية أو لا يوجد مرسل قابل للزر)
           ok=False → reason = سبب الفشل (المستدعي يعود لمسار حسابات
-                     المستخدمين بنفس النص بدون أزرار ويُسجل السبب).
+                     المستخدمين بنفس القالب بدون أزرار ويُسجل السبب).
         """
         if not self.enabled:
             return False, "", "no_alert_bot_token"
@@ -383,7 +509,7 @@ class AlertBot:
 
         base_method = built["contact_method"]
         sender_dropped = False
-        payload = self._build_payload(built, include_sender_button=True)
+        payload = self._build_payload(built, include_user_button=True)
 
         for attempt in range(1, self.max_retries + 1):
             try:
@@ -415,19 +541,21 @@ class AlertBot:
                 self.last_error = f"rate_limited_after_{self.max_retries}_attempts"
                 return False, "", self.last_error
 
-            # ── زر المرسل المرفوض (خصوصية/صلاحية) → إعادة بدون زر المرسل ──
-            # الخطآن هذان يخصان زر tg://user حصراً — زر t.me/username لا
-            # يسببها أبداً فيُسلَّم فشله لمسار الـfallback مباشرة.
+            # ── زر tg://user المرفوض (خصوصية/صلاحية) → إعادة بدون زر
+            # «مراسلة» فقط — بقية الأزرار (عرض الرسالة/نسخ اليوزر/القروب ↗)
+            # تبقى. الخطآن يخصان زر tg://user حصراً — زر t.me لا يسببهما
+            # فيُسلَّم فشله لمسار الـfallback مباشرة.
             if (
                 not sender_dropped
-                and (built.get("sender_button") or {}).get("url", "").startswith("tg://user?id=")
+                and _has_tg_user_button(built)
                 and any(b in desc.upper() for b in BUTTON_USER_ERRORS)
             ):
                 sender_dropped = True
-                payload = self._build_payload(built, include_sender_button=False)
+                payload = self._build_payload(built, include_user_button=False)
                 logger.warning(
                     f"⚠️ AlertBot sender button rejected ({desc[:80]}) — إعادة "
-                    "الإرسال بدون زر المرسل (رابط الاسم يبقى في النص وزر «جروب» يبقى)"
+                    "الإرسال بدون زر «مراسلة» (رابط الاسم يبقى في النص وتبقى "
+                    "بقية الأزرار)"
                 )
                 continue
 
