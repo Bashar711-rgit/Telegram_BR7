@@ -4,7 +4,13 @@
 # ================================================================
 
 # ========== Core ==========
-telethon>=1.34.0,<2.0.0
+# v10.4: PINNED (engineering brief). Telethon 1.45.0 verified for:
+#   * telethon.extensions.html.parse — keeps tg:// anchors as TextUrl
+#   * send_message/send_file formatting_entities (bypasses _parse_message_text,
+#     so our real InputMessageEntityMentionName is sent verbatim)
+#   * InputUser / InputUserFromMessage / InputPeerUserFromMessage availability
+# Verify this pin after ANY upgrade (mention fix depends on the above).
+telethon==1.45.0
 python-dotenv>=1.0.0,<2.0.0
 loguru>=0.7.0,<1.0.0
 

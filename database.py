@@ -429,6 +429,13 @@ class EnhancedDatabase:
         # SELECT traffic without observable latency in enforcement.
         self._can_send_alert_cache: Dict[int, Tuple[bool, float]] = {}
 
+        # v10.4: event-driven queue wakeup — add_to_queue sets this Event so
+        # the producer loop's pop wakes IMMEDIATELY instead of waiting out
+        # the 0.1s poll tick (SQLite stays the durable source of truth;
+        # this only removes the poll LATENCY). Lazy so tests/CLI usage
+        # without a running loop never constructs an Event needlessly.
+        self._queue_notify: Optional[asyncio.Event] = None
+
         # Stats
         self.stats: Dict[str, int] = defaultdict(int)
         self._stats_lock = asyncio.Lock()
@@ -491,6 +498,7 @@ class EnhancedDatabase:
             await self._migrate_bigint_ids()
             await self._migrate_sender_intel()
             await self._migrate_dashboard_account_status()  # v9.34
+            await self._migrate_sender_account_hashes()  # v10.4
             await self._create_indexes()
             self.is_connected = True
             await self.start_writer()
@@ -1177,6 +1185,25 @@ class EnhancedDatabase:
         await self._commit()
 
     # ─── Persistent Queue (fix #3 / #9) ──────────────────────────────────────
+    # ─── v10.4: event-driven queue wakeup ───────────────────────────────────
+    @property
+    def queue_notify(self) -> asyncio.Event:
+        """Lazily-created Event set on every successful add_to_queue. The
+        producer loop awaits it (with the old poll interval as timeout
+        fallback) so queue pops happen ~instantly instead of on the next
+        0.1s tick. SQLite/PostgreSQL remain the durable source of truth."""
+        ev = self._queue_notify
+        if ev is None:
+            ev = asyncio.Event()
+            self._queue_notify = ev
+        return ev
+
+    def _notify_queue_wakeup(self) -> None:
+        try:
+            self.queue_notify.set()
+        except Exception:
+            pass
+
     async def add_to_queue(self, event_data: dict, priority: int = 5) -> int:
         """
         Add an event to the persistent processing queue.
@@ -1245,6 +1272,7 @@ class EnhancedDatabase:
                     self._queue_size_mirror += 1
                     async with self._stats_lock:
                         self.stats["queue_inserts"] = self.stats.get("queue_inserts", 0) + 1
+                    self._notify_queue_wakeup()
                     return cursor.lastrowid
 
                 else:
@@ -1273,6 +1301,7 @@ class EnhancedDatabase:
                             self._queue_size_mirror += 1
                             async with self._stats_lock:
                                 self.stats["queue_inserts"] = self.stats.get("queue_inserts", 0) + 1
+                            self._notify_queue_wakeup()
                             return result["id"]
 
         except Exception as e:
@@ -1753,6 +1782,88 @@ class EnhancedDatabase:
         except Exception as e:
             logger.debug(f"get_sender_contact error: {e}")
             return None
+
+    # ─── v10.4: per-account sender access hashes (mention tier-4) ───────────
+    # access_hash is PER-ACCOUNT knowledge — the (account_name, sender_id)
+    # key lets the mention builder build a valid InputUser for whichever
+    # account actually sends the alert. Table is additive & idempotent;
+    # nothing existing is renamed/dropped.
+    async def _migrate_sender_account_hashes(self) -> None:
+        try:
+            await self._execute(
+                "CREATE TABLE IF NOT EXISTS sender_account_hashes ("
+                "account_name TEXT NOT NULL, "
+                "sender_id BIGINT NOT NULL, "
+                "access_hash BIGINT NOT NULL, "
+                "updated_at DOUBLE PRECISION NOT NULL, "
+                "PRIMARY KEY (account_name, sender_id))"
+            )
+            try:
+                await self._execute(
+                    "CREATE INDEX IF NOT EXISTS idx_sender_account_hashes_sender "
+                    "ON sender_account_hashes (sender_id)"
+                )
+            except Exception:
+                pass  # index is an optimization only
+            await self._commit()
+            logger.debug("sender_account_hashes table ready (v10.4)")
+        except Exception as e:
+            logger.warning(f"sender_account_hashes migration skipped: {type(e).__name__}: {str(e)[:120]}")
+
+    async def upsert_sender_account_hash(self, account_name: str, sender_id: int, access_hash: int) -> bool:
+        """Persist one (account, sender) → access_hash observation.
+        Write-behind only when the value is NEW/CHANGED (caller gates via
+        AccountAccessHashStore.record). Never raises."""
+        try:
+            if not account_name or not sender_id or not isinstance(access_hash, int) or access_hash == 0:
+                return False
+            if self.db_type == "postgresql":
+                await self._execute(
+                    "INSERT INTO sender_account_hashes (account_name, sender_id, access_hash, updated_at) "
+                    "VALUES ($1, $2, $3, $4) "
+                    "ON CONFLICT (account_name, sender_id) DO UPDATE SET "
+                    "access_hash = EXCLUDED.access_hash, updated_at = EXCLUDED.updated_at",
+                    (str(account_name), int(sender_id), int(access_hash), time.time()),
+                )
+            else:
+                await self._execute(
+                    "INSERT INTO sender_account_hashes (account_name, sender_id, access_hash, updated_at) "
+                    "VALUES (?, ?, ?, ?) "
+                    "ON CONFLICT (account_name, sender_id) DO UPDATE SET "
+                    "access_hash = excluded.access_hash, updated_at = excluded.updated_at",
+                    (str(account_name), int(sender_id), int(access_hash), time.time()),
+                )
+            await self._commit()
+            return True
+        except Exception as e:
+            logger.debug(f"upsert_sender_account_hash error: {type(e).__name__}")
+            return False
+
+    async def get_sender_account_hash(self, account_name: str, sender_id: int) -> Optional[int]:
+        """Stored access_hash for THIS account's view of the sender (or None)."""
+        try:
+            row = await self._fetchone(
+                "SELECT access_hash FROM sender_account_hashes "
+                "WHERE account_name = ? AND sender_id = ?",
+                (str(account_name), int(sender_id)),
+            )
+            if row and isinstance(row.get("access_hash"), int):
+                return int(row["access_hash"])
+        except Exception as e:
+            logger.debug(f"get_sender_account_hash error: {type(e).__name__}")
+        return None
+
+    async def recent_chat_ids(self, limit: int = 30) -> List[int]:
+        """Most-recently-seen source chat ids (cache warm-up, bounded)."""
+        try:
+            rows = await self._fetchall(
+                "SELECT DISTINCT chat_id FROM messages ORDER BY id DESC LIMIT ?",
+                (max(1, min(int(limit), 200)),),
+            )
+            return [int(r["chat_id"]) for r in rows if r.get("chat_id") is not None]
+        except Exception as e:
+            logger.debug(f"recent_chat_ids error: {type(e).__name__}")
+            return []
 
     async def update_sender_reputation(self, sender_id: int, is_valid: bool) -> None:
         try:

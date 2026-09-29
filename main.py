@@ -107,8 +107,8 @@ from database import EnhancedDatabase
 from dedup import get_dedup_snapshot, init_deduplicator
 from antispam import get_antispam, setup_antispam, get_antispam_snapshot
 from filter_engine import EnhancedFilter
-from monitors import EnhancedAccountMonitor, HealthMonitor, get_capture_snapshot
-from sender_resolver import get_sender_intel_snapshot
+from monitors import EnhancedAccountMonitor, HealthMonitor, get_capture_snapshot, alert_latency
+from sender_resolver import get_sender_intel_snapshot, get_mention_intel_snapshot
 
 # Import Dashboard
 try:
@@ -407,7 +407,23 @@ class EnhancedTelegramBot:
                         # NOT trigger a re-enqueue of an already-queued item.
                         event_data = None
                     else:
-                        await asyncio.sleep(0.1)
+                        # v10.4: event-driven wakeup — add_to_queue sets
+                        # db.queue_notify the moment a row lands, so the
+                        # pop happens ~instantly instead of on the next
+                        # 0.1s poll tick. The timeout fallback keeps the
+                        # old cadence when the Event is unavailable; the
+                        # DB queue stays the durable source of truth.
+                        if getattr(CFG, "QUEUE_EVENT_WAKE", True):
+                            try:
+                                await asyncio.wait_for(self.db.queue_notify.wait(), timeout=0.1)
+                            except asyncio.TimeoutError:
+                                pass
+                            try:
+                                self.db.queue_notify.clear()
+                            except Exception:
+                                pass
+                        else:
+                            await asyncio.sleep(0.1)
                 except asyncio.CancelledError:
                     # v9.12 (audit M-07): graceful shutdown window — if we
                     # were cancelled BETWEEN pop_from_queue (which deletes
@@ -914,6 +930,8 @@ class EnhancedTelegramBot:
                 "monitors": sum(1 for m in self.monitors if m.is_connected),
                 "fast_capture": get_capture_snapshot(),
                 "sender_intel": get_sender_intel_snapshot(),
+                "mention_intel": get_mention_intel_snapshot(),
+                "alert_latency": alert_latency.snapshot(),
                 "dedup": get_dedup_snapshot(),
                 "antispam": get_antispam_snapshot(),
             })
@@ -1636,9 +1654,47 @@ class EnhancedTelegramBot:
         self._main_client_watchdog_task = self._track_task(
             self._main_client_watchdog_loop(), "main_client_watchdog"
         )
+        # v10.4: warm the group-entity caches right after boot so the first
+        # alerts skip the cold get_entity round-trip (bounded, fire-safe).
+        self._track_task(self._warmup_chat_caches(), "chat_cache_warmup")
 
         logger.info("✅ Initialization complete (Render Edition, hardened)")
         return True
+
+    async def _warmup_chat_caches(self) -> None:
+        """v10.4: prefetch the entities of recently-seen source chats into
+        each connected monitor's long-TTL entity cache (_chat_info reads
+        the same cache, so behavior is unchanged — only warmer). Bounded:
+        ≤30 chats × ≤6 accounts, semaphore 3, 10s per lookup, never raises."""
+        if not getattr(CFG, "WARMUP_CHAT_CACHE", True):
+            return
+        try:
+            chat_ids = await self.db.recent_chat_ids(limit=30)
+        except Exception:
+            return
+        if not chat_ids:
+            return
+        sem = asyncio.Semaphore(3)
+
+        async def _warm(monitor: EnhancedAccountMonitor, chat_id: int) -> None:
+            async with sem:
+                try:
+                    ent = await asyncio.wait_for(monitor.client.get_entity(int(chat_id)), timeout=10)
+                    if ent is not None:
+                        async with monitor._cache_lock:
+                            monitor._entity_cache[int(chat_id)] = ent
+                except Exception as e:
+                    logger.debug(f"warmup chat={chat_id} [{monitor.account['name']}]: {type(e).__name__}")
+
+        tasks: list = []
+        for m in self.monitors:
+            if m.client and m.is_connected:
+                for cid in chat_ids:
+                    tasks.append(asyncio.create_task(_warm(m, int(cid))))
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+            logger.info(f"🔥 chat-entity cache warmed: {len(chat_ids)} chats × "
+                        f"{sum(1 for m in self.monitors if m.is_connected)} accounts")
 
     # ─── Run & Shutdown ────────────────────────────────────────────────────────
     async def run(self) -> None:
