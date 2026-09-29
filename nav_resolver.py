@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-nav_resolver.py — Alert Navigation Resolver v10.5.0
+nav_resolver.py — Alert Navigation Resolver v10.6.0
 ====================================================
 
 Centralized multi-strategy resolution for the three clickable alert actions:
@@ -18,10 +18,22 @@ ARCHITECTURE (priority ladders — first wins, every failure advances):
         usernames are GLOBAL truth, safe for links across accounts —
         access_hash would NOT be, and is never taken from here)
     S3  DB sender_contacts row    — a username seen on ANY earlier message
-    S4  (no username)             — the frozen builder keeps its current
-        tg://openmessage/tg://user anchors; Telethon send-time behavior
-        decides clickability (v10.4 mention ladder upgrades it when the
-        sending account can resolve the user)
+    S4  DISCOVERY via the source message — users.getUsers fed with
+        InputUserFromMessage(peer, msg_id, user_id). Legitimate MTProto:
+        the account is a member of the source chat and RECEIVED the
+        sender's message, so Telegram resolves the user through that
+        context even when the participant list hides them. A recovered
+        username becomes a universally-clickable t.me link AND is
+        persisted (COALESCE) so every future alert is clickable too;
+        the fresh per-account access_hash feeds the v10.4 mention
+        ladder tier-4. Telegram returns only what it permits — a truly
+        hidden username simply comes back absent and we degrade honestly.
+    S5  (still no username)       — the frozen builder keeps its current
+        tg://openmessage/tg://user anchors; at SEND time the v10.4
+        mention ladder upgrades them when the sending account can
+        resolve the user, and harden_sender_anchor() guarantees the
+        fallback payload's name click lands on the SOURCE MESSAGE
+        (avatar tap → profile) instead of being silently dropped.
 
   CHAT (group name):
     C1  resolved entity.username  — from the SENDING account's view
@@ -81,9 +93,14 @@ try:  # ExportMessageLink exists on every Telethon ≥1.x used by this project
 except Exception:  # pragma: no cover — extremely old Telethon fallback
     ExportMessageLinkRequest = None  # type: ignore[assignment]
 
+try:  # v10.6 sender discovery — users.getUsers via message context
+    from telethon.tl.functions.users import GetUsersRequest
+except Exception:  # pragma: no cover — extremely old Telethon fallback
+    GetUsersRequest = None  # type: ignore[assignment]
+
 from config import CFG
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 _USERNAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{3,63}$")
 
@@ -145,6 +162,48 @@ def is_valid_tme_url(url: Any) -> bool:
     return True
 
 
+def harden_sender_anchor(alert_html: str, sender_id: Any, fallback_url: Optional[str]) -> str:
+    """v10.6 — guaranteed-reachable sender name for the FALLBACK payload.
+
+    Background: when the v10.4 mention ladder cannot produce a real
+    mention entity for the SENDING account, Telethon's html send path
+    silently DELETES the tg://user/tg://openmessage anchor entity
+    (_replace_with_mention) — the sender name renders as plain text and
+    nothing is clickable. That dead anchor is exactly the «user not
+    clickable» complaint.
+
+    This helper rewrites ONLY that anchor's href (same exact displayed
+    text — the wire format stays byte-identical) to `fallback_url`, the
+    alert's own source-message link: opening the message always allows
+    opening the sender's profile via the avatar tap, for every sender
+    who sent a message, regardless of their DM/privacy settings. That
+    is the maximum Telegram permits — and it is legitimately permitted.
+
+    Pure string surgery on the two exact anchor shapes _build_alert can
+    emit (sender_resolver.sender_url_forms); a username anchor (t.me)
+    is already universally clickable and is never touched. A fallback
+    URL that fails t.me shape validation is ignored (never inject an
+    unvalidated link)."""
+    if not alert_html or not fallback_url or not is_valid_tme_url(fallback_url):
+        return alert_html
+    try:
+        sid = int(sender_id or 0)
+    except Exception:
+        return alert_html
+    if not sid:
+        return alert_html
+    try:
+        from sender_resolver import sender_url_forms as _forms
+        hardened = alert_html
+        for href in _forms(sid):
+            needle = f'href="{href}"'
+            if needle in hardened:
+                hardened = hardened.replace(needle, f'href="{fallback_url}"')
+        return hardened
+    except Exception:
+        return alert_html
+
+
 def build_canonical_links(chat_id: Any, message_id: Any, username: Any) -> Dict[str, str]:
     """Same shapes as monitors.build_telegram_links but with the -100 guard
     the button builder was missing: c/ form ONLY for -100 ids, username
@@ -200,6 +259,8 @@ class NavigationResolver:
 
     EXPORT_TTL_SECONDS = 3600      # exported links are stable — 1h cache
     EXPORT_NEG_TTL_SECONDS = 300   # failed export → 5min cool-down per chat
+    DISCOVERY_NEG_TTL_SECONDS = 300  # failed/absent username → 5min per sender
+    DISCOVERY_LOCK_MAX = 4096      # bounded single-flight lock map
 
     def __init__(self):
         self._export_cache: "TTLCache[int, Dict[str, str]]" = TTLCache(
@@ -209,9 +270,15 @@ class NavigationResolver:
             maxsize=2000, ttl=self.EXPORT_NEG_TTL_SECONDS
         )
         self._export_lock = asyncio.Lock()
+        self._discovery_negative: "TTLCache[int, bool]" = TTLCache(
+            maxsize=5000, ttl=self.DISCOVERY_NEG_TTL_SECONDS
+        )
+        self._discovery_locks: "Dict[int, asyncio.Lock]" = {}
         self._metrics: Dict[str, int] = {
             "sender_username_event": 0, "sender_username_cache": 0,
             "sender_username_db": 0, "sender_username_miss": 0,
+            "sender_discovery_skip": 0, "sender_discovery_call": 0,
+            "sender_discovery_ok": 0, "sender_discovery_fail": 0,
             "chat_entity_username": 0, "chat_event_username": 0,
             "chat_c_form": 0, "chat_export_hit": 0, "chat_export_call": 0,
             "chat_export_ok": 0, "chat_export_fail": 0, "chat_unlinkable": 0,
@@ -225,10 +292,11 @@ class NavigationResolver:
             pass
 
     # ─────────────────────────────────────────────────────────────────────
-    # SENDER — S1 event → S2 shared entity cache → S3 DB row
+    # SENDER — S1 event → S2 shared entity cache → S3 DB row → S4 discovery
     # ─────────────────────────────────────────────────────────────────────
     async def _resolve_sender_username(
-        self, monitor: Any, data: Dict[str, Any], report: NavReport
+        self, monitor: Any, data: Dict[str, Any], report: NavReport,
+        send_client: Any = None,
     ) -> Optional[str]:
         sender_id = data.get("sender_id") or 0
 
@@ -271,9 +339,180 @@ class NavigationResolver:
         except Exception as e:
             report.notes.append(f"S3:{type(e).__name__}")
 
+        # S4 — network discovery THROUGH the source message (the last
+        # strategy with a real API basis; legitimacy argument inside).
+        try:
+            uname = await self._discover_sender_username_via_message(
+                monitor, data, send_client, report
+            )
+            if is_valid_username(uname):
+                data["sender_username"] = uname
+                return uname
+        except Exception as e:
+            report.notes.append(f"S4:{type(e).__name__}")
+
         self._inc("sender_username_miss")
         report.sender_strategy = "anchor_fallback"
         return None
+
+    # ─────────────────────────────────────────────────────────────────────
+    # S4 — users.getUsers(InputUserFromMessage(...)) — sender discovery
+    # through the sender's own source message
+    # ─────────────────────────────────────────────────────────────────────
+    async def _discover_sender_username_via_message(
+        self,
+        monitor: Any,
+        data: Dict[str, Any],
+        send_client: Any,
+        report: NavReport,
+    ) -> Optional[str]:
+        """Recover the sender's username (and a fresh per-account
+        access_hash) via InputUserFromMessage — the STRONGEST legitimate
+        resolution mechanism Telegram offers for group senders.
+
+        Legitimacy (no privacy bypass, requirement #12):
+          * the account is a member of the source chat (it received the
+            update that produced this alert);
+          * the sender identified themselves by posting there — Telegram
+            itself exposes message-context peer resolution to every
+            member (this is how native clients open profiles from
+            messages);
+          * Telegram returns ONLY what it permits for this account. A
+            user who hid their username or restricted themselves simply
+            comes back without one — we record an honest miss and
+            degrade; nothing is inferred, guessed or scraped.
+
+        What this buys: a username invisible to S1–S3 becomes a
+        universally-clickable t.me link, is persisted (COALESCE — never
+        nulls existing fields) so all FUTURE alerts for this sender are
+        clickable, and the fresh access_hash feeds the v10.4 mention
+        ladder tier-4 (per-account store — never shared cross-account).
+
+        Failure handling: per-sender negative cache (5 min) + single-
+        flight lock + FloodWait honored + bounded timeouts; clients are
+        tried capturing-view first (guaranteed source-chat member),
+        then the alert sender. Never raises."""
+        if not bool(getattr(CFG, "NAV_USER_DISCOVERY_ENABLED", True)):
+            self._inc("sender_discovery_skip")
+            return None
+        if GetUsersRequest is None:
+            return None
+        sender_id = int(data.get("sender_id") or 0)
+        chat_id = data.get("chat_id")
+        message_id = data.get("message_id")
+        if not sender_id or not chat_id or not message_id:
+            return None
+        if self._discovery_negative.get(sender_id):
+            report.notes.append("discovery:negcached")
+            return None
+
+        # bounded single-flight per sender (concurrent alerts share one call)
+        if len(self._discovery_locks) > self.DISCOVERY_LOCK_MAX:
+            try:
+                self._discovery_locks.pop(next(iter(self._discovery_locks)))
+            except Exception:
+                pass
+        lock = self._discovery_locks.setdefault(int(sender_id), asyncio.Lock())
+        async with lock:
+            if self._discovery_negative.get(sender_id):
+                report.notes.append("discovery:negcached")
+                return None
+
+            # capturing account's own view first (it provably sees the
+            # source chat), then the alert-sending client
+            clients: List[Any] = []
+            for c in (getattr(monitor, "client", None), send_client):
+                if c is not None and not any(c is x for x in clients):
+                    clients.append(c)
+
+            for client in clients:
+                try:
+                    peer = await asyncio.wait_for(
+                        client.get_input_entity(int(chat_id)), timeout=2.0
+                    )
+                    from sender_resolver import (
+                        input_user_from_message_context as _iu_from_msg,
+                    )
+                    input_user = _iu_from_msg(peer, message_id, sender_id)
+                    if input_user is None:
+                        continue
+                    self._inc("sender_discovery_call")
+                    res = await asyncio.wait_for(
+                        client(GetUsersRequest(id=[input_user])), timeout=5.0
+                    )
+                    users = list(getattr(res, "users", []) or [])
+                    user = next(
+                        (
+                            u for u in users
+                            if int(getattr(u, "id", 0) or 0) == sender_id
+                        ),
+                        None,
+                    )
+                    if user is None:
+                        # server answered without our user — never guess
+                        continue
+                    if bool(getattr(user, "deleted", False)):
+                        # deleted/deactivated account: no links can exist
+                        self._discovery_negative[sender_id] = True
+                        self._inc("sender_discovery_fail")
+                        report.notes.append("discovery:deleted")
+                        return None
+                    uname = clean_username(getattr(user, "username", None))
+                    if not is_valid_username(uname):
+                        # username hidden/absent by the user's own privacy
+                        # settings — an honest miss, negative-cached
+                        self._discovery_negative[sender_id] = True
+                        report.notes.append("discovery:no_username")
+                        return None
+                    # ── success: persist every artifact we legitimately own ──
+                    ah = getattr(user, "access_hash", None)
+                    try:
+                        from sender_resolver import account_hash_store as _ahs
+                        acct = monitor._account_name_for_client(client)
+                        if isinstance(ah, int) and ah != 0 and acct:
+                            _ahs.record(acct, sender_id, ah)
+                            asyncio.create_task(
+                                monitor._persist_account_hash(sender_id, ah)
+                            )
+                    except Exception as e:
+                        report.notes.append(f"discovery:hash:{type(e).__name__}")
+                    try:
+                        if getattr(monitor, "db", None) is not None:
+                            # COALESCE upsert — username-only, never nulls
+                            await monitor.db.upsert_sender_contact(
+                                {"sender_id": int(sender_id), "username": uname}
+                            )
+                    except Exception as e:
+                        report.notes.append(f"discovery:db:{type(e).__name__}")
+                    self._inc("sender_discovery_ok")
+                    report.sender_strategy = "discovered_via_message"
+                    report.notes.append(f"discovery:ok:{uname}")
+                    logger.info(
+                        f"🔎 nav discovery ok | sender={sender_id} → @{uname} "
+                        f"(via source message, account view persisted)"
+                    )
+                    return uname
+                except FloodWaitError as e:
+                    self._discovery_negative[sender_id] = True
+                    self._inc("sender_discovery_fail")
+                    report.notes.append(
+                        f"discovery:flood{int(getattr(e, 'seconds', 0) or 0)}"
+                    )
+                    logger.warning(
+                        f"nav sender discovery FloodWait sender={sender_id}: {e.seconds}s"
+                    )
+                    return None
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    report.notes.append(f"discovery:{type(e).__name__}")
+                    logger.debug(
+                        f"nav sender discovery failed [{type(e).__name__}] sender={sender_id}"
+                    )
+                    continue  # next client — one failure never stops the chain
+            self._discovery_negative[sender_id] = True
+            self._inc("sender_discovery_fail")
+            return None
 
     # ─────────────────────────────────────────────────────────────────────
     # CHAT + MESSAGE — C1 entity → C2 event username → C3 c/ form → C4 export
@@ -586,7 +825,9 @@ class NavigationResolver:
         report = NavReport()
         sender_username: Optional[str] = None
         try:
-            sender_username = await self._resolve_sender_username(monitor, data, report)
+            sender_username = await self._resolve_sender_username(
+                monitor, data, report, send_client
+            )
         except Exception as e:  # one strategy failing must never stop the rest
             report.notes.append(f"sender:{type(e).__name__}")
             logger.debug(f"nav sender stage error: {type(e).__name__}: {e}")
@@ -617,6 +858,7 @@ class NavigationResolver:
                 **self._metrics,
                 "export_cache_size": len(self._export_cache),
                 "export_negative_size": len(self._export_negative),
+                "discovery_negative_size": len(self._discovery_negative),
             }
         except Exception:
             return {}

@@ -95,14 +95,16 @@ GOLDEN = {
             '<blockquote dir="rtl"><a href="https://t.me/c/1234567890">مجموعة خاصة</a>\n\n'
             '<a href="https://t.me/c/1234567890/456"><b>عرض الرسالة الأصلية</b></a></blockquote>'
         ),
-        # لا username → مراسلة عبر openmessage + مجموعة خاصة → t.me/c/inner/msg
+        # لا username → مراسلة تقود الآن (v10.6) لرابط الرسالة المصدر
+        # (HTTPS مضمون على كل العملاء → لمس صورة المرسل يفتح ملفه)،
+        # بدل openmessage الذي يعمل على ديسكتوب فقط. النص مجمد حرفياً.
         "buttons": [
             [
                 ("url", "عرض الرسالة", "https://t.me/c/1234567890/456"),
                 ("callback", "تواصل مع المرسل", "cnt_abc123"),
             ],
             [
-                ("url", "مراسلة", "tg://openmessage?user_id=777000222"),
+                ("url", "مراسلة", "https://t.me/c/1234567890/456"),
                 ("callback", "📋 نسخ النص", "copy_abc123"),
             ],
         ],

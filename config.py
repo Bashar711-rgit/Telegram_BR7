@@ -478,6 +478,11 @@ class _ConfigData:
     # الحلّ متعدد الاستراتيجيات للأزرار الثلاثة (المرسل/المجموعة/عرض الرسالة).
     # يقرر فقط البيانات التي تُغذّي البانِر المتجمّد — لا يغيّر الشكل أبداً.
     NAV_EXPORT_LINK_ENABLED: bool
+    # v10.6: اكتشاف username المرسل عبر رسالته المصدر (users.getUsers +
+    # InputUserFromMessage) — آلية MTProto مشروعة: الحساب عضو في المجموعة
+    # المصدر وقد تسلّم رسالة المرسل بنفسه. تيليجرام يُعيد فقط ما يسمح به
+    # لهذا الحساب — username مخفي يعود غائباً ونتعامل مع ذلك بصدق.
+    NAV_USER_DISCOVERY_ENABLED: bool
     # Telethon client: replay missed updates after reconnect + parallel updates
     TELEGRAM_CATCH_UP: bool
     # حدثي: استيقاظ حلقة الطابور فور الإدراج بدل polling ثابت
@@ -838,6 +843,7 @@ class Config:
             MENTION_MAX_TIERS_PER_CANDIDATE=SecretManager.get_int("MENTION_MAX_TIERS_PER_CANDIDATE", 3, required=False),
             # ── v10.5 Alert Navigation Resolver (فشل-آمن؛ الإيقاف يترك الروابط كما كانت) ──
             NAV_EXPORT_LINK_ENABLED=SecretManager.get_bool("NAV_EXPORT_LINK_ENABLED", True),
+            NAV_USER_DISCOVERY_ENABLED=SecretManager.get_bool("NAV_USER_DISCOVERY_ENABLED", True),
             TELEGRAM_CATCH_UP=SecretManager.get_bool("TELEGRAM_CATCH_UP", True),
             QUEUE_EVENT_WAKE=SecretManager.get_bool("QUEUE_EVENT_WAKE", True),
             ALERT_LATENCY_LOG_EVERY=SecretManager.get_int("ALERT_LATENCY_LOG_EVERY", 100, required=False),

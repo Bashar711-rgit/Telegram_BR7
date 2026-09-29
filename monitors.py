@@ -164,6 +164,7 @@ from sender_resolver import (
 from nav_resolver import nav_resolver as _nav_resolver  # v10.5 navigation multi-strategy resolver
 from nav_resolver import is_valid_username as _nav_valid_username      # v10.5 link validation
 from nav_resolver import private_supergroup_inner_id as _nav_inner_id  # v10.5 -100 id guard
+from nav_resolver import harden_sender_anchor as _nav_harden_anchor    # v10.6 guaranteed-reachable anchor
 
 
 # (نفس الدوال المساعدة من النسخة الأصلية: resolve_chat_entity, build_telegram_links)
@@ -267,9 +268,18 @@ def build_dynamic_buttons(sender: dict, chat: dict, msg_hash: str = None) -> lis
     if row1:
         rows.append(row1)
 
-    # ── زر «مراسلة» (الثالث — فتح محادثة مباشرة مع المرسل، بدون أي إرسال) ──
+    # ── زر «مراسلة» — سلّم الوصول الأقصى (v10.6):
+    # الهدف أن كل نقرة تصل لمكان حقيقي يقود لملف المرسل حتى لو كانت
+    # مراسلته مغلقة بإعدادات الخصوصية:
+    #   1) t.me/username      — يفتح الملف/الدردشة مباشرة (عالمي، كل العملاء)
+    #   2) رابط الرسالة المصدر — HTTPS يعمل على كل العملاء: يفتح الرسالة
+    #      نفسها، واللمس على صورة المرسل يفتح ملفه الشخصي — أضمن مسار
+    #      مصرّح به في تيليجرام لأي مستخدم أرسل رسالة في مجموعة نراقبها
+    #   3) tg://openmessage    — الشكل القديم (ديسكتوب فقط) كخيار أخير
     if username:
         contact_url = f"https://t.me/{username}"
+    elif msg_url:
+        contact_url = msg_url
     elif sender_id:
         contact_url = f"tg://openmessage?user_id={sender_id}"
     else:
@@ -2487,6 +2497,24 @@ class EnhancedAccountMonitor:
                   "username": nav_sender_username or sender_username,
                   "access_hash": sender_access_hash}
         alert_text, buttons = self._build_alert(sender, chat_info, keyword, text, analysis)
+        # ══ v10.6: تصلب مرساة المرسل لمسار الإرسال الاحتياطي ══
+        # عندما يفشل سلّم mention بالكامل، تيليجرام يحذف كيان tg://user
+        # صامتاً (_replace_with_mention) فيتحول اسم المرسل لنص غير قابل
+        # للنقر — السبب الجذري لشكوى «مستخدم لا يُنقر». نستبدل المرساة
+        # برابط الرسالة المصدر (الذي تحقق منه بوابة v10.5): فتح الرسالة
+        # يتيح دائماً فتح ملف المرسل باللمس على صورته، لكل مرسل أرسل
+        # رسالة، مهما كانت إعدادات خصوصيته — أقصى ما يسمح به تيليجرام.
+        _harden_url = chat_info.get("msg_link")
+        if _harden_url == "#":
+            _harden_url = None
+        _hardened_cache: Optional[str] = None
+
+        def _hardened_alert_text() -> str:
+            nonlocal _hardened_cache
+            if _hardened_cache is None:
+                _hardened_cache = _nav_harden_anchor(alert_text, sender_id, _harden_url)
+            return _hardened_cache
+
         user_media = data.get("media_object")
         async def _send_alert_payload(
             c: TelegramClient,
@@ -2501,12 +2529,15 @@ class EnhancedAccountMonitor:
             if entities is not None:
                 wire_text, wire_ents = entities
             else:
-                wire_text, wire_ents = alert_text, None
+                # v10.6: المسار الأصلي يُرسل النص المُصلّب — اسم المرسل
+                # يقود دائماً لمكان حقيقي (الرسالة المصدر) بدل مرساة tg://
+                # التي قد يحذفها تيليجرام صامتاً.
+                wire_text, wire_ents = _hardened_alert_text(), None
             if user_media is not None:
                 try:
                     if wire_ents is not None:
                         return await c.send_file(CFG.TARGET_GROUP_ID, file=user_media, caption=wire_text, buttons=buttons, formatting_entities=wire_ents, link_preview=False)
-                    return await c.send_file(CFG.TARGET_GROUP_ID, file=user_media, caption=alert_text, buttons=buttons, parse_mode="html", link_preview=False)
+                    return await c.send_file(CFG.TARGET_GROUP_ID, file=user_media, caption=wire_text, buttons=buttons, parse_mode="html", link_preview=False)
                 except FloodWaitError:
                     raise
                 except Exception as e:
@@ -2524,14 +2555,14 @@ class EnhancedAccountMonitor:
                         if result and hasattr(result, 'photos') and len(result.photos) > 0:
                             if wire_ents is not None:
                                 return await c.send_file(CFG.TARGET_GROUP_ID, file=result.photos[0], caption=wire_text, buttons=buttons, formatting_entities=wire_ents, link_preview=False)
-                            return await c.send_file(CFG.TARGET_GROUP_ID, file=result.photos[0], caption=alert_text, buttons=buttons, parse_mode="html", link_preview=False)
+                            return await c.send_file(CFG.TARGET_GROUP_ID, file=result.photos[0], caption=wire_text, buttons=buttons, parse_mode="html", link_preview=False)
                     except FloodWaitError:
                         raise
                     except Exception as e:
                         logger.debug(f"Chat photo fallback send failed [{account_name}]: {e}")
             if wire_ents is not None:
                 return await c.send_message(CFG.TARGET_GROUP_ID, wire_text, buttons=buttons, formatting_entities=wire_ents, link_preview=False)
-            return await c.send_message(CFG.TARGET_GROUP_ID, alert_text, buttons=buttons, parse_mode="html", link_preview=False)
+            return await c.send_message(CFG.TARGET_GROUP_ID, wire_text, buttons=buttons, parse_mode="html", link_preview=False)
 
         async def do_send():
             """v10.2: تدوير مرشحي الإرسال — أول عميل ينجح يلتزم الإرسال.

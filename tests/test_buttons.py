@@ -99,12 +99,15 @@ class TestBuildDynamicButtons:
             chat={"id": -1001234567890, "message_id": 789, "username": "eng_group"},
             msg_hash=HASH,
         )
+        # v10.6: بلا username، مراسلة تقود لرابط الرسالة المصدر (HTTPS
+        # مضمون على كل العملاء → لمس الصورة يفتح ملف المرسل) بدل
+        # openmessage الذي يعمل على ديسكتوب فقط.
         assert _specs(rows) == [
             [
                 ("url", "عرض الرسالة", "https://t.me/eng_group/789"),
                 ("callback", "تواصل مع المرسل", f"cnt_{HASH}"),
             ],
-            [("url", "مراسلة", "tg://openmessage?user_id=1")],
+            [("url", "مراسلة", "https://t.me/eng_group/789")],
         ]
 
     def test_private_chat_message_link(self):
@@ -114,12 +117,13 @@ class TestBuildDynamicButtons:
             msg_hash=HASH,
         )
         # -100 يُقتطع مرة واحدة فقط → t.me/c/1234567890/456
+        # v10.6: مراسلة = رابط الرسالة المصدر (نفس سلّم الوصول الأقصى)
         assert _specs(rows) == [
             [
                 ("url", "عرض الرسالة", "https://t.me/c/1234567890/456"),
                 ("callback", "تواصل مع المرسل", f"cnt_{HASH}"),
             ],
-            [("url", "مراسلة", "tg://openmessage?user_id=1")],
+            [("url", "مراسلة", "https://t.me/c/1234567890/456")],
         ]
 
     def test_missing_data_never_renders_broken_buttons(self):

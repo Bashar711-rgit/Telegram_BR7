@@ -589,3 +589,287 @@ def _all_specs(row):
         else:
             out.append("")
     return out
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 9) v10.6 — S4 discovery: users.getUsers عبر رسالة المصدر
+# ═══════════════════════════════════════════════════════════════════════════
+import sender_resolver as _real_sender_resolver  # noqa: E402
+from nav_resolver import harden_sender_anchor  # noqa: E402
+from telethon.errors import FloodWaitError  # noqa: E402
+
+
+class DiscoveryUser:
+    """مشابه لكيان User الذي يعيده users.getUsers."""
+
+    def __init__(self, user_id: int, username: Optional[str],
+                 access_hash: int = 555, deleted: bool = False):
+        self.id = user_id
+        self.username = username
+        self.access_hash = access_hash
+        self.deleted = deleted
+
+
+class DiscoveryClient:
+    """عميل وهمي يدعم get_input_entity + users.getUsers فقط."""
+
+    def __init__(self, users: Optional[List[Any]] = None, fail: bool = False,
+                 exc: Optional[Exception] = None):
+        self.users = users or []
+        self.fail = fail
+        self.exc = exc
+        self.calls = 0
+
+    async def get_input_entity(self, key: Any):
+        return FakeChannel(int(key), username=None)
+
+    async def __call__(self, req: Any):
+        self.calls += 1
+        if self.exc is not None:
+            raise self.exc
+        if self.fail:
+            raise RuntimeError("USER_ID_INVALID")
+        return SimpleNamespace(users=self.users)
+
+
+class FakeHashStore:
+    def __init__(self):
+        self.records: List[Any] = []
+
+    def record(self, account_name, sender_id, access_hash):
+        self.records.append((account_name, sender_id, access_hash))
+        return True
+
+
+class FakeUpsertDB:
+    def __init__(self, contact: Optional[Dict[str, Any]] = None):
+        self.contact = contact or {}
+        self.upserts: List[Dict[str, Any]] = []
+
+    async def get_sender_contact(self, sender_id: int):
+        return self.contact or None
+
+    async def upsert_sender_contact(self, sender_data: Dict[str, Any]):
+        self.upserts.append(dict(sender_data))
+
+
+async def _noop_persist_hash(sender_id: int, access_hash: int) -> None:
+    return None
+
+
+def _discovery_monitor(client: Any, db: Any = None) -> SimpleNamespace:
+    """مراقب خفيف — الواجهة الدنيا التي يستخدمها مسار S4 فقط."""
+    return SimpleNamespace(
+        client=client,
+        db=db if db is not None else FakeUpsertDB(),
+        _account_name_for_client=lambda c: "NavAcc",
+        _persist_account_hash=_noop_persist_hash,
+    )
+
+
+def _patch_sender_resolver(monkeypatch, hash_store: FakeHashStore):
+    """استبدل وحدة sender_resolver عند الاستيراد داخل nav_resolver فقط —
+        الدوال الحقيقية تبقى، والمخزن يصبح وهمياً."""
+    async def _noop_hash(sender_id: int, access_hash: int) -> None:
+        return None
+
+    monkeypatch.setitem(sys.modules, "sender_resolver", SimpleNamespace(
+        input_user_from_message_context=_real_sender_resolver.input_user_from_message_context,
+        sender_url_forms=_real_sender_resolver.sender_url_forms,
+        account_hash_store=hash_store,
+    ))
+
+
+class TestSenderDiscoveryS4:
+    async def test_discovery_recovers_hidden_username(self, resolver, monkeypatch):
+        """مرسل بلا username في الحدث/الكاش/DB — يُكتشف عبر رسالته المصدر
+        (InputUserFromMessage) ويعود باسم صالح يُغذّي التنبيه فوراً."""
+        store = FakeHashStore()
+        _patch_sender_resolver(monkeypatch, store)
+        client = DiscoveryClient(users=[DiscoveryUser(777000111, "found_via_msg")])
+        db = FakeUpsertDB()
+        mon = _discovery_monitor(client, db)
+        data = _base_data()
+        data["sender_username"] = None
+        report = NavReport()
+        got = await resolver._resolve_sender_username(mon, data, report, send_client=None)
+        assert got == "found_via_msg"
+        assert data["sender_username"] == "found_via_msg"       # COALESCE في بيانات الحدث
+        assert report.sender_strategy == "discovered_via_message"
+        assert client.calls == 1                                 # مكالمة واحدة فقط
+        assert db.upserts == [{"sender_id": 777000111, "username": "found_via_msg"}]
+        assert store.records == [("NavAcc", 777000111, 555)]     # hash لكل حساب — ذاكرة mention
+
+    async def test_discovery_deleted_user_honest_miss(self, resolver, monkeypatch):
+        """حساب محذوف: لا يوجد أي رابط شرعي — miss صادق + كاش سلبي."""
+        store = FakeHashStore()
+        _patch_sender_resolver(monkeypatch, store)
+        client = DiscoveryClient(users=[DiscoveryUser(777000111, None, deleted=True)])
+        mon = _discovery_monitor(client)
+        data = _base_data()
+        data["sender_username"] = None
+        report = NavReport()
+        got = await resolver._resolve_sender_username(mon, data, report, send_client=None)
+        assert got is None
+        assert client.calls == 1
+        # المكالمة الثانية تُخدَم من الكاش السلبي — بلا RPC جديد
+        got2 = await resolver._resolve_sender_username(mon, data, NavReport(), send_client=None)
+        assert got2 is None
+        assert client.calls == 1
+
+    async def test_discovery_username_absent_by_privacy(self, resolver, monkeypatch):
+        """المستخدم الذي أخفى username يرجع بلا username من تيليجرام نفسه —
+            نتعامل بصدق (miss) ولا نخترع شيئاً."""
+        store = FakeHashStore()
+        _patch_sender_resolver(monkeypatch, store)
+        client = DiscoveryClient(users=[DiscoveryUser(777000111, None)])
+        mon = _discovery_monitor(client)
+        data = _base_data()
+        data["sender_username"] = None
+        got = await resolver._resolve_sender_username(mon, data, NavReport(), send_client=None)
+        assert got is None
+
+    async def test_discovery_floodwait_honored(self, resolver, monkeypatch):
+        """FloodWait يُحترم: miss فوري + كاش سلبي (بلا أي إعادة محاولة)."""
+        store = FakeHashStore()
+        _patch_sender_resolver(monkeypatch, store)
+        client = DiscoveryClient(exc=FloodWaitError(request=None, capture=9))
+        mon = _discovery_monitor(client)
+        data = _base_data()
+        data["sender_username"] = None
+        report = NavReport()
+        got = await resolver._resolve_sender_username(mon, data, report, send_client=None)
+        assert got is None
+        assert client.calls == 1
+        assert any(n.startswith("discovery:flood") for n in report.notes)
+
+    async def test_discovery_chain_continues_to_second_client(self, resolver, monkeypatch):
+        """فشل العميل الأول لا يوقف السلسلة — العميل الثاني ينجح."""
+        store = FakeHashStore()
+        _patch_sender_resolver(monkeypatch, store)
+        bad = DiscoveryClient(fail=True)
+        good = DiscoveryClient(users=[DiscoveryUser(777000111, "second_view")])
+        mon = _discovery_monitor(bad, FakeUpsertDB())
+        data = _base_data()
+        data["sender_username"] = None
+        got = await resolver._resolve_sender_username(mon, data, NavReport(), send_client=good)
+        assert got == "second_view"
+        assert bad.calls == 1 and good.calls == 1
+
+    async def test_discovery_disabled_flag_skips_network(self, resolver, monkeypatch):
+        restore = None
+        old = getattr(CFG, "NAV_USER_DISCOVERY_ENABLED", True)
+        object.__setattr__(CFG, "NAV_USER_DISCOVERY_ENABLED", False)
+
+        def _restore():
+            object.__setattr__(CFG, "NAV_USER_DISCOVERY_ENABLED", old)
+        restore = _restore
+        try:
+            store = FakeHashStore()
+            _patch_sender_resolver(monkeypatch, store)
+            client = DiscoveryClient(users=[DiscoveryUser(777000111, "never_asked")])
+            mon = _discovery_monitor(client)
+            data = _base_data()
+            data["sender_username"] = None
+            got = await resolver._resolve_sender_username(mon, data, NavReport(), send_client=None)
+            assert got is None
+            assert client.calls == 0  # المفتاح مُغلق → صفر استدعاءات شبكة
+        finally:
+            if restore:
+                restore()
+
+    async def test_discovery_no_clients_fail_safe(self, resolver):
+        """لا عملاء متاحين → None بلا أي انهيار (فشل-آمن حرفياً)."""
+        mon = _discovery_monitor(None)
+        data = _base_data()
+        data["sender_username"] = None
+        got = await resolver._resolve_sender_username(mon, data, NavReport(), send_client=None)
+        assert got is None
+
+    async def test_server_answer_without_our_user_never_guesses(self, resolver, monkeypatch):
+        """إجابة من الخادم لا تحتوي مرسلنا → تُهمَل ولا يُخترع اسم منها."""
+        store = FakeHashStore()
+        _patch_sender_resolver(monkeypatch, store)
+        client = DiscoveryClient(users=[DiscoveryUser(999999999, "someone_else")])
+        mon = _discovery_monitor(client)
+        data = _base_data()
+        data["sender_username"] = None
+        got = await resolver._resolve_sender_username(mon, data, NavReport(), send_client=None)
+        assert got is None
+        assert client.calls == 1  # محاولة واحدة فشلت منطقياً → فشل كلي بلا اختراع
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 10) v10.6 — harden_sender_anchor: ضمان قابلية النقر في المسار الاحتياطي
+# ═══════════════════════════════════════════════════════════════════════════
+class TestHardenSenderAnchor:
+    def test_replaces_tg_user_anchor(self):
+        html = '👤: <a href="tg://user?id=777000111">أحمد</a>'
+        out = harden_sender_anchor(html, 777000111, "https://t.me/c/1234567890/456")
+        assert out == '👤: <a href="https://t.me/c/1234567890/456">أحمد</a>'
+
+    def test_replaces_openmessage_anchor(self):
+        html = '👤: <a href="tg://openmessage?user_id=777000111">أحمد</a>'
+        out = harden_sender_anchor(html, 777000111, "https://t.me/mygroup/789")
+        assert out == '👤: <a href="https://t.me/mygroup/789">أحمد</a>'
+
+    def test_username_anchor_never_touched(self):
+        html = '👤: <a href="https://t.me/ahmed_99">أحمد</a>'
+        assert harden_sender_anchor(html, 777000111, "https://t.me/c/1/2") == html
+
+    def test_invalid_fallback_ignored(self):
+        html = '👤: <a href="tg://user?id=5">م</a>'
+        for bad in (None, "", "#", "http://t.me/g/1", "javascript:alert(1)"):
+            assert harden_sender_anchor(html, 5, bad) == html
+
+    def test_displayed_text_byte_identical(self):
+        """العقد المتجمد: فقط href يتغير — النص الظاهر حرفياً كما هو."""
+        html = '<b>الرسالة:</b>\nنص\n\n👤: <a href="tg://user?id=42">سارة</a>'
+        out = harden_sender_anchor(html, 42, "https://t.me/c/123/9")
+        assert out.replace('href="https://t.me/c/123/9"', 'href="tg://user?id=42"') == html
+
+    def test_integration_build_alert_no_username(self, monitor):
+        """تكامل مع البانِر المجمد: تنبيه بلا username + رابط رسالة صالح →
+            المرساة النهائية تقود للرسالة المصدر بدل المرساة الميتة."""
+        sender = {"id": 777000111, "display": "سارة", "username": None, "access_hash": None}
+        chat = {"entity": None, "title": "ق", "id": -1001234567890, "message_id": 456,
+                "username": None, "group_link": "https://t.me/c/1234567890",
+                "msg_link": "https://t.me/c/1234567890/456"}
+        alert, _ = monitor._build_alert(sender, chat, "ك", "نص", {"msg_hash": "h3"})
+        assert 'href="tg://user?id=777000111"' in alert          # الشكل المجمد قبل التصلب
+        hardened = harden_sender_anchor(alert, 777000111, chat["msg_link"])
+        assert 'href="https://t.me/c/1234567890/456"' in hardened
+        assert "سارة" in hardened
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 11) v10.6 — سلّم زر «مراسلة»: كل نقرة تصل لمكان حقيقي
+# ═══════════════════════════════════════════════════════════════════════════
+class TestContactButtonLadder:
+    def test_username_still_wins(self):
+        rows = build_dynamic_buttons(
+            sender={"id": 5, "username": "ahmed_99"},
+            chat={"id": -1001234567890, "message_id": 42, "username": None},
+        )
+        assert "https://t.me/ahmed_99" in [u for row in rows or [] for u in _all_specs(row)]
+
+    def test_no_username_falls_back_to_source_message(self):
+        """بلا username: زر مراسلة يفتح الرسالة المصدر (HTTPS يعمل على كل
+            العملاء) — اللمس على صورة المرسل يفتح ملفه الشخصي دائماً."""
+        rows = build_dynamic_buttons(
+            sender={"id": 5, "username": None},
+            chat={"id": -1001234567890, "message_id": 42, "username": None},
+        )
+        urls = [u for row in rows or [] for u in _all_specs(row)]
+        assert "https://t.me/c/1234567890/42" in urls  # مراسلة = رابط الرسالة
+
+    def test_basic_group_keeps_openmessage_last_resort(self):
+        """مجموعة أساسية (لا روابط رسائل في تيليجرام) → الشكل القديم
+            tg://openmessage يبقى آخر خيار متاح بصدق."""
+        rows = build_dynamic_buttons(
+            sender={"id": 5, "username": None},
+            chat={"id": -1234567, "message_id": 42, "username": None},
+        )
+        urls = [u for row in rows or [] for u in _all_specs(row)]
+        assert "tg://openmessage?user_id=5" in urls
+        assert all(not u.startswith("https://t.me/c/") for u in urls)
