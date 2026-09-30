@@ -17,14 +17,15 @@ SENDER:
   - username:  <a href="https://t.me/USERNAME">@USERNAME</a>
   - بدونه:     <a href="tg://user?id=ID">الاسم الكامل</a>
 
-الأزرار (v10.9): Inline Keyboard صف واحد أسفل كل تنبيه مباشرة، ترتيب
-RTL («مراسلة» في أقصى اليمين كما في الصورة المرجعية):
+الأزرار (v10.9.1): Inline Keyboard صف واحد أسفل كل تنبيه مباشرة، ترتيب
+RTL («مراسلة» في أقصى اليمين كما في الصورة المرجعية) — نصوص مصغّرة
+(تيليجرام يحسب حجم الزر من طول نصه حصراً — لا تحكم API في الخط/الحاشية):
 
-    [ مراسلة ] [ عرض الرسالة ] [ نسخ اليوزر ] [ القروب ↗ ]
+    [ مراسلة ] [ عرض ] [ نسخ ] [ القروب ]
 
 تُبنى حصراً عبر الدالة المركزية alert_bot.build_alert_buttons وترسل عبر
 بوت التنبيهات (Bot API). حسابات المستخدمين لا ترسل أزراراً — _build_alert
-يعيد buttons=None دائماً. نسخ اليوزر زر copy_text فعلي (@username أو ID).
+يعيد buttons=None دائماً. نسخ زر copy_text فعلي (@username أو ID).
 الزر الذي تنعدم بياناته يُحذف (لا روابط وهمية ولا أزرار معطلة).
 
 If ANY of these tests fail, the alert format changed and the release
@@ -59,9 +60,9 @@ GOLDEN = {
         # أزرار بوت التنبيهات: صف واحد بترتيب RTL
         "bot_buttons": [
             {"text": "مراسلة", "url": "https://t.me/ahmed_99"},
-            {"text": "عرض الرسالة", "url": "https://t.me/mygroup/123"},
-            {"text": "نسخ اليوزر", "copy_text": {"text": "@ahmed_99"}},
-            {"text": "القروب ↗", "url": "https://t.me/mygroup"},
+            {"text": "عرض", "url": "https://t.me/mygroup/123"},
+            {"text": "نسخ", "copy_text": {"text": "@ahmed_99"}},
+            {"text": "القروب", "url": "https://t.me/mygroup"},
         ],
     },
     "S2_private_chat": {
@@ -74,9 +75,9 @@ GOLDEN = {
         ),
         "bot_buttons": [
             {"text": "مراسلة", "url": "tg://user?id=777000222"},
-            {"text": "عرض الرسالة", "url": "https://t.me/c/1234567890/456"},
-            {"text": "نسخ اليوزر", "copy_text": {"text": "777000222"}},
-            {"text": "القروب ↗", "url": "https://t.me/c/1234567890"},
+            {"text": "عرض", "url": "https://t.me/c/1234567890/456"},
+            {"text": "نسخ", "copy_text": {"text": "777000222"}},
+            {"text": "القروب", "url": "https://t.me/c/1234567890"},
         ],
     },
     "S3_no_username_hash": {
@@ -87,10 +88,10 @@ GOLDEN = {
             '<b>نص الرسالة:</b>\n'
             '<blockquote>أبي مساعدة في واجب الاحصاء ضروري</blockquote>'
         ),
-        # بلا روابط → يختفي زرا «عرض الرسالة» و«القروب ↗» بصدق (لا روابط وهمية)
+        # بلا روابط → يختفي زرا «عرض» و«القروب» بصدق (لا روابط وهمية)
         "bot_buttons": [
             {"text": "مراسلة", "url": "tg://user?id=888000333"},
-            {"text": "نسخ اليوزر", "copy_text": {"text": "888000333"}},
+            {"text": "نسخ", "copy_text": {"text": "888000333"}},
         ],
     },
     "S4_unknown_title": {
@@ -103,9 +104,9 @@ GOLDEN = {
         ),
         "bot_buttons": [
             {"text": "مراسلة", "url": "https://t.me/user_x"},
-            {"text": "عرض الرسالة", "url": "https://t.me/eng_group/789"},
-            {"text": "نسخ اليوزر", "copy_text": {"text": "@user_x"}},
-            {"text": "القروب ↗", "url": "https://t.me/eng_group"},
+            {"text": "عرض", "url": "https://t.me/eng_group/789"},
+            {"text": "نسخ", "copy_text": {"text": "@user_x"}},
+            {"text": "القروب", "url": "https://t.me/eng_group"},
         ],
     },
 }
@@ -245,7 +246,7 @@ class TestAlertRegression:
     @pytest.mark.asyncio
     async def test_bot_api_payload_shape(self, monitor):
         """حمولة Bot API: parse_mode=HTML + link_preview_options disabled
-        + صف أزرار واحد [مراسلة][عرض الرسالة][نسخ اليوزر][القروب ↗]
+        + صف أزرار واحد [مراسلة][عرض][نسخ][القروب]
         (طريقة الإرسال المطلوبة حرفياً)."""
         from alert_bot import AlertBot
 

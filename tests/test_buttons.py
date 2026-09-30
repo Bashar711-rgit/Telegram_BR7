@@ -174,7 +174,7 @@ class TestBuildAlertButtons:
     """v10.8/v10.9: حُذف Button.inline/Button.url (cnt_/copy_) من مسار
     التنبيه بالكامل — _build_alert يعيد buttons=None دائماً (حسابات
     المستخدمين لا ترسل أزراراً). الأزرار الأربعة الموحدة
-    [مراسلة][عرض الرسالة][نسخ اليوزر][القروب ↗] تُبنى في alert_bot عبر
+    [مراسلة][عرض][نسخ][القروب] (نصوص مصغّرة v10.9.1) تُبنى في alert_bot عبر
     build_alert_buttons وتُرسل عبر بوت التنبيهات (Bot API). دالة
     build_dynamic_buttons محفوظة كدالة ميزة (تُختبر في
     TestBuildDynamicButtons أعلاه) ولم تعد تُستدعى من مسار التنبيهات.
@@ -253,7 +253,7 @@ class TestBuildAlertButtons:
         )
         assert built["buttons"] == [[
             {"text": "مراسلة", "url": "https://t.me/ahmed_99"},
-            {"text": "عرض الرسالة", "url": "https://t.me/g/7"},
-            {"text": "نسخ اليوزر", "copy_text": {"text": "@ahmed_99"}},
-            {"text": "القروب ↗", "url": "https://t.me/g"},
+            {"text": "عرض", "url": "https://t.me/g/7"},
+            {"text": "نسخ", "copy_text": {"text": "@ahmed_99"}},
+            {"text": "القروب", "url": "https://t.me/g"},
         ]]

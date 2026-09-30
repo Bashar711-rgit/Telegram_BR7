@@ -7,9 +7,9 @@
       (فارغ) <b>نص الرسالة:</b>
       <blockquote>{النص الأصلي كاملاً — لا truncate(400)}
   * أزرار Inline في صف واحد (ترتيب RTL: «مراسلة» أقصى اليمين):
-      [ مراسلة ] [ عرض الرسالة ] [ نسخ اليوزر ] [ القروب ↗ ]
+      [ مراسلة ] [ عرض ] [ نسخ ] [ القروب ]   (v10.9.1 نصوص مصغّرة)
     تُبنى حصراً عبر الدالة المركزية build_alert_buttons — الزر الذي
-    تنعدم بياناته يُحذف. نسخ اليوزر زر copy_text فعلي (@username أو ID).
+    تنعدم بياناته يُحذف. نسخ زر copy_text فعلي (@username أو ID).
   * الإرسال عبر Bot API sendMessage بـ aiohttp + link_preview_options
     disabled؛ 429 → retry_after (≤3)؛ BUTTON_USER_INVALID /
     BUTTON_USER_PRIVACY_RESTRICTED → إعادة بدون زر «مراسلة» فقط؛ أي
@@ -102,9 +102,9 @@ class TestBuildAlertHtml:
         assert "رابط الرسالة" not in built["text"]
         assert built["buttons"] == [[
             {"text": "مراسلة", "url": "https://t.me/Lara507"},
-            {"text": "عرض الرسالة", "url": "https://t.me/sultanu1999/531011"},
-            {"text": "نسخ اليوزر", "copy_text": {"text": "@Lara507"}},
-            {"text": "القروب ↗", "url": "https://t.me/sultanu1999"},
+            {"text": "عرض", "url": "https://t.me/sultanu1999/531011"},
+            {"text": "نسخ", "copy_text": {"text": "@Lara507"}},
+            {"text": "القروب", "url": "https://t.me/sultanu1999"},
         ]]
 
     def test_acceptance_2_no_username_name_button(self):
@@ -116,43 +116,43 @@ class TestBuildAlertHtml:
         # _data() لديه chat_id=-100111222333 وmessage_id=4242 → روابط خاصة صالحة
         assert built["buttons"] == [[
             {"text": "مراسلة", "url": f"tg://user?id={SENDER_ID}"},
-            {"text": "عرض الرسالة", "url": f"https://t.me/c/{INNER}/{MSG_ID}"},
-            {"text": "نسخ اليوزر", "copy_text": {"text": str(SENDER_ID)}},
-            {"text": "القروب ↗", "url": f"https://t.me/c/{INNER}"},
+            {"text": "عرض", "url": f"https://t.me/c/{INNER}/{MSG_ID}"},
+            {"text": "نسخ", "copy_text": {"text": str(SENDER_ID)}},
+            {"text": "القروب", "url": f"https://t.me/c/{INNER}"},
         ]]
 
     def test_acceptance_3_private_group_message_link(self):
-        """قروب خاص (id يبدأ -100): زر عرض الرسالة بصيغة t.me/c/{inner}/{id}."""
+        """قروب خاص (id يبدأ -100): زر عرض بصيغة t.me/c/{inner}/{id}."""
         built = build_alert_html(_data())  # بلا username للقروب، بلا overrides
         assert built["msg_link"] == f"https://t.me/c/{INNER}/{MSG_ID}"
-        assert {"text": "عرض الرسالة", "url": f"https://t.me/c/{INNER}/{MSG_ID}"} in _row_of(built)
-        assert {"text": "القروب ↗", "url": f"https://t.me/c/{INNER}"} in _row_of(built)
+        assert {"text": "عرض", "url": f"https://t.me/c/{INNER}/{MSG_ID}"} in _row_of(built)
+        assert {"text": "القروب", "url": f"https://t.me/c/{INNER}"} in _row_of(built)
 
     def test_public_group_message_link(self):
         built = build_alert_html(_data(chat_username="mygroup", message_id=789))
-        assert {"text": "عرض الرسالة", "url": "https://t.me/mygroup/789"} in _row_of(built)
-        assert {"text": "القروب ↗", "url": "https://t.me/mygroup"} in _row_of(built)
+        assert {"text": "عرض", "url": "https://t.me/mygroup/789"} in _row_of(built)
+        assert {"text": "القروب", "url": "https://t.me/mygroup"} in _row_of(built)
 
     def test_acceptance_4_no_link_unavailable_no_group_button(self):
-        """قروب بلا رابط: يختفي زرا «عرض الرسالة» و«القروب ↗» بصدق
+        """قروب بلا رابط: يختفي زرا «عرض» و«القروب» بصدق
         (لا روابط وهمية) وتبقى أزرار المرسل فعّالة."""
         built = build_alert_html(_data(chat_id=-987654321))  # مجموعة عادية
         row = _row_of(built)
         assert {"text": "مراسلة", "url": f"tg://user?id={SENDER_ID}"} in row
-        assert {"text": "نسخ اليوزر", "copy_text": {"text": str(SENDER_ID)}} in row
-        assert all(b["text"] not in ("عرض الرسالة", "القروب ↗") for b in row)
+        assert {"text": "نسخ", "copy_text": {"text": str(SENDER_ID)}} in row
+        assert all(b["text"] not in ("عرض", "القروب") for b in row)
         assert built["msg_link"] is None
         assert "<b>نص الرسالة:</b>\n<blockquote>" in built["text"]
 
     def test_view_button_falls_back_to_group_link(self):
-        """بدون رابط رسالة مباشر → عرض الرسالة يستخدم أفضل آلية متاحة
+        """بدون رابط رسالة مباشر → عرض يستخدم أفضل آلية متاحة
         (رابط القروب) بدل رابط وهمي."""
         built = build_alert_html(
             _data(message_id=None, chat_id=-987654321),
             msg_link=None, group_link="https://t.me/g_only",
         )
         row = _row_of(built)
-        assert {"text": "عرض الرسالة", "url": "https://t.me/g_only"} in row
+        assert {"text": "عرض", "url": "https://t.me/g_only"} in row
 
     def test_full_text_no_400_truncate(self):
         """v10.9: النص الأصلي كاملاً داخل البطاقة — لا truncate(400)."""
@@ -187,7 +187,7 @@ class TestBuildAlertHtml:
         ru1 = SimpleNamespace(username="main_u", active=True)
         ru2 = SimpleNamespace(username="second_u", active=True)
         built = build_alert_html(_data(sender_username="main_u", sender_usernames=[ru1, ru2]))
-        assert {"text": "نسخ اليوزر", "copy_text": {"text": "@main_u"}} in _row_of(built)
+        assert {"text": "نسخ", "copy_text": {"text": "@main_u"}} in _row_of(built)
 
     def test_rule_tag_feature_preserved(self):
         built = build_alert_html(_data(), {"rule_tag": "قاعدة تجريبية"})
@@ -209,7 +209,7 @@ class TestBuildAlertHtml:
 class TestBuildAlertButtons:
     def test_full_row_order_rtl(self):
         """الترتيب المطلوب (RTL: مراسلة أقصى اليمين في عملاء تيليجرام العربية):
-        [ مراسلة ] [ عرض الرسالة ] [ نسخ اليوزر ] [ القروب ↗ ]."""
+        [ مراسلة ] [ عرض ] [ نسخ ] [ القروب ]."""
         from alert_bot import build_alert_buttons
         kb = build_alert_buttons(
             sender_id=777, sender_username="u7",
@@ -217,9 +217,9 @@ class TestBuildAlertButtons:
         )
         assert kb == [[
             {"text": "مراسلة", "url": "https://t.me/u7"},
-            {"text": "عرض الرسالة", "url": "https://t.me/g/9"},
-            {"text": "نسخ اليوزر", "copy_text": {"text": "@u7"}},
-            {"text": "القروب ↗", "url": "https://t.me/g"},
+            {"text": "عرض", "url": "https://t.me/g/9"},
+            {"text": "نسخ", "copy_text": {"text": "@u7"}},
+            {"text": "القروب", "url": "https://t.me/g"},
         ]]
 
     def test_copy_uses_id_without_username(self):
@@ -227,7 +227,7 @@ class TestBuildAlertButtons:
         kb = build_alert_buttons(sender_id=555)
         assert kb == [[
             {"text": "مراسلة", "url": "tg://user?id=555"},
-            {"text": "نسخ اليوزر", "copy_text": {"text": "555"}},
+            {"text": "نسخ", "copy_text": {"text": "555"}},
         ]]
 
     def test_include_user_button_false_drops_only_contact(self):
@@ -238,9 +238,9 @@ class TestBuildAlertButtons:
             group_link="https://t.me/g", include_user_button=False,
         )
         assert kb == [[
-            {"text": "عرض الرسالة", "url": "https://t.me/g/9"},
-            {"text": "نسخ اليوزر", "copy_text": {"text": "777"}},
-            {"text": "القروب ↗", "url": "https://t.me/g"},
+            {"text": "عرض", "url": "https://t.me/g/9"},
+            {"text": "نسخ", "copy_text": {"text": "777"}},
+            {"text": "القروب", "url": "https://t.me/g"},
         ]]
 
     def test_empty_when_no_data(self):
@@ -291,9 +291,9 @@ class TestAlertBotSend:
         kb = _buttons_of(p)
         assert kb == [
             {"text": "مراسلة", "url": "https://t.me/Lara507"},
-            {"text": "عرض الرسالة", "url": "https://t.me/sultanu1999/531011"},
-            {"text": "نسخ اليوزر", "copy_text": {"text": "@Lara507"}},
-            {"text": "القروب ↗", "url": "https://t.me/sultanu1999"},
+            {"text": "عرض", "url": "https://t.me/sultanu1999/531011"},
+            {"text": "نسخ", "copy_text": {"text": "@Lara507"}},
+            {"text": "القروب", "url": "https://t.me/sultanu1999"},
         ]
         assert bot.calls[0]["method"] == "sendMessage"
 
@@ -343,15 +343,15 @@ class TestAlertBotSend:
         first_kb = _buttons_of(bot.calls[0]["payload"])
         assert first_kb == [
             {"text": "مراسلة", "url": f"tg://user?id={SENDER_ID}"},
-            {"text": "عرض الرسالة", "url": "https://t.me/g1/9"},
-            {"text": "نسخ اليوزر", "copy_text": {"text": str(SENDER_ID)}},
-            {"text": "القروب ↗", "url": "https://t.me/g1"},
+            {"text": "عرض", "url": "https://t.me/g1/9"},
+            {"text": "نسخ", "copy_text": {"text": str(SENDER_ID)}},
+            {"text": "القروب", "url": "https://t.me/g1"},
         ]
         second_kb = _buttons_of(bot.calls[1]["payload"])
         assert second_kb == [
-            {"text": "عرض الرسالة", "url": "https://t.me/g1/9"},
-            {"text": "نسخ اليوزر", "copy_text": {"text": str(SENDER_ID)}},
-            {"text": "القروب ↗", "url": "https://t.me/g1"},
+            {"text": "عرض", "url": "https://t.me/g1/9"},
+            {"text": "نسخ", "copy_text": {"text": str(SENDER_ID)}},
+            {"text": "القروب", "url": "https://t.me/g1"},
         ]
         # رابط الاسم يبقى في النص حرفياً
         assert 'tg://user?id=6079171409' in bot.calls[1]["payload"]["text"]
