@@ -109,6 +109,7 @@ from antispam import get_antispam, setup_antispam, get_antispam_snapshot
 from filter_engine import EnhancedFilter
 from monitors import EnhancedAccountMonitor, HealthMonitor, get_capture_snapshot, alert_latency
 from alert_bot import AlertBot  # v10.8: إرسال التنبيهات عبر Bot API
+from alert_ui import AlertBotClient  # v11.0: عميل بوت حي — Callbacks + إرسال احتياطي بالأزرار
 from sender_resolver import get_sender_intel_snapshot, get_mention_intel_snapshot
 
 # Import Dashboard
@@ -334,11 +335,18 @@ class EnhancedTelegramBot:
         # يعمل مسار حسابات المستخدمين (fallback) بنفس نص التنبيه بدون
         # أزرار كما في v10.7 — بلا أعطال.
         self.alert_bot = AlertBot(
-            token=getattr(CFG, "ALERT_BOT_TOKEN", None),
+            # v11.0: BOT_TOKEN اسم بديل مقبول (نفس توكن @alzariqi711r_bot)
+            token=(getattr(CFG, "ALERT_BOT_TOKEN", None) or os.getenv("BOT_TOKEN")),
             chat_id=getattr(CFG, "TARGET_GROUP_ID", 0),
             timeout=getattr(CFG, "ALERT_BOT_TIMEOUT", 12.0),
             max_retries=getattr(CFG, "ALERT_BOT_MAX_RETRIES", 3),
         )
+        # v11.0: عميل بوت التنبيهات الحي (alert_ui.AlertBotClient) —
+        # يستقبل CallbackQuery فعلياً ويعمل طبقة إرسال احتياطية بالأزرار.
+        # يُشغَّل في initialize() بعد نجاح فحص AlertBot، ويُربط بـalert_bot
+        # عبر set_client() ليكتمل سلّم الإرسال:
+        #   Bot API ← عميل البوت الحي (أزرار) ← حسابات المستخدمين (نص).
+        self.alert_ui_client: Optional[AlertBotClient] = None
         self.monitors: List[EnhancedAccountMonitor] = []
         self.is_running = False
         self._start_time = time.monotonic()
@@ -1660,6 +1668,36 @@ class EnhancedTelegramBot:
                 "— التنبيهات تُرسل من حسابات المستخدمين بدون أزرار (fallback)"
             )
 
+        # ══ v11.0: عميل بوت التنبيهات الحي — أزرار عملية باستقبال فعلي ══
+        # نفس توكن البوت عبر MTProto: يستقبل CallbackQuery (معالج «copy_»
+        # يجيب بنص التنبيه من DB) ويعمل طبقة إرسال احتياطية بالأزرار إن
+        # فشل Bot API. فشل التشغيل لا يوقف الإقلاع أبداً (فشل-آمن).
+        if self.alert_bot.enabled and getattr(CFG, "ALERT_BOT_ENABLED", True) \
+                and getattr(CFG, "ALERT_UI_CLIENT_ENABLED", True):
+            try:
+                _main_acc = next(
+                    (a for a in (getattr(CFG, "ACCOUNTS", None) or []) if a.get("is_main")),
+                    None,
+                )
+                _ui = AlertBotClient(
+                    api_id=(_main_acc or {}).get("api_id") or 0,
+                    api_hash=(_main_acc or {}).get("api_hash") or "",
+                    token=getattr(CFG, "ALERT_BOT_TOKEN", None) or os.getenv("BOT_TOKEN"),
+                    db=self.db,
+                    target_chat_id=getattr(CFG, "TARGET_GROUP_ID", 0),
+                )
+                if await _ui.start():
+                    self.alert_ui_client = _ui
+                    self.alert_bot.set_client(_ui)
+                else:
+                    self.alert_ui_client = None
+            except Exception as _ui_err:
+                logger.warning(
+                    f"⚠️ AlertBotClient boot skipped: {type(_ui_err).__name__}: "
+                    f"{str(_ui_err)[:120]} — السلّم يعمل بدونه"
+                )
+                self.alert_ui_client = None
+
         await self._register_admin_commands()
         await self._register_copy_handler()
         # v9.11: معالجات زر «تواصل مع المرسل» + مسار الرد البديل
@@ -1826,6 +1864,10 @@ class EnhancedTelegramBot:
             logger.debug(f"Shutdown notification failed: {e}")
 
         await asyncio.gather(*(m.disconnect() for m in self.monitors), return_exceptions=True)
+        # v11.0: فصل عميل بوت التنبيهات الحي بشكل نظيف
+        if self.alert_ui_client is not None:
+            await self.alert_ui_client.stop()
+            self.alert_ui_client = None
         await self.db.close()
         logger.info("✅ Shutdown complete")
 

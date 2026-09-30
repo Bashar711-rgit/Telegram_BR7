@@ -1678,6 +1678,19 @@ class EnhancedAccountMonitor:
         except Exception:
             _msg_ts = None
             _recv_lag = None
+        # v11.0: موضوع المنتدى (forum topic) الذي نُشرت فيه الرسالة —
+        # يُستخدم لبناء رابط رسالة حقيقي يفتح داخل الموضوع الصحيح
+        # (t.me/{u}/{topic}/{id} أو t.me/c/{inner}/{topic}/{id}).
+        _topic_id: Optional[int] = None
+        try:
+            _rt = getattr(event.message, "reply_to", None)
+            if _rt is not None and getattr(_rt, "forum_topic", False):
+                _topic_id = (
+                    getattr(_rt, "reply_to_top_id", None)
+                    or getattr(_rt, "reply_to_msg_id", None)
+                )
+        except Exception:
+            _topic_id = None
         event_data = {
             "chat_id": event.chat_id, "message_id": event.message.id,
             "sender_id": getattr(event, "sender_id", 0) or 0,
@@ -1688,6 +1701,7 @@ class EnhancedAccountMonitor:
             "text": full_text, "has_text": bool(full_text), "has_media": has_media, "media_type": media_type,
             "account_name": self.account["name"], "timestamp": time.time(),
             "msg_date_ts": _msg_ts, "receive_lag_ms": _recv_lag,
+            "topic_id": _topic_id,  # v11.0: روابط رسائل المنتديات الحقيقية
             # v9.12 (audit H-03): flag tells the worker whether the inline
             # path skipped enrichment (sender was None); the worker then
             # runs the resolver in the background.

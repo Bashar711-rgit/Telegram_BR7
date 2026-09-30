@@ -111,6 +111,17 @@ BTN_GROUP = "القروب"
 # تبقى، ورابط الاسم يبقى في النص).
 BUTTON_USER_ERRORS = ("BUTTON_USER_INVALID", "BUTTON_USER_PRIVACY_RESTRICTED")
 
+# v11.0: أخطاء أزرار عامة أخرى — يُعاد الإرسال **بدون أزرار** (نص التنبيه
+# يبقى بروابطه القابلة للنقر في الترويسة) بدل إسقاط التنبيه كله على
+# المسار الاحتياطي. الهدف: التنبيه لا يضيع أبداً بسبب زر.
+GENERIC_BUTTON_ERRORS = (
+    "BUTTON_URL_INVALID",
+    "BUTTON_DATA_INVALID",
+    "BUTTON_TYPE_INVALID",
+    "BUTTON_TEXT_INVALID",
+    "REPLY_MARKUP_INVALID",
+)
+
 _TG_URL = "https://t.me/"
 _PARTIAL_ENTITY_RE = re.compile(r"&[a-zA-Z#0-9]{0,10}$")
 
@@ -134,16 +145,22 @@ def _tme_inner_id(chat_id: Any) -> Optional[str]:
 
 
 def build_message_link(data: Dict[str, Any], chat_username: Optional[str] = None) -> Optional[str]:
-    """رابط الرسالة الحقيقي: عام → t.me/{u}/{id}؛ خاص -100 → t.me/c/{inner}/{id}."""
+    """رابط الرسالة الحقيقي: عام → t.me/{u}/{id}؛ خاص -100 → t.me/c/{inner}/{id}.
+
+    v11.0: مجموعات المنتديات (topics) → t.me/{u}/{topic}/{id} و
+    t.me/c/{inner}/{topic}/{id} — topic_id يُقرأ من data (يلتقطه
+    _event_to_dict) فيفتح الرابط داخل الموضوع الصحيح فعلياً."""
     message_id = data.get("message_id")
     if not message_id:
         return None
+    topic = data.get("topic_id")
+    mid = f"{topic}/{message_id}" if topic else f"{message_id}"
     uname = _clean_username(chat_username) or _clean_username(data.get("chat_username"))
     if uname:
-        return f"{_TG_URL}{uname}/{message_id}"
+        return f"{_TG_URL}{uname}/{mid}"
     inner = _tme_inner_id(data.get("chat_id"))
     if inner:
-        return f"{_TG_URL}c/{inner}/{message_id}"
+        return f"{_TG_URL}c/{inner}/{mid}"
     return None
 
 
@@ -381,12 +398,20 @@ class AlertBot:
         self.bot_id: Optional[int] = None
         self.bot_username: Optional[str] = None
         self.last_error: Optional[str] = None
+        # v11.0: عميل البوت الحي (alert_ui.AlertBotClient) — طبقة إرسال
+        # احتياطية بالأزرار عند فشل Bot API. يُربط من main.initialize.
+        self._client: Any = None
 
     # ── الحالة ──
     @property
     def enabled(self) -> bool:
         """توكن + قناة هدف = البوت جاهز. غير ذلك → fallback مباشرة."""
         return bool(self.token) and bool(self.chat_id)
+
+    def set_client(self, client: Any) -> None:
+        """v11.0: ربط عميل البوت الحي (AlertBotClient) كطبقة إرسال احتياطية
+        بالأزرار — يُستدعى من main.initialize بعد start() الناجح فقط."""
+        self._client = client
 
     # ── Bot API primitives ──
     async def _post(self, method: str, payload: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
@@ -522,6 +547,7 @@ class AlertBot:
 
         base_method = built["contact_method"]
         sender_dropped = False
+        buttons_dropped = False
         payload = self._build_payload(built, include_user_button=True)
 
         for attempt in range(1, self.max_retries + 1):
@@ -533,7 +559,7 @@ class AlertBot:
                 return False, "", f"network_error:{type(e).__name__}"
 
             if status == 200 and body.get("ok"):
-                method = "text_only" if sender_dropped else base_method
+                method = "text_only" if (sender_dropped or buttons_dropped) else base_method
                 return True, method, ""
 
             desc = str(body.get("description") or "")
@@ -572,7 +598,37 @@ class AlertBot:
                 )
                 continue
 
+            # ── v11.0: خطأ زر عام (URL/نوع/markup) → إعادة بدون أزرار —
+            # نص التنبيه يبقى بروابطه القابلة للنقر في الترويسة؛ التنبيه
+            # لا يُسلَّم للمسار الاحتياطي إلا إن فشلت هذه الإعادة أيضاً.
+            if not buttons_dropped and any(b in desc.upper() for b in GENERIC_BUTTON_ERRORS):
+                buttons_dropped = True
+                payload = self._build_payload(built)
+                payload.pop("reply_markup", None)
+                logger.warning(
+                    f"⚠️ AlertBot button rejected ({desc[:80]}) — إعادة الإرسال "
+                    "بدون أزرار (روابط الترويسة تبقى قابلة للنقر في النص)"
+                )
+                continue
+
             self.last_error = f"bot_api_{status}:{desc[:120]}"
+            # ── v11.0: طبقة الإرسال الاحتياطية بالأزرار — عميل البوت الحي
+            # (Telethon) بنفس النص والأزرار قبل الاستسلام لحسابات المستخدمين.
+            if self._client is not None:
+                try:
+                    if await self._client.send_buttons(
+                        built["text"], built.get("buttons") or []
+                    ):
+                        method = "text_only" if (sender_dropped or buttons_dropped) else base_method
+                        logger.info(
+                            "🤖 Alert delivered via AlertBotClient (Bot API failed) | "
+                            f"contact_method={method} | bot_api_reason={self.last_error[:80]}"
+                        )
+                        return True, method, ""
+                except Exception as _cl_err:
+                    logger.debug(
+                        f"AlertBotClient fallback error: {type(_cl_err).__name__}"
+                    )
             return False, "", self.last_error
 
         return False, "", "exhausted_retries"
