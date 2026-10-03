@@ -439,7 +439,7 @@ class TestFrozenBuilderIntegration:
         alert, buttons = monitor._build_alert(sender, chat, "واجب", "نص التنبيه", {"msg_hash": "h1"})
         assert '<a href="https://t.me/ahmed_99">@ahmed_99</a>' in alert
         # القالب الموحد v10.9: البطاقة تُظهر النص الأصلي كاملاً
-        assert '<b>نص الرسالة:</b>\n<blockquote>نص التنبيه</blockquote>' in alert
+        assert '<b>💬 الرسالة:</b>\n<blockquote>نص التنبيه</blockquote>' in alert
         assert "رابط الرسالة" not in alert  # الروابط في الأزرار الآن
         assert buttons is None  # الأزرار من بوت التنبيهات فقط
 

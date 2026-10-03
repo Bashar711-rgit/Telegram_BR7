@@ -2,6 +2,37 @@
 
 نظام متقدم لمراقبة مجموعات تيليجرام واصطياد طلبات المساعدة الطلابية، مهيأ للتشغيل **24/7 على Render المجاني** كـ Web Service.---
 
+## 🆕 v11.1 — قالب تنبيه جديد + كيانات معيارية منفصلة (طلب المستخدم المباشر)
+
+**1) واجهة التنبيه الجديدة (2 زر):**
+
+    👤 المستخدم: {اسم المرسل — رابط قابل للنقر}
+
+    💬 الرسالة:
+    {النص الأصلي كاملاً داخل blockquote}
+
+    [ مراسلة ] [ عرض الرسالة ]
+
+- **النسخ بالضغط على النص:** النص داخل `<blockquote>` — الضغط عليه في عملاء تيليجرام الرسمية يفتح قائمة «Copy Text» (نسخ فعلي للحافظة). هذه هي الآلية الرسمية الوحيدة في تيليجرام؛ لا توجد API تجعل النص الحر يُنسخ بلمسة مباشرة.
+- حُذف زرا «نسخ» و«القروب» من الصف حسب المواصفة (زر النسخ لم يعد ضرورياً مع النسخ بالضغط على النص).
+- السلوك الأمني كما هو: رفض tg://user يُسقط زر «مراسلة» فقط؛ أخطاء الأزرار العامة تُعيد الإرسال بدون أزرار؛ التنبيه لا يضيع أبداً بسبب زر.
+
+**2) الكيانات المعيارية المنفصلة في قاعدة البيانات (v11.1) — بيانات التنبيه ≠ بيانات المستخدم:**
+
+| الكيان | الجدول | المحتوى |
+|---|---|---|
+| المستخدم | `users` | user_id, access_hash, first/last/full_name, username, phone, bio, profile_photo, is_bot/verified/premium/scam/fake/deleted, status, last_seen |
+| العضوية | `group_memberships` | (chat_id,user_id) + chat_title/username/type, member_status/role, admin_permissions, joined_at, is_member/admin/owner/banned/restricted/muted |
+| الرسالة | `group_messages` | (chat_id,message_id) + النص والتواريخ والرابط والرد والوسائط وurls/mentions/hashtags/phone_numbers |
+| النشاط | `user_activity` | first/last_seen, total_messages, هِستوغرام الساعات (24) والأيام (7) |
+| التحليل | `message_analysis` | intent/confidence, matched_keywords/patterns, urgency/negation/spam/advert/final scores, classification, accepted/rejected, rejection_reason, processing_time_ms, engine/filter_version |
+| التنبيه | `alerts` (+7 أعمدة) | alert_status, alert_sent_at, alerted_to, notification_attempts/error, button_message_url, button_user_url |
+
+- التدفق الموثق مطبَّق حرفياً: Telegram Message → Capture → حفظ المستخدم → المجموعة → الرسالة → Intent Engine → Analysis → عند التطابق → Alert (بالحالة وروابط الأزرار الفعلية).
+- ما لا يوفره حدث الرسالة (bio, member_status, joined_at…) يُخزَّن NULL بصدق — لا بيانات مُختلقة؛ والقيم تُثرى تراكمياً بـCOALESCE.
+- ترحيل إضافي فقط (CREATE IF NOT EXISTS + ALTER ADD COLUMN): صفر تأثير على الجداول القديمة والاحتفاظ واللوحة؛ متوافق SQLite/PostgreSQL (BIGINT للمعرفات).
+- رسالة في المجموعة = دليل عضوية موثق (is_member=1) — العضوية لا تُختلق ولا تُنقص.
+
 ## 🆕 v11.0 — عميل بوت حي: أزرار عملية 100% + سلّم إرسال لا يضيع
 
 تطبيق مواصفة «أزرار حقيقية وليست وهمية» (ملف alert_ui.py المستلم من المستخدم، مُكيَّفاً على معمارية المشروع الحالية):

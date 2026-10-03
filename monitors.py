@@ -200,6 +200,7 @@ and documented FOLLOW-UP items for other files.
 """
 from __future__ import annotations
 import asyncio
+import json
 import os
 import secrets
 import time
@@ -1725,6 +1726,17 @@ class EnhancedAccountMonitor:
             "sender_phone": getattr(sender, "phone", None) if _sender_type == "user" else None,
             "sender_usernames": _sender_usernames,
         })
+        # ══ v11.1: بيانات الرد للكيان المعياري group_messages ══
+        # reply_to_msg_id من الحدث مباشرة — is_reply يشتق منه. فشل-آمن.
+        try:
+            _rt = getattr(event.message, "reply_to", None)
+            if _rt is not None:
+                _rt_id = (getattr(_rt, "reply_to_msg_id", None)
+                          or getattr(_rt, "reply_to_top_id", None))
+                if _rt_id:
+                    event_data["reply_to_message_id"] = int(_rt_id)
+        except Exception:
+            pass
         return event_data
 
 
@@ -2236,6 +2248,14 @@ class EnhancedAccountMonitor:
     async def _analyze_and_alert(self, data: Dict[str, Any], msg_hash: str, validated_text: Optional[str]):
         sender_id = data.get("sender_id", 0); has_media = bool(data.get("media_object"))
         start_time = time.perf_counter()
+        # ══ v11.1: حفظ الكيانات المعيارية المنفصلة عند كل رسالة ══
+        # users → group_memberships → group_messages → user_activity
+        # (قبل الفلترة — بيانات الرسالة تُحفظ مهما كان القرار؛ فشل-آمن)
+        try:
+            await self._record_intel_snapshot(
+                data, msg_hash, validated_text if validated_text is not None else (data.get("text") or None))
+        except Exception as _ie_err:
+            logger.debug(f"intel snapshot skipped [{self.account['name']}]: {type(_ie_err).__name__}")
         if validated_text:
             analysis = await self.filter.analyze(validated_text)
             decision = analysis.get("decision", "ignore"); confidence = analysis.get("confidence", 0.0)
@@ -2361,6 +2381,37 @@ class EnhancedAccountMonitor:
                 })
             except Exception as _fd_err:
                 logger.debug(f"filter decision log skipped [{self.account['name']}]: {_fd_err}")
+        # ══ v11.1: message_analysis — تحليل الرسالة ككيان منفصل ══
+        # تُسجَّل كل رسالة وصلت لمرحلة الكلمات (accept/ignore) بمؤشرات
+        # المحرك الفعلية فقط — ما لا ينتجه المحرك يُخزَّن NULL بصدق.
+        if validated_text and analysis.get("keyword") is not None:
+            try:
+                _decision_v11 = analysis.get("decision", "ignore")
+                _reasons_v11 = analysis.get("reasons") or []
+                _kw_v11 = analysis.get("keyword")
+                await self.db.record_message_analysis({
+                    "chat_id": chat_id_rule, "message_id": data.get("message_id"),
+                    "user_id": sender_id, "msg_hash": msg_hash,
+                    "intent": str(analysis.get("intent_verb") or "") or None,
+                    "intent_confidence": float(analysis.get("confidence") or 0.0),
+                    "matched_keywords": json.dumps([str(_kw_v11)]) if _kw_v11 is not None else None,
+                    "matched_patterns": json.dumps([str(r) for r in _reasons_v11[:8]]) if _reasons_v11 else None,
+                    "academic_context": str(analysis.get("academic_object") or "") or None,
+                    "urgency_score": 1.0 if analysis.get("urgent") else 0.0,
+                    "final_score": float(analysis.get("score")) if isinstance(analysis.get("score"), (int, float)) else None,
+                    "classification": str(_decision_v11),
+                    "accepted": _decision_v11 == "accept",
+                    "rejected": _decision_v11 != "accept",
+                    "rejection_reason": (None if _decision_v11 == "accept"
+                                         else ("; ".join(str(r) for r in _reasons_v11[:8])
+                                               or str(analysis.get("reason") or "") or None)),
+                    "detection_reason": str(_kw_v11) if _kw_v11 is not None else None,
+                    "processing_time_ms": round((time.perf_counter() - start_time) * 1000, 3),
+                    "engine_version": str(getattr(CFG, "BOT_VERSION", "11.1.0")),
+                    "filter_version": "intent-engine-v13",
+                })
+            except Exception as _ma_err:
+                logger.debug(f"message_analysis log skipped [{self.account['name']}]: {type(_ma_err).__name__}")
         try: await self.db.update_sender_reputation(sender_id, is_valid)
         except Exception as e: logger.warning(f"update_sender_reputation failed [{self.account['name']}]: {e}")
         if is_valid and await self.db.can_send_alert(sender_id):
@@ -2414,6 +2465,120 @@ class EnhancedAccountMonitor:
         processing_time = (time.perf_counter() - start_time) * 1000
         await self._update_avg_time(processing_time)
 
+
+    # ══ v11.1: الكيانات المعيارية المنفصلة — حفظ كل البيانات المتاحة ══
+    # users → group_memberships → group_messages → user_activity
+    # فصل تام بين بيانات التنبيه وبيانات المستخدم (مواصفة v11.1): كل كيان
+    # جدوله الخاص ودورة حياته الخاصة، وفشل أي كتابة لا يوقف التالي ولا
+    # التنبيه أبداً (فشل-آمن). ما لا يوفره الحدث يُخزَّن NULL بصدق —
+    # لا بيانات مُختلقة أبداً.
+    _URL_RE = None
+    _MENTION_RE = None
+    _HASHTAG_RE = None
+    _PHONE_RE = None
+
+    @classmethod
+    def _extract_text_artifacts(cls, text: Optional[str]) -> Dict[str, Optional[str]]:
+        """استخراج urls/mentions/hashtags/phone_numbers من نص الرسالة —
+        JSON strings للحقول المعيارية (قوائم فارغة → None)."""
+        if not text:
+            return {"urls": None, "mentions": None, "hashtags": None, "phone_numbers": None}
+        import re as _re
+        if cls._URL_RE is None:
+            cls._URL_RE = _re.compile(r"https?://\S+|www\.\S+|t\.me/\S+")
+            cls._MENTION_RE = _re.compile(r"@[A-Za-z][A-Za-z0-9_]{3,63}")
+            cls._HASHTAG_RE = _re.compile(r"#\S{1,80}")
+            cls._PHONE_RE = _re.compile(r"\+\d{7,15}\b")
+        try:
+            urls = sorted(set(cls._URL_RE.findall(text)))[:20]
+            mentions = sorted(set(cls._MENTION_RE.findall(text)))[:20]
+            hashtags = sorted(set(cls._HASHTAG_RE.findall(text)))[:20]
+            phones = sorted(set(cls._PHONE_RE.findall(text)))[:20]
+            return {
+                "urls": json.dumps(urls) if urls else None,
+                "mentions": json.dumps(mentions) if mentions else None,
+                "hashtags": json.dumps(hashtags) if hashtags else None,
+                "phone_numbers": json.dumps(phones) if phones else None,
+            }
+        except Exception:
+            return {"urls": None, "mentions": None, "hashtags": None, "phone_numbers": None}
+
+    async def _record_intel_snapshot(self, data: Dict[str, Any], msg_hash: str,
+                                     text: Optional[str]) -> None:
+        """v11.1 — التقاط كامل: مستخدم + عضوية + رسالة + نشاط، بترتيب
+        الكيانات الموثق. كل كتابة مستقلة فشل-آمنة."""
+        db = self.db
+        sender_id = data.get("sender_id") or 0
+        chat_id = data.get("chat_id") or 0
+        ts = data.get("timestamp") or time.time()
+        message_id = data.get("message_id")
+
+        # ── 1) users ──
+        try:
+            if sender_id:
+                await db.upsert_tg_user({
+                    "user_id": int(sender_id),
+                    "access_hash": data.get("sender_access_hash"),
+                    "first_name": data.get("sender_first_name"),
+                    "last_name": data.get("sender_last_name"),
+                    "username": data.get("sender_username"),
+                    "phone": data.get("sender_phone"),
+                    "is_bot": data.get("sender_is_bot"),
+                    "is_verified": data.get("sender_is_verified"),
+                    "is_premium": data.get("sender_is_premium"),
+                    "is_scam": data.get("sender_is_scam"),
+                    "is_fake": data.get("sender_is_fake"),
+                    "is_deleted": data.get("sender_is_deleted"),
+                    "status": data.get("sender_status"),
+                    # bio/profile_photo/last_seen: لا يوفرها الحدث → NULL صادقة
+                })
+        except Exception as e:
+            logger.debug(f"intel users skipped: {type(e).__name__}")
+
+        # ── 2) group_memberships — إرسال رسالة في المجموعة دليل عضوية ──
+        try:
+            if chat_id and sender_id:
+                await db.upsert_group_membership({
+                    "chat_id": int(chat_id), "user_id": int(sender_id),
+                    "chat_title": data.get("chat_title"),
+                    "chat_username": data.get("chat_username"),
+                    "chat_type": data.get("chat_type"),
+                    "is_member": True,
+                    # member_status/role/admin_permissions/joined_at: تحتاج
+                    # استعلام عضوية إداري — لا يوفره حدث رسالة → NULL صادق
+                })
+        except Exception as e:
+            logger.debug(f"intel membership skipped: {type(e).__name__}")
+
+        # ── 3) group_messages ──
+        try:
+            if chat_id and message_id:
+                artifacts = self._extract_text_artifacts(text)
+                await db.record_group_message({
+                    "chat_id": int(chat_id), "message_id": int(message_id),
+                    "user_id": int(sender_id) if sender_id else None,
+                    "message_text": text,
+                    "message_date": ts,
+                    "message_link": build_telegram_links(
+                        chat_id, message_id, username=data.get("chat_username")
+                    ).get("message"),
+                    "reply_to_message_id": data.get("reply_to_message_id"),
+                    "is_reply": bool(data.get("reply_to_message_id")),
+                    "is_forward": bool(data.get("is_forward")),
+                    "media_type": data.get("media_type"),
+                    "msg_hash": msg_hash,
+                    **artifacts,
+                })
+        except Exception as e:
+            logger.debug(f"intel message skipped: {type(e).__name__}")
+
+        # ── 4) user_activity ──
+        try:
+            if chat_id and sender_id:
+                await db.record_user_activity(int(sender_id), int(chat_id),
+                                              message_id, ts)
+        except Exception as e:
+            logger.debug(f"intel activity skipped: {type(e).__name__}")
 
     # ── v10.4: mention-intelligence helpers (backend-only) ─────────────
     def _account_name_for_client(self, client: Optional[TelegramClient]) -> Optional[str]:
@@ -2926,16 +3091,33 @@ class EnhancedAccountMonitor:
                     # (ميزة v10.7 القائمة) يضمن وصول الوسائط لقناة الهدف.
                     if user_media is not None:
                         await _forward_supplement(None)
+                    _bmsg_v11 = chat_info.get("msg_link")
+                    _bmsg_v11 = _bmsg_v11 if _bmsg_v11 and _bmsg_v11 != "#" else None
+                    _busr_v11 = (f"https://t.me/{sender.get('username')}"
+                                 if sender.get("username")
+                                 else (f"tg://user?id={sender_id}" if sender_id else None))
                     await self._record_sent_alert(
                         None, data, msg_hash, account_name, keyword, alert_text,
                         chat_id, sender_id, display_name, contact_method=_method,
+                        button_message_url=_bmsg_v11, button_user_url=_busr_v11,
                     )
                     return
+                try:  # v11.1: فشل محاولة الإرسال يُسجل بصدق (status=failed)
+                    await self.db.mark_alert_dispatched(
+                        msg_hash, status="failed", error=str(_reason or "")[:300])
+                except Exception:
+                    pass
                 logger.warning(
                     f"AlertBot failed → user-account fallback [{account_name}] "
                     f"(msg_hash={msg_hash}): {_reason}"
                 )
             except Exception as _ab_err:
+                try:  # v11.1: نفس التسجيل لمسار الاستثناء
+                    await self.db.mark_alert_dispatched(
+                        msg_hash, status="failed",
+                        error=f"{type(_ab_err).__name__}: {str(_ab_err)[:250]}")
+                except Exception:
+                    pass
                 logger.warning(
                     f"AlertBot error → user-account fallback [{account_name}]: "
                     f"{type(_ab_err).__name__}: {str(_ab_err)[:150]}"
@@ -3219,6 +3401,10 @@ class EnhancedAccountMonitor:
         sender_id: int,
         display_name: str,
         contact_method: str = "",
+        button_message_url: Optional[str] = None,
+        button_user_url: Optional[str] = None,
+        alert_status: str = "sent",
+        notification_error: Optional[str] = None,
     ) -> None:
         """Unified post-send bookkeeping (audit H-05).
 
@@ -3249,6 +3435,18 @@ class EnhancedAccountMonitor:
         await self.db.add_alert(AlertRecord(message_hash=msg_hash, chat_id=chat_id, sender_id=sender_id,
             account_name=account_name, keyword=safe_keyword, alert_text=alert_text, timestamp=time.time(),
             contact_method=(contact_method or "")[:20]))
+        # ══ v11.1: سجل الإرسال — الحالة + الزمن + الوجهة + روابط الأزرار ══
+        # add_alert دفعي (writer) — التحديث بـmessage_hash يطبق عند وصول الصف.
+        try:
+            _target_v11 = str(getattr(CFG, "TARGET_GROUP_ID", "") or "") or None
+            await self.db.mark_alert_dispatched(
+                msg_hash, status=alert_status, alerted_to=_target_v11,
+                error=notification_error, attempts=1,
+                button_message_url=button_message_url,
+                button_user_url=button_user_url,
+            )
+        except Exception as _md_err:
+            logger.debug(f"mark_alert_dispatched failed [{account_name}]: {type(_md_err).__name__}")
         # v9.12 (audit H-01): invalidate can_send_alert cache so the next
         # message from this sender sees the new last_alert_time immediately.
         try:

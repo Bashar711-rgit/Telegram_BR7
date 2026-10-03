@@ -281,7 +281,7 @@ class TestSendLadder:
         assert len(fake.sent) == 1
         # الأزرار الأربعة وصلت للعميل نفسها (بنية build_alert_buttons)
         row = fake.sent[0][1][0]
-        assert [b["text"] for b in row] == ["مراسلة", "عرض", "نسخ", "القروب"]
+        assert [b["text"] for b in row] == ["مراسلة", "عرض الرسالة"]
 
     @pytest.mark.asyncio
     async def test_bot_api_failure_client_fallback_success(self):

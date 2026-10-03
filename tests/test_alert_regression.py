@@ -7,10 +7,9 @@ the current code.
 ⚠️ v10.9 (2026-09) — GOLDEN UPDATED BY EXPLICIT USER REQUEST (النمط الموحد):
 نمط واجهة موحد لكل التنبيهات دون استثناء (parse_mode=HTML):
 
-    سطر 1:  👤 {SENDER}
-    سطر 2:  <b>المرسل :</b> ID {sender_id}
+    سطر 1:  👤 المستخدم: {SENDER}
     (سطر فارغ)
-    <b>نص الرسالة:</b>
+    <b>💬 الرسالة:</b>
     <blockquote>{النص الأصلي كاملاً — بطاقة منظمة RTL}</blockquote>
 
 SENDER:
@@ -21,11 +20,11 @@ SENDER:
 RTL («مراسلة» في أقصى اليمين كما في الصورة المرجعية) — نصوص مصغّرة
 (تيليجرام يحسب حجم الزر من طول نصه حصراً — لا تحكم API في الخط/الحاشية):
 
-    [ مراسلة ] [ عرض ] [ نسخ ] [ القروب ]
+    [ مراسلة ] [ عرض الرسالة ]
 
 تُبنى حصراً عبر الدالة المركزية alert_bot.build_alert_buttons وترسل عبر
 بوت التنبيهات (Bot API). حسابات المستخدمين لا ترسل أزراراً — _build_alert
-يعيد buttons=None دائماً. نسخ زر copy_text فعلي (@username أو ID).
+يعيد buttons=None دائماً. النسخ بالضغط على نص الرسالة (quote → Copy Text).
 الزر الذي تنعدم بياناته يُحذف (لا روابط وهمية ولا أزرار معطلة).
 
 If ANY of these tests fail, the alert format changed and the release
@@ -51,62 +50,51 @@ import pytest  # noqa: E402
 GOLDEN = {
     "S1_username_chat": {
         "alert": (
-            '👤 <a href="https://t.me/ahmed_99">@ahmed_99</a>\n'
-            '<b>المرسل :</b> ID 555000111\n'
+            '👤 المستخدم: <a href="https://t.me/ahmed_99">@ahmed_99</a>\n'
             '\n'
-            '<b>نص الرسالة:</b>\n'
+            '<b>💬 الرسالة:</b>\n'
             '<blockquote>أبي مساعدة في واجب الاحصاء ضروري</blockquote>'
         ),
         # أزرار بوت التنبيهات: صف واحد بترتيب RTL
         "bot_buttons": [
             {"text": "مراسلة", "url": "https://t.me/ahmed_99"},
-            {"text": "عرض", "url": "https://t.me/mygroup/123"},
-            {"text": "نسخ", "copy_text": {"text": "@ahmed_99"}},
-            {"text": "القروب", "url": "https://t.me/mygroup"},
+            {"text": "عرض الرسالة", "url": "https://t.me/mygroup/123"},
         ],
     },
     "S2_private_chat": {
         "alert": (
-            '👤 <a href="tg://user?id=777000222">سارة</a>\n'
-            '<b>المرسل :</b> ID 777000222\n'
+            '👤 المستخدم: <a href="tg://user?id=777000222">سارة</a>\n'
             '\n'
-            '<b>نص الرسالة:</b>\n'
+            '<b>💬 الرسالة:</b>\n'
             '<blockquote>أبي مساعدة في واجب الاحصاء ضروري</blockquote>'
         ),
         "bot_buttons": [
             {"text": "مراسلة", "url": "tg://user?id=777000222"},
-            {"text": "عرض", "url": "https://t.me/c/1234567890/456"},
-            {"text": "نسخ", "copy_text": {"text": "777000222"}},
-            {"text": "القروب", "url": "https://t.me/c/1234567890"},
+            {"text": "عرض الرسالة", "url": "https://t.me/c/1234567890/456"},
         ],
     },
     "S3_no_username_hash": {
         "alert": (
-            '👤 <a href="tg://user?id=888000333">خالد</a>\n'
-            '<b>المرسل :</b> ID 888000333\n'
+            '👤 المستخدم: <a href="tg://user?id=888000333">خالد</a>\n'
             '\n'
-            '<b>نص الرسالة:</b>\n'
+            '<b>💬 الرسالة:</b>\n'
             '<blockquote>أبي مساعدة في واجب الاحصاء ضروري</blockquote>'
         ),
-        # بلا روابط → يختفي زرا «عرض» و«القروب» بصدق (لا روابط وهمية)
+        # بلا روابط → يختفي زر «عرض الرسالة» بصدق (لا روابط وهمية)
         "bot_buttons": [
             {"text": "مراسلة", "url": "tg://user?id=888000333"},
-            {"text": "نسخ", "copy_text": {"text": "888000333"}},
         ],
     },
     "S4_unknown_title": {
         "alert": (
-            '👤 <a href="https://t.me/user_x">@user_x</a>\n'
-            '<b>المرسل :</b> ID 999000444\n'
+            '👤 المستخدم: <a href="https://t.me/user_x">@user_x</a>\n'
             '\n'
-            '<b>نص الرسالة:</b>\n'
+            '<b>💬 الرسالة:</b>\n'
             '<blockquote>أبي مساعدة في واجب الاحصاء ضروري</blockquote>'
         ),
         "bot_buttons": [
             {"text": "مراسلة", "url": "https://t.me/user_x"},
-            {"text": "عرض", "url": "https://t.me/eng_group/789"},
-            {"text": "نسخ", "copy_text": {"text": "@user_x"}},
-            {"text": "القروب", "url": "https://t.me/eng_group"},
+            {"text": "عرض الرسالة", "url": "https://t.me/eng_group/789"},
         ],
     },
 }

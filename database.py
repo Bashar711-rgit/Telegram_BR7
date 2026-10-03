@@ -115,7 +115,7 @@ import os
 import sqlite3
 import time
 import zlib
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -519,6 +519,7 @@ class EnhancedDatabase:
             await self._migrate_dashboard_account_status()  # v9.34
             await self._migrate_sender_account_hashes()  # v10.4
             await self._migrate_sender_access()  # v10.7
+            await self._migrate_intel_entities()  # v11.1 normalized intel entities
             await self._create_indexes()
             self.is_connected = True
             await self.start_writer()
@@ -1812,6 +1813,549 @@ class EnhancedDatabase:
     # key lets the mention builder build a valid InputUser for whichever
     # account actually sends the alert. Table is additive & idempotent;
     # nothing existing is renamed/dropped.
+    # ─── v11.1: normalized intel entities — separated per design spec ─────
+    # users → group_memberships → group_messages → message_analysis → alerts
+    # (+ user_activity). Alert data is NEVER conflated with user data: each
+    # entity has its own table, its own lifecycle, and its own writer.
+    # All tables are ADDITIVE (CREATE IF NOT EXISTS) — zero impact on legacy
+    # messages/alerts consumers, retention and dashboard queries.
+    _INTEL_ALERT_COLUMNS = [
+        ("alert_status", "TEXT"),
+        ("alert_sent_at", "DOUBLE PRECISION"),
+        ("alerted_to", "TEXT"),
+        ("notification_attempts", "INTEGER DEFAULT 0"),
+        ("notification_error", "TEXT"),
+        ("button_message_url", "TEXT"),
+        ("button_user_url", "TEXT"),
+    ]
+
+    _INTEL_ENTITY_STATEMENTS = (
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            access_hash INTEGER,
+            first_name TEXT,
+            last_name TEXT,
+            full_name TEXT,
+            username TEXT,
+            phone TEXT,
+            bio TEXT,
+            profile_photo TEXT,
+            is_bot INTEGER DEFAULT 0,
+            is_verified INTEGER DEFAULT 0,
+            is_premium INTEGER DEFAULT 0,
+            is_scam INTEGER DEFAULT 0,
+            is_fake INTEGER DEFAULT 0,
+            is_deleted INTEGER DEFAULT 0,
+            status TEXT,
+            last_seen REAL,
+            created_at REAL,
+            updated_at REAL
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS group_memberships (
+            chat_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            chat_title TEXT,
+            chat_username TEXT,
+            chat_type TEXT,
+            member_status TEXT,
+            member_role TEXT,
+            admin_permissions TEXT,
+            joined_at REAL,
+            is_member INTEGER DEFAULT 0,
+            is_admin INTEGER DEFAULT 0,
+            is_owner INTEGER DEFAULT 0,
+            is_banned INTEGER DEFAULT 0,
+            is_restricted INTEGER DEFAULT 0,
+            is_muted INTEGER DEFAULT 0,
+            updated_at REAL,
+            PRIMARY KEY (chat_id, user_id)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS group_messages (
+            chat_id INTEGER NOT NULL,
+            message_id INTEGER NOT NULL,
+            user_id INTEGER,
+            message_text TEXT,
+            message_date REAL,
+            edit_date REAL,
+            message_link TEXT,
+            reply_to_message_id INTEGER,
+            reply_to_user_id INTEGER,
+            is_reply INTEGER DEFAULT 0,
+            is_forward INTEGER DEFAULT 0,
+            is_edited INTEGER DEFAULT 0,
+            is_deleted INTEGER DEFAULT 0,
+            is_pinned INTEGER DEFAULT 0,
+            views INTEGER,
+            forwards INTEGER,
+            replies_count INTEGER,
+            media_type TEXT,
+            media_id TEXT,
+            file_name TEXT,
+            file_size INTEGER,
+            entities TEXT,
+            urls TEXT,
+            mentions TEXT,
+            hashtags TEXT,
+            phone_numbers TEXT,
+            msg_hash TEXT,
+            created_at REAL,
+            updated_at REAL,
+            PRIMARY KEY (chat_id, message_id)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS message_analysis (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL,
+            message_id INTEGER NOT NULL,
+            user_id INTEGER,
+            msg_hash TEXT,
+            intent TEXT,
+            intent_confidence REAL,
+            matched_keywords TEXT,
+            matched_patterns TEXT,
+            academic_context TEXT,
+            action_score REAL,
+            urgency_score REAL,
+            negation_score REAL,
+            spam_score REAL,
+            advertisement_score REAL,
+            similarity_score REAL,
+            fuzzy_score REAL,
+            final_score REAL,
+            classification TEXT,
+            accepted INTEGER DEFAULT 0,
+            rejected INTEGER DEFAULT 0,
+            duplicate INTEGER DEFAULT 0,
+            rejection_reason TEXT,
+            detection_reason TEXT,
+            processing_time_ms REAL,
+            engine_version TEXT,
+            filter_version TEXT,
+            created_at REAL
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS user_activity (
+            user_id INTEGER NOT NULL,
+            chat_id INTEGER NOT NULL,
+            first_seen_at REAL,
+            last_seen_at REAL,
+            total_messages INTEGER DEFAULT 0,
+            first_message_id INTEGER,
+            last_message_id INTEGER,
+            activity_hours TEXT,
+            activity_days TEXT,
+            updated_at REAL,
+            PRIMARY KEY (user_id, chat_id)
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_group_messages_user ON group_messages (user_id, chat_id, message_date)",
+        "CREATE INDEX IF NOT EXISTS idx_group_messages_date ON group_messages (message_date)",
+        "CREATE INDEX IF NOT EXISTS idx_message_analysis_msg ON message_analysis (chat_id, message_id)",
+        "CREATE INDEX IF NOT EXISTS idx_users_username ON users (username)",
+    )
+
+    @staticmethod
+    def _intel_pg_sql(sql: str) -> str:
+        """PostgreSQL dialect transform for v11.1 entity statements
+        (mirrors _create_tables replacements): Telegram IDs exceed int32."""
+        return (
+            sql.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "BIGSERIAL PRIMARY KEY")
+            .replace("INTEGER PRIMARY KEY", "BIGINT PRIMARY KEY")
+            .replace("INTEGER NOT NULL", "BIGINT NOT NULL")
+            .replace("INTEGER,", "BIGINT,")
+            .replace("INTEGER)", "BIGINT)")
+        )
+
+    async def _migrate_intel_entities(self) -> None:
+        """v11.1 — additive, idempotent, zero-data-loss:
+          1. CREATE TABLE IF NOT EXISTS: users / group_memberships /
+             group_messages / message_analysis / user_activity (+ indexes).
+          2. ALTER TABLE alerts ADD COLUMN: alert_status, alert_sent_at,
+             alerted_to, notification_attempts, notification_error,
+             button_message_url, button_user_url.
+        Failure of any single statement never blocks boot."""
+        created = 0
+        for stmt in self._INTEL_ENTITY_STATEMENTS:
+            try:
+                sql = self._intel_pg_sql(stmt) if self.db_type == "postgresql" else stmt
+                await self._execute(sql)
+                created += 1
+            except Exception as e:
+                logger.warning(f"intel-entities migration statement skipped: {type(e).__name__}: {str(e)[:120]}")
+        # alerts dispatch columns (pragma-check on SQLite like other migrations)
+        if self._INTEL_ALERT_COLUMNS:
+            existing: set = set()
+            try:
+                if self.db_type == "postgresql":
+                    rows = await self._fetchall(
+                        "SELECT column_name FROM information_schema.columns WHERE table_name = 'alerts'", ()
+                    )
+                    existing = {r["column_name"] for r in rows}
+                else:
+                    rows = await self._fetchall("PRAGMA table_info(alerts)", ())
+                    existing = {r["name"] for r in rows}
+            except Exception:
+                existing = set()
+            added = 0
+            for name, decl in self._INTEL_ALERT_COLUMNS:
+                if name in existing:
+                    continue
+                try:
+                    if self.db_type == "postgresql":
+                        await self._execute(f"ALTER TABLE alerts ADD COLUMN {name} {decl}")
+                    else:
+                        await self._execute(
+                            f"ALTER TABLE alerts ADD COLUMN {name} "
+                            f"{decl.replace('DOUBLE PRECISION', 'REAL')}"
+                        )
+                    added += 1
+                except Exception as e:
+                    logger.warning(f"alerts dispatch column {name} skipped: {type(e).__name__}")
+            if added:
+                logger.info(f"Database migration v11.1: alerts dispatch columns (+{added})")
+        await self._commit()
+        if created:
+            logger.info(f"Database migration v11.1: intel entities ready ({created} statements)")
+
+    async def upsert_tg_user(self, d: Dict[str, Any]) -> bool:
+        """v11.1 users upsert — COALESCE semantics: a new non-null value
+        wins, None keeps the stored one (identity fields are never blanked
+        by a later partial event). Never raises."""
+        try:
+            full_name = d.get("full_name")
+            if full_name is None:
+                fn, ln = d.get("first_name"), d.get("last_name")
+                full_name = f"{fn or ''} {ln or ''}".strip() or None
+            await self._execute(
+                """
+                INSERT INTO users (user_id, access_hash, first_name, last_name, full_name,
+                    username, phone, bio, profile_photo, is_bot, is_verified, is_premium,
+                    is_scam, is_fake, is_deleted, status, last_seen, created_at, updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT (user_id) DO UPDATE SET
+                    access_hash = COALESCE(EXCLUDED.access_hash, users.access_hash),
+                    first_name = COALESCE(EXCLUDED.first_name, users.first_name),
+                    last_name = COALESCE(EXCLUDED.last_name, users.last_name),
+                    full_name = COALESCE(EXCLUDED.full_name, users.full_name),
+                    username = COALESCE(EXCLUDED.username, users.username),
+                    phone = COALESCE(EXCLUDED.phone, users.phone),
+                    bio = COALESCE(EXCLUDED.bio, users.bio),
+                    profile_photo = COALESCE(EXCLUDED.profile_photo, users.profile_photo),
+                    is_bot = COALESCE(EXCLUDED.is_bot, users.is_bot),
+                    is_verified = COALESCE(EXCLUDED.is_verified, users.is_verified),
+                    is_premium = COALESCE(EXCLUDED.is_premium, users.is_premium),
+                    is_scam = COALESCE(EXCLUDED.is_scam, users.is_scam),
+                    is_fake = COALESCE(EXCLUDED.is_fake, users.is_fake),
+                    is_deleted = COALESCE(EXCLUDED.is_deleted, users.is_deleted),
+                    status = COALESCE(EXCLUDED.status, users.status),
+                    last_seen = COALESCE(EXCLUDED.last_seen, users.last_seen),
+                    updated_at = EXCLUDED.updated_at
+                """,
+                (
+                    int(d.get("user_id") or 0), d.get("access_hash"), d.get("first_name"),
+                    d.get("last_name"), full_name, d.get("username"), d.get("phone"),
+                    d.get("bio"), d.get("profile_photo"),
+                    1 if d.get("is_bot") else 0 if d.get("is_bot") is not None else None,
+                    1 if d.get("is_verified") else 0 if d.get("is_verified") is not None else None,
+                    1 if d.get("is_premium") else 0 if d.get("is_premium") is not None else None,
+                    1 if d.get("is_scam") else 0 if d.get("is_scam") is not None else None,
+                    1 if d.get("is_fake") else 0 if d.get("is_fake") is not None else None,
+                    1 if d.get("is_deleted") else 0 if d.get("is_deleted") is not None else None,
+                    d.get("status"), d.get("last_seen"), time.time(), time.time(),
+                ),
+            )
+            await self._commit()
+            return True
+        except Exception as e:
+            logger.debug(f"upsert_tg_user skipped: {type(e).__name__}: {str(e)[:120]}")
+            return False
+
+    async def upsert_group_membership(self, d: Dict[str, Any]) -> bool:
+        """v11.1 group_memberships upsert — chat identity refreshed, member
+        flags OR-accumulated (a proven fact is never un-proven). Sending a
+        message in the group is PROOF of membership (is_member=1).
+        Never raises."""
+        try:
+            await self._execute(
+                """
+                INSERT INTO group_memberships (chat_id, user_id, chat_title, chat_username,
+                    chat_type, member_status, member_role, admin_permissions, joined_at,
+                    is_member, is_admin, is_owner, is_banned, is_restricted, is_muted, updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT (chat_id, user_id) DO UPDATE SET
+                    chat_title = COALESCE(EXCLUDED.chat_title, group_memberships.chat_title),
+                    chat_username = COALESCE(EXCLUDED.chat_username, group_memberships.chat_username),
+                    chat_type = COALESCE(EXCLUDED.chat_type, group_memberships.chat_type),
+                    member_status = COALESCE(EXCLUDED.member_status, group_memberships.member_status),
+                    member_role = COALESCE(EXCLUDED.member_role, group_memberships.member_role),
+                    admin_permissions = COALESCE(EXCLUDED.admin_permissions, group_memberships.admin_permissions),
+                    joined_at = COALESCE(EXCLUDED.joined_at, group_memberships.joined_at),
+                    is_member = MAX(COALESCE(group_memberships.is_member, 0), COALESCE(EXCLUDED.is_member, 0)),
+                    is_admin = MAX(COALESCE(group_memberships.is_admin, 0), COALESCE(EXCLUDED.is_admin, 0)),
+                    is_owner = MAX(COALESCE(group_memberships.is_owner, 0), COALESCE(EXCLUDED.is_owner, 0)),
+                    is_banned = MAX(COALESCE(group_memberships.is_banned, 0), COALESCE(EXCLUDED.is_banned, 0)),
+                    is_restricted = MAX(COALESCE(group_memberships.is_restricted, 0), COALESCE(EXCLUDED.is_restricted, 0)),
+                    is_muted = MAX(COALESCE(group_memberships.is_muted, 0), COALESCE(EXCLUDED.is_muted, 0)),
+                    updated_at = EXCLUDED.updated_at
+                """,
+                (
+                    int(d.get("chat_id") or 0), int(d.get("user_id") or 0),
+                    d.get("chat_title"), d.get("chat_username"), d.get("chat_type"),
+                    d.get("member_status"), d.get("member_role"), d.get("admin_permissions"),
+                    d.get("joined_at"),
+                    1 if d.get("is_member") else 0,
+                    1 if d.get("is_admin") else 0,
+                    1 if d.get("is_owner") else 0,
+                    1 if d.get("is_banned") else 0,
+                    1 if d.get("is_restricted") else 0,
+                    1 if d.get("is_muted") else 0,
+                    time.time(),
+                ),
+            )
+            await self._commit()
+            return True
+        except Exception as e:
+            logger.debug(f"upsert_group_membership skipped: {type(e).__name__}: {str(e)[:120]}")
+            return False
+
+    async def record_group_message(self, d: Dict[str, Any]) -> bool:
+        """v11.1 group_messages upsert (chat_id, message_id) — text COALESCE,
+        edit flags refreshed on conflict. Never raises."""
+        try:
+            await self._execute(
+                """
+                INSERT INTO group_messages (chat_id, message_id, user_id, message_text,
+                    message_date, edit_date, message_link, reply_to_message_id, reply_to_user_id,
+                    is_reply, is_forward, is_edited, is_deleted, is_pinned, views, forwards,
+                    replies_count, media_type, media_id, file_name, file_size, entities,
+                    urls, mentions, hashtags, phone_numbers, msg_hash, created_at, updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT (chat_id, message_id) DO UPDATE SET
+                    user_id = COALESCE(EXCLUDED.user_id, group_messages.user_id),
+                    message_text = COALESCE(EXCLUDED.message_text, group_messages.message_text),
+                    edit_date = COALESCE(EXCLUDED.edit_date, group_messages.edit_date),
+                    message_link = COALESCE(EXCLUDED.message_link, group_messages.message_link),
+                    reply_to_message_id = COALESCE(EXCLUDED.reply_to_message_id, group_messages.reply_to_message_id),
+                    reply_to_user_id = COALESCE(EXCLUDED.reply_to_user_id, group_messages.reply_to_user_id),
+                    is_reply = MAX(COALESCE(group_messages.is_reply, 0), COALESCE(EXCLUDED.is_reply, 0)),
+                    is_forward = MAX(COALESCE(group_messages.is_forward, 0), COALESCE(EXCLUDED.is_forward, 0)),
+                    is_edited = MAX(COALESCE(group_messages.is_edited, 0), COALESCE(EXCLUDED.is_edited, 0)),
+                    is_deleted = COALESCE(EXCLUDED.is_deleted, group_messages.is_deleted),
+                    is_pinned = MAX(COALESCE(group_messages.is_pinned, 0), COALESCE(EXCLUDED.is_pinned, 0)),
+                    views = COALESCE(EXCLUDED.views, group_messages.views),
+                    forwards = COALESCE(EXCLUDED.forwards, group_messages.forwards),
+                    replies_count = COALESCE(EXCLUDED.replies_count, group_messages.replies_count),
+                    media_type = COALESCE(EXCLUDED.media_type, group_messages.media_type),
+                    media_id = COALESCE(EXCLUDED.media_id, group_messages.media_id),
+                    file_name = COALESCE(EXCLUDED.file_name, group_messages.file_name),
+                    file_size = COALESCE(EXCLUDED.file_size, group_messages.file_size),
+                    entities = COALESCE(EXCLUDED.entities, group_messages.entities),
+                    urls = COALESCE(EXCLUDED.urls, group_messages.urls),
+                    mentions = COALESCE(EXCLUDED.mentions, group_messages.mentions),
+                    hashtags = COALESCE(EXCLUDED.hashtags, group_messages.hashtags),
+                    phone_numbers = COALESCE(EXCLUDED.phone_numbers, group_messages.phone_numbers),
+                    msg_hash = COALESCE(EXCLUDED.msg_hash, group_messages.msg_hash),
+                    updated_at = EXCLUDED.updated_at
+                """,
+                (
+                    int(d.get("chat_id") or 0), int(d.get("message_id") or 0), d.get("user_id"),
+                    d.get("message_text"), d.get("message_date"), d.get("edit_date"),
+                    d.get("message_link"), d.get("reply_to_message_id"), d.get("reply_to_user_id"),
+                    1 if d.get("is_reply") else 0,
+                    1 if d.get("is_forward") else 0,
+                    1 if d.get("is_edited") else 0,
+                    1 if d.get("is_deleted") else 0,
+                    1 if d.get("is_pinned") else 0,
+                    d.get("views"), d.get("forwards"), d.get("replies_count"),
+                    d.get("media_type"), d.get("media_id"), d.get("file_name"), d.get("file_size"),
+                    d.get("entities"), d.get("urls"), d.get("mentions"), d.get("hashtags"),
+                    d.get("phone_numbers"), d.get("msg_hash"), time.time(), time.time(),
+                ),
+            )
+            await self._commit()
+            return True
+        except Exception as e:
+            logger.debug(f"record_group_message skipped: {type(e).__name__}: {str(e)[:120]}")
+            return False
+
+    async def record_message_analysis(self, d: Dict[str, Any]) -> bool:
+        """v11.1 message_analysis — one immutable row per analyzed message.
+        Never raises."""
+        try:
+            await self._execute(
+                """
+                INSERT INTO message_analysis (chat_id, message_id, user_id, msg_hash,
+                    intent, intent_confidence, matched_keywords, matched_patterns,
+                    academic_context, action_score, urgency_score, negation_score,
+                    spam_score, advertisement_score, similarity_score, fuzzy_score,
+                    final_score, classification, accepted, rejected, duplicate,
+                    rejection_reason, detection_reason, processing_time_ms,
+                    engine_version, filter_version, created_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    int(d.get("chat_id") or 0), int(d.get("message_id") or 0), d.get("user_id"),
+                    d.get("msg_hash"), d.get("intent"), d.get("intent_confidence"),
+                    d.get("matched_keywords"), d.get("matched_patterns"), d.get("academic_context"),
+                    d.get("action_score"), d.get("urgency_score"), d.get("negation_score"),
+                    d.get("spam_score"), d.get("advertisement_score"), d.get("similarity_score"),
+                    d.get("fuzzy_score"), d.get("final_score"), d.get("classification"),
+                    1 if d.get("accepted") else 0,
+                    1 if d.get("rejected") else 0,
+                    1 if d.get("duplicate") else 0,
+                    d.get("rejection_reason"), d.get("detection_reason"),
+                    d.get("processing_time_ms"), d.get("engine_version"), d.get("filter_version"),
+                    time.time(),
+                ),
+            )
+            await self._commit()
+            return True
+        except Exception as e:
+            logger.debug(f"record_message_analysis skipped: {type(e).__name__}: {str(e)[:120]}")
+            return False
+
+    async def record_user_activity(
+        self, user_id: int, chat_id: int, message_id: Optional[int], ts: Optional[float]
+    ) -> bool:
+        """v11.1 user_activity — first/last seen, total counter, per-hour and
+        per-weekday histograms (JSON merged in Python; 24h / 7 buckets).
+        Never raises."""
+        try:
+            ts = float(ts or time.time())
+            row = await self._fetchone(
+                "SELECT activity_hours, activity_days FROM user_activity WHERE user_id = ? AND chat_id = ?",
+                (int(user_id or 0), int(chat_id or 0)),
+            )
+            hours: Dict[str, int] = {}
+            days: Dict[str, int] = {}
+            if row is not None:
+                try:
+                    hours = dict(json.loads(row["activity_hours"])) if row["activity_hours"] else {}
+                except Exception:
+                    hours = {}
+                try:
+                    days = dict(json.loads(row["activity_days"])) if row["activity_days"] else {}
+                except Exception:
+                    days = {}
+            hkey = str(datetime.fromtimestamp(ts, tz=timezone.utc).hour)
+            dkey = str(datetime.fromtimestamp(ts, tz=timezone.utc).weekday())
+            hours[hkey] = int(hours.get(hkey, 0)) + 1
+            days[dkey] = int(days.get(dkey, 0)) + 1
+            await self._execute(
+                """
+                INSERT INTO user_activity (user_id, chat_id, first_seen_at, last_seen_at,
+                    total_messages, first_message_id, last_message_id, activity_hours,
+                    activity_days, updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT (user_id, chat_id) DO UPDATE SET
+                    last_seen_at = EXCLUDED.last_seen_at,
+                    total_messages = user_activity.total_messages + 1,
+                    last_message_id = EXCLUDED.last_message_id,
+                    activity_hours = EXCLUDED.activity_hours,
+                    activity_days = EXCLUDED.activity_days,
+                    updated_at = EXCLUDED.updated_at
+                """,
+                (
+                    int(user_id or 0), int(chat_id or 0), ts, ts, 1,
+                    message_id, message_id,
+                    json.dumps(hours), json.dumps(days),
+                    time.time(),
+                ),
+            )
+            await self._commit()
+            return True
+        except Exception as e:
+            logger.debug(f"record_user_activity skipped: {type(e).__name__}: {str(e)[:120]}")
+            return False
+
+    async def get_user_activity(self, user_id: int, chat_id: int) -> Dict[str, Any]:
+        """v11.1 — aggregated activity snapshot: counters from user_activity,
+        rolling windows (today/week/month) counted live from group_messages,
+        averages derived. Missing data → honest zeros/None, never fabricated."""
+        out: Dict[str, Any] = {
+            "user_id": user_id, "chat_id": chat_id,
+            "first_seen_at": None, "last_seen_at": None,
+            "total_messages": 0, "messages_today": 0, "messages_week": 0, "messages_month": 0,
+            "first_message_id": None, "last_message_id": None,
+            "average_messages_per_day": None,
+            "activity_hours": {}, "activity_days": {},
+        }
+        try:
+            row = await self._fetchone(
+                "SELECT * FROM user_activity WHERE user_id = ? AND chat_id = ?",
+                (int(user_id or 0), int(chat_id or 0)),
+            )
+            if row is not None:
+                out["first_seen_at"] = row["first_seen_at"]
+                out["last_seen_at"] = row["last_seen_at"]
+                out["total_messages"] = int(row["total_messages"] or 0)
+                out["first_message_id"] = row["first_message_id"]
+                out["last_message_id"] = row["last_message_id"]
+                for key, col in (("activity_hours", "activity_hours"), ("activity_days", "activity_days")):
+                    try:
+                        out[key] = dict(json.loads(row[col])) if row[col] else {}
+                    except Exception:
+                        out[key] = {}
+                if out["first_seen_at"]:
+                    span_days = max((time.time() - float(out["first_seen_at"])) / 86400.0, 1.0 / 24.0)
+                    out["average_messages_per_day"] = round(out["total_messages"] / span_days, 3)
+            now = time.time()
+            for key, secs in (("messages_today", 86400), ("messages_week", 7 * 86400), ("messages_month", 30 * 86400)):
+                try:
+                    r = await self._fetchone(
+                        "SELECT COUNT(*) AS cnt FROM group_messages "
+                        "WHERE user_id = ? AND chat_id = ? AND message_date >= ?",
+                        (int(user_id or 0), int(chat_id or 0), now - secs),
+                    )
+                    out[key] = int(r["cnt"]) if r is not None else 0
+                except Exception:
+                    out[key] = 0
+        except Exception as e:
+            logger.debug(f"get_user_activity skipped: {type(e).__name__}")
+        return out
+
+    async def mark_alert_dispatched(
+        self,
+        msg_hash: str,
+        status: str = "sent",
+        alerted_to: Optional[str] = None,
+        error: Optional[str] = None,
+        attempts: int = 1,
+        button_message_url: Optional[str] = None,
+        button_user_url: Optional[str] = None,
+    ) -> bool:
+        """v11.1 — record the dispatch outcome on the alerts row: status,
+        sent-at, destination, attempts, error, and the ACTUAL button URLs
+        used. Never raises; silently no-ops when the alert row is absent."""
+        try:
+            await self._execute(
+                """
+                UPDATE alerts SET
+                    alert_status = ?,
+                    alert_sent_at = CASE WHEN ? = 'sent' THEN ? ELSE alert_sent_at END,
+                    alerted_to = COALESCE(?, alerted_to),
+                    notification_attempts = COALESCE(notification_attempts, 0) + ?,
+                    notification_error = ?,
+                    button_message_url = COALESCE(?, button_message_url),
+                    button_user_url = COALESCE(?, button_user_url)
+                WHERE message_hash = ?
+                """,
+                (status, status, time.time(), alerted_to, int(attempts or 1),
+                 error, button_message_url, button_user_url, msg_hash),
+            )
+            await self._commit()
+            return True
+        except Exception as e:
+            logger.debug(f"mark_alert_dispatched skipped: {type(e).__name__}")
+            return False
+
     async def _migrate_sender_account_hashes(self) -> None:
         try:
             await self._execute(
