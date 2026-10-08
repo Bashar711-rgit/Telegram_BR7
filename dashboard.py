@@ -1297,6 +1297,12 @@ async def health_full(request: Request):
         mention_intel = get_mention_intel_snapshot()
     except Exception:
         mention_intel = {"mention_fix_enabled": False, "available": False}
+    # v11.2 sender contact system: resolution/clickable/button metrics
+    try:
+        from contact_target import get_contact_metrics_snapshot
+        sender_contact = get_contact_metrics_snapshot()
+    except Exception:
+        sender_contact = {"enabled": False, "available": False}
     # v10.4 alert delivery latency percentiles (additive, logs/health only).
     try:
         from monitors import alert_latency
@@ -1315,6 +1321,7 @@ async def health_full(request: Request):
         "fast_capture": fast_capture,
         "sender_intel": sender_intel,
         "mention_intel": mention_intel,
+        "sender_contact": sender_contact,
         "alert_latency": alert_latency_snap,
         "dedup": dedup,
         "antispam": antispam,
