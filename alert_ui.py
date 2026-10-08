@@ -235,6 +235,7 @@ class AlertBotClient:
         text_html: str,
         buttons: List[List[Dict[str, Any]]],
         target: Any = None,
+        formatting_entities: Optional[List[Any]] = None,
     ) -> bool:
         """يرسل HTML + أزراراً حقيقية عبر عميل البوت. False = سلّم المسار
         التالي (حسابات المستخدمين). خطأ زر → إعادة بدون أزرار (النص بروابطه
@@ -246,18 +247,32 @@ class AlertBotClient:
             return False
         markup = self._convert_markup(buttons)
         try:
-            await self.client.send_message(
-                chat, text_html, parse_mode="html", buttons=markup, link_preview=False
-            )
+            if formatting_entities:
+                # v11.2: كيانات جاهزة من contact_target — تجاوز HTML parse
+                # الذي يحذف tg://user?id صامتاً (السبب الجذري لفقدان النقر)
+                await self.client.send_message(
+                    chat, text_html, buttons=markup,
+                    formatting_entities=formatting_entities, link_preview=False,
+                )
+            else:
+                await self.client.send_message(
+                    chat, text_html, parse_mode="html", buttons=markup, link_preview=False
+                )
             return True
         except RPCError as e:
             msg = (getattr(e, "message", "") or type(e).__name__).upper()
             if any(code in msg for code in _BUTTON_RETRY_ERRORS) and markup is not None:
                 logger.warning(f"⚠️ AlertBotClient button rejected ({msg[:80]}) — إعادة بدون أزرار")
                 try:
-                    await self.client.send_message(
-                        chat, text_html, parse_mode="html", buttons=None, link_preview=False
-                    )
+                    if formatting_entities:
+                        await self.client.send_message(
+                            chat, text_html, buttons=None,
+                            formatting_entities=formatting_entities, link_preview=False,
+                        )
+                    else:
+                        await self.client.send_message(
+                            chat, text_html, parse_mode="html", buttons=None, link_preview=False
+                        )
                     return True
                 except Exception:
                     return False

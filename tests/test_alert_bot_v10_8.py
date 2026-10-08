@@ -93,9 +93,9 @@ class TestBuildAlertHtml:
             group_link="https://t.me/sultanu1999",
         )
         assert built["contact_method"] == "username"
-        assert built["text"].startswith('👤 المستخدم: <a href="https://t.me/Lara507">@Lara507</a>\n')
+        assert built["text"].startswith('👤: <a href="https://t.me/Lara507">هناء العنزي</a>\n')
         # البطاقة الموحدة: عنوان «نص الرسالة:» + المحتوى داخل blockquote
-        assert "<b>💬 الرسالة:</b>\n<blockquote>" in built["text"]
+        assert "<b>💬:</b>\n<blockquote>" in built["text"]
         assert built["text"].rstrip().endswith("</blockquote>")
         # الروابط انتقلت من سطر النص إلى الأزرار
         assert "رابط الرسالة" not in built["text"]
@@ -109,7 +109,7 @@ class TestBuildAlertHtml:
         tg://user + نسخ فعلي للـID (الأزرار من بيانات التنبيه نفسه)."""
         built = build_alert_html(_data(), msg_link=None, group_link=None)
         assert built["contact_method"] == "mention_button"
-        assert built["text"].startswith('👤 المستخدم: <a href="tg://user?id=6079171409">هناء العنزي</a>\n')
+        assert built["text"].startswith('👤: <a href="tg://user?id=6079171409">هناء العنزي</a>\n')
         # _data() لديه chat_id=-100111222333 وmessage_id=4242 → روابط خاصة صالحة
         assert built["buttons"] == [[
             {"text": "مراسلة", "url": f"tg://user?id={SENDER_ID}"},
@@ -134,7 +134,7 @@ class TestBuildAlertHtml:
         assert {"text": "مراسلة", "url": f"tg://user?id={SENDER_ID}"} in row
         assert all(b["text"] not in ("عرض الرسالة", "القروب") for b in row)
         assert built["msg_link"] is None
-        assert "<b>💬 الرسالة:</b>\n<blockquote>" in built["text"]
+        assert "<b>💬:</b>\n<blockquote>" in built["text"]
 
     def test_view_button_falls_back_to_group_link(self):
         """بدون رابط رسالة مباشر → عرض يستخدم أفضل آلية متاحة
@@ -191,7 +191,7 @@ class TestBuildAlertHtml:
 
     def test_never_raises_on_garbage(self):
         built = build_alert_html({"sender_id": "x", "chat_id": None, "message_id": None, "text": None})
-        assert "👤 المستخدم: " in built["text"] and "<b>💬 الرسالة:</b>" in built["text"]
+        assert "👤: " in built["text"] and "<b>💬:</b>" in built["text"]
         # لا مرسل ولا روابط → كل الأزرار تُحذف بصدق (لا أزرار معطلة)
         assert built["buttons"] == []
 
@@ -296,7 +296,7 @@ class TestAlertBotSend:
                    "parameters": {"retry_after": 2}}),
             (200, {"ok": True}),
         ])
-        ok, method, reason = await bot.send(_data(sender_username="u1"))
+        ok, method, reason = await bot.send(_data(sender_username="user1"))
         assert ok is True and method == "username"
         assert len(bot.calls) == 2 and sleeps == [2.3]
 
@@ -307,7 +307,7 @@ class TestAlertBotSend:
 
         monkeypatch.setattr(ab.asyncio, "sleep", _fake_sleep)
         bot = _FakeAlertBot([(429, {"ok": False, "parameters": {"retry_after": 1}})] * 3)
-        ok, method, reason = await bot.send(_data(sender_username="u1"))
+        ok, method, reason = await bot.send(_data(sender_username="user1"))
         assert ok is False and reason == "rate_limited_after_3_attempts"
         assert len(bot.calls) == 3
 
@@ -353,7 +353,7 @@ class TestAlertBotSend:
         bot = _FakeAlertBot([
             (400, {"ok": False, "description": "Bad Request: BUTTON_USER_INVALID"}),
         ])
-        ok, method, reason = await bot.send(_data(sender_username="u1", chat_id=-987654321))
+        ok, method, reason = await bot.send(_data(sender_username="user1", chat_id=-987654321))
         # لا زر tg://user ليُسقط — الخطأ ليس زر «مراسلة» → فشل → fallback
         assert ok is False and "BUTTON_USER_INVALID" in reason
 
@@ -362,7 +362,7 @@ class TestAlertBotSend:
         bot = _FakeAlertBot([
             (403, {"ok": False, "description": "Bad Request: bot was blocked"}),
         ])
-        ok, method, reason = await bot.send(_data(sender_username="u1"))
+        ok, method, reason = await bot.send(_data(sender_username="user1"))
         assert ok is False and method == "" and reason == "bot_api_403:Bad Request: bot was blocked"
 
     @pytest.mark.asyncio
@@ -372,14 +372,14 @@ class TestAlertBotSend:
                 raise ConnectionError("no network")
 
         bot = _Broken(token="1:t", chat_id=TARGET)
-        ok, method, reason = await bot.send(_data(sender_username="u1"))
+        ok, method, reason = await bot.send(_data(sender_username="user1"))
         assert ok is False and reason == "network_error:ConnectionError"
 
     @pytest.mark.asyncio
     async def test_no_token_send_returns_not_ok(self):
         bot = AlertBot(token=None, chat_id=TARGET)
         assert bot.enabled is False
-        ok, method, reason = await bot.send(_data(sender_username="u1"))
+        ok, method, reason = await bot.send(_data(sender_username="user1"))
         assert ok is False and method == "" and reason == "no_alert_bot_token"
 
     @pytest.mark.asyncio
@@ -556,8 +556,8 @@ class TestMonitorIntegration:
         call = m.client.calls[0]
         assert "buttons" not in call or call.get("buttons") is None
         # القالب الموحد v10.9 (بعد تحليل HTML لمسار mention — بلا وسوم ظاهرة)
-        assert "المستخدم: " in call["text"]
-        assert "💬 الرسالة:" in call["text"]
+        assert "👤: " in call["text"]
+        assert "💬:" in call["text"]
         await db._flush()  # add_alert دفعي — الصف يظهر بعد flush
         row = await db._fetchone(
             "SELECT contact_method FROM alerts WHERE message_hash = 'h_v109_fb'"

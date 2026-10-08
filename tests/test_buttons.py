@@ -207,7 +207,7 @@ class TestBuildAlertButtons:
         assert buttons is None
         # القالب الموحد: رابط المرسل في الترويسة + البطاقة بلا سطر روابط
         assert 'href="https://t.me/ahmed_99"' in alert
-        assert '<b>💬 الرسالة:</b>\n<blockquote>نص</blockquote>' in alert
+        assert '<b>💬:</b>\n<blockquote>نص</blockquote>' in alert
         assert "رابط الرسالة" not in alert
 
     @pytest.mark.asyncio

@@ -111,6 +111,7 @@ from monitors import EnhancedAccountMonitor, HealthMonitor, get_capture_snapshot
 from alert_bot import AlertBot  # v10.8: إرسال التنبيهات عبر Bot API
 from alert_ui import AlertBotClient  # v11.0: عميل بوت حي — Callbacks + إرسال احتياطي بالأزرار
 from sender_resolver import get_sender_intel_snapshot, get_mention_intel_snapshot
+from contact_target import get_contact_metrics_snapshot
 
 # Import Dashboard
 try:
@@ -951,6 +952,7 @@ class EnhancedTelegramBot:
                 "fast_capture": get_capture_snapshot(),
                 "sender_intel": get_sender_intel_snapshot(),
                 "mention_intel": get_mention_intel_snapshot(),
+                "sender_contact": get_contact_metrics_snapshot(),  # v11.2 مراسلة المرسل
                 "alert_latency": alert_latency.snapshot(),
                 "dedup": get_dedup_snapshot(),
                 "antispam": get_antispam_snapshot(),

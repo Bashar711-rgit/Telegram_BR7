@@ -1,14 +1,20 @@
 #!/usr/bin/env python3
 """
-alert_bot.py - v11.1 Alert Bot - واجهة التنبيهات الموحدة (HTML) + زران في صف
-واحد، مرسل عبر Telegram Bot API (aiohttp).
+alert_bot.py - v11.2 Alert Bot - نظام مراسلة المرسل + واجهة التنبيهات الموحدة.
 
-v11.1 (طلب المستخدم): قالب جديد + زران فقط + نسخ بالضغط على النص:
+v11.2 (طلب المستخدم — نظام مراسلة المرسل): ContactTarget هو المصدر الوحيد
+لاختيار رابط المرسل (username ← user_id ← لا شيء) — الاسم والزر يشتركان في
+نفس selected_url، وزر «مراسلة» يعمل حتى بلا username عبر tg://user?id،
+والقنوات/المحذوفون لا تُخترق لهم وسيلة وصول، وطبقة الإرسال الاحتياطية
+(MTProto) تمرر الكيانات جاهزة عبر formatting_entities فيبقى الاسم قابلًا
+للنقر بعد أن كان تيليثون يحذف tg://user?id صامتاً عند الـparse.
 
-    سطر 1:  👤 المستخدم: {SENDER}
+القالب (مواصفة المستخدم النهائية):
+
+    👤: {اسم المرسل قابل للنقر}
     (سطر فارغ)
-    <b>💬 الرسالة:</b>
-    <blockquote>{النص الأصلي كاملاً - escape_html - بلا حذف أجزاء}</blockquote>
+    <b>💬:</b>
+    <blockquote>{النص الأصلي كاملاً - بلا حذف أجزاء}</blockquote>
 
     [ مراسلة ] [ عرض الرسالة ]
 
@@ -83,13 +89,25 @@ import aiohttp
 from loguru import logger
 
 from config import InputSanitizer
+# v11.2: نظام مراسلة المرسل — المصدر الوحيد لاختيار رابط المرسل (spec #8).
+# لا يُبنى رابط مرسل يدوياً في هذا الملف ولا في أي ملف آخر — ContactTarget
+# يقرر (username ← user_id ← لا شيء) ويستخدم الاسم والزر نفس selected_url.
+from contact_target import (  # noqa: E402
+    ContactTarget,
+    SENDER_LABEL,
+    build_alert_entity_pack,
+    metric_inc as _contact_metric,
+    resolve_contact_target as _resolve_contact_target,
+)
 
 BOT_API_BASE = "https://api.telegram.org"
 # حد تيليجرام الأقصى لنص الرسالة — الحاجز الوحيد المسموح لتقصير المحتوى
 TELEGRAM_MAX_TEXT_LEN = 4096
 
 # ══ القالب الموحد — نصوص ثابتة (لا تُغيَّر: عقد واجهة) ══
-CARD_TITLE_HTML = "<b>💬 الرسالة:</b>"
+# v11.2 (مواصفة المستخدم): «👤: الاسم» و«💬:» — الاسم نفسه رابط داخلي،
+# والنسخ بالضغط على نص الرسالة (blockquote → Copy Text).
+CARD_TITLE_HTML = "<b>💬:</b>"
 MSG_LINK_UNAVAILABLE = "غير متاح"  # محتفظ به للتوافق الخلفي (لم يعد في النص)
 
 # نصوص الزرين (v11.1) — صف واحد: [ مراسلة ] [ عرض الرسالة ]
@@ -110,6 +128,12 @@ GENERIC_BUTTON_ERRORS = (
     "BUTTON_TEXT_INVALID",
     "REPLY_MARKUP_INVALID",
 )
+
+# أنواع المرسل التي لا يُبنى لها زر tg://user?id إطلاقاً (spec #18 —
+# لا اختلاق معلومات: قناة/محذوف/بلا هوية ليسوا مستخدمين reachable).
+# ملاحظة: sender_type فاضي أو "none" مع sender_id يصبح assumed_user في
+# resolve_contact_target — فزر tg://user?id يبقى متاحاً للمسار التاريخي.
+_NO_USER_BUTTON_TYPES = ("channel", "deleted")
 
 _TG_URL = "https://t.me/"
 _PARTIAL_ENTITY_RE = re.compile(r"&[a-zA-Z#0-9]{0,10}$")
@@ -176,17 +200,22 @@ def build_alert_buttons(
     group_link: Optional[str] = None,
     include_user_button: bool = True,
     copy_text: Optional[str] = None,
+    contact_url: Optional[str] = None,
+    sender_type: Optional[str] = None,
 ) -> List[List[Dict[str, Any]]]:
-    """══ الدالة المركزية الوحيدة لبناء أزرار التنبيه (v11.1) ══
+    """══ الدالة المركزية الوحيدة لبناء أزرار التنبيه (v11.2) ══
 
     صف واحد بترتيب RTL («مراسلة» تظهر في أقصى اليمين في عملاء تيليجرام
-    العربية) — زران فقط حسب مواصفة v11.1:
+    العربية) — زران حسب مواصفة v11.1 + مصدر موحد v11.2:
 
         [ مراسلة ] [ عرض الرسالة ]
 
     * الزر الذي تنعدم بياناته يُحذف كلياً (لا أزرار معطلة ولا روابط وهمية).
-    * النسخ لم يعد زراً: النص داخل <blockquote> والضغط عليه في عملاء
-      تيليجرام يفتح قائمة «Copy Text» (نسخ فعلي للحافظة).
+    * v11.2 (spec #16): contact_url من ContactTarget.selected_url — الاسم
+      والزر يشتركان في نفس الهدف المختار (username ← user_id). تمريره
+      يتفوق على بناء الرابط من sender_id/username مباشرة.
+    * v11.2 (spec #18): sender_type ∈ (channel, deleted) يمنع زر
+      tg://user?id — لا اختلاق وسيلة وصول لغير المستخدمين.
     * include_user_button=False بعد رفض tg://user (خصوصية) — يُسقط زر
       «مراسلة» فقط ويبقى زر العرض.
     * copy_text: معامل محفوظ للتوافق الخلفي (v10.9.1) — مُتجاهَل منذ v11.1.
@@ -201,12 +230,19 @@ def build_alert_buttons(
         sid = 0
 
     # 1) مراسلة — فتح محادثة المستخدم مباشرة (يمين الصف في عملاء RTL)
+    #    الزر لا يعتمد على username: بلا username يُستخدم tg://user?id
+    #    (spec #15) أو الهدف الذي اختاره ContactTarget إن مرّر (spec #16).
     if include_user_button:
-        if username:
-            row.append({"text": BTN_CONTACT, "url": f"{_TG_URL}{username}"})
-        elif sid:
+        url: Optional[str] = None
+        if contact_url:
+            url = str(contact_url)
+        elif username:
+            url = f"{_TG_URL}{username}"
+        elif sid and str(sender_type or "").strip().lower() not in _NO_USER_BUTTON_TYPES:
             # أفضل رابط مباشر ممكن لمن لا يملك username
-            row.append({"text": BTN_CONTACT, "url": f"tg://user?id={sid}"})
+            url = f"tg://user?id={sid}"
+        if url:
+            row.append({"text": BTN_CONTACT, "url": url})
 
     # 2) عرض الرسالة — الرسالة نفسها لا الصفحة الرئيسية؛ بدون رابط مباشر
     #    نستخدم أفضل آلية متاحة (رابط القروب) بدل رابط وهمي.
@@ -240,6 +276,7 @@ def build_alert_html(
     group_link: Optional[str] = None,
     chat_username: Optional[str] = None,
     sender_username: Optional[str] = None,
+    contact_target: Optional[ContactTarget] = None,
 ) -> Dict[str, Any]:
     """يبني القالب الموحد للتنبيه (HTML) + الأزرار الأربعة (صف واحد).
 
@@ -271,21 +308,43 @@ def build_alert_html(
                 username = _c
                 break
 
+    # ── v11.2: ContactTarget — الحل المركزي الوحيد لرابط المرسل (spec #7/#8) ──
+    # الطرق الثلاث تُبنى هنا داخلياً عند عدم تمرير هدف جاهز من monitors
+    # (المرسل هناك قد حلّ عبر nav resolver: حدث ← كاش الكيانات ← DB).
+    # الاسم والزر سيستخدمان نفس selected_url حصراً (spec #16).
+    target = contact_target
+    if target is None:
+        target = _resolve_contact_target(
+            sender_id=sender_id,
+            username=username,
+            usernames=data.get("sender_usernames"),
+            first_name=data.get("sender_first_name"),
+            last_name=data.get("sender_last_name"),
+            display=data.get("sender_display"),
+            sender_type=data.get("sender_type") or "",
+            is_bot=data.get("sender_is_bot"),
+            is_deleted=data.get("sender_is_deleted"),
+        )
+
     # ── الاسم المعروض (سقف 128 حرفاً — حماية حد 4096) ──
+    # ── الاسم المعروض (spec #17) — الأولوية: display ← أول+أخير ←
+    #    username ← fallback؛ سقف 128 حرفاً حمايةً لحد 4096 ──
     display = (
         str(data.get("sender_display") or "").strip()
-        or f"{data.get('sender_first_name') or ''} {data.get('sender_last_name') or ''}".strip()
+        or (target.display_name or "").strip()
         or (f"مستخدم ({sender_id})" if sender_id else "مستخدم")
     )
     if len(display) > 128:
         display = display[:127] + "…"
 
     # ── SENDER: سطر 1 ──
-    if username:
-        sender_html = f'<a href="{_TG_URL}{username}">@{username}</a>'
+    # النص الظاهر ≠ الرابط (spec #14): لا يظهر للمستخدم أي https://t.me
+    # أو tg:// — الرابط يُحمل ككيان داخل الاسم فقط.
+    if target.username_url:
+        sender_html = f'<a href="{target.username_url}">{InputSanitizer.escape_html(display)}</a>'
         contact_method = "username"
-    elif sender_id:
-        sender_html = f'<a href="tg://user?id={sender_id}">{InputSanitizer.escape_html(display)}</a>'
+    elif target.user_id_url:
+        sender_html = f'<a href="{target.user_id_url}">{InputSanitizer.escape_html(display)}</a>'
         contact_method = "mention_button"
     else:
         sender_html = InputSanitizer.escape_html(display)
@@ -301,7 +360,7 @@ def build_alert_html(
     # الحاجز الوحيد: حد تيليجرام 4096 للرسالة كلها — يُقص المتجاوز فقط
     # مع "…" وتحذير لوج (لا نقسم كيان HTML نصف مكتمل).
     header = "\n".join([
-        f"👤 المستخدم: {sender_html}",
+        f"{SENDER_LABEL}{sender_html}",
         "",
         CARD_TITLE_HTML,
     ])
@@ -332,6 +391,10 @@ def build_alert_html(
         "sender_name": display,
         "msg_link": link or None,
         "group_link": glink or None,
+        # v11.2 (spec #16): الاسم والزر من نفس ContactTarget — selected_url
+        # هو الحكم الوحيد؛ sender_type يمنع اختلاق زر tg://user للقنوات.
+        "contact_url": target.selected_url,
+        "sender_type": target.sender_type,
     }
     buttons = build_alert_buttons(**button_kwargs)
 
@@ -342,6 +405,7 @@ def build_alert_html(
         "contact_method": contact_method,
         "msg_link": link or None,
         "display": display,
+        "contact_target": target,
     }
 
 
@@ -497,6 +561,7 @@ class AlertBot:
         group_link: Optional[str] = None,
         chat_username: Optional[str] = None,
         sender_username: Optional[str] = None,
+        contact_target: Optional[ContactTarget] = None,
     ) -> Tuple[bool, str, str]:
         """يرسل تنبيهاً واحداً عبر Bot API بالقالب الموحد.
 
@@ -515,6 +580,7 @@ class AlertBot:
                 data, analysis,
                 msg_link=msg_link, group_link=group_link,
                 chat_username=chat_username, sender_username=sender_username,
+                contact_target=contact_target,
             )
         except Exception as e:
             return False, "", f"build_error:{type(e).__name__}"
@@ -534,6 +600,11 @@ class AlertBot:
 
             if status == 200 and body.get("ok"):
                 method = "text_only" if (sender_dropped or buttons_dropped) else base_method
+                # v11.2 (spec #23): نتيجة زر المراسلة الفعلية — مرة واحدة لكل تنبيه
+                _contact_metric(
+                    "contact_button_success" if method in ("username", "mention_button")
+                    else "contact_button_failure"
+                )
                 return True, method, ""
 
             desc = str(body.get("description") or "")
@@ -590,10 +661,28 @@ class AlertBot:
             # (Telethon) بنفس النص والأزرار قبل الاستسلام لحسابات المستخدمين.
             if self._client is not None:
                 try:
+                    # v11.2 (سبب جذري): تمرير الكيانات جاهزة عبر
+                    # formatting_entities يتجاوز مسار HTML parse الذي يحذف
+                    # روابط tg://user?id صامتاً في Telethon 1.45 عند فشل حلّ
+                    # المرسل من كاش الجلسة — الاسم يبقى قابلاً للنقر في
+                    # الطبقة الاحتياطية أيضاً (spec #14).
+                    _tgt = built.get("contact_target")
+                    _rule = (analysis or {}).get("rule_tag") if isinstance(analysis, dict) else None
+                    _pack = build_alert_entity_pack(
+                        built.get("display") or "",
+                        str(data.get("text") or ""),
+                        _tgt,
+                        rule_tag=_rule,
+                    )
                     if await self._client.send_buttons(
-                        built["text"], built.get("buttons") or []
+                        _pack["plain_text"], built.get("buttons") or [],
+                        formatting_entities=_pack.get("formatting_entities"),
                     ):
                         method = "text_only" if (sender_dropped or buttons_dropped) else base_method
+                        _contact_metric(
+                            "contact_button_success" if method in ("username", "mention_button")
+                            else "contact_button_failure"
+                        )
                         logger.info(
                             "🤖 Alert delivered via AlertBotClient (Bot API failed) | "
                             f"contact_method={method} | bot_api_reason={self.last_error[:80]}"

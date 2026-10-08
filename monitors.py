@@ -261,6 +261,11 @@ from nav_resolver import is_valid_username as _nav_valid_username      # v10.5 l
 from nav_resolver import private_supergroup_inner_id as _nav_inner_id  # v10.5 -100 id guard
 from nav_resolver import harden_sender_anchor as _nav_harden_anchor    # v10.6 guaranteed-reachable anchor
 from alert_bot import build_alert_html as _build_alert_v108            # v10.8 alert format + AlertBot buttons
+from contact_target import (                                           # v11.2 نظام مراسلة المرسل
+    resolve_contact_target as _resolve_contact_target,
+    log_sender_resolution as _log_sender_resolution,
+    metric_inc as _contact_metric,
+)
 
 
 # (نفس الدوال المساعدة من النسخة الأصلية: resolve_chat_entity, build_telegram_links)
@@ -1242,7 +1247,7 @@ class EnhancedAccountMonitor:
         return {"entity": entity, "title": title, "group_link": links["group"], "msg_link": links["message"]}
 
 
-    def _build_alert(self, sender: Dict, chat: Dict, keyword: str, text: str, analysis: Dict = None) -> Tuple[str, Optional[List]]:
+    def _build_alert(self, sender: Dict, chat: Dict, keyword: str, text: str, analysis: Dict = None, contact_target: Any = None) -> Tuple[str, Optional[List]]:
         """══ v10.9 — القالب الموحد (parse_mode=HTML) ══
 
             سطر 1:  👤 {SENDER}
@@ -1278,6 +1283,7 @@ class EnhancedAccountMonitor:
             data_view, analysis,
             msg_link=chat.get("msg_link"),
             group_link=chat.get("group_link"),
+            contact_target=contact_target,  # v11.2: هدف واحد للاسم والزر
         )
         # v10.8: الأزرار من حسابات المستخدمين محذوفة — Bot API فقط.
         # (بناء الأزرار القديم محفوظ في build_dynamic_buttons كدالة ميزة.)
@@ -2861,7 +2867,7 @@ class EnhancedAccountMonitor:
         sender_username = data.get("sender_username"); sender_first_name = data.get("sender_first_name")
         sender_last_name = data.get("sender_last_name"); sender_access_hash = data.get("sender_access_hash")
         chat_access_hash = data.get("chat_access_hash"); chat_username = data.get("chat_username")
-        display_name = f"{sender_first_name or ''} {sender_last_name or ''}".strip() or f"مستخدم ({sender_id})"
+        display_name = f"{sender_first_name or ''} {sender_last_name or ''}".strip()
         send_clients = await self._resolve_send_clients(data)
         send_client = send_clients[0] if send_clients else None
         if not send_client:
@@ -2930,13 +2936,51 @@ class EnhancedAccountMonitor:
                 _nav_resolver.verify_navigation(chat_info, sender_username, sender_id)
             except Exception:
                 pass
+        # ══ v11.2: ContactTarget — الحل المركزي الوحيد لوسيلة الوصول للمرسل ══
+        # الهوية الأساسية user_id (username مجرد وسيلة وصول إضافية): username
+        # من nav resolver (حدث ← كاش الكيانات ← DB) ثم الحدث، وusernames
+        # النشطة، والنوع من الكيان الملتقط. بلا I/O — pure-sync (spec #24).
+        sender_target = _resolve_contact_target(
+            sender_id=sender_id,
+            username=nav_sender_username or sender_username or data.get("sender_username"),
+            usernames=data.get("sender_usernames"),
+            first_name=sender_first_name, last_name=sender_last_name,
+            sender_type=data.get("sender_type") or "",
+            is_bot=data.get("sender_is_bot"),
+            is_deleted=data.get("sender_is_deleted"),
+        )
+        # الاسم المعروض (spec #17): أول+أخير ← أول ← username ← fallback
+        if not display_name:
+            display_name = sender_target.display_name or f"مستخدم ({sender_id})"
+        # v11.2 (spec #23): قابلية النقر تُحسب مرة واحدة لكل تنبيه
+        try:
+            _contact_metric(
+                "clickable_sender_success" if sender_target.reachable
+                else "clickable_sender_failure"
+            )
+        except Exception:
+            pass
         # v10.3: أُزيلت شارة ثقة المرسل (v10.0) — التنسيق عاد لـ v9.37 المستقر
         sender = {"id": sender_id, "display": display_name,
                   "username": nav_sender_username or sender_username,
                   "access_hash": sender_access_hash,
                   # v10.8: كل usernames المرسل النشطة (تغذي زر/رابط t.me)
                   "usernames": data.get("sender_usernames")}
-        alert_text, buttons = self._build_alert(sender, chat_info, keyword, text, analysis)
+        alert_text, buttons = self._build_alert(sender, chat_info, keyword, text, analysis,
+                                                contact_target=sender_target)
+        # ══ v11.2: [SENDER] — سطر التشخيص الموحد (spec #22) ══
+        # لوج فقط — لا يدخل نص التنبيه أبداً؛ بلا بيانات حساسة.
+        try:
+            _log_sender_resolution(
+                sender_target,
+                message_id=message_id, chat_id=chat_id, sender_id=sender_id,
+                resolution=("nav" if nav_sender_username
+                            else ("event" if sender_username else "none")),
+                clickable=sender_target.reachable,
+                contact_button=sender_target.reachable,
+            )
+        except Exception:
+            pass
         # ══ v10.7 §2: تمرير روابط الرسالة/المجموعة إلى upsert ══
         # sender_contacts في _analyze_and_alert (كانا يُحفظان NULL دائماً).
         try:
@@ -3081,6 +3125,7 @@ class EnhancedAccountMonitor:
                     group_link=chat_info.get("group_link"),
                     chat_username=chat_username,
                     sender_username=sender.get("username"),
+                    contact_target=sender_target,
                 )
                 if _ok:
                     logger.info(
@@ -3093,9 +3138,7 @@ class EnhancedAccountMonitor:
                         await _forward_supplement(None)
                     _bmsg_v11 = chat_info.get("msg_link")
                     _bmsg_v11 = _bmsg_v11 if _bmsg_v11 and _bmsg_v11 != "#" else None
-                    _busr_v11 = (f"https://t.me/{sender.get('username')}"
-                                 if sender.get("username")
-                                 else (f"tg://user?id={sender_id}" if sender_id else None))
+                    _busr_v11 = sender_target.selected_url or None  # v11.2: هدف الاسم/الزر نفسه
                     await self._record_sent_alert(
                         None, data, msg_hash, account_name, keyword, alert_text,
                         chat_id, sender_id, display_name, contact_method=_method,

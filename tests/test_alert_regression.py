@@ -46,13 +46,13 @@ from alert_bot import build_alert_html  # noqa: E402
 import pytest  # noqa: E402
 
 
-# ── GOLDEN OUTPUT (v10.9 — القالب الموحد المطلوب حرفياً) ────────────────
+# ── GOLDEN OUTPUT (v11.2 — القالب الموحد المطلوب حرفياً) ────────────────
 GOLDEN = {
     "S1_username_chat": {
         "alert": (
-            '👤 المستخدم: <a href="https://t.me/ahmed_99">@ahmed_99</a>\n'
+            '👤: <a href="https://t.me/ahmed_99">أحمد محمد</a>\n'
             '\n'
-            '<b>💬 الرسالة:</b>\n'
+            '<b>💬:</b>\n'
             '<blockquote>أبي مساعدة في واجب الاحصاء ضروري</blockquote>'
         ),
         # أزرار بوت التنبيهات: صف واحد بترتيب RTL
@@ -63,9 +63,9 @@ GOLDEN = {
     },
     "S2_private_chat": {
         "alert": (
-            '👤 المستخدم: <a href="tg://user?id=777000222">سارة</a>\n'
+            '👤: <a href="tg://user?id=777000222">سارة</a>\n'
             '\n'
-            '<b>💬 الرسالة:</b>\n'
+            '<b>💬:</b>\n'
             '<blockquote>أبي مساعدة في واجب الاحصاء ضروري</blockquote>'
         ),
         "bot_buttons": [
@@ -75,9 +75,9 @@ GOLDEN = {
     },
     "S3_no_username_hash": {
         "alert": (
-            '👤 المستخدم: <a href="tg://user?id=888000333">خالد</a>\n'
+            '👤: <a href="tg://user?id=888000333">خالد</a>\n'
             '\n'
-            '<b>💬 الرسالة:</b>\n'
+            '<b>💬:</b>\n'
             '<blockquote>أبي مساعدة في واجب الاحصاء ضروري</blockquote>'
         ),
         # بلا روابط → يختفي زر «عرض الرسالة» بصدق (لا روابط وهمية)
@@ -87,9 +87,9 @@ GOLDEN = {
     },
     "S4_unknown_title": {
         "alert": (
-            '👤 المستخدم: <a href="https://t.me/user_x">@user_x</a>\n'
+            '👤: <a href="https://t.me/user_x">مستخدم</a>\n'
             '\n'
-            '<b>💬 الرسالة:</b>\n'
+            '<b>💬:</b>\n'
             '<blockquote>أبي مساعدة في واجب الاحصاء ضروري</blockquote>'
         ),
         "bot_buttons": [

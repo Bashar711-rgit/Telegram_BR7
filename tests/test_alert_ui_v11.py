@@ -248,8 +248,10 @@ class _FakeLiveClient:
         return True
 
     async def send_buttons(self, text_html: str, buttons: List[List[Dict[str, Any]]],
-                           target: Any = None) -> bool:
-        self.sent.append((text_html, buttons))
+                           target: Any = None, **kwargs) -> bool:
+        # v11.2: formatting_entities تُمرَّر من طبقة الإرسال الاحتياطية — تُسجَّل
+        # للتحقق من أن الاسم قابل للنقر عبر كيانات جاهزة (بلا HTML parse).
+        self.sent.append((text_html, buttons, kwargs))
         return self.ok
 
 
@@ -261,7 +263,7 @@ class TestSendLadder:
             (400, {"ok": False, "description": "Bad Request: BUTTON_URL_INVALID"}),
             (200, {"ok": True}),
         ])
-        ok, method, reason = await bot.send(_data(sender_username="u1"))
+        ok, method, reason = await bot.send(_data(sender_username="user1"))
         assert ok is True and method == "text_only" and reason == ""
         assert len(bot.calls) == 2
         assert "reply_markup" not in bot.calls[1]["payload"]
@@ -276,7 +278,7 @@ class TestSendLadder:
         ])
         fake = _FakeLiveClient(ok=True)
         bot.set_client(fake)
-        ok, method, reason = await bot.send(_data(sender_username="u1"))
+        ok, method, reason = await bot.send(_data(sender_username="user1"))
         assert ok is True and method == "text_only"
         assert len(fake.sent) == 1
         # الأزرار الأربعة وصلت للعميل نفسها (بنية build_alert_buttons)
@@ -288,7 +290,7 @@ class TestSendLadder:
         """فشل Bot API (غير أزرار) → العميل الحي يسلّم بالأزرار."""
         bot = _FakeAlertBot([(500, {"ok": False, "description": "Bad Gateway"})])
         bot.set_client(_FakeLiveClient(ok=True))
-        ok, method, reason = await bot.send(_data(sender_username="u1"))
+        ok, method, reason = await bot.send(_data(sender_username="user1"))
         assert ok is True and method == "username" and reason == ""
 
     @pytest.mark.asyncio
@@ -296,7 +298,7 @@ class TestSendLadder:
         """فشل العميل أيضاً → ok=False بالسبب نفسه (حسابات المستخدمين تتكفل)."""
         bot = _FakeAlertBot([(500, {"ok": False, "description": "Bad Gateway"})])
         bot.set_client(_FakeLiveClient(ok=False))
-        ok, method, reason = await bot.send(_data(sender_username="u1"))
+        ok, method, reason = await bot.send(_data(sender_username="user1"))
         assert ok is False and method == ""
         assert reason == "bot_api_500:Bad Gateway"
 
@@ -304,7 +306,7 @@ class TestSendLadder:
     async def test_no_client_fails_as_before(self):
         """بلا عميل حي → العقد القديم حرفياً (ok=False والسبب محفوظ)."""
         bot = _FakeAlertBot([(500, {"ok": False, "description": "Bad Gateway"})])
-        ok, method, reason = await bot.send(_data(sender_username="u1"))
+        ok, method, reason = await bot.send(_data(sender_username="user1"))
         assert ok is False and reason == "bot_api_500:Bad Gateway"
 
     @pytest.mark.asyncio
@@ -314,6 +316,6 @@ class TestSendLadder:
         bot = _FakeAlertBot([
             (400, {"ok": False, "description": "Bad Request: BUTTON_USER_INVALID"}),
         ])
-        ok, method, reason = await bot.send(_data(sender_username="u1"))
+        ok, method, reason = await bot.send(_data(sender_username="user1"))
         assert ok is False and "BUTTON_USER_INVALID" in reason
         assert len(bot.calls) == 1  # لا إعادة عبر Bot API

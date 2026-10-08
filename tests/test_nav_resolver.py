@@ -437,9 +437,9 @@ class TestFrozenBuilderIntegration:
                 "message_id": 789, "username": "mygroup",
                 "group_link": "https://t.me/mygroup", "msg_link": "https://t.me/mygroup/789"}
         alert, buttons = monitor._build_alert(sender, chat, "واجب", "نص التنبيه", {"msg_hash": "h1"})
-        assert '<a href="https://t.me/ahmed_99">@ahmed_99</a>' in alert
+        assert '<a href="https://t.me/ahmed_99">أحمد</a>' in alert
         # القالب الموحد v10.9: البطاقة تُظهر النص الأصلي كاملاً
-        assert '<b>💬 الرسالة:</b>\n<blockquote>نص التنبيه</blockquote>' in alert
+        assert '<b>💬:</b>\n<blockquote>نص التنبيه</blockquote>' in alert
         assert "رابط الرسالة" not in alert  # الروابط في الأزرار الآن
         assert buttons is None  # الأزرار من بوت التنبيهات فقط
 
@@ -451,7 +451,7 @@ class TestFrozenBuilderIntegration:
                 "message_id": 456, "username": None,
                 "group_link": "https://t.me/c/1234567890", "msg_link": "https://t.me/c/1234567890/456"}
         alert, _ = monitor._build_alert(sender, chat, "ك", "نص", {"msg_hash": "h2"})
-        assert '<a href="https://t.me/recovered_user">@recovered_user</a>' in alert
+        assert '<a href="https://t.me/recovered_user">سارة</a>' in alert
 
 
 # ═══════════════════════════════════════════════════════════════════════════

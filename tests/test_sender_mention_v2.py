@@ -496,7 +496,7 @@ async def test_do_send_advances_to_next_tier_on_invalid(db):
     # the winning tier must NOT carry the hash the account rejected
     assert getattr(ius[0], "access_hash", None) != GOOD_HASH
     # wire text is the parsed v10.8 message: same content & field order
-    assert "أحمد" in final["text"] and "المستخدم: " in final["text"]
+    assert "أحمد" in final["text"] and "👤: " in final["text"]
     assert "👤" in final["text"]
 
 
