@@ -4,17 +4,20 @@
 deploys. These tests pin the EXACT expected text/buttons produced by
 the current code.
 
-⚠️ v10.9 (2026-09) — GOLDEN UPDATED BY EXPLICIT USER REQUEST (النمط الموحد):
+⚠️ v11.3 (2026-10) — GOLDEN UPDATED BY EXPLICIT USER REQUEST (بلا سطر «💬:»):
 نمط واجهة موحد لكل التنبيهات دون استثناء (parse_mode=HTML):
 
-    سطر 1:  👤 المستخدم: {SENDER}
+    سطر 1:  👤: {SENDER}
     (سطر فارغ)
-    <b>💬 الرسالة:</b>
-    <blockquote>{النص الأصلي كاملاً — بطاقة منظمة RTL}</blockquote>
+    <blockquote>{النص الأصلي كاملاً — نسخ بالضغط (Copy Text)}</blockquote>
+
+    [ مراسلة ]   [ عرض الرسالة ]
 
 SENDER:
-  - username:  <a href="https://t.me/USERNAME">@USERNAME</a>
+  - username:  <a href="https://t.me/U">الاسم</a>
   - بدونه:     <a href="tg://user?id=ID">الاسم الكامل</a>
+    (إن أُسقط الكيان من الخادم يُصلح تلقائياً برابط الرسالة المصدر —
+     v11.3 self-heal، انظر test_bot_api_heals_dropped_name_entity).
 
 الأزرار (v10.9.1): Inline Keyboard صف واحد أسفل كل تنبيه مباشرة، ترتيب
 RTL («مراسلة» في أقصى اليمين كما في الصورة المرجعية) — نصوص مصغّرة
@@ -46,13 +49,12 @@ from alert_bot import build_alert_html  # noqa: E402
 import pytest  # noqa: E402
 
 
-# ── GOLDEN OUTPUT (v11.2 — القالب الموحد المطلوب حرفياً) ────────────────
+# ── GOLDEN OUTPUT (v11.3 — القالب الموحد المطلوب حرفياً) ────────────────
 GOLDEN = {
     "S1_username_chat": {
         "alert": (
-            '👤: <a href="https://t.me/ahmed_99">أحمد محمد</a>\n'
-            '\n'
-            '<b>💬:</b>\n'
+            '👤: <a href="https://t.me/ahmed_99">أحمد محمد</a>'
+            '\n\n'
             '<blockquote>أبي مساعدة في واجب الاحصاء ضروري</blockquote>'
         ),
         # أزرار بوت التنبيهات: صف واحد بترتيب RTL
@@ -63,9 +65,8 @@ GOLDEN = {
     },
     "S2_private_chat": {
         "alert": (
-            '👤: <a href="tg://user?id=777000222">سارة</a>\n'
-            '\n'
-            '<b>💬:</b>\n'
+            '👤: <a href="tg://user?id=777000222">سارة</a>'
+            '\n\n'
             '<blockquote>أبي مساعدة في واجب الاحصاء ضروري</blockquote>'
         ),
         "bot_buttons": [
@@ -75,9 +76,8 @@ GOLDEN = {
     },
     "S3_no_username_hash": {
         "alert": (
-            '👤: <a href="tg://user?id=888000333">خالد</a>\n'
-            '\n'
-            '<b>💬:</b>\n'
+            '👤: <a href="tg://user?id=888000333">خالد</a>'
+            '\n\n'
             '<blockquote>أبي مساعدة في واجب الاحصاء ضروري</blockquote>'
         ),
         # بلا روابط → يختفي زر «عرض الرسالة» بصدق (لا روابط وهمية)
@@ -87,9 +87,8 @@ GOLDEN = {
     },
     "S4_unknown_title": {
         "alert": (
-            '👤: <a href="https://t.me/user_x">مستخدم</a>\n'
-            '\n'
-            '<b>💬:</b>\n'
+            '👤: <a href="https://t.me/user_x">مستخدم</a>'
+            '\n\n'
             '<blockquote>أبي مساعدة في واجب الاحصاء ضروري</blockquote>'
         ),
         "bot_buttons": [
@@ -234,8 +233,11 @@ class TestAlertRegression:
     @pytest.mark.asyncio
     async def test_bot_api_payload_shape(self, monitor):
         """حمولة Bot API: parse_mode=HTML + link_preview_options disabled
-        + صف أزرار واحد [مراسلة][عرض][نسخ][القروب]
-        (طريقة الإرسال المطلوبة حرفياً)."""
+        + صف أزرار واحد [مراسلة][عرض الرسالة]
+        (طريقة الإرسال المطلوبة حرفياً).
+
+        v11.3: الاستجابة تحمل كيانات الرسالة الفعلية — عند وجود text_link
+        لموضع الاسم لا يحدث أي edit (الاسم قابل للنقر فعلاً)."""
         from alert_bot import AlertBot
 
         class _CaptureBot(AlertBot):
@@ -245,7 +247,10 @@ class TestAlertRegression:
 
             async def _post(self, method, payload):
                 self.captured = (method, payload)
-                return 200, {"ok": True}
+                # استجابة واقعية: كيان text_link عند موضع الاسم (offset=4)
+                return 200, {"ok": True, "result": {"message_id": 11, "entities": [
+                    {"type": "text_link", "offset": 4, "length": 9, "url": "https://t.me/ahmed_99"},
+                ]}}
 
         bot = _CaptureBot()
         ok, method, reason = await bot.send(
@@ -261,6 +266,70 @@ class TestAlertRegression:
         assert payload["link_preview_options"] == {"is_disabled": True}
         kb = payload["reply_markup"]["inline_keyboard"]
         assert len(kb) == 1 and kb[0] == GOLDEN["S1_username_chat"]["bot_buttons"]
+
+    @pytest.mark.asyncio
+    async def test_bot_api_heals_dropped_name_entity(self, monitor):
+        """v11.3 — السبب الجذري للشكوى «الاسم غير قابل للنقر»: Bot API يقبل
+        الرسالة لكنه يُسقط كيان tg://user?id عندما لا يعرف البوت المرسل.
+        الاستجابة بلا text_link عند موضع الاسم → editMessageText فوري:
+        نفس النص والأزرار، ورابط الاسم = رابط الرسالة المصدر (يفتح دائماً)."""
+        from alert_bot import AlertBot
+
+        class _DroppingBot(AlertBot):
+            def __init__(self):
+                super().__init__(token="1:t", chat_id=int(CFG.TARGET_GROUP_ID))
+                self.methods = []
+
+            async def _post(self, method, payload):
+                self.methods.append((method, dict(payload)))
+                if method == "sendMessage":
+                    # استجابة بدون كيان الاسم — أُسقط من الخادم
+                    return 200, {"ok": True, "result": {"message_id": 22, "entities": []}}
+                # editMessageText
+                return 200, {"ok": True, "result": {"message_id": 22}}
+
+        bot = _DroppingBot()
+        ok, method, reason = await bot.send(
+            {"sender_id": 777000222, "sender_display": "سارة",
+             "text": TEXT, "chat_id": -1001234567890, "message_id": 456},
+            msg_link="https://t.me/c/1234567890/456", group_link="https://t.me/c/1234567890",
+        )
+        assert ok is True and reason == ""
+        # الاسم لم يصل قابلاً للنقر → تسجيل صادق
+        assert method == "text_only"
+        methods = [m for m, _ in bot.methods]
+        assert "editMessageText" in methods
+        edit_payload = next(p for m, p in bot.methods if m == "editMessageText")
+        # نفس النص لكن رابط الاسم صار رابط الرسالة المصدر
+        assert edit_payload["text"].startswith('👤: <a href="https://t.me/c/1234567890/456">سارة</a>')
+        assert "<blockquote>" in edit_payload["text"]
+        # نفس الأزرار بقيت على الرسالة المعدّلة
+        assert edit_payload["reply_markup"]["inline_keyboard"][0][0]["url"] == "tg://user?id=777000222"
+
+    @pytest.mark.asyncio
+    async def test_bot_api_no_edit_when_name_entity_present(self, monitor):
+        """v11.3: وصول كيان الاسم = لا edit إطلاقاً (لا طلبات زائدة)."""
+        from alert_bot import AlertBot
+
+        class _HealthyBot(AlertBot):
+            def __init__(self):
+                super().__init__(token="1:t", chat_id=int(CFG.TARGET_GROUP_ID))
+                self.methods = []
+
+            async def _post(self, method, payload):
+                self.methods.append(method)
+                return 200, {"ok": True, "result": {"message_id": 33, "entities": [
+                    {"type": "text_link", "offset": 4, "length": 4, "url": "tg://user?id=777000222"},
+                ]}}
+
+        bot = _HealthyBot()
+        ok, method, _ = await bot.send(
+            {"sender_id": 777000222, "sender_display": "سارة",
+             "text": TEXT, "chat_id": -1001234567890, "message_id": 456},
+            msg_link="https://t.me/c/1234567890/456",
+        )
+        assert ok is True and method == "mention_button"
+        assert bot.methods == ["sendMessage"]
 
 
 @pytest.mark.asyncio

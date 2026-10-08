@@ -64,13 +64,11 @@ from loguru import logger
 try:  # pragma: no cover — بيئة الإنتاج لديها telethon دائمًا
     from telethon.tl.types import (
         MessageEntityBlockquote,
-        MessageEntityBold,
         MessageEntityTextUrl,
     )
 
     _TL_OK = True
 except Exception:  # pragma: no cover
-    MessageEntityBold = None
     MessageEntityBlockquote = None
     MessageEntityTextUrl = None
     _TL_OK = False
@@ -79,19 +77,17 @@ except Exception:  # pragma: no cover
 from nav_resolver import clean_username as _clean_username  # noqa: E402
 from nav_resolver import is_valid_username as _is_valid_username  # noqa: E402
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 _TG_URL = "https://t.me/"
 
 # ── نصوص القالب (المصدر الوحيد — alert_bot يستوردها) ─────────────────────
-# شكل التنبيه النهائي الفعال (مواصفة المستخدم):
+# شكل التنبيه النهائي الفعال (مواصفة المستخدم v11.3 — بلا سطر «💬:»):
 #     👤: [اسم المرسل قابل للنقر]
 #     (سطر فارغ)
-#     💬:
 #     [نص الرسالة كاملاً]
 #     [ مراسلة ]  [ عرض الرسالة ]
 SENDER_LABEL = "👤: "
-CARD_TITLE_PLAIN = "💬:"
 
 # أنواع المرسل التي يُسمح لها بـ tg://user?id (لا القنوات ولا المحذوفون)
 _USER_ID_CAPABLE_TYPES = frozenset({"user", "bot", "assumed_user"})
@@ -410,10 +406,11 @@ def build_alert_entity_pack(
     *,
     rule_tag: Optional[str] = None,
     plain_budget: int = 3800,
+    name_url_override: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    يبني (plain_text, formatting_entities) للقالب v11.2 — نفس الشكل المرئي
-    لحرفياً للنسخة HTML (parse_mode="html") لكن عبر كيانات جاهزة.
+    يبني (plain_text, formatting_entities) للقالب v11.3 — نفس الشكل المرئي
+    حرفياً للنسخة HTML (parse_mode="html") لكن عبر كيانات جاهزة.
 
     لماذا كيانات جاهزة؟ Telethon 1.45 `client.send_message(parse_mode=...)`
     يمرر النص عبر _parse_message_text التي **تحذف** أي MessageEntityTextUrl
@@ -426,8 +423,10 @@ def build_alert_entity_pack(
     is None) فتصل الكيانات حرفياً كما بُنيت.
 
     الكيانات:
-        MessageEntityTextUrl    → الاسم (الرابط الداخلي selected_url)
-        MessageEntityBold       → «💬:»
+        MessageEntityTextUrl    → الاسم (الرابط الداخلي selected_url،
+                                  أو name_url_override — حزمة الإصلاح الذاتي
+                                  v11.3: رابط الرسالة المصدر عند إسقاط الخادم
+                                  لكيان tg://user)
         MessageEntityBlockquote → نص الرسالة (الضغط عليه → Copy Text)
     """
     display = str(display_name or "").strip() or "مستخدم"
@@ -435,23 +434,21 @@ def build_alert_entity_pack(
     if len(raw) > max(64, int(plain_budget)):
         raw = raw[: max(64, int(plain_budget)) - 1].rstrip() + "…"
 
-    plain_text = f"{SENDER_LABEL}{display}\n\n{CARD_TITLE_PLAIN}\n{raw}"
+    plain_text = f"{SENDER_LABEL}{display}\n\n{raw}"
     entities: List[Any] = []
 
     try:
         name_off = utf16_len(SENDER_LABEL)
         name_len = utf16_len(display)
-        label_off = name_off + name_len + utf16_len("\n\n")
-        if target is not None and target.selected_url and MessageEntityTextUrl is not None:
+        text_off = name_off + name_len + utf16_len("\n\n")
+        name_url = (str(name_url_override).strip() if name_url_override else None) or (
+            target.selected_url if target is not None else None
+        )
+        if target is not None and name_url and MessageEntityTextUrl is not None:
             entities.append(
-                MessageEntityTextUrl(offset=name_off, length=name_len, url=target.selected_url)
-            )
-        if MessageEntityBold is not None:
-            entities.append(
-                MessageEntityBold(offset=label_off, length=utf16_len(CARD_TITLE_PLAIN))
+                MessageEntityTextUrl(offset=name_off, length=name_len, url=name_url)
             )
         if raw and MessageEntityBlockquote is not None:
-            text_off = label_off + utf16_len(CARD_TITLE_PLAIN) + utf16_len("\n")
             entities.append(
                 MessageEntityBlockquote(offset=text_off, length=utf16_len(raw))
             )
@@ -470,7 +467,8 @@ def build_alert_entity_pack(
         "formatting_entities": entities or None,
         "clickable": bool(
             target is not None
-            and target.selected_url
+            and ((str(name_url_override).strip() if name_url_override else None)
+                 or target.selected_url)
             and any(type(e).__name__ == "MessageEntityTextUrl" for e in entities)
         ),
     }

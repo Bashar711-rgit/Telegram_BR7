@@ -319,3 +319,106 @@ class TestSendLadder:
         ok, method, reason = await bot.send(_data(sender_username="user1"))
         assert ok is False and "BUTTON_USER_INVALID" in reason
         assert len(bot.calls) == 1  # لا إعادة عبر Bot API
+
+
+# ══ ══ ══ v11.3: فحص كيان اسم المرسل + الإصلاح الذاتي ══ ══ ══
+class TestNameEntityHeal:
+    """السبب الجذري للشكوى «الاسم غير قابل للنقر»: الخادم يُسقط كيان
+    tg://user?id من رسالة البوت حين لا يعرف المرسل — الاسم يصل نصاً.
+    send_buttons يفحص كيانات الرسالة المُرسلة فعلاً ويُصلح فوراً بـedit
+    (رابط الاسم = رابط الرسالة المصدر — يفتح دائماً)."""
+
+    def _client(self, fake) -> AlertBotClient:
+        c = AlertBotClient(api_id=1, api_hash="h", token="123:ABC", db=None,
+                           target_chat_id=TARGET)
+        c.client = fake
+        c._started = True
+        return c
+
+    @pytest.mark.asyncio
+    async def test_heals_when_name_entity_dropped(self):
+        from types import SimpleNamespace
+
+        edits: List[Dict[str, Any]] = []
+
+        class _Fake:
+            calls: List[Any] = []
+
+            def is_connected(self):
+                return True
+
+            async def send_message(self, chat, text, **kw):
+                # الخادم أرجع الرسالة بلا كيان اسم (أُسقط)
+                return SimpleNamespace(id=55, entities=[])
+
+            async def edit_message(self, chat, **kw):
+                edits.append({"chat": chat, **kw})
+                return SimpleNamespace(id=55, entities=[])
+
+        pack_text = "👤: هناء العنزي\n\nأبي مساعدة"
+        c = self._client(_Fake())
+        ok = await c.send_buttons(
+            pack_text, [[{"text": "مراسلة", "url": "tg://user?id=6079171409"}]],
+            formatting_entities=[object()],
+            heal_pack=(pack_text, None),
+        )
+        assert ok is True
+        assert len(edits) == 1
+        assert edits[0]["chat"] == TARGET
+        assert edits[0]["message"] == 55
+        assert edits[0]["text"] == pack_text
+
+    @pytest.mark.asyncio
+    async def test_no_edit_when_name_entity_present(self):
+        from types import SimpleNamespace
+
+        from telethon.tl.types import MessageEntityTextUrl
+
+        class _Fake:
+            def __init__(self):
+                self.edits = 0
+
+            def is_connected(self):
+                return True
+
+            async def send_message(self, chat, text, **kw):
+                return SimpleNamespace(id=56, entities=[
+                    MessageEntityTextUrl(offset=4, length=11, url="tg://user?id=6079171409"),
+                ])
+
+            async def edit_message(self, chat, **kw):
+                self.edits += 1
+                return SimpleNamespace(id=56)
+
+        fake = _Fake()
+        c = self._client(fake)
+        ok = await c.send_buttons(
+            "👤: هناء العنزي\n\nأبي مساعدة",
+            [[{"text": "مراسلة", "url": "tg://user?id=6079171409"}]],
+            formatting_entities=[object()],
+            heal_pack=("x", None),
+        )
+        assert ok is True
+        assert fake.edits == 0  # الاسم وصل قابلاً للنقر — لا edit إطلاقاً
+
+    @pytest.mark.asyncio
+    async def test_heal_failure_never_breaks_send(self):
+        from types import SimpleNamespace
+
+        class _Fake:
+            def is_connected(self):
+                return True
+
+            async def send_message(self, chat, text, **kw):
+                return SimpleNamespace(id=57, entities=[])
+
+            async def edit_message(self, chat, **kw):
+                raise RuntimeError("edit boom")
+
+        c = self._client(_Fake())
+        ok = await c.send_buttons(
+            "👤: هناء\n\nنص", [[{"text": "مراسلة", "url": "tg://user?id=1"}]],
+            formatting_entities=[object()],
+            heal_pack=("👤: هناء\n\nنص", None),
+        )
+        assert ok is True  # الإصلاح ميزة — فشله لا يكسر الإرسال

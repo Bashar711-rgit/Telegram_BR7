@@ -195,8 +195,9 @@ class TestClickableName:
         assert name_ent.offset == utf16_len("👤: ") == 4
         assert name_ent.length == utf16_len("نواف محمد")
         assert name_ent.url == f"tg://user?id={SENDER_ID}"
-        # القالب نفسه
-        assert pack["plain_text"].startswith("👤: نواف محمد\n\n💬:\nنص الرسالة")
+        # القالب نفسه (v11.3: بلا سطر «💬:» — الاسم ثم (فارغ) ثم النص)
+        assert pack["plain_text"].startswith("👤: نواف محمد\n\nنص الرسالة")
+        assert "💬" not in pack["plain_text"]
 
     def test_entity_pack_without_target_plain(self):
         """بلا هدف → نص عادي بلا كيان رابط (فشل-آمن)."""
@@ -206,6 +207,22 @@ class TestClickableName:
             type(e).__name__ != "MessageEntityTextUrl"
             for e in (pack["formatting_entities"] or [])
         )
+
+    def test_entity_pack_name_url_override(self):
+        """v11.3: name_url_override — حزمة الإصلاح الذاتي (رابط الرسالة
+        المصدر مكان رابط الاسم عند إسقاط الخادم لكيان tg://user)."""
+        t = resolve_contact_target(sender_id=SENDER_ID, first_name="نواف", last_name="محمد")
+        pack = build_alert_entity_pack(
+            "نواف محمد", "نص الرسالة", t,
+            name_url_override="https://t.me/c/1234567890/77",
+        )
+        ents = pack["formatting_entities"]
+        name_ents = [e for e in ents if type(e).__name__ == "MessageEntityTextUrl"]
+        assert len(name_ents) == 1
+        assert name_ents[0].url == "https://t.me/c/1234567890/77"
+        assert name_ents[0].offset == 4
+        # النص الظاهر لا يتغير إطلاقاً — الرابط الداخلي فقط
+        assert pack["plain_text"] == "👤: نواف محمد\n\nنص الرسالة"
 
     def test_entity_pack_rule_tag_appended(self):
         pack = build_alert_entity_pack("نواف", "نص",
@@ -279,8 +296,16 @@ class _FakeAlertBot(AlertBot):
     async def _post(self, method: str, payload: Dict[str, Any]):
         self.calls.append({"method": method, "payload": payload})
         if self._responses:
-            return self._responses.pop(0)
-        return 200, {"ok": True}
+            status, body = self._responses.pop(0)
+        else:
+            status, body = 200, {"ok": True}
+        # v11.3: استجابة صحية افتراضياً — كيان الاسم عند الموضع 4 حتى لا
+        # ينطلق الإصلاح الذاتي في اختبارات لا تعنيه.
+        if status == 200 and body.get("ok") and method == "sendMessage":
+            body.setdefault("result", {}).setdefault("entities", [
+                {"type": "text_link", "offset": 4, "length": 9, "url": "https://t.me/test"}
+            ])
+        return status, body
 
 
 class TestAlertBotSend:
@@ -341,7 +366,8 @@ class TestAlertBotSend:
             for e in ents
         )
         # النص الظاهر في الطبقة الاحتياطية يطابق القالب (بلا وسوم HTML)
-        assert call["text"].startswith("👤: نواف محمد\n\n💬:\n")
+        # v11.3: بلا سطر «💬:» — الاسم ثم (فارغ) ثم النص مباشرة
+        assert call["text"].startswith("👤: نواف محمد\n\n")
 
     @pytest.mark.asyncio
     async def test_no_token_safe_fallback(self):
@@ -668,9 +694,9 @@ class TestMetrics:
 
 class TestFinalTemplate:
     def test_exact_shape(self):
-        """الشكل النهائي الفعّال: 👤: الاسم ← (فارغ) ← 💬: ← النص ← [مراسلة][عرض]."""
+        """الشكل النهائي الفعّال (v11.3): 👤: الاسم ← (فارغ) ← النص ← [مراسلة][عرض]."""
         built = build_alert_html(_data())
-        expected_head = "👤: <a href=\"tg://user?id=5601276336\">نواف محمد</a>\n\n<b>💬:</b>\n<blockquote>نص الرسالة الأصلي</blockquote>"
+        expected_head = "👤: <a href=\"tg://user?id=5601276336\">نواف محمد</a>\n\n<blockquote>نص الرسالة الأصلي</blockquote>"
         assert built["text"] == expected_head
         assert [[b["text"] for b in row] for row in built["buttons"]] == [
             ["مراسلة", "عرض الرسالة"]
@@ -691,5 +717,5 @@ class TestFinalTemplate:
         text, buttons = m._build_alert(sender, chat, "واجب", "النص", {},
                                        contact_target=target)
         assert text == ("👤: <a href=\"tg://user?id=5601276336\">نواف محمد</a>\n\n"
-                        "<b>💬:</b>\n<blockquote>النص</blockquote>")
+                        "<blockquote>النص</blockquote>")
         assert buttons is None  # الأزرار من بوت التنبيهات فقط (عقد v10.8)

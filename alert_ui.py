@@ -29,12 +29,16 @@ alert_ui.py – v11.0 Alert UI Client — عميل بوت تنبيهات حي (T
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from loguru import logger
 from telethon import TelegramClient, events
 from telethon.errors import RPCError
 from telethon.sessions import StringSession
+
+# v11.3: فحص قابلية نقر اسم المرسل + الإصلاح الذاتي — المصدر الموحد للموضع
+# (contact_target) حتى لا يتشعب حساب الإزاحة في ملفات متعددة.
+from contact_target import SENDER_LABEL, utf16_len  # noqa: E402
 
 try:  # Telethon ≥ 1.45 — طبقة الأزرار المُعاد هيكلتها
     from telethon.tl.types import (
@@ -229,17 +233,22 @@ class AlertBotClient:
         rows = [_mk_row(r) for r in (AlertBotClient._convert_row(row) for row in buttons or []) if r]
         return ReplyInlineMarkup(rows=rows) if rows else None
 
-    # ── الإرسال (طبقة احتياطية بالأزرار — v11.0) ──
+    # ── الإرسال (طبقة احتياطية بالأزرار — v11.0 / فحص الاسم v11.3) ──
     async def send_buttons(
         self,
         text_html: str,
         buttons: List[List[Dict[str, Any]]],
         target: Any = None,
         formatting_entities: Optional[List[Any]] = None,
+        heal_pack: Optional[Tuple[str, Optional[List[Any]]]] = None,
     ) -> bool:
         """يرسل HTML + أزراراً حقيقية عبر عميل البوت. False = سلّم المسار
         التالي (حسابات المستخدمين). خطأ زر → إعادة بدون أزرار (النص بروابطه
-        يبقى) قبل الاستسلام."""
+        يبقى) قبل الاستسلام.
+
+        v11.3: heal_pack=(نص, كيانات) — إن أُسقط كيان رابط الاسم
+        (tg://user?id) من الخادم لأن البوت لا يعرف المرسل، يُعدّل التنبيه
+        فوراً برابط الرسالة المصدر مكان رابط الاسم (يفتح دائماً)."""
         if not self.is_alive:
             return False
         chat = int(target) if target else self.target_chat_id
@@ -250,14 +259,18 @@ class AlertBotClient:
             if formatting_entities:
                 # v11.2: كيانات جاهزة من contact_target — تجاوز HTML parse
                 # الذي يحذف tg://user?id صامتاً (السبب الجذري لفقدان النقر)
-                await self.client.send_message(
+                sent = await self.client.send_message(
                     chat, text_html, buttons=markup,
                     formatting_entities=formatting_entities, link_preview=False,
                 )
             else:
-                await self.client.send_message(
+                sent = await self.client.send_message(
                     chat, text_html, parse_mode="html", buttons=markup, link_preview=False
                 )
+            # v11.3: استجابة الخادم تحمل الكيانات الناجية فعلاً — غياب
+            # text_link عند موضع الاسم = الاسم وصل نصاً عادياً → إصلاح فوري.
+            if heal_pack is not None:
+                await self._heal_name_entity(chat, sent, markup, heal_pack)
             return True
         except RPCError as e:
             msg = (getattr(e, "message", "") or type(e).__name__).upper()
@@ -281,3 +294,47 @@ class AlertBotClient:
         except Exception as e:
             logger.debug(f"AlertBotClient send error: {type(e).__name__}: {str(e)[:120]}")
             return False
+
+    # ── v11.3: فحص كيان الاسم + إصلاح ذاتي (رابط الرسالة المصدر) ──
+    @staticmethod
+    def _name_entity_present(sent_msg: Any) -> bool:
+        """هل وصل كيان text_link لاسم المرسل داخل الرسالة المرسلة فعلاً؟
+        فشل القراءة لا يُعاقب عليه (True) — الفحص ميزة لا حكم."""
+        try:
+            ents = getattr(sent_msg, "entities", None) or []
+            off = utf16_len(SENDER_LABEL)
+            for e in ents:
+                if type(e).__name__ == "MessageEntityTextUrl":
+                    if int(getattr(e, "offset", -1)) == off and int(getattr(e, "length", 0)) > 0:
+                        return True
+        except Exception:
+            return True
+        return False
+
+    async def _heal_name_entity(
+        self,
+        chat: int,
+        sent_msg: Any,
+        markup: Any,
+        heal_pack: Tuple[str, Optional[List[Any]]],
+    ) -> None:
+        """كيان الاسم أُسقط من الخادم → edit فوري بنفس النص/الأزرار ورابط
+        الاسم = رابط الرسالة المصدر (يفتح دائماً لكل من يرى التنبيه).
+        لا ترفع استثناءً أبداً — الإصلاح ميزة، فشله لا يكسر الإرسال."""
+        try:
+            if sent_msg is None or self._name_entity_present(sent_msg):
+                return
+            heal_text, heal_entities = heal_pack
+            msg_id = getattr(sent_msg, "id", None)
+            if not msg_id or not heal_text:
+                return
+            await self.client.edit_message(
+                chat, message=msg_id, text=heal_text,
+                formatting_entities=heal_entities, buttons=markup, link_preview=False,
+            )
+            logger.warning(
+                "[SENDER] clickable_name=FAILED (server dropped the name entity) "
+                "→ healed via source-message link (AlertBotClient)"
+            )
+        except Exception as e:
+            logger.debug(f"name-entity heal failed: {type(e).__name__}: {str(e)[:100]}")

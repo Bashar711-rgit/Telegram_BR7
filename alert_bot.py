@@ -9,11 +9,10 @@ v11.2 (طلب المستخدم — نظام مراسلة المرسل): ContactT
 (MTProto) تمرر الكيانات جاهزة عبر formatting_entities فيبقى الاسم قابلًا
 للنقر بعد أن كان تيليثون يحذف tg://user?id صامتاً عند الـparse.
 
-القالب (مواصفة المستخدم النهائية):
+القالب (مواصفة المستخدم النهائية v11.3 — بلا سطر «💬:»):
 
     👤: {اسم المرسل قابل للنقر}
     (سطر فارغ)
-    <b>💬:</b>
     <blockquote>{النص الأصلي كاملاً - بلا حذف أجزاء}</blockquote>
 
     [ مراسلة ] [ عرض الرسالة ]
@@ -22,12 +21,18 @@ v11.2 (طلب المستخدم — نظام مراسلة المرسل): ContactT
     الرسمية الضغط على منطقة quote يفتح قائمة فيها «Copy Text» (نسخ فعلي
     للحافظة). هذه هي الآلية الرسمية الوحيدة لـ«الضغط على النص ليُنسخ» -
     لا توجد أي API تجعل النص الحر يُنسخ بلمسة واحدة مباشرة.
-  * البطاقة: عنوان «💬 الرسالة:» أعلى ومحتوى الرسالة الأصلي كاملاً أسفله
-    داخل <blockquote>، مع دعم العربية/RTL والحفاظ على الأسطر والفقرات.
+  * البطاقة (v11.3): سطر «👤: الاسم» ثم (سطر فارغ) ثم نص الرسالة الأصلي
+    كاملاً داخل <blockquote> — بلا سطر «💬:» — مع دعم العربية/RTL والحفاظ
+    على الأسطر والفقرات.
   * النص الأصلي يُحفظ كاملاً (لا truncate(400)) - التقصير الوحيد المسموح
     هو حاجز حد تيليجرام 4096 حرفاً للرسالة كلها (مع "…" وتحذير في اللوج).
-  * SENDER: username -> <a href="https://t.me/U">@U</a>؛ بدونه
+  * SENDER: username -> <a href="https://t.me/U">الاسم</a>؛ بدونه
     <a href="tg://user?id=ID">الاسم الكامل</a>.
+  * v11.3 — إصلاح «الاسم غير قابل للنقر»: بعد كل 200 من Bot API يُفحص
+    result.entities — غياب text_link عند موضع الاسم (أُسقط لأن البوت لا
+    يعرف المرسل) → editMessageText فوري برابط الرسالة المصدر مكان
+    tg://user — الاسم يفتح دائماً شيئاً حقيقياً (الرسالة ← ملف المرسل).
+    نفس الفحص/الإصلاح في AlertBotClient.send_buttons عبر edit_message.
 
 الأزرار - Inline Keyboard في صف واحد (الدالة المركزية build_alert_buttons -
 لا يُبنى أي زر يدوياً في أي مكان آخر):
@@ -98,16 +103,19 @@ from contact_target import (  # noqa: E402
     build_alert_entity_pack,
     metric_inc as _contact_metric,
     resolve_contact_target as _resolve_contact_target,
+    utf16_len,
 )
+# v11.3: إصلاح ذاتي لقابلية نقر الاسم — نفس جراحة الروابط الموثوقة لمسار
+# حسابات المستخدمين (v10.6) أصبحت تُستخدم لمسار البوت أيضاً.
+from nav_resolver import harden_sender_anchor  # noqa: E402
 
 BOT_API_BASE = "https://api.telegram.org"
 # حد تيليجرام الأقصى لنص الرسالة — الحاجز الوحيد المسموح لتقصير المحتوى
 TELEGRAM_MAX_TEXT_LEN = 4096
 
 # ══ القالب الموحد — نصوص ثابتة (لا تُغيَّر: عقد واجهة) ══
-# v11.2 (مواصفة المستخدم): «👤: الاسم» و«💬:» — الاسم نفسه رابط داخلي،
-# والنسخ بالضغط على نص الرسالة (blockquote → Copy Text).
-CARD_TITLE_HTML = "<b>💬:</b>"
+# v11.3 (مواصفة المستخدم): «👤: الاسم» ثم نص الرسالة مباشرة — بلا سطر
+# «💬:» — الاسم نفسه رابط داخلي، والنسخ بالضغط على النص (blockquote).
 MSG_LINK_UNAVAILABLE = "غير متاح"  # محتفظ به للتوافق الخلفي (لم يعد في النص)
 
 # نصوص الزرين (v11.1) — صف واحد: [ مراسلة ] [ عرض الرسالة ]
@@ -268,6 +276,34 @@ def _has_tg_user_button(built: Dict[str, Any]) -> bool:
     )
 
 
+# ══ v11.3: التحقق الفعلي من قابلية نقر اسم المرسل + الإصلاح الذاتي ══
+# السبب الجذري للشكوى «الاسم غير قابل للنقر»: Bot API يقبل الرسالة (200)
+# لكن كيان tg://user?id=text_link قد يُسقط قبل التخزين حين لا يعرف البوت
+# المرسل (لم يتفاعل معه ولا يشاركه مجموعة) — فيصل الاسم نصاً عادياً غير
+# قابل للنقر. استجابة sendMessage نفسها تحمل الكيانات الناجية
+# (result.entities): غياب text_link عند موضع الاسم بالضبط = الاسم وصل
+# بلا رابط → إصلاح ذاتي فوري بـeditMessageText (رابط الاسم = رابط الرسالة
+# المصدر — يفتح دائماً لكل من يرى التنبيه، ومنها يُفتح ملف المرسل).
+_NAME_OFFSET_UTF16 = utf16_len(SENDER_LABEL)  # 👤 وحدتا UTF-16 + ": " → 4
+
+
+def _name_entity_missing(entities: Any) -> bool:
+    """True = لا يوجد كيان text_link عند موضع اسم المرسل (وصل نصاً عادياً).
+
+    فشل قراءة الاستجابة لا يُعاقب عليه (False) — الفحص ميزة لا حكم."""
+    try:
+        for e in entities or []:
+            if str(e.get("type") or "") == "text_link":
+                if (
+                    int(e.get("offset") or -1) == _NAME_OFFSET_UTF16
+                    and int(e.get("length") or 0) > 0
+                ):
+                    return False
+    except Exception:
+        return False
+    return True
+
+
 def build_alert_html(
     data: Dict[str, Any],
     analysis: Optional[Dict[str, Any]] = None,
@@ -359,11 +395,8 @@ def build_alert_html(
     # ── بطاقة نص الرسالة: المحتوى الأصلي كاملاً (لا حذف أجزاء) ──
     # الحاجز الوحيد: حد تيليجرام 4096 للرسالة كلها — يُقص المتجاوز فقط
     # مع "…" وتحذير لوج (لا نقسم كيان HTML نصف مكتمل).
-    header = "\n".join([
-        f"{SENDER_LABEL}{sender_html}",
-        "",
-        CARD_TITLE_HTML,
-    ])
+    # v11.3 (مواصفة المستخدم): بلا سطر «💬:» — الاسم ثم (فارغ) ثم النص.
+    header = f"{SENDER_LABEL}{sender_html}"
     overhead = len(header) + len("<blockquote></blockquote>") + len(rule_part) + 1 + 16
     budget = max(TELEGRAM_MAX_TEXT_LEN - overhead, 256)
     safe_text = InputSanitizer.escape_html(str(data.get("text") or ""))
@@ -375,7 +408,7 @@ def build_alert_html(
             f"⚠️ alert text truncated to Telegram 4096 limit "
             f"(escaped_len={len(safe_text)} budget={budget})"
         )
-    text = f"{header}\n<blockquote>{safe_text}</blockquote>{rule_part}"
+    text = f"{header}\n\n<blockquote>{safe_text}</blockquote>{rule_part}"
 
     # ── روابط الرسالة/القروب الحقيقية (قيم المحلّل أولاً ثم البناء) ──
     link = str(msg_link or "").strip()
@@ -599,7 +632,51 @@ class AlertBot:
                 return False, "", f"network_error:{type(e).__name__}"
 
             if status == 200 and body.get("ok"):
-                method = "text_only" if (sender_dropped or buttons_dropped) else base_method
+                # ══ v11.3: فحص قابلية نقر الاسم بعد الوصول + إصلاح ذاتي ══
+                # الاستجابة نفسها تحمل الكيانات الناجية — غياب text_link
+                # عند موضع الاسم = الاسم وصل نصاً عادياً (الشكوى الأصلية)
+                # → editMessageText فوري: رابط الاسم يصبح رابط الرسالة
+                # المصدر (يفتح دائماً لكل من يرى التنبيه، ومنها يُفتح
+                # ملف المرسل باللمس على صورته) — بنفس النص والأزرار.
+                _result = body.get("result") or {}
+                if _name_entity_missing(_result.get("entities")):
+                    # صراحة: الاسم لم يصل قابلاً للنقر — لا ادعاء نجاح
+                    method = "text_only"
+                    _heal_url = str(built.get("msg_link") or "").strip()
+                    _healed = False
+                    if _heal_url and _heal_url != "#":
+                        try:
+                            _sid = int((built.get("button_kwargs") or {}).get("sender_id") or 0)
+                        except Exception:
+                            _sid = 0
+                        _hardened = harden_sender_anchor(built["text"], _sid, _heal_url)
+                        _mid = _result.get("message_id")
+                        if _hardened != built["text"] and _mid:
+                            _edit: Dict[str, Any] = {
+                                "chat_id": self.chat_id,
+                                "message_id": _mid,
+                                "text": _hardened,
+                                "parse_mode": "HTML",
+                                "link_preview_options": {"is_disabled": True},
+                            }
+                            if payload.get("reply_markup"):
+                                _edit["reply_markup"] = payload["reply_markup"]
+                            try:
+                                _est, _ebody = await self._post("editMessageText", _edit)
+                                _ok_edit = bool(_est == 200 and _ebody.get("ok"))
+                            except Exception as _ee:
+                                logger.debug(f"AlertBot name-heal edit error: {type(_ee).__name__}")
+                                _ok_edit = False
+                            if _ok_edit:
+                                built["text"] = _hardened
+                                _healed = True
+                    logger.warning(
+                        "[SENDER] clickable_name=FAILED (Bot API dropped the "
+                        "name entity) | healed="
+                        + ("source_message_link" if _healed else "none")
+                    )
+                else:
+                    method = "text_only" if (sender_dropped or buttons_dropped) else base_method
                 # v11.2 (spec #23): نتيجة زر المراسلة الفعلية — مرة واحدة لكل تنبيه
                 _contact_metric(
                     "contact_button_success" if method in ("username", "mention_button")
@@ -674,9 +751,24 @@ class AlertBot:
                         _tgt,
                         rule_tag=_rule,
                     )
+                    # v11.3: حزمة الإصلاح الذاتي — إن أُسقط كيان tg://user
+                    # من الخادم (البوت لا يعرف المرسل) يُعدَّل التنبيه
+                    # بكيان اسم رابطه رابط الرسالة المصدر (يفتح دائماً).
+                    _heal_pack = None
+                    _heal_url = str(built.get("msg_link") or "").strip()
+                    if _heal_url and _heal_url != "#":
+                        _hpack = build_alert_entity_pack(
+                            built.get("display") or "",
+                            str(data.get("text") or ""),
+                            _tgt,
+                            rule_tag=_rule,
+                            name_url_override=_heal_url,
+                        )
+                        _heal_pack = (_hpack["plain_text"], _hpack.get("formatting_entities"))
                     if await self._client.send_buttons(
                         _pack["plain_text"], built.get("buttons") or [],
                         formatting_entities=_pack.get("formatting_entities"),
+                        heal_pack=_heal_pack,
                     ):
                         method = "text_only" if (sender_dropped or buttons_dropped) else base_method
                         _contact_metric(

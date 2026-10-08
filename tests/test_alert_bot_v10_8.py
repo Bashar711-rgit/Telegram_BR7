@@ -93,9 +93,10 @@ class TestBuildAlertHtml:
             group_link="https://t.me/sultanu1999",
         )
         assert built["contact_method"] == "username"
-        assert built["text"].startswith('👤: <a href="https://t.me/Lara507">هناء العنزي</a>\n')
-        # البطاقة الموحدة: عنوان «نص الرسالة:» + المحتوى داخل blockquote
-        assert "<b>💬:</b>\n<blockquote>" in built["text"]
+        assert built["text"].startswith('👤: <a href="https://t.me/Lara507">هناء العنزي</a>\n\n')
+        # v11.3: الاسم ثم (سطر فارغ) ثم المحتوى داخل blockquote — بلا «💬:»
+        assert "\n\n<blockquote>" in built["text"]
+        assert "💬" not in built["text"]
         assert built["text"].rstrip().endswith("</blockquote>")
         # الروابط انتقلت من سطر النص إلى الأزرار
         assert "رابط الرسالة" not in built["text"]
@@ -109,7 +110,7 @@ class TestBuildAlertHtml:
         tg://user + نسخ فعلي للـID (الأزرار من بيانات التنبيه نفسه)."""
         built = build_alert_html(_data(), msg_link=None, group_link=None)
         assert built["contact_method"] == "mention_button"
-        assert built["text"].startswith('👤: <a href="tg://user?id=6079171409">هناء العنزي</a>\n')
+        assert built["text"].startswith('👤: <a href="tg://user?id=6079171409">هناء العنزي</a>\n\n')
         # _data() لديه chat_id=-100111222333 وmessage_id=4242 → روابط خاصة صالحة
         assert built["buttons"] == [[
             {"text": "مراسلة", "url": f"tg://user?id={SENDER_ID}"},
@@ -134,7 +135,7 @@ class TestBuildAlertHtml:
         assert {"text": "مراسلة", "url": f"tg://user?id={SENDER_ID}"} in row
         assert all(b["text"] not in ("عرض الرسالة", "القروب") for b in row)
         assert built["msg_link"] is None
-        assert "<b>💬:</b>\n<blockquote>" in built["text"]
+        assert "\n\n<blockquote>" in built["text"] and "💬" not in built["text"]
 
     def test_view_button_falls_back_to_group_link(self):
         """بدون رابط رسالة مباشر → عرض يستخدم أفضل آلية متاحة
@@ -191,7 +192,7 @@ class TestBuildAlertHtml:
 
     def test_never_raises_on_garbage(self):
         built = build_alert_html({"sender_id": "x", "chat_id": None, "message_id": None, "text": None})
-        assert "👤: " in built["text"] and "<b>💬:</b>" in built["text"]
+        assert "👤: " in built["text"] and "💬" not in built["text"]
         # لا مرسل ولا روابط → كل الأزرار تُحذف بصدق (لا أزرار معطلة)
         assert built["buttons"] == []
 
@@ -249,8 +250,18 @@ class _FakeAlertBot(AlertBot):
     async def _post(self, method: str, payload: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
         self.calls.append({"method": method, "payload": payload})
         if self._responses:
-            return self._responses.pop(0)
-        return 200, {"ok": True, "result": {"message_id": 777}}
+            status, body = self._responses.pop(0)
+        else:
+            status, body = 200, {"ok": True, "result": {"message_id": 777}}
+        # v11.3: استجابة صحية افتراضياً — كيان text_link عند موضع الاسم
+        # (offset=4) حتى لا ينطلق الإصلاح الذاتي في اختبارات لا تعنيه
+        # (اختبارات إسقاط الكيان/الإصلاح لها بوتات مزيّفة خاصة).
+        if status == 200 and body.get("ok") and method == "sendMessage":
+            result = body.setdefault("result", {})
+            result.setdefault("entities", [
+                {"type": "text_link", "offset": 4, "length": 8, "url": "https://t.me/test"}
+            ])
+        return status, body
 
 
 def _buttons_of(payload: Dict[str, Any]) -> List[Dict[str, str]]:
@@ -557,7 +568,6 @@ class TestMonitorIntegration:
         assert "buttons" not in call or call.get("buttons") is None
         # القالب الموحد v10.9 (بعد تحليل HTML لمسار mention — بلا وسوم ظاهرة)
         assert "👤: " in call["text"]
-        assert "💬:" in call["text"]
         await db._flush()  # add_alert دفعي — الصف يظهر بعد flush
         row = await db._fetchone(
             "SELECT contact_method FROM alerts WHERE message_hash = 'h_v109_fb'"
