@@ -241,7 +241,7 @@ from telethon.tl.types import (
 from config import CFG, InputSanitizer, fast_hash
 from database import EnhancedDatabase, MessageRecord, AlertRecord, DeadLetterRecord
 from filter_engine import EnhancedFilter
-from dedup import content_fingerprint, get_deduplicator  # v9.10 cross-account dedup
+from dedup import content_fingerprint, get_deduplicator, normalize_for_fingerprint  # v9.10 dedup + v11.5.2 verify
 from similarity import get_similarity_gate  # v10.0 Precision: near-duplicate gate
 from antispam import get_antispam  # v9.11 anti-spam (Watch List → Permanent Ignore)
 from sender_resolver import (
@@ -267,6 +267,84 @@ from contact_target import (                                           # v11.2 �
     metric_inc as _contact_metric,
 )
 from reply_fix import get_reply_fixer as _get_reply_fixer              # v11.5 الرد التعويضي F (مواصفة §11)
+
+
+# ══ v11.5.2: حاجز صدى التنبيهات (Anti-Echo) ══
+# المشكلة الحقيقية من الإنتاج: القالب الموحد الجديد (👤/💬) مضغوط بحيث يقع
+# نص التنبيه نفسه ضمن حد 6..65 حرفاً → عندما يُرسل التنبيه إلى مجموعة
+# الهدف والمراقبة مفتوحة على كل شيء (جدول sources فارغ)، يراها المراقب
+# كرسالة جديدة → تُصنّف (تحوي الكلمة المفتاحية الأصلية) → تنبيه جديد يحوي
+# بطاقة سابقة → سلسلة صدى متداخلة (👤: مستخدم / بطاقات فارغة / تكرار).
+# الحل من طبقتين:
+#   1) سجل هوياتنا الذاتية (معرّف بوت التنبيهات + معرّف كل حساب من
+#      حساباتنا) — أي حدث مرسله هوية من هويّاتنا يُتجاهل قبل أي فلترة.
+#   2) بصمة القالب: نص يبدأ بـ«👤:» ويحوي «💬:» قريباً من البداية = بطاقة
+#      تنبيه منتجرة — يُتجاهل حتى لو فشل تحديد هوية المرسل (مجهول/أنون).
+# لا يؤثر إطلاقاً على رسائل المستخدمين الحقيقيين: لا يبدأ نصهم ببطاقتنا.
+_SELF_SENDER_IDS: set = set()
+
+
+def register_self_sender(sender_id) -> bool:
+    """تسجيل هوية من هويّاتنا (بوت التنبيهات أو أحد حسابات المراقبة).
+
+    أعداد صحيحة موجبة فقط — القيم غير القابلة للتحويل أو الكسرية غير
+    الصحيحة (1.5) تُرفض (لا int-truncation خفي يسجّل هوية خاطئة)."""
+    if isinstance(sender_id, bool):
+        return False
+    try:
+        sid = int(sender_id)
+    except (TypeError, ValueError):
+        return False
+    if isinstance(sender_id, float) and float(sender_id) != float(sid):
+        return False
+    if sid <= 0:
+        return False
+    _SELF_SENDER_IDS.add(sid)
+    return True
+
+
+def is_self_sender(sender_id) -> bool:
+    try:
+        return int(sender_id or 0) in _SELF_SENDER_IDS
+    except Exception:
+        return False
+
+
+_ALERT_CARD_HEADER = "👤:"
+_ALERT_CARD_MSG_LABEL = "💬:"
+
+
+def is_alert_card_echo(text) -> bool:
+    """True إذا كان النص نفسه بطاقة تنبيه منتجرة (صدى) — فحص نصي فقط.
+
+    عقد القالب (v11.5 §7): البطاقة تبدأ دائماً بـ«👤:» ثم «💬:» خلال
+    أول 64 حرفاً. رسائل المستخدمين العادية لا تبدأ بهذا الترويسة
+    (وحتى لو ذُكر 👤 وسط رسالة، البداية هي الفيصل)."""
+    if not text:
+        return False
+    t = str(text).lstrip()
+    if not t.startswith(_ALERT_CARD_HEADER):
+        return False
+    return _ALERT_CARD_MSG_LABEL in t[:64]
+
+
+def unknown_send_result_policy(reason: str, has_verifier: bool) -> str:
+    """v11.5.2: سياسة النتيجة المجهولة — لا إعادة إرسال أعمى أبداً.
+
+    يعيد واحدة من:
+      'verify'   — timeout/network مع وجود مُحقّق AlertUI: افحص الوصول أولاً.
+      'stop'     — timeout بلا مُحقّق: النتيجة مجهولة والمواصفة تمنع
+                   إعادة الإرسال الأعمى (تنبيه مكرر أسوأ من انتظار).
+      'fallback' — فشل مؤكد (4xx/رفض أزرار) أو network_error بلا مُحقّق
+                   (الأغلبية الساحقة: الطلب لم يُرسل أصلاً) → fallback.
+    """
+    r = str(reason or "")
+    if not (r.startswith("timeout_attempt") or r.startswith("network_error")):
+        return "fallback"
+    if has_verifier:
+        return "verify"
+    return "stop" if r.startswith("timeout_attempt") else "fallback"
+
 
 
 # (نفس الدوال المساعدة من النسخة الأصلية: resolve_chat_entity, build_telegram_links)
@@ -1111,6 +1189,7 @@ class EnhancedAccountMonitor:
         self._deleted_handler_func: Optional[Callable] = None
         self._stats: Dict[str, Any] = {
             "messages_processed": 0, "alerts_sent": 0, "errors": 0, "duplicates": 0, "rate_limited": 0,
+            "echo_skipped": 0,   # v11.5.2: بطاقاتنا/هويّاتنا لا تُعاد معالجتها (صدى)
             "send_errors": 0, "queue_processed": 0, "media_processed": 0, "avg_processing_time_ms": 0.0,
             "total_processing_time_ms": 0.0, "last_error": None, "last_alert_time": 0.0,
             "connect_attempts": 0, "reconnect_attempts": 0,
@@ -1334,6 +1413,8 @@ class EnhancedAccountMonitor:
                         self._stats["last_error"] = "Session expired - re-login via /login"
                         return False
                     me = await client.get_me()
+                    # v11.5.2: سجّل هويتنا — رسائل هذا الحساب لا تُراقب (صدى التنبيهات)
+                    register_self_sender(getattr(me, "id", 0))
                     logger.info(f"Connected {account['name']} as @{me.username or me.id}")
                     self.client = client; self.is_connected = True; self.started_at = time.time()
                     self._last_connect_error = None; self._stats["last_error"] = None
@@ -2233,6 +2314,13 @@ class EnhancedAccountMonitor:
             await self._inc_stat("spam_skipped")
             return False
         text = data.get("text", "")
+        # ══ v11.5.2: حاجز صدى التنبيهات — قبل أي شيء آخر (بعد الحظر مباشرة) ══
+        # رسائلنا نحن (بوت التنبيهات/حسابات المراقبة) أو أي نص هو بطاقة
+        # تنبيه منتجرة → يُتجاهل فوراً. هذا يقطع سلسلة «تنبيه على تنبيه»
+        # من جذورها ولا يمس رسائل المستخدمين الحقيقيين إطلاقاً.
+        if is_self_sender(sender_id) or is_alert_card_echo(text):
+            await self._inc_stat("echo_skipped")
+            return False
         if text and not (CFG.MIN_MESSAGE_LENGTH <= len(text) <= CFG.MAX_MESSAGE_LENGTH):
             await self._inc_stat("errors"); return False
         return True
@@ -2845,6 +2933,43 @@ class EnhancedAccountMonitor:
         return result
 
 
+    async def _verify_alertbot_delivery(self, ui_client: Any, expected_norm_prefix: str) -> bool:
+        """v11.5.2: هل سلّم بوت التنبيهات رسالته فعلاً إلى مجموعة الهدف؟
+
+        عميل AlertUI هو MTProto بنفس هوية البوت — رسائل البوت فيه out=True.
+        نفحص آخر 10 رسائل: صادرة من البوت + تبدأ بترويسة بطاقتنا «👤:» +
+        خلال آخر 180 ثانية + تطابق بادئة النص الظاهر (بعد نزع وسوم HTML
+        وفك الترميز — لأن alert_text يحوي وسوماً بينما telethon يعيد نصاً
+        خاماً). أي فشل/شك = False (المتصل يقرر: False مع timeout = fallback)."""
+        if ui_client is None:
+            return False
+        try:
+            msgs = await ui_client.get_messages(CFG.TARGET_GROUP_ID, limit=10)
+        except Exception:
+            return False
+        import re as _re
+        import html as _html_mod
+        _tag_re = _re.compile(r"<[^>]+>")
+        now = time.time()
+        try:
+            for m in (msgs or []):
+                if not getattr(m, "out", False):
+                    continue
+                raw = str(getattr(m, "message", "") or "")
+                if not raw.lstrip().startswith(_ALERT_CARD_HEADER):
+                    continue
+                dt = getattr(m, "date", None)
+                if dt is not None and (now - dt.timestamp()) > 180:
+                    continue
+                if not expected_norm_prefix:
+                    return True
+                visible = _html_mod.unescape(_tag_re.sub("", raw))
+                if expected_norm_prefix in normalize_for_fingerprint(visible):
+                    return True
+        except Exception:
+            return False
+        return False
+
     async def _send_alert(
         self,
         data: Dict[str, Any],
@@ -3167,6 +3292,106 @@ class EnhancedAccountMonitor:
                         msg_hash, status="failed", error=str(_reason or "")[:300])
                 except Exception:
                     pass
+                # ══ v11.5.2: النتيجة المجهولة — لا إعادة إرسال أعمى أبداً ══
+                # timeout = الطلب ربما وصل وقد سلّم فعلاً (unknown result).
+                # إعادة الإرسال الفوري عبر حساب المستخدم = تنبيه مكرر (بلاغ
+                # الإنتاج الحقيقي). السياسة في unknown_send_result_policy:
+                # مع مُحقّق AlertUI نتحقق أولاً؛ timeout بلا مُحقّق = لا إعادة؛
+                # network_error بلا مُحقّق = الأرجح لم يُرسل أصلاً → fallback.
+                _unk_reason = str(_reason or "")
+                _ui = getattr(self._bot_ref, "alert_ui_client", None) if self._bot_ref is not None else None
+                _policy = unknown_send_result_policy(_unk_reason, _ui is not None)
+                if _policy == "verify":
+                    _expected = normalize_for_fingerprint(alert_text or "")[:48]
+                    _verified = False
+                    try:
+                        _verified = await self._verify_alertbot_delivery(_ui, _expected)
+                    except Exception as _ver_err:
+                        logger.debug(f"alert delivery verify error [{account_name}]: {type(_ver_err).__name__}")
+                    if _verified:
+                        logger.info(
+                            f"AlertBot {_unk_reason.split(':')[0]} but delivery VERIFIED via AlertUI "
+                            f"[{account_name}] — no fallback resend (duplicate prevented)"
+                        )
+                        try:
+                            await self.db.mark_alert_dispatched(
+                                msg_hash, status="delivered", error="verified_after_unknown")
+                        except Exception:
+                            pass
+                        await self._record_sent_alert(
+                            None, data, msg_hash, account_name, keyword, alert_text,
+                            chat_id, sender_id, display_name,
+                            contact_method="bot_verified",
+                        )
+                        return
+                    logger.info(
+                        f"AlertBot {_unk_reason.split(':')[0]} and NOT found in target "
+                        f"[{account_name}] — confirmed failure → user-account fallback"
+                    )
+                    # فشل مؤكد — نسقط للـfallback الطبيعي أدناه
+                elif _policy == "stop":
+                    logger.warning(
+                        f"AlertBot timeout with no AlertUI verifier [{account_name}] — "
+                        f"NOT resending (unknown result; blind-resend forbidden)"
+                    )
+                    try:
+                        await self.db.mark_alert_dispatched(
+                            msg_hash, status="unknown", error="timeout_no_verifier")
+                    except Exception:
+                        pass
+                    return
+                # ══ v11.5.2: النتيجة المجهولة — لا إعادة إرسال أعمى أبداً ══
+                # timeout = الطلب ربما وصل وقد سلّم فعلاً (unknown result).
+                # إعادة الإرسال الفوري عبر حساب المستخدم = تنبيه مكرر (بلاغ
+                # الإنتاج الحقيقي). أولاً: تحقق عبر عميل AlertUI (MTProto
+                # بنفس هوية البوت — يقرر آخر رسائل مجموعة الهدف). وُجدت
+                # بطاقتنا حديثاً → سُلّم فعلاً → لا fallback. لم توجد → فشل
+                # مؤكد → fallback كالمعتاد. بلا عميل تحقق: timeout = لا
+                # إعادة إرسال (متطلب المواصفة: unknown ≠ confirmed failure)،
+                # أما network_error فيُرجّح عدم الوصول أصلاً → fallback.
+                _unk_reason = str(_reason or "")
+                if _unk_reason.startswith("timeout_attempt") or _unk_reason.startswith("network_error"):
+                    _ui = getattr(self._bot_ref, "alert_ui_client", None) if self._bot_ref is not None else None
+                    _expected = normalize_for_fingerprint(alert_text or "")[:48]
+                    if _ui is not None:
+                        _verified = False
+                        try:
+                            _verified = await self._verify_alertbot_delivery(_ui, _expected)
+                        except Exception as _ver_err:
+                            logger.debug(f"alert delivery verify error [{account_name}]: {type(_ver_err).__name__}")
+                        if _verified:
+                            logger.info(
+                                f"AlertBot {_unk_reason.split(':')[0]} but delivery VERIFIED via AlertUI "
+                                f"[{account_name}] — no fallback resend (duplicate prevented)"
+                            )
+                            try:
+                                await self.db.mark_alert_dispatched(
+                                    msg_hash, status="delivered", error="verified_after_unknown")
+                            except Exception:
+                                pass
+                            await self._record_sent_alert(
+                                None, data, msg_hash, account_name, keyword, alert_text,
+                                chat_id, sender_id, display_name,
+                                contact_method="bot_verified",
+                            )
+                            return
+                        logger.info(
+                            f"AlertBot {_unk_reason.split(':')[0]} and NOT found in target "
+                            f"[{account_name}] — confirmed failure → user-account fallback"
+                        )
+                        # فشل مؤكد — نسقط للـfallback الطبيعي أدناه
+                    elif _unk_reason.startswith("timeout_attempt"):
+                        logger.warning(
+                            f"AlertBot timeout with no AlertUI verifier [{account_name}] — "
+                            f"NOT resending (unknown result; blind-resend forbidden)"
+                        )
+                        try:
+                            await self.db.mark_alert_dispatched(
+                                msg_hash, status="unknown", error="timeout_no_verifier")
+                        except Exception:
+                            pass
+                        return
+                    # network_error بلا مُحقّق: الأغلبية اتصال لم يُقطع أصلاً → fallback
                 logger.warning(
                     f"AlertBot failed → user-account fallback [{account_name}] "
                     f"(msg_hash={msg_hash}): {_reason}"
@@ -3647,6 +3872,7 @@ class EnhancedAccountMonitor:
             "last_error": self._last_connect_error, "messages_processed": stats.get("messages_processed", 0),
             "alerts_sent": stats.get("alerts_sent", 0), "errors": stats.get("errors", 0),
             "duplicates": stats.get("duplicates", 0), "rate_limited": stats.get("rate_limited", 0),
+            "echo_skipped": stats.get("echo_skipped", 0),  # v11.5.2
             "send_errors": stats.get("send_errors", 0), "queue_processed": stats.get("queue_processed", 0),
             "media_processed": stats.get("media_processed", 0), "avg_processing_time_ms": round(stats.get("avg_processing_time_ms", 0), 2),
             "last_alert_time": stats.get("last_alert_time", 0), "dlq_stats": await self._dlq.get_stats(),

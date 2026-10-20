@@ -107,7 +107,10 @@ from database import EnhancedDatabase
 from dedup import get_dedup_snapshot, init_deduplicator
 from antispam import get_antispam, setup_antispam, get_antispam_snapshot
 from filter_engine import EnhancedFilter
-from monitors import EnhancedAccountMonitor, HealthMonitor, get_capture_snapshot, alert_latency
+from monitors import (
+    EnhancedAccountMonitor, HealthMonitor, get_capture_snapshot, alert_latency,
+    register_self_sender,  # v11.5.2 حاجز صدى التنبيهات
+)
 from alert_bot import AlertBot  # v10.8: إرسال التنبيهات عبر Bot API
 from alert_ui import AlertBotClient  # v11.0: عميل بوت حي — Callbacks + إرسال احتياطي بالأزرار
 from sender_resolver import get_sender_intel_snapshot, get_mention_intel_snapshot
@@ -1746,6 +1749,8 @@ class EnhancedTelegramBot:
                 f"🤖 AlertBot ready: @{self.alert_bot.bot_username} "
                 f"(id={self.alert_bot.bot_id})"
             )
+            # v11.5.2: هوية البوت من هويّاتنا — رسائله في مجموعة الهدف لا تُراقب
+            register_self_sender(self.alert_bot.bot_id)
             await self.alert_bot.check_membership()
         except Exception as e:
             logger.debug(f"alert_bot boot check skipped: {type(e).__name__}: {e}")
