@@ -80,3 +80,26 @@ Work Log:
 Stage Summary:
 - v11.5.3 في الطريق للإنتاج. بعد إقلاعه يُتوقع في اللوج: «AlertUI creds from connected account: Account 1» بدل تحذير api_id/api_hash مفقود، وزرّا التنبيه يعملان عبر AlertBot Bot API (URL buttons) دوماً، ومع العميل الحي صارت طبقة الزرار الاحتياطية والتحقق فعالتين.
 - مطلوب من المستخدم: إعادة دخول Account 2 عبر /login.
+
+---
+
+Task ID: 9 (المهمة الهندسية: إصلاح شامل وموثوق لقالب التنبيهات وروابط المرسل والأزرار — v11.6.0)
+Agent: Z.ai Code (main orchestrator)
+Task: فحص مسار التنبيه كاملاً، توحيد القالب «المرسل: الاسم — @username / نص الرسالة:» بلا رموز وبلا blockquote، ضمان لوحة أزرار فعلية [ عرض الرسالة ][ مراسلة ] في كل مسارات الإرسال، واختبار كل شيء
+
+Work Log:
+- sandbox أُعيد إنشاؤه: استنساخ عام للمستودع (origin/main=6fa0635=v11.5.3) + بناء .venv (uv, Telethon 1.45).
+- خريطة المسار (مثبتة بالكود): _validate_event (بوابة 6..65 على النص الأصلي فقط) ← _analyze_and_alert ← _send_alert (dedup ← rate limiter ← similarity ← nav resolver ← ContactTarget ← _build_alert) ← AlertBot.send (Bot API) ← AlertBotClient (MTProto) ← سلّم حسابات المستخدمين (L1 username / L2-3 mention / L4 no-mention + forward) ← DLQ retry.
+- جذور فقدان الأزرار المُثبتة: (1) _build_alert كان يعيد buttons=None دائماً لمسار الحسابات؛ (2) GENERIC_BUTTON_ERRORS كان يعيد الإرسال بلا أزرار ويحسبه نجاحاً.
+- contact_target.py (المصدر الوحيد): SENDER_LABEL="المرسل: "، MSG_TEXT_LABEL="نص الرسالة:"، build_username_suffix() (« — @username» فقط عند صلاحية الشكل)، build_alert_entity_pack بالقالب الجديد بلا blockquote (كيان TextUrl على الاسم فقط، offset محسوب من الترويسة).
+- alert_bot.py: build_alert_html بالقالب الحرفي (الترويسة + « — @username» مهربة + قسم النص بلا إطار، المهروب HTML فقط؛ حد 4096 الوحيد للقص)؛ build_alert_buttons بالترتيب الحرفي [ عرض الرسالة ][ مراسلة ]؛ رفض زر tg://user → إسقاط مراسلة فقط؛ رفض عام → إعادة بلوحة t.me فقط ثم فشل مؤكد للسلّم (لا نصية-بلا-أزرار كنجاح — §5.7).
+- monitors.py: حارس الصدى بالتوقيع الجديد (المرسل: + نص الرسالة: خلال 256) مع إبقاء توقيع 👤/💬 القديم؛ _verify_alertbot_delivery يقبل الترويسين؛ _build_alert يعيد اللوحة الحقيقية؛ _send_alert_payload يحاول الأزرار في مسار الحسابات مع تدهور صادق (كشف خطأ button/markup → إعادة بلا أزرار + عداد user_buttons_dropped + قفل لكل حساب؛ والرفض الصامت يُكشف بفحص reply_markup في المرسَل).
+- alert_ui.py: رفض لوحة → إعادة بلوحة t.me فقط قبل النسخة النصية (أخير منفذ موثق) مع عداد.
+- config.py: BOT_VERSION=11.6.0؛ شارة اللوحة BR7 · v11.6؛ حدّث توثيق رؤوس الملفات.
+- الاختبارات: تحديث عقود 7 ملفات قديمة (GOLDEN/offsets/ترتيب الأزرار/رد فشل عام) + ملف جديد tests/test_alert_template_v11_6.py بمصفوفة الحالات الـ14 الإلزامية كاملة (26 اختباراً). **974/974 PASS**.
+- فحص الفرق: 16 ملفاً (+1078/−275) — بلا أسرار/جلسات/توكنات (scan سالب). Commit محلي: ec73f6d.
+
+Stage Summary:
+- القالب الجديد مؤكد بالاختبارات: «المرسل: الاسم — @username» (الاسم وحده رابط) ← (فارغ) ← «نص الرسالة:» ← (فارغ) ← النص الأصلي كاملاً مهرباً HTML؛ لوحة فعلية أسفل التنبيه في كل المسارات (Bot API / AlertBotClient / حسابات المستخدمين).
+- الحدود الموثقة بصدق: مراسلة تُسقط فقط عند رفض tg://user (خصوصية تيليجرام) أو بلا هدف؛ عرض يختفي بلا رابط حقيقي (لا روابط وهمية)؛ مسار الحسابات قد يرفض الخادم لوحته → تدهور مسجل بعداد ولوج (قيد منصة).
+- **لم يُنفذ بعد (بيئة بلا توكنات)**: git push (لا PAT في هذا الـsandbox) — أمر الرفع: ضع التوكن ثم `git push origin main` من /home/z/Telegram_BR7 (commit ec73f6d جاهز) → نشر Render تلقائي؛ واختبار Telegram الحقيقي عبر scripts/test_alert_live.py (ALERT_BOT_TOKEN + TARGET_GROUP_ID) — يتحقق من كيان الاسم واللوحة من استجابة sendMessage فعلياً.
