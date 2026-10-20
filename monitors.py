@@ -148,40 +148,39 @@ v10.7 (this pass) — SENDER ACCESS REGISTRY: كل اسم مرسل قابل لل
 
 v10.8 (سابقة) — ALERT BOT: الإرسال عبر Bot API (aiohttp) — انظر alert_bot.py.
 
-v10.9 (this pass) — نمط الواجهة الموحد للتنبيهات (الشكل المطلوب حرفياً في
-المواصفة والصورة المرجعية) — نفس التصميم لكل التنبيهات دون استثناء:
+v10.9 (تاريخية) — نمط الواجهة الموحد للتنبيهات — نفس التصميم لكل
+التنبيهات دون استثناء. v11.6 — القالب الحرفي الحالي (مواصفة المستخدم):
   * القالب الموحد (parse_mode=HTML) لكل تنبيه يصل TARGET_GROUP_ID:
-      سطر 1: 👤 {SENDER}        — username: <a href="https://t.me/U">@U</a>
-                                 بدونه: <a href="tg://user?id=ID">الاسم</a>
-      سطر 2: <b>المرسل :</b> ID {sender_id}
-      (سطر فارغ) <b>نص الرسالة:</b>
-      <blockquote>{النص الأصلي كاملاً — بطاقة منظمة بدعم RTL و preserve الأسطر}
+      سطر 1:  المرسل: {الاسم}          — username: <a href="https://t.me/U">الاسم</a> — @U
+                                        بدونه: <a href="tg://user?id=ID">الاسم</a>
+      (سطر فارغ)
+      نص الرسالة:
+      (سطر فارغ)
+      {النص الأصلي كاملاً — بلا إطار/اقتباس وبلا رموز 👤/💬}
   * النص الأصلي كامل (لا truncate(400)) — التقصير الوحيد حاجز تيليجرام
     4096 للرسالة كلها (يُلجأ إليه فقط عند التجاوز مع "…" وتحذير لوج).
-  * الأزرار الأربعة (Inline Keyboard — صف واحد أسفل كل تنبيه مباشرة،
-    ترتيب RTL: «مراسلة» في أقصى اليمين كما في الصورة؛ نصوص مصغّرة
-    v10.9.1 — حجم زر inline تابع لطول نصه حصراً ليستقيم الأربعة
-    في سطر واحد بعرض الرسالة):
-      [ مراسلة ] [ عرض ] [ نسخ ] [ القروب ]
+  * لوحة الأزرار (Inline Keyboard — صف واحد أسفل كل تنبيه، بنية
+    build_alert_buttons المركزية):
+      [ عرض الرسالة ] [ مراسلة ]
     تُبنى كلها حصراً عبر الدالة المركزية alert_bot.build_alert_buttons:
       مراسلة = t.me/{username} أو tg://user?id= (يعمل فعلياً)؛
       عرض = رابط الرسالة الحقيقي (t.me/{u}/{id} | t.me/c/{inner}/{id})
-        وإلا أفضل آلية متاحة (رابط القروب) — لا روابط وهمية؛
-      نسخ = زر copy_text رسمي (نسخ فعلي للحافظة: @username أو ID)؛
-      القروب = t.me/{u} أو t.me/c/{inner} أو رابط الدعوة.
-    الزر الذي تنعدم بياناته يُحذف كلياً (لا أزرار معطلة). الحسابات لا
-    ترسل أزراراً — الأزرار من بوت التنبيهات فقط (Bot API).
+        وإلا أفضل آلية متاحة (رابط القروب) — لا روابط وهمية.
+    الزر الذي تنعدم بياناته يُحذف كلياً (لا أزرار معطلة). v11.6: كل
+    المسارات تحاول إرفاق اللوحة نفسها — مسار الحسابات الاحتياطي بتدهور
+    صادق موثق عند رفض الخادم (عداد user_buttons_dropped).
   * الإرسال كله يمر عبر alert_bot.AlertBot.send(data, analysis) من
     _send_alert: Bot API sendMessage بـ aiohttp — chat_id=TARGET_GROUP_ID,
     parse_mode="HTML", link_preview_options={"is_disabled": true},
-    reply_markup={"inline_keyboard": [[الأزرار الأربعة]]} (صف واحد).
+    reply_markup={"inline_keyboard": [[عرض الرسالة، مراسلة]]} (صف واحد).
     المراقبون يستمعون ويبنون البيانات فقط.
   * معالجة أخطاء البوت: 429 → انتظار retry_after وإعادة (≤3)؛
     BUTTON_USER_INVALID/BUTTON_USER_PRIVACY_RESTRICTED → إعادة بدون زر
-    «مراسلة» فقط (رابط الاسم يبقى في النص وتبقى بقية الأزرار)؛ أي فشل
-    آخر أو غياب ALERT_BOT_TOKEN → fallback لمسار حسابات المستخدمين
-    بنفس القالب الموحد بدون أزرار مع تسجيل السبب (rate_limiter/circuit
-    breaker كما هم).
+    «مراسلة» فقط (رابط الاسم يبقى في النص وتبقى بقية الأزرار)؛ رفض عام
+    للوحة → إعادة بلوحة t.me فقط ثم فشل مؤكد للسلّم (لا نسخة نصية تُحسب
+    نجاحاً — v11.6 §5.7)؛ أي فشل آخر أو غياب ALERT_BOT_TOKEN → fallback
+    لمسار حسابات المستخدمين بنفس القالب واللوحة مع تسجيل السبب
+    (rate_limiter/circuit breaker كما هم).
   * alerts.contact_method (عمود v10.7 نفسه): username | mention_button |
     text_only لمسار البوت، والقيم السابقة (username | mention | forward |
     link) لمسار الـfallback.
@@ -269,17 +268,20 @@ from contact_target import (                                           # v11.2 �
 from reply_fix import get_reply_fixer as _get_reply_fixer              # v11.5 الرد التعويضي F (مواصفة §11)
 
 
-# ══ v11.5.2: حاجز صدى التنبيهات (Anti-Echo) ══
-# المشكلة الحقيقية من الإنتاج: القالب الموحد الجديد (👤/💬) مضغوط بحيث يقع
-# نص التنبيه نفسه ضمن حد 6..65 حرفاً → عندما يُرسل التنبيه إلى مجموعة
-# الهدف والمراقبة مفتوحة على كل شيء (جدول sources فارغ)، يراها المراقب
-# كرسالة جديدة → تُصنّف (تحوي الكلمة المفتاحية الأصلية) → تنبيه جديد يحوي
-# بطاقة سابقة → سلسلة صدى متداخلة (👤: مستخدم / بطاقات فارغة / تكرار).
+# ══ v11.5.2: حاجز صدى التنبيهات (Anti-Echo) — ترويسات v11.6 ══
+# المشكلة الحقيقية من الإنتاج: القالب الموحد يقع ضمن حد 6..65 حرفاً في
+# بعض الحالات → عندما يُرسل التنبيه إلى مجموعة الهدف والمراقبة مفتوحة على
+# كل شيء (جدول sources فارغ)، تراه المراقبة كرسالة جديدة → تُصنّف (تحوي
+# الكلمة المفتاحية الأصلية) → تنبيه جديد يحوي بطاقة سابقة → سلسلة صدى.
 # الحل من طبقتين:
 #   1) سجل هوياتنا الذاتية (معرّف بوت التنبيهات + معرّف كل حساب من
 #      حساباتنا) — أي حدث مرسله هوية من هويّاتنا يُتجاهل قبل أي فلترة.
-#   2) بصمة القالب: نص يبدأ بـ«👤:» ويحوي «💬:» قريباً من البداية = بطاقة
-#      تنبيه منتجرة — يُتجاهل حتى لو فشل تحديد هوية المرسل (مجهول/أنون).
+#   2) بصمة القالب: نص يبدأ بترويسة بطاقتنا ويحوي تسمية قسم النص قريباً
+#      من البداية = بطاقة تنبيه منتجرة — يُتجاهل حتى لو فشل تحديد هوية
+#      المرسل (مجهول/أنون). v11.6: الترويسة «المرسل:» والتسمية «نص
+#      الرسالة:» خلال أول 256 حرفاً (الاسم المسموح 128 + لاحقة username)،
+#      مع إبقاء فحص التواقيع القديمة (👤:/💬:) للبطاقات السابقة التي قد
+#      لا تزال تتناقل في المجموعة.
 # لا يؤثر إطلاقاً على رسائل المستخدمين الحقيقيين: لا يبدأ نصهم ببطاقتنا.
 _SELF_SENDER_IDS: set = set()
 
@@ -310,22 +312,29 @@ def is_self_sender(sender_id) -> bool:
         return False
 
 
-_ALERT_CARD_HEADER = "👤:"
-_ALERT_CARD_MSG_LABEL = "💬:"
+# ── تواقيع بطاقة التنبيه (v11.6: القالب الجديد + القديم للتوافق) ──
+_ALERT_CARD_HEADER = "المرسل:"
+_ALERT_CARD_MSG_LABEL = "نص الرسالة:"
+_ECHO_SCAN_WINDOW = 256  # الاسم ≤128 + لاحقة « — @username» + هامش
+_LEGACY_CARD_HEADER = "👤:"
+_LEGACY_CARD_MSG_LABEL = "💬:"
 
 
 def is_alert_card_echo(text) -> bool:
     """True إذا كان النص نفسه بطاقة تنبيه منتجرة (صدى) — فحص نصي فقط.
 
-    عقد القالب (v11.5 §7): البطاقة تبدأ دائماً بـ«👤:» ثم «💬:» خلال
-    أول 64 حرفاً. رسائل المستخدمين العادية لا تبدأ بهذا الترويسة
-    (وحتى لو ذُكر 👤 وسط رسالة، البداية هي الفيصل)."""
+    عقد القالب (v11.6): البطاقة تبدأ دائماً بـ«المرسل:» ثم تحوي «نص
+    الرسالة:» خلال أول 256 حرفاً. رسائل المستخدمين العادية لا تبدأ بهذا
+    الترويسة. توقيع القالب القديم (👤: + 💬: خلال 64) يبقى مُكتشفاً
+    للبطاقات السابقة التي قد تُمرَّر/تُنسخ في المجموعة."""
     if not text:
         return False
     t = str(text).lstrip()
-    if not t.startswith(_ALERT_CARD_HEADER):
-        return False
-    return _ALERT_CARD_MSG_LABEL in t[:64]
+    if t.startswith(_ALERT_CARD_HEADER):
+        return _ALERT_CARD_MSG_LABEL in t[:_ECHO_SCAN_WINDOW]
+    if t.startswith(_LEGACY_CARD_HEADER):
+        return _LEGACY_CARD_MSG_LABEL in t[:64]
+    return False
 
 
 def unknown_send_result_policy(reason: str, has_verifier: bool) -> str:
@@ -1328,25 +1337,24 @@ class EnhancedAccountMonitor:
 
 
     def _build_alert(self, sender: Dict, chat: Dict, keyword: str, text: str, analysis: Dict = None, contact_target: Any = None) -> Tuple[str, Optional[List]]:
-        """══ v10.9 — القالب الموحد (parse_mode=HTML) ══
+        """══ v11.6 — القالب الموحد (parse_mode=HTML) ══
 
-            سطر 1:  👤 {SENDER}
-            سطر 2:  <b>المرسل :</b> ID {sender_id}
+            سطر 1:  المرسل: {اسم المرسل قابل للنقر}{ — @username}
             (سطر فارغ)
-            <b>نص الرسالة:</b>
-            <blockquote>{النص الأصلي كاملاً — بطاقة منظمة RTL}</blockquote>
+            نص الرسالة:
+            (سطر فارغ)
+            {النص الأصلي كاملاً — بلا إطار/اقتباس وبلا رموز 👤/💬}
 
-        SENDER: username → <a href="https://t.me/U">@U</a>؛ بدونه
-        <a href="tg://user?id=ID">الاسم الكامل</a>.
+        SENDER: username → <a href="https://t.me/U">الاسم</a>؛ بدونه
+        <a href="tg://user?id=ID">الاسم الكامل</a>. «@username» نص مستقل
+        بجانب الاسم لا يُختلق عند غيابه.
 
-        العائد دائماً (نص, None): حسابات المستخدمين لا ترسل أزراراً —
-        الأزرار الأربعة المصغّرة [مراسلة][عرض][نسخ][القروب]
-        (صف واحد، ترتيب RTL) تبنيها الدالة المركزية
-        alert_bot.build_alert_buttons ويرسلها بوت التنبيهات
-        (alert_bot.AlertBot) في مسار الإرسال عبر Bot API. الزر الذي
-        تنعدم بياناته يُحذف كلياً. حُذف من هذا البانِر Button.inline/
-        Button.url (cnt_/copy_) بالكامل حسب المواصفة (معالجات main.py
-        بقيت لميزة الرد اليدوي). سطر «🏷 قاعدة» (محرك القواعد — ميزة
+        العائد (نص, أزرار): الأزرار الحقيقية من الدالة المركزية
+        alert_bot.build_alert_buttons — [ عرض الرسالة ][ مراسلة ] صف واحد.
+        مسار البوت (AlertBot/Bot API) يرسلها عبر reply_markup، ومسار
+        حسابات المستخدمين الاحتياطي يحاول إرفاقها عبر MTProto مع تدهور
+        صادق موثق عند رفض الخادم (لا نسخة نصية تُحسب نجاحاً كاملاً —
+        انظر _send_alert_payload). سطر «🏷 قاعدة» (محرك القواعد — ميزة
         قائمة) يُلاحق عند وجوده فقط في نهاية التنبيه.
         """
         data_view = {
@@ -1365,9 +1373,12 @@ class EnhancedAccountMonitor:
             group_link=chat.get("group_link"),
             contact_target=contact_target,  # v11.2: هدف واحد للاسم والزر
         )
-        # v10.8: الأزرار من حسابات المستخدمين محذوفة — Bot API فقط.
-        # (بناء الأزرار القديم محفوظ في build_dynamic_buttons كدالة ميزة.)
-        return built["text"], None
+        # v11.6: الأزرار الحقيقية تُعاد لكل المسارات — مسار البوت يرسلها
+        # عبر Bot API (الأساسي)، ومسار حسابات المستخدمين الاحتياطي يحاول
+        # إرفاقها عبر MTProto (تدهور صادق موثق عند رفض الخادم — انظر
+        # _send_alert_payload). الدالة المركزية build_alert_buttons هي
+        # المصدر الوحيد — الزر الذي تنعدم بياناته يُحذف كلياً.
+        return built["text"], built["buttons"]
 
 
     async def connect(self) -> bool:
@@ -2956,7 +2967,11 @@ class EnhancedAccountMonitor:
                 if not getattr(m, "out", False):
                     continue
                 raw = str(getattr(m, "message", "") or "")
-                if not raw.lstrip().startswith(_ALERT_CARD_HEADER):
+                _raw_stripped = raw.lstrip()
+                if not (
+                    _raw_stripped.startswith(_ALERT_CARD_HEADER)
+                    or _raw_stripped.startswith(_LEGACY_CARD_HEADER)
+                ):
                     continue
                 dt = getattr(m, "date", None)
                 if dt is not None and (now - dt.timestamp()) > 180:
@@ -3141,6 +3156,48 @@ class EnhancedAccountMonitor:
             return _hardened_cache
 
         user_media = data.get("media_object")
+
+        # ── v11.6: أزرار مسار حسابات المستخدمين — إرفاق فعلي بتدهور صادق ──
+        # المسار الاحتياطي يحاول إرفاق لوحة الأزرار نفسها (مواصفة v11.6 §5.6:
+        # لا إسقاط reply_markup في أي مسار). إن رفض الخادم الأزرار (خطأ
+        # BUTTON_*/markup) أو تجاهلها صامتاً (المرسَل بلا reply_markup):
+        # يُسجَّل السبب بصدق + عداد user_buttons_dropped + إعادة بلا أزرار —
+        # ولا يُحسب ذلك نجاحاً كاملاً (اللوج يوضح فقدان اللوحة). قفل على
+        # مستوى الحساب يمنع تكرار المحاولة المكلفة بعد أول رفض.
+        def _looks_like_button_error(e: Exception) -> bool:
+            try:
+                name = type(e).__name__.lower()
+                msg = str(e).lower()
+                return any(
+                    k in name or k in msg
+                    for k in ("button", "reply_markup", "keyboard", "markup")
+                )
+            except Exception:
+                return False
+
+        def _kb_for_this_send() -> Optional[List]:
+            if not buttons:
+                return None
+            if getattr(self, "_user_buttons_kb_rejected", False):
+                return None
+            return buttons
+
+        def _note_user_buttons_dropped(why: str) -> None:
+            try:
+                self._user_buttons_kb_rejected = True
+            except Exception:
+                pass
+            try:
+                _contact_metric("user_buttons_dropped")
+            except Exception:
+                pass
+            logger.warning(
+                f"[ALERT] buttons=dropped (user-account tier) reason={why} — "
+                "التنبيه سُلّم نصاً بروابط الترويسة؛ تيليجرام رفض لوحة الأزرار "
+                "من حساب مستخدم (قيد منصة موثق) — لاحقاً سيرسل هذا الحساب بلا "
+                "محاولة أزرار"
+            )
+
         async def _send_alert_payload(
             c: TelegramClient,
             entities: Optional[Tuple[str, List[Any]]],
@@ -3150,7 +3207,10 @@ class EnhancedAccountMonitor:
             entities=None  → مسار v10.3 الحرفي (parse_mode="html") — عقد متجمد.
             entities=(t,e) → نفس المحتوى نصياً لكن بكيانات جاهزة حيث اسم
                              المرسل mention حقيقي (InputMessageEntityMentionName)
-                             صالح لحساب الإرسال — تنسيق مرئي مطابق 100%."""
+                             صالح لحساب الإرسال — تنسيق مرئي مطابق 100%.
+            v11.6: الأزرار تُحاول دائماً ما لم يرفضها الخادم سابقاً لهذا
+            الحساب (قفل _user_buttons_kb_rejected) — النجاح بلا لوحة بعد
+            رفض صامت يُسجل ويُعدّ."""
             if entities is not None:
                 wire_text, wire_ents = entities
             else:
@@ -3158,14 +3218,21 @@ class EnhancedAccountMonitor:
                 # يقود دائماً لمكان حقيقي (الرسالة المصدر) بدل مرساة tg://
                 # التي قد يحذفها تيليجرام صامتاً.
                 wire_text, wire_ents = _hardened_alert_text(), None
+            kb = _kb_for_this_send()
             if user_media is not None:
                 try:
                     if wire_ents is not None:
-                        return await c.send_file(CFG.TARGET_GROUP_ID, file=user_media, caption=wire_text, buttons=buttons, formatting_entities=wire_ents, link_preview=False)
-                    return await c.send_file(CFG.TARGET_GROUP_ID, file=user_media, caption=wire_text, buttons=buttons, parse_mode="html", link_preview=False)
+                        return await c.send_file(CFG.TARGET_GROUP_ID, file=user_media, caption=wire_text, buttons=kb, formatting_entities=wire_ents, link_preview=False)
+                    return await c.send_file(CFG.TARGET_GROUP_ID, file=user_media, caption=wire_text, buttons=kb, parse_mode="html", link_preview=False)
                 except FloodWaitError:
                     raise
                 except Exception as e:
+                    if kb is not None and _looks_like_button_error(e):
+                        _note_user_buttons_dropped(f"{type(e).__name__}: {str(e)[:80]}")
+                        kb = None
+                        if wire_ents is not None:
+                            return await c.send_file(CFG.TARGET_GROUP_ID, file=user_media, caption=wire_text, buttons=None, formatting_entities=wire_ents, link_preview=False)
+                        return await c.send_file(CFG.TARGET_GROUP_ID, file=user_media, caption=wire_text, buttons=None, parse_mode="html", link_preview=False)
                     logger.debug(f"User media send failed: {e}")
             # v9.12 (audit H-02): the group-photo fallback is now opt-in via
             # CFG.ATTACH_GROUP_PHOTO. The default is False — text alerts go
@@ -3179,15 +3246,32 @@ class EnhancedAccountMonitor:
                         result = await c.get_profile_photos(chat_entity, limit=1)
                         if result and hasattr(result, 'photos') and len(result.photos) > 0:
                             if wire_ents is not None:
-                                return await c.send_file(CFG.TARGET_GROUP_ID, file=result.photos[0], caption=wire_text, buttons=buttons, formatting_entities=wire_ents, link_preview=False)
-                            return await c.send_file(CFG.TARGET_GROUP_ID, file=result.photos[0], caption=wire_text, buttons=buttons, parse_mode="html", link_preview=False)
+                                return await c.send_file(CFG.TARGET_GROUP_ID, file=result.photos[0], caption=wire_text, buttons=kb, formatting_entities=wire_ents, link_preview=False)
+                            return await c.send_file(CFG.TARGET_GROUP_ID, file=result.photos[0], caption=wire_text, buttons=kb, parse_mode="html", link_preview=False)
                     except FloodWaitError:
                         raise
                     except Exception as e:
                         logger.debug(f"Chat photo fallback send failed [{account_name}]: {e}")
-            if wire_ents is not None:
-                return await c.send_message(CFG.TARGET_GROUP_ID, wire_text, buttons=buttons, formatting_entities=wire_ents, link_preview=False)
-            return await c.send_message(CFG.TARGET_GROUP_ID, wire_text, buttons=buttons, parse_mode="html", link_preview=False)
+            try:
+                if wire_ents is not None:
+                    sent_msg = await c.send_message(CFG.TARGET_GROUP_ID, wire_text, buttons=kb, formatting_entities=wire_ents, link_preview=False)
+                else:
+                    sent_msg = await c.send_message(CFG.TARGET_GROUP_ID, wire_text, buttons=kb, parse_mode="html", link_preview=False)
+            except FloodWaitError:
+                raise
+            except Exception as e:
+                if kb is not None and _looks_like_button_error(e):
+                    # تدهور صادق: الخادم رفض اللوحة → إعادة بلا أزرار فوراً
+                    _note_user_buttons_dropped(f"{type(e).__name__}: {str(e)[:80]}")
+                    if wire_ents is not None:
+                        return await c.send_message(CFG.TARGET_GROUP_ID, wire_text, buttons=None, formatting_entities=wire_ents, link_preview=False)
+                    return await c.send_message(CFG.TARGET_GROUP_ID, wire_text, buttons=None, parse_mode="html", link_preview=False)
+                raise
+            # v11.6: تحقق صادق — طلبنا لوحة ووصلت الرسالة بلا reply_markup =
+            # الخادم تجاهلها صامتاً (حسابات المستخدمين) → سجل + قفل
+            if kb is not None and getattr(sent_msg, "reply_markup", None) is None:
+                _note_user_buttons_dropped("silent_drop_no_reply_markup")
+            return sent_msg
 
         def _sticky(c: TelegramClient) -> None:
             """يلتصق أول عميل ناجح بالإرسال (عقد v10.2 — صفر تكلفة تدوير)."""

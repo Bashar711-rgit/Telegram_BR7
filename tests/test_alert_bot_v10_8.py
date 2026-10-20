@@ -87,35 +87,43 @@ def _row_of(built):
 
 class TestBuildAlertHtml:
     def test_acceptance_1_username_sender(self):
-        """مرسل بـ username: سطر 👤 @user + الأزرار الأربعة في صف واحد."""
+        """v11.6: مرسل بـ username — «المرسل: الاسم — @user» + لوحة أزرار فعلية."""
         built = build_alert_html(
             _data(sender_username="Lara507", chat_username="sultanu1999"),
             msg_link="https://t.me/sultanu1999/531011",
             group_link="https://t.me/sultanu1999",
         )
         assert built["contact_method"] == "username"
-        assert built["text"].startswith('👤: <a href="https://t.me/Lara507">هناء العنزي</a>\n\n')
-        # v11.5 (spec §7): الاسم ثم «💬:» ثم المحتوى داخل blockquote
-        assert "\n\n💬:\n<blockquote>" in built["text"]
-        assert "💬:" in built["text"]
-        assert built["text"].rstrip().endswith("</blockquote>")
-        # الروابط انتقلت من سطر النص إلى الأزرار
+        # القالب الحرفي: الاسم وحده رابط + « — @username» نص مستقل بجانبه
+        assert built["text"].startswith(
+            'المرسل: <a href="https://t.me/Lara507">هناء العنزي</a> — @Lara507\n\n'
+        )
+        assert "\n\nنص الرسالة:\n\n" in built["text"]
+        # v11.6: بلا رموز 👤/💬 وبلا blockquote/اقتباس
+        assert "👤" not in built["text"] and "💬" not in built["text"]
+        assert "<blockquote>" not in built["text"]
+        # الروابط في الأزرار لا في النص
         assert "رابط الرسالة" not in built["text"]
+        # ترتيب المواصفة الحرفي: [ عرض الرسالة ] [ مراسلة ]
         assert built["buttons"] == [[
-            {"text": "مراسلة", "url": "https://t.me/Lara507"},
             {"text": "عرض الرسالة", "url": "https://t.me/sultanu1999/531011"},
+            {"text": "مراسلة", "url": "https://t.me/Lara507"},
         ]]
 
     def test_acceptance_2_no_username_name_button(self):
-        """مرسل بلا username: الاسم رابط tg://user في النص + زر مراسلة
-        tg://user + نسخ فعلي للـID (الأزرار من بيانات التنبيه نفسه)."""
+        """v11.6: مرسل بلا username — الاسم رابط tg://user، بلا @username
+        مُختلق، وزر مراسلة tg://user (الأزرار من بيانات التنبيه نفسه)."""
         built = build_alert_html(_data(), msg_link=None, group_link=None)
         assert built["contact_method"] == "mention_button"
-        assert built["text"].startswith('👤: <a href="tg://user?id=6079171409">هناء العنزي</a>\n\n')
+        # بلا username → لا لاحقة « — @...» في السطر
+        assert built["text"].startswith(
+            'المرسل: <a href="tg://user?id=6079171409">هناء العنزي</a>\n\n'
+        )
+        assert "— @" not in built["text"]
         # _data() لديه chat_id=-100111222333 وmessage_id=4242 → روابط خاصة صالحة
         assert built["buttons"] == [[
-            {"text": "مراسلة", "url": f"tg://user?id={SENDER_ID}"},
             {"text": "عرض الرسالة", "url": f"https://t.me/c/{INNER}/{MSG_ID}"},
+            {"text": "مراسلة", "url": f"tg://user?id={SENDER_ID}"},
         ]]
 
     def test_acceptance_3_private_group_message_link(self):
@@ -136,7 +144,8 @@ class TestBuildAlertHtml:
         assert {"text": "مراسلة", "url": f"tg://user?id={SENDER_ID}"} in row
         assert all(b["text"] not in ("عرض الرسالة", "القروب") for b in row)
         assert built["msg_link"] is None
-        assert "\n\n💬:\n<blockquote>" in built["text"] and "💬:" in built["text"]
+        assert "\n\nنص الرسالة:\n\n" in built["text"]
+        assert "<blockquote>" not in built["text"]
 
     def test_view_button_falls_back_to_group_link(self):
         """بدون رابط رسالة مباشر → عرض يستخدم أفضل آلية متاحة
@@ -149,20 +158,22 @@ class TestBuildAlertHtml:
         assert {"text": "عرض الرسالة", "url": "https://t.me/g_only"} in row
 
     def test_full_text_no_400_truncate(self):
-        """v10.9: النص الأصلي كاملاً داخل البطاقة — لا truncate(400)."""
+        """v10.9→v11.6: النص الأصلي كاملاً بعد «نص الرسالة:» — لا truncate(400)."""
         long_text = "ع" * 600
         built = build_alert_html(_data(text=long_text))
-        body = built["text"].split("<blockquote>")[1].split("</blockquote>")[0]
+        body = built["text"].split("\n\nنص الرسالة:\n\n", 1)[1]
         assert body == long_text
         esc = build_alert_html(_data(text="<b>خط & إهمال</b>"))
         assert "&lt;b&gt;خط &amp; إهمال&lt;/b&gt;" in esc["text"]
+        # وسوم المستخدم تظهر نصاً عادياً — لا تُفسد بنية التنبيه
+        assert "<b>خط" not in esc["text"]
 
     def test_telegram_4096_guard(self):
         """الحاجز الوحيد المسموح: حد تيليجرام 4096 — يُقص فقط عند التجاوز
         مع «…» (ولا يُقطع كيان HTML نصف مكتمل)."""
         built = build_alert_html(_data(text="ع" * 6000))
         assert len(built["text"]) <= 4096
-        assert built["text"].endswith("…</blockquote>")
+        assert built["text"].endswith("…")
 
     def test_html_escaping_in_display_name(self):
         built = build_alert_html(_data(sender_first_name="<سك>rip", sender_last_name=None))
@@ -193,7 +204,7 @@ class TestBuildAlertHtml:
 
     def test_never_raises_on_garbage(self):
         built = build_alert_html({"sender_id": "x", "chat_id": None, "message_id": None, "text": None})
-        assert "👤: " in built["text"] and "💬:" in built["text"]
+        assert "المرسل: " in built["text"] and "نص الرسالة:" in built["text"]
         # لا مرسل ولا روابط → كل الأزرار تُحذف بصدق (لا أزرار معطلة)
         assert built["buttons"] == []
 
@@ -201,17 +212,16 @@ class TestBuildAlertHtml:
 # ═════════════════ build_alert_buttons — الدالة المركزية ═════════════════
 
 class TestBuildAlertButtons:
-    def test_full_row_order_rtl(self):
-        """الترتيب المطلوب (RTL: مراسلة أقصى اليمين في عملاء تيليجرام العربية):
-        [ مراسلة ] [ عرض الرسالة ]."""
+    def test_full_row_order_v11_6(self):
+        """الترتيب الحرفي لمواصفة v11.6: [ عرض الرسالة ] [ مراسلة ]."""
         from alert_bot import build_alert_buttons
         kb = build_alert_buttons(
             sender_id=777, sender_username="u7",
             msg_link="https://t.me/g/9", group_link="https://t.me/g",
         )
         assert kb == [[
-            {"text": "مراسلة", "url": "https://t.me/u7"},
             {"text": "عرض الرسالة", "url": "https://t.me/g/9"},
+            {"text": "مراسلة", "url": "https://t.me/u7"},
         ]]
 
     def test_contact_only_without_username(self):
@@ -254,13 +264,15 @@ class _FakeAlertBot(AlertBot):
             status, body = self._responses.pop(0)
         else:
             status, body = 200, {"ok": True, "result": {"message_id": 777}}
-        # v11.3: استجابة صحية افتراضياً — كيان text_link عند موضع الاسم
-        # (offset=4) حتى لا ينطلق الإصلاح الذاتي في اختبارات لا تعنيه
-        # (اختبارات إسقاط الكيان/الإصلاح لها بوتات مزيّفة خاصة).
+        # v11.3 (v11.6): استجابة صحية افتراضياً — كيان text_link عند موضع
+        # الاسم (offset ترويسة القالب من المصدر الموحد) حتى لا ينطلق
+        # الإصلاح الذاتي في اختبارات لا تعنيه (اختبارات إسقاط الكيان/
+        # الإصلاح لها بوتات مزيّفة خاصة).
         if status == 200 and body.get("ok") and method == "sendMessage":
+            from contact_target import SENDER_LABEL as _SL, utf16_len as _u16
             result = body.setdefault("result", {})
             result.setdefault("entities", [
-                {"type": "text_link", "offset": 4, "length": 8, "url": "https://t.me/test"}
+                {"type": "text_link", "offset": _u16(_SL), "length": 8, "url": "https://t.me/test"}
             ])
         return status, body
 
@@ -290,8 +302,8 @@ class TestAlertBotSend:
         assert p["link_preview_options"] == {"is_disabled": True}
         kb = _buttons_of(p)
         assert kb == [
-            {"text": "مراسلة", "url": "https://t.me/Lara507"},
             {"text": "عرض الرسالة", "url": "https://t.me/sultanu1999/531011"},
+            {"text": "مراسلة", "url": "https://t.me/Lara507"},
         ]
         assert bot.calls[0]["method"] == "sendMessage"
 
@@ -340,8 +352,8 @@ class TestAlertBotSend:
         assert len(bot.calls) == 2
         first_kb = _buttons_of(bot.calls[0]["payload"])
         assert first_kb == [
-            {"text": "مراسلة", "url": f"tg://user?id={SENDER_ID}"},
             {"text": "عرض الرسالة", "url": "https://t.me/g1/9"},
+            {"text": "مراسلة", "url": f"tg://user?id={SENDER_ID}"},
         ]
         second_kb = _buttons_of(bot.calls[1]["payload"])
         assert second_kb == [
@@ -555,7 +567,9 @@ class TestMonitorIntegration:
 
     @pytest.mark.asyncio
     async def test_bot_failure_falls_back_to_user_account(self, db):
-        """فشل البوت → fallback لحساب المستخدم بنفس القالب الموحد بدون أزرار."""
+        """فشل البوت → fallback لحساب المستخدم بنفس القالب الموحد v11.6
+        مع محاولة إرفاق نفس لوحة الأزرار (v11.6 §5.6 — لا إسقاط reply_markup
+        في المسارات البديلة؛ الرفض الصامت من الخادم يُسجل بصدق)."""
         m = _monitor(db, "Account 1", _FakeClient("Account 1"))
         stub = _StubAlertBot((False, "", "bot_api_400:test"))
         _wire(db, m, m.client, alert_bot=stub)
@@ -566,9 +580,13 @@ class TestMonitorIntegration:
         assert len(stub.calls) == 1
         assert len(m.client.calls) >= 1  # أُرسل من حساب المستخدم
         call = m.client.calls[0]
-        assert "buttons" not in call or call.get("buttons") is None
-        # القالب الموحد v10.9 (بعد تحليل HTML لمسار mention — بلا وسوم ظاهرة)
-        assert "👤: " in call["text"]
+        # v11.6: اللوحة تُحاول فعلاً في المسار الاحتياطي — الزران الهدفان
+        assert call.get("buttons"), "لوحة الأزرار يجب أن تُحاول في المسار الاحتياطي"
+        kb0 = (call.get("buttons") or [[]])[0]
+        assert [b.get("text") for b in kb0] == ["عرض الرسالة", "مراسلة"]
+        # القالب الموحد v11.6 (بعد تحليل HTML لمسار mention — بلا وسوم ظاهرة)
+        assert "المرسل: " in call["text"] and "نص الرسالة:" in call["text"]
+        assert "👤" not in call["text"] and "💬" not in call["text"]
         await db._flush()  # add_alert دفعي — الصف يظهر بعد flush
         row = await db._fetchone(
             "SELECT contact_method FROM alerts WHERE message_hash = 'h_v109_fb'"

@@ -63,13 +63,11 @@ from loguru import logger
 
 try:  # pragma: no cover — بيئة الإنتاج لديها telethon دائمًا
     from telethon.tl.types import (
-        MessageEntityBlockquote,
         MessageEntityTextUrl,
     )
 
     _TL_OK = True
 except Exception:  # pragma: no cover
-    MessageEntityBlockquote = None
     MessageEntityTextUrl = None
     _TL_OK = False
 
@@ -81,13 +79,42 @@ __version__ = "1.1.0"
 
 _TG_URL = "https://t.me/"
 
-# ── نصوص القالب (المصدر الوحيد — alert_bot يستوردها) ─────────────────────
-# شكل التنبيه النهائي الفعال (مواصفة المستخدم v11.3 — بلا سطر «💬:»):
-#     👤: [اسم المرسل قابل للنقر]
+# ── نصوص القالب (المصدر الوحيد — alert_bot وalert_ui يستوردها) ─────────────
+# شكل التنبيه النهائي الفعال (مواصفة المستخدم v11.6 — بلا رموز 👤/💬 و
+# بلا اقتباس/blockquote):
+#     المرسل: [اسم المرسل قابل للنقر] — @username
 #     (سطر فارغ)
-#     [نص الرسالة كاملاً]
-#     [ مراسلة ]  [ عرض الرسالة ]
-SENDER_LABEL = "👤: "
+#     نص الرسالة:
+#     (سطر فارغ)
+#     [النص الأصلي كاملاً — أسطره ورموزه وروابطه كما وردت]
+#     ثم لوحة أزرار فعلية (Inline Keyboard): [ عرض الرسالة ] [ مراسلة ]
+# ملاحظات العقد:
+#   * «— @username» تُعرض فقط عند توفر username صالح — لا يُختلق أبداً.
+#   * اسم المرسل وحده هو الرابط (كيان/وسم anchor) — ليس السطر كله ولا
+#     نص الرسالة، و«@username» نص مستقل بجانب الاسم.
+#   * SENDER_LABEL يحدد إزاحة كيان الاسم (UTF-16) في كل المستهلكين
+#     (alert_bot فحص الاسم + alert_ui الإصلاح الذاتي) — تغييره هنا
+#     ينتشر تلقائياً.
+SENDER_LABEL = "المرسل: "
+
+# تسمية قسم نص الرسالة (سطر مستقل يسبق النص الأصلي مباشرة بعد سطر فارغ)
+MSG_TEXT_LABEL = "نص الرسالة:"
+
+# الفاصل بين اسم المرسل و«@username» في سطر الترويسة
+SENDER_DASH = " — "
+
+
+def build_username_suffix(username: Any = None) -> str:
+    """الجزء النصي الملاصق لاسم المرسل: « — @username» عند توفر username
+    صالح، وإلا سلسلة فارغة (لا يُختلق @username أبداً — مواصفة v11.6 §3.6).
+    الرابط لا يُبنى هنا — هذا نص العرض المستقل فقط (الاسم نفسه يحمل الرابط)."""
+    try:
+        u = str(username or "").strip().lstrip("@")
+    except Exception:
+        return ""
+    if not u or not _is_valid_username(u):
+        return ""
+    return f"{SENDER_DASH}@{u}"
 
 # أنواع المرسل التي يُسمح لها بـ tg://user?id (لا القنوات ولا المحذوفون)
 _USER_ID_CAPABLE_TYPES = frozenset({"user", "bot", "assumed_user"})
@@ -120,6 +147,8 @@ _METRIC_KEYS = (
     "contact_B1", "contact_B2", "contact_B3", "contact_B4", "contact_B5",
     "view_V1", "view_V2", "view_V3", "view_V4",
     "reply_fix_success", "reply_fix_failure", "reply_fix_skipped",
+    # ── v11.6: إسقاط أزرار مسار حسابات المستخدمين (قيد تيليجرام الموثق) ──
+    "user_buttons_dropped",
 )
 
 
@@ -415,7 +444,7 @@ def build_alert_entity_pack(
     name_url_override: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    يبني (plain_text, formatting_entities) للقالب v11.3 — نفس الشكل المرئي
+    يبني (plain_text, formatting_entities) للقالب v11.6 — نفس الشكل المرئي
     حرفياً للنسخة HTML (parse_mode="html") لكن عبر كيانات جاهزة.
 
     لماذا كيانات جاهزة؟ Telethon 1.45 `client.send_message(parse_mode=...)`
@@ -428,37 +457,32 @@ def build_alert_entity_pack(
     telethon/client/messages.py — parse ينفذ فقط عندما formatting_entities
     is None) فتصل الكيانات حرفياً كما بُنيت.
 
-    الكيانات:
-        MessageEntityTextUrl    → الاسم (الرابط الداخلي selected_url،
-                                  أو name_url_override — حزمة الإصلاح الذاتي
-                                  v11.3: رابط الرسالة المصدر عند إسقاط الخادم
-                                  لكيان tg://user)
-        MessageEntityBlockquote → نص الرسالة (الضغط عليه → Copy Text)
+    الكيانات (v11.6 — بلا blockquote حصراً حسب المواصفة):
+        MessageEntityTextUrl → الاسم فقط (الرابط الداخلي selected_url،
+        أو name_url_override — حزمة الإصلاح الذاتي v11.3: رابط الرسالة
+        المصدر عند إسقاط الخادم لكيان tg://user).
     """
     display = str(display_name or "").strip() or "مستخدم"
     raw = str(message_text or "")
     if len(raw) > max(64, int(plain_budget)):
         raw = raw[: max(64, int(plain_budget)) - 1].rstrip() + "…"
 
-    plain_text = f"{SENDER_LABEL}{display}\n\n💬:\n{raw}"
+    uname = getattr(target, "username", None) if target is not None else None
+    plain_text = (
+        f"{SENDER_LABEL}{display}{build_username_suffix(uname)}"
+        f"\n\n{MSG_TEXT_LABEL}\n\n{raw}"
+    )
     entities: List[Any] = []
 
     try:
         name_off = utf16_len(SENDER_LABEL)
         name_len = utf16_len(display)
-        # v11.5 (مواصفة §7): سطر «💬:» مستعاد بين الاسم والنص —
-        # 👤: الاسم ← (فارغ) ← 💬: ← النص. إزاحة النص = بعد "\n\n💬:\n".
-        text_off = name_off + name_len + utf16_len("\n\n💬:\n")
         name_url = (str(name_url_override).strip() if name_url_override else None) or (
             target.selected_url if target is not None else None
         )
         if target is not None and name_url and MessageEntityTextUrl is not None:
             entities.append(
                 MessageEntityTextUrl(offset=name_off, length=name_len, url=name_url)
-            )
-        if raw and MessageEntityBlockquote is not None:
-            entities.append(
-                MessageEntityBlockquote(offset=text_off, length=utf16_len(raw))
             )
     except Exception as e:  # الكيانات ميزة — فشلها لا يكسر الإرسال
         logger.debug(f"contact_target entity pack failed: {type(e).__name__}: {e}")

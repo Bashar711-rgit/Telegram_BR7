@@ -495,9 +495,9 @@ async def test_do_send_advances_to_next_tier_on_invalid(db):
     assert ius and ius[0].user_id == data["sender_id"]
     # the winning tier must NOT carry the hash the account rejected
     assert getattr(ius[0], "access_hash", None) != GOOD_HASH
-    # wire text is the parsed v10.8 message: same content & field order
-    assert "أحمد" in final["text"] and "👤: " in final["text"]
-    assert "👤" in final["text"]
+    # wire text is the parsed v11.6 message: same content & field order
+    assert "أحمد" in final["text"] and "المرسل: " in final["text"]
+    assert "نص الرسالة:" in final["text"]
 
 
 @pytest.mark.asyncio

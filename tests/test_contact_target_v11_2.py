@@ -166,10 +166,10 @@ class TestContactTargetCore:
 
 class TestClickableName:
     def test_html_name_clickable_no_raw_url_visible(self):
-        """spec #3/#14: المستخدم يرى «👤: نواف» فقط — الرابط داخل href."""
+        """spec #3/#14: المستخدم يرى «المرسل: نواف» فقط — الرابط داخل href."""
         built = build_alert_html(_data())
-        # السطر الظاهر: الاسم فقط بين وسوم الرابط
-        assert built["text"].startswith("👤: <a href=\"tg://user?id=5601276336\">نواف محمد</a>\n")
+        # السطر الظاهر: الاسم فقط بين وسوم الرابط (قالب v11.6)
+        assert built["text"].startswith("المرسل: <a href=\"tg://user?id=5601276336\">نواف محمد</a>\n")
         # لا رابط خام خارج الوسوم: بعد إزالة قيم href لا يبقى أي tg:// أو t.me
         import re as _re
         visible = _re.sub(r'href="[^"]*"', "", built["text"])
@@ -181,7 +181,9 @@ class TestClickableName:
         built = build_alert_html(_data())
         t = built["contact_target"]
         name_url = built["text"].split('href="')[1].split('"')[0]
-        button_url = built["buttons"][0][0]["url"]
+        button_url = next(
+            b["url"] for b in built["buttons"][0] if b["text"] == "مراسلة"
+        )
         assert name_url == button_url == t.selected_url
 
     def test_entity_pack_utf16_offsets(self):
@@ -192,12 +194,13 @@ class TestClickableName:
         ents = pack["formatting_entities"]
         kinds = {type(e).__name__: e for e in ents}
         name_ent = kinds["MessageEntityTextUrl"]
-        assert name_ent.offset == utf16_len("👤: ") == 4
+        from contact_target import SENDER_LABEL as _SL
+        assert name_ent.offset == utf16_len(_SL) == 8
         assert name_ent.length == utf16_len("نواف محمد")
         assert name_ent.url == f"tg://user?id={SENDER_ID}"
-        # القالب نفسه (v11.5 spec §7: الاسم ← (فارغ) ← 💬: ← النص)
-        assert pack["plain_text"].startswith("👤: نواف محمد\n\n💬:\nنص الرسالة")
-        assert "💬:" in pack["plain_text"]
+        # القالب نفسه (v11.6): الاسم ← (فارغ) ← نص الرسالة: ← النص
+        assert pack["plain_text"].startswith("المرسل: نواف محمد\n\nنص الرسالة:\n\nنص الرسالة")
+        assert "👤" not in pack["plain_text"] and "💬" not in pack["plain_text"]
 
     def test_entity_pack_without_target_plain(self):
         """بلا هدف → نص عادي بلا كيان رابط (فشل-آمن)."""
@@ -220,9 +223,10 @@ class TestClickableName:
         name_ents = [e for e in ents if type(e).__name__ == "MessageEntityTextUrl"]
         assert len(name_ents) == 1
         assert name_ents[0].url == "https://t.me/c/1234567890/77"
-        assert name_ents[0].offset == 4
-        # النص الظاهر لا يتغير إطلاقاً — الرابط الداخلي فقط (v11.5: مع سطر 💬)
-        assert pack["plain_text"] == "👤: نواف محمد\n\n💬:\nنص الرسالة"
+        from contact_target import SENDER_LABEL as _SL
+        assert name_ents[0].offset == utf16_len(_SL)
+        # النص الظاهر لا يتغير إطلاقاً — الرابط الداخلي فقط (قالب v11.6)
+        assert pack["plain_text"] == "المرسل: نواف محمد\n\nنص الرسالة:\n\nنص الرسالة"
 
     def test_entity_pack_rule_tag_appended(self):
         pack = build_alert_entity_pack("نواف", "نص",
@@ -299,11 +303,13 @@ class _FakeAlertBot(AlertBot):
             status, body = self._responses.pop(0)
         else:
             status, body = 200, {"ok": True}
-        # v11.3: استجابة صحية افتراضياً — كيان الاسم عند الموضع 4 حتى لا
-        # ينطلق الإصلاح الذاتي في اختبارات لا تعنيه.
+        # v11.3 (v11.6): استجابة صحية افتراضياً — كيان الاسم عند موضع
+        # ترويسة القالب من المصدر الموحد حتى لا ينطلق الإصلاح الذاتي في
+        # اختبارات لا تعنيه.
         if status == 200 and body.get("ok") and method == "sendMessage":
+            from contact_target import SENDER_LABEL as _SL, utf16_len as _u16
             body.setdefault("result", {}).setdefault("entities", [
-                {"type": "text_link", "offset": 4, "length": 9, "url": "https://t.me/test"}
+                {"type": "text_link", "offset": _u16(_SL), "length": 9, "url": "https://t.me/test"}
             ])
         return status, body
 
@@ -316,8 +322,8 @@ class TestAlertBotSend:
         assert ok is True and method == "username" and reason == ""
         sent = bot.calls[0]["payload"]
         assert sent["parse_mode"] == "HTML"
-        # لا رابط خام في النص الظاهر (داخل href فقط)
-        assert sent["text"].startswith("👤: <a href=\"https://t.me/iesk1\">")
+        # لا رابط خام في النص الظاهر (داخل href فقط) — قالب v11.6 مع @username
+        assert sent["text"].startswith("المرسل: <a href=\"https://t.me/iesk1\">نواف محمد</a> — @iesk1\n")
 
     @pytest.mark.asyncio
     async def test_send_user_id_button_without_username(self):
@@ -366,8 +372,8 @@ class TestAlertBotSend:
             for e in ents
         )
         # النص الظاهر في الطبقة الاحتياطية يطابق القالب (بلا وسوم HTML)
-        # v11.5 (spec §7): الاسم ثم «💬:» ثم النص مباشرة
-        assert call["text"].startswith("👤: نواف محمد\n\n💬:\n")
+        # v11.6: الاسم ثم «نص الرسالة:» ثم النص مباشرة
+        assert call["text"].startswith("المرسل: نواف محمد\n\nنص الرسالة:\n\n")
 
     @pytest.mark.asyncio
     async def test_no_token_safe_fallback(self):
@@ -380,8 +386,8 @@ class TestAlertBotSend:
     async def test_alert_never_lost_on_avatar_failure(self):
         """spec #21: الصورة optional — فشلها لا يمنع الاسم ولا الزر."""
         built = build_alert_html(_data(sender_photo_available=False))
-        assert built["text"].startswith("👤: <a href=\"tg://user?id=5601276336\">نواف محمد</a>")
-        assert built["buttons"][0][0]["text"] == "مراسلة"
+        assert built["text"].startswith("المرسل: <a href=\"tg://user?id=5601276336\">نواف محمد</a>")
+        assert "مراسلة" in [b["text"] for b in built["buttons"][0]]
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -536,21 +542,23 @@ class TestSpecTenCases:
         """Test 1: username=@iesk1 + user_id → اسم clickable + زر موجود."""
         built = build_alert_html(_data(sender_id=123456789, sender_username="@iesk1"))
         assert 'href="https://t.me/iesk1"' in built["text"]
-        assert built["buttons"][0][0] == {"text": "مراسلة", "url": "https://t.me/iesk1"}
+        assert {"text": "مراسلة", "url": "https://t.me/iesk1"} in built["buttons"][0]
+        assert built["text"].startswith("المرسل: <a href=\"https://t.me/iesk1\">نواف محمد</a> — @iesk1\n")
 
     def test_case2_no_username_uid_5601276336(self):
         """Test 2: username=None + user_id=5601276336 → clickable عبر user_id."""
         built = build_alert_html(_data(sender_id=5601276336, sender_first_name="نواف",
                                        sender_last_name=None))
         assert 'href="tg://user?id=5601276336"' in built["text"]
-        assert built["buttons"][0][0]["url"] == "tg://user?id=5601276336"
+        assert "tg://user?id=5601276336" in [b["url"] for b in built["buttons"][0]]
+        assert "— @" not in built["text"]  # بلا username → لا لاحقة مُختلقّة
 
     def test_case3_no_username_uid_1630216165(self):
         """Test 3: username=None + user_id=1630216165 → نفس المطلوب."""
         built = build_alert_html(_data(sender_id=1630216165, sender_first_name="أحمد",
                                        sender_last_name=None))
         assert 'href="tg://user?id=1630216165"' in built["text"]
-        assert built["buttons"][0][0]["url"] == "tg://user?id=1630216165"
+        assert "tg://user?id=1630216165" in [b["url"] for b in built["buttons"][0]]
 
     def test_case4_cached_user_no_api(self):
         """Test 4: cached → لا API request — مغطى في TestEntityCache.test_cache_hit_no_api_request."""
@@ -588,7 +596,7 @@ class TestSpecTenCases:
         built = build_alert_html(_data(sender_photo_available=False,
                                        sender_is_deleted=False))
         assert built["contact_method"] == "mention_button"
-        assert built["buttons"][0][0]["text"] == "مراسلة"
+        assert "مراسلة" in [b["text"] for b in built["buttons"][0]]
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -694,12 +702,13 @@ class TestMetrics:
 
 class TestFinalTemplate:
     def test_exact_shape(self):
-        """الشكل النهائي الفعّال (v11.5 spec §7): 👤: الاسم ← (فارغ) ← 💬: ← النص ← [مراسلة][عرض]."""
+        """الشكل النهائي الفعّال (v11.6): المرسل: الاسم ← (فارغ) ← نص الرسالة: ← النص ← [عرض][مراسلة]."""
         built = build_alert_html(_data())
-        expected_head = "👤: <a href=\"tg://user?id=5601276336\">نواف محمد</a>\n\n💬:\n<blockquote>نص الرسالة الأصلي</blockquote>"
+        expected_head = ("المرسل: <a href=\"tg://user?id=5601276336\">نواف محمد</a>"
+                         "\n\nنص الرسالة:\n\nنص الرسالة الأصلي")
         assert built["text"] == expected_head
         assert [[b["text"] for b in row] for row in built["buttons"]] == [
-            ["مراسلة", "عرض الرسالة"]
+            ["عرض الرسالة", "مراسلة"]
         ]
 
     def test_monitor_build_alert_uses_same_target(self):
@@ -716,6 +725,10 @@ class TestFinalTemplate:
                                         last_name="محمد")
         text, buttons = m._build_alert(sender, chat, "واجب", "النص", {},
                                        contact_target=target)
-        assert text == ("👤: <a href=\"tg://user?id=5601276336\">نواف محمد</a>\n\n💬:\n"
-                        "<blockquote>النص</blockquote>")
-        assert buttons is None  # الأزرار من بوت التنبيهات فقط (عقد v10.8)
+        assert text == ("المرسل: <a href=\"tg://user?id=5601276336\">نواف محمد</a>\n\n"
+                        "نص الرسالة:\n\nالنص")
+        # v11.6: نفس اللوحة لكل المسارات (عرض ← مراسلة من هدف ContactTarget)
+        assert buttons == [[
+            {"text": "عرض الرسالة", "url": f"https://t.me/c/111222333/{MSG_ID}"},
+            {"text": "مراسلة", "url": f"tg://user?id={SENDER_ID}"},
+        ]]

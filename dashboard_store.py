@@ -83,7 +83,7 @@ SETTINGS_SCHEMA: Dict[str, Dict[str, Any]] = {
         "label": "أزرار التنبيه (مراسلة / عرض الرسالة)", "type": bool,
         "min": None, "max": None,
         "cfg": "ALERT_WITH_BUTTONS", "limiter": False, "group": "alerts",
-        "note": "زرّا 💬 مراسلة و📨 عرض الرسالة أسفل كل تنبيه — يُطبَّق فوراً على التنبيه القادم.",
+        "note": "زرّا «عرض الرسالة» و«مراسلة» أسفل كل تنبيه — يُطبَّق فوراً على التنبيه القادم.",
     },
     "alert_with_copy_button": {
         "label": "زر نسخ النص 📋", "type": bool,

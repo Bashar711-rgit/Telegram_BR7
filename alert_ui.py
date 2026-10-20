@@ -38,7 +38,7 @@ from telethon.sessions import StringSession
 
 # v11.3: فحص قابلية نقر اسم المرسل + الإصلاح الذاتي — المصدر الموحد للموضع
 # (contact_target) حتى لا يتشعب حساب الإزاحة في ملفات متعددة.
-from contact_target import SENDER_LABEL, utf16_len  # noqa: E402
+from contact_target import SENDER_LABEL, metric_inc, utf16_len  # noqa: E402
 
 try:  # Telethon ≥ 1.45 — طبقة الأزرار المُعاد هيكلتها
     from telethon.tl.types import (
@@ -275,7 +275,44 @@ class AlertBotClient:
         except RPCError as e:
             msg = (getattr(e, "message", "") or type(e).__name__).upper()
             if any(code in msg for code in _BUTTON_RETRY_ERRORS) and markup is not None:
-                logger.warning(f"⚠️ AlertBotClient button rejected ({msg[:80]}) — إعادة بدون أزرار")
+                # v11.6: لا إسقاط صامت للوحة — أولاً إعادة بلوحة t.me فقط
+                # (أزرار tg:// هي المشتبه الأرجح)، والنسخة النصية آخر منفذ
+                # موثق بعد رفض اللوحة المصقولة أيضاً (لوج + عداد صادق).
+                try:
+                    rows = [
+                        [b for b in row
+                         if str(b.get("url") or "").startswith("https://t.me/")]
+                        for row in (buttons or [])
+                    ]
+                    rows = [r for r in rows if r]
+                    sanitized = self._convert_markup(rows) if rows else None
+                except Exception:
+                    sanitized = None
+                if sanitized is not None:
+                    logger.warning(
+                        f"⚠️ AlertBotClient button rejected ({msg[:80]}) — "
+                        "إعادة بلوحة t.me فقط (بدون أزرار tg://)"
+                    )
+                    try:
+                        if formatting_entities:
+                            await self.client.send_message(
+                                chat, text_html, buttons=sanitized,
+                                formatting_entities=formatting_entities,
+                                link_preview=False,
+                            )
+                        else:
+                            await self.client.send_message(
+                                chat, text_html, parse_mode="html",
+                                buttons=sanitized, link_preview=False
+                            )
+                        return True
+                    except Exception:
+                        pass  # اللوحة المصقولة رُفضت أيضاً → النص أدناه
+                metric_inc("user_buttons_dropped")
+                logger.warning(
+                    f"[ALERT] buttons=dropped (AlertBotClient) reason={msg[:80]} "
+                    "— إعادة نصاً مع روابط الترويسة (قيد تيليجرام الموثق)"
+                )
                 try:
                     if formatting_entities:
                         await self.client.send_message(

@@ -438,11 +438,16 @@ class TestFrozenBuilderIntegration:
                 "group_link": "https://t.me/mygroup", "msg_link": "https://t.me/mygroup/789"}
         alert, buttons = monitor._build_alert(sender, chat, "واجب", "نص التنبيه", {"msg_hash": "h1"})
         assert '<a href="https://t.me/ahmed_99">أحمد</a>' in alert
-        # القالب الموحد v11.5 (spec §7): الاسم ← (فارغ) ← «💬:» ← النص كاملاً
-        assert '\n\n💬:\n<blockquote>نص التنبيه</blockquote>' in alert
-        assert '💬:' in alert
+        # القالب الموحد v11.6: الاسم ← (فارغ) ← «نص الرسالة:» ← النص كاملاً بلا إطار
+        assert '\n\nنص الرسالة:\n\nنص التنبيه' in alert
+        assert '<blockquote>' not in alert and '💬' not in alert and '👤' not in alert
+        assert "— @ahmed_99" in alert  # الـusername نص مستقل بجانب الاسم
         assert "رابط الرسالة" not in alert  # الروابط في الأزرار الآن
-        assert buttons is None  # الأزرار من بوت التنبيهات فقط
+        # v11.6: نفس اللوحة لكل المسارات — [ عرض الرسالة ][ مراسلة ]
+        assert buttons == [[
+            {"text": "عرض الرسالة", "url": "https://t.me/mygroup/789"},
+            {"text": "مراسلة", "url": "https://t.me/ahmed_99"},
+        ]]
 
     async def test_no_username_uses_recovered_db_username(self, monitor):
         """مرسل بلا username في الحدث لكن له اسم محفوظ → الرابط t.me بدل

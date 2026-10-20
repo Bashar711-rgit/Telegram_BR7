@@ -54,32 +54,32 @@ import pytest  # noqa: E402
 GOLDEN = {
     "S1_username_chat": {
         "alert": (
-            '👤: <a href="https://t.me/ahmed_99">أحمد محمد</a>'
-            '\n\n💬:\n'
-            '<blockquote>أبي مساعدة في واجب الاحصاء ضروري</blockquote>'
+            'المرسل: <a href="https://t.me/ahmed_99">أحمد محمد</a> — @ahmed_99'
+            '\n\nنص الرسالة:\n\n'
+            'أبي مساعدة في واجب الاحصاء ضروري'
         ),
-        # أزرار بوت التنبيهات: صف واحد بترتيب RTL
+        # أزرار بوت التنبيهات: صف واحد بالترتيب الحرفي v11.6
         "bot_buttons": [
-            {"text": "مراسلة", "url": "https://t.me/ahmed_99"},
             {"text": "عرض الرسالة", "url": "https://t.me/mygroup/123"},
+            {"text": "مراسلة", "url": "https://t.me/ahmed_99"},
         ],
     },
     "S2_private_chat": {
         "alert": (
-            '👤: <a href="tg://user?id=777000222">سارة</a>'
-            '\n\n💬:\n'
-            '<blockquote>أبي مساعدة في واجب الاحصاء ضروري</blockquote>'
+            'المرسل: <a href="tg://user?id=777000222">سارة</a>'
+            '\n\nنص الرسالة:\n\n'
+            'أبي مساعدة في واجب الاحصاء ضروري'
         ),
         "bot_buttons": [
-            {"text": "مراسلة", "url": "tg://user?id=777000222"},
             {"text": "عرض الرسالة", "url": "https://t.me/c/1234567890/456"},
+            {"text": "مراسلة", "url": "tg://user?id=777000222"},
         ],
     },
     "S3_no_username_hash": {
         "alert": (
-            '👤: <a href="tg://user?id=888000333">خالد</a>'
-            '\n\n💬:\n'
-            '<blockquote>أبي مساعدة في واجب الاحصاء ضروري</blockquote>'
+            'المرسل: <a href="tg://user?id=888000333">خالد</a>'
+            '\n\nنص الرسالة:\n\n'
+            'أبي مساعدة في واجب الاحصاء ضروري'
         ),
         # بلا روابط → يختفي زر «عرض الرسالة» بصدق (لا روابط وهمية)
         "bot_buttons": [
@@ -88,13 +88,13 @@ GOLDEN = {
     },
     "S4_unknown_title": {
         "alert": (
-            '👤: <a href="https://t.me/user_x">مستخدم</a>'
-            '\n\n💬:\n'
-            '<blockquote>أبي مساعدة في واجب الاحصاء ضروري</blockquote>'
+            'المرسل: <a href="https://t.me/user_x">مستخدم</a> — @user_x'
+            '\n\nنص الرسالة:\n\n'
+            'أبي مساعدة في واجب الاحصاء ضروري'
         ),
         "bot_buttons": [
-            {"text": "مراسلة", "url": "https://t.me/user_x"},
             {"text": "عرض الرسالة", "url": "https://t.me/eng_group/789"},
+            {"text": "مراسلة", "url": "https://t.me/user_x"},
         ],
     },
 }
@@ -134,7 +134,8 @@ class TestAlertRegression:
         }
         alert, buttons = monitor._build_alert(sender, chat, "واجب", TEXT, {"msg_hash": "abc123"})
         assert alert == GOLDEN["S1_username_chat"]["alert"]
-        assert buttons is None
+        # v11.6: أزرار حقيقية من الدالة المركزية — لكل المسارات
+        assert buttons == [GOLDEN["S1_username_chat"]["bot_buttons"]]
         built = build_alert_html(
             {"sender_id": 555000111, "sender_username": "ahmed_99", "sender_display": "أحمد محمد", "text": TEXT,
              "chat_id": -1001234567890, "message_id": 123, "chat_username": "mygroup"},
@@ -151,7 +152,7 @@ class TestAlertRegression:
         }
         alert, buttons = monitor._build_alert(sender, chat, "واجب", TEXT, {"msg_hash": "abc123"})
         assert alert == GOLDEN["S2_private_chat"]["alert"]
-        assert buttons is None
+        assert buttons == [GOLDEN["S2_private_chat"]["bot_buttons"]]
         built = build_alert_html(
             {"sender_id": 777000222, "sender_username": None, "sender_display": "سارة", "text": TEXT,
              "chat_id": -1001234567890, "message_id": 456, "chat_username": None},
@@ -165,7 +166,8 @@ class TestAlertRegression:
         chat = {"group_link": "#", "title": None, "msg_link": "#"}
         alert, buttons = monitor._build_alert(sender, chat, "واجب", TEXT, {"msg_hash": "abc123"})
         assert alert == GOLDEN["S3_no_username_hash"]["alert"]
-        assert buttons is None
+        # بلا روابط → زر «عرض الرسالة» يختفي بصدق ويبقى مراسلة فقط
+        assert buttons == [GOLDEN["S3_no_username_hash"]["bot_buttons"]]
         # بلا chat_id/message_id في chat → لا رابط قروب → الزران يُحذفان بصدق
         built = build_alert_html(
             {"sender_id": 888000333, "sender_username": None, "sender_display": "خالد", "text": TEXT},
@@ -181,7 +183,7 @@ class TestAlertRegression:
         }
         alert, buttons = monitor._build_alert(sender, chat, "واجب", TEXT, {"msg_hash": "abc123"})
         assert alert == GOLDEN["S4_unknown_title"]["alert"]
-        assert buttons is None
+        assert buttons == [GOLDEN["S4_unknown_title"]["bot_buttons"]]
         built = build_alert_html(
             {"sender_id": 999000444, "sender_username": "user_x", "sender_display": "مستخدم", "text": TEXT,
              "chat_id": -1009876543210, "message_id": 789, "chat_username": "eng_group"},
@@ -223,7 +225,7 @@ class TestAlertRegression:
                 sender, chat, "واجب", TEXT,
                 {"msg_hash": "abc123", "rule_tag": "قاعدة"},
             )
-            assert buttons is None
+            assert buttons == [GOLDEN["S1_username_chat"]["bot_buttons"]]
             assert "cnt_abc123" not in alert
             assert "copy_abc123" not in alert
             # سطر القاعدة (ميزة محفوظة) يُلاحق في النهاية بعد البطاقة
@@ -248,9 +250,10 @@ class TestAlertRegression:
 
             async def _post(self, method, payload):
                 self.captured = (method, payload)
-                # استجابة واقعية: كيان text_link عند موضع الاسم (offset=4)
+                # استجابة واقعية: كيان text_link عند موضع الاسم (offset الترويسة)
+                from contact_target import SENDER_LABEL as _SL, utf16_len as _u16
                 return 200, {"ok": True, "result": {"message_id": 11, "entities": [
-                    {"type": "text_link", "offset": 4, "length": 9, "url": "https://t.me/ahmed_99"},
+                    {"type": "text_link", "offset": _u16(_SL), "length": 9, "url": "https://t.me/ahmed_99"},
                 ]}}
 
         bot = _CaptureBot()
@@ -301,11 +304,14 @@ class TestAlertRegression:
         methods = [m for m, _ in bot.methods]
         assert "editMessageText" in methods
         edit_payload = next(p for m, p in bot.methods if m == "editMessageText")
-        # نفس النص لكن رابط الاسم صار رابط الرسالة المصدر
-        assert edit_payload["text"].startswith('👤: <a href="https://t.me/c/1234567890/456">سارة</a>')
-        assert "<blockquote>" in edit_payload["text"]
-        # نفس الأزرار بقيت على الرسالة المعدّلة
-        assert edit_payload["reply_markup"]["inline_keyboard"][0][0]["url"] == "tg://user?id=777000222"
+        # نفس النص لكن رابط الاسم صار رابط الرسالة المصدر (قالب v11.6)
+        assert edit_payload["text"].startswith('المرسل: <a href="https://t.me/c/1234567890/456">سارة</a>')
+        assert "نص الرسالة:" in edit_payload["text"]
+        assert "<blockquote>" not in edit_payload["text"]
+        # نفس الأزرار بقيت على الرسالة المعدّلة — الزران (عرض ثم مراسلة)
+        row = edit_payload["reply_markup"]["inline_keyboard"][0]
+        assert row[0]["url"] == "https://t.me/c/1234567890/456"
+        assert "tg://user?id=777000222" in [b["url"] for b in row]
 
     @pytest.mark.asyncio
     async def test_bot_api_no_edit_when_name_entity_present(self, monitor):
@@ -319,8 +325,9 @@ class TestAlertRegression:
 
             async def _post(self, method, payload):
                 self.methods.append(method)
+                from contact_target import SENDER_LABEL as _SL, utf16_len as _u16
                 return 200, {"ok": True, "result": {"message_id": 33, "entities": [
-                    {"type": "text_link", "offset": 4, "length": 4, "url": "tg://user?id=777000222"},
+                    {"type": "text_link", "offset": _u16(_SL), "length": 4, "url": "tg://user?id=777000222"},
                 ]}}
 
         bot = _HealthyBot()

@@ -257,17 +257,31 @@ class _FakeLiveClient:
 
 class TestSendLadder:
     @pytest.mark.asyncio
-    async def test_generic_button_error_retries_text_only(self):
-        """BUTTON_URL_INVALID → إعادة بدون أزرار عبر Bot API — التنبيه يُسلَّم."""
+    async def test_generic_button_error_no_text_only_success(self):
+        """v11.6 §5.7: BUTTON_URL_INVALID على لوحة t.me فقط = فشل مؤكد →
+        سلّم الإرسال الاحتياطي (لا نسخة نصية تُحسب نجاحاً)."""
+        bot = _FakeAlertBot([
+            (400, {"ok": False, "description": "Bad Request: BUTTON_URL_INVALID"}),
+        ])
+        ok, method, reason = await bot.send(_data(sender_username="user1"))
+        # بلا أزرار tg:// ليُسقطها → لا إعادة نصية بلا أزرار — فشل للمسلّم التالي
+        assert ok is False and "BUTTON_URL_INVALID" in reason
+        assert len(bot.calls) == 1
+        assert "reply_markup" in bot.calls[0]["payload"]
+
+    @pytest.mark.asyncio
+    async def test_generic_button_error_drops_tg_buttons_first(self):
+        """v11.6: رفض عام مع أزرار tg:// → إعادة بلوحة t.me فقط (بقاء زر العرض)."""
         bot = _FakeAlertBot([
             (400, {"ok": False, "description": "Bad Request: BUTTON_URL_INVALID"}),
             (200, {"ok": True}),
         ])
-        ok, method, reason = await bot.send(_data(sender_username="user1"))
-        assert ok is True and method == "text_only" and reason == ""
+        ok, method, reason = await bot.send(_data())  # بلا username → زر مراسلة tg://user
+        assert ok is True and reason == ""
         assert len(bot.calls) == 2
-        assert "reply_markup" not in bot.calls[1]["payload"]
-        assert "reply_markup" in bot.calls[0]["payload"]
+        kb1 = (bot.calls[1]["payload"].get("reply_markup") or {}).get("inline_keyboard", [[]])[0]
+        # أزرار tg:// أُسقطت — ما بقي لوحة t.me صالحة
+        assert all(str(b["url"]).startswith("https://t.me/") for b in kb1)
 
     @pytest.mark.asyncio
     async def test_persistent_button_error_uses_live_client(self):
@@ -281,9 +295,9 @@ class TestSendLadder:
         ok, method, reason = await bot.send(_data(sender_username="user1"))
         assert ok is True and method == "text_only"
         assert len(fake.sent) == 1
-        # الأزرار الأربعة وصلت للعميل نفسها (بنية build_alert_buttons)
+        # الأزرار وصلت للعميل نفسها (بنية build_alert_buttons — ترتيب v11.6)
         row = fake.sent[0][1][0]
-        assert [b["text"] for b in row] == ["مراسلة", "عرض الرسالة"]
+        assert [b["text"] for b in row] == ["عرض الرسالة", "مراسلة"]
 
     @pytest.mark.asyncio
     async def test_bot_api_failure_client_fallback_success(self):
@@ -382,8 +396,9 @@ class TestNameEntityHeal:
                 return True
 
             async def send_message(self, chat, text, **kw):
+                from contact_target import SENDER_LABEL as _SL, utf16_len as _u16
                 return SimpleNamespace(id=56, entities=[
-                    MessageEntityTextUrl(offset=4, length=11, url="tg://user?id=6079171409"),
+                    MessageEntityTextUrl(offset=_u16(_SL), length=11, url="tg://user?id=6079171409"),
                 ])
 
             async def edit_message(self, chat, **kw):

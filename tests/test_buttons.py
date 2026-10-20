@@ -171,13 +171,13 @@ class TestBuildDynamicButtons:
 
 
 class TestBuildAlertButtons:
-    """v10.8/v10.9: حُذف Button.inline/Button.url (cnt_/copy_) من مسار
-    التنبيه بالكامل — _build_alert يعيد buttons=None دائماً (حسابات
-    المستخدمين لا ترسل أزراراً). الأزرار الأربعة الموحدة
-    [مراسلة][عرض][نسخ][القروب] (نصوص مصغّرة v10.9.1) تُبنى في alert_bot عبر
-    build_alert_buttons وتُرسل عبر بوت التنبيهات (Bot API). دالة
-    build_dynamic_buttons محفوظة كدالة ميزة (تُختبر في
-    TestBuildDynamicButtons أعلاه) ولم تعد تُستدعى من مسار التنبيهات.
+    """v11.6: _build_alert يعيد لوحة الأزرار الحقيقية من build_alert_buttons
+    — [ عرض الرسالة ][ مراسلة ] صف واحد — لكل المسارات: البوت عبر
+    reply_markup، وحسابات المستخدمين الاحتياطية بمحاولة إرفاق فعلية
+    (تدهور صادق موثق عند رفض الخادم). بلا أزرار callback (cnt_/copy_)
+    في مسار التنبيه إطلاقاً. build_dynamic_buttons دالة ميزة محفوظة
+    (تُختبر في TestBuildDynamicButtons أعلاه) ولم تعد تُستدعى من مسار
+    التنبيهات.
     """
 
     @pytest.mark.asyncio
@@ -191,7 +191,11 @@ class TestBuildAlertButtons:
             chat = {"group_link": "https://t.me/g", "title": "ت", "msg_link": "https://t.me/g/7",
                     "id": -100123, "message_id": 7, "username": "g"}
             alert, buttons = monitor._build_alert(sender, chat, "ك", "نص", {"msg_hash": "xyz"})
-            assert buttons is None
+            # v11.6: اللوحة الحقيقية تُعاد لكل المسارات — بلا callback أزرار
+            assert buttons == [[
+                {"text": "عرض الرسالة", "url": "https://t.me/g/7"},
+                {"text": "مراسلة", "url": "https://t.me/ahmed_99"},
+            ]]
             assert "cnt_xyz" not in alert and "copy_xyz" not in alert
         finally:
             object.__setattr__(CFG, "ALERT_BUTTONS_ENABLED", old)
@@ -204,11 +208,15 @@ class TestBuildAlertButtons:
         chat = {"group_link": "https://t.me/g", "title": "ت", "msg_link": "https://t.me/g/7",
                 "id": -100123, "message_id": 7, "username": "g"}
         alert, buttons = monitor._build_alert(sender, chat, "ك", "نص", {"msg_hash": "x"})
-        assert buttons is None
-        # القالب الموحد v11.5 (spec §7): الترويسة ثم «💬:» ثم النص
+        assert buttons == [[
+            {"text": "عرض الرسالة", "url": "https://t.me/g/7"},
+            {"text": "مراسلة", "url": "https://t.me/ahmed_99"},
+        ]]
+        # القالب الموحد v11.6: «المرسل: الاسم — @username / نص الرسالة:»
         assert 'href="https://t.me/ahmed_99"' in alert
-        assert '\n\n💬:\n<blockquote>نص</blockquote>' in alert
-        assert '💬:' in alert  # v11.5: سطر 💬 مستعاد وفق §7
+        assert "— @ahmed_99" in alert
+        assert '\n\nنص الرسالة:\n\nنص' in alert
+        assert "👤" not in alert and "💬" not in alert and "<blockquote>" not in alert
         assert "رابط الرسالة" not in alert
 
     @pytest.mark.asyncio
@@ -220,7 +228,8 @@ class TestBuildAlertButtons:
         try:
             object.__setattr__(CFG, "ALERT_WITH_BUTTONS", False)
             _, buttons = monitor._build_alert(sender, chat, "ك", "نص", {"msg_hash": "x"})
-            assert buttons is None
+            # v11.6: المفتاح القديم لا يمنع لوحة v11.6 المركزية
+            assert buttons and buttons[0][0]["text"] == "عرض الرسالة"
         finally:
             object.__setattr__(CFG, "ALERT_WITH_BUTTONS", True)
 
@@ -231,7 +240,11 @@ class TestBuildAlertButtons:
         sender = {"id": 1, "display": "أ", "username": "u", "access_hash": None}
         chat = {"id": -1001, "message_id": 2, "username": "g"}
         _, buttons = monitor._build_alert(sender, chat, "ك", "نص", {"msg_hash": "x"})
-        assert buttons is None
+        # v11.6: لا أزرار نسخ في أي مسار — اللوحة URL حصراً
+        assert buttons == [[
+            {"text": "عرض الرسالة", "url": "https://t.me/g/2"},
+            {"text": "مراسلة", "url": "tg://user?id=1"},
+        ]]
 
     @pytest.mark.asyncio
     async def test_contact_button_flag_preserved(self, monitor):
@@ -240,7 +253,11 @@ class TestBuildAlertButtons:
         sender = {"id": 1, "display": "أ", "username": "u", "access_hash": None}
         chat = {"id": -1001, "message_id": 2, "username": "g"}
         _, buttons = monitor._build_alert(sender, chat, "ك", "نص", {"msg_hash": "x"})
-        assert buttons is None
+        # v11.6: زر المراسلة tg://user من هدف ContactTarget الموحد
+        assert buttons == [[
+            {"text": "عرض الرسالة", "url": "https://t.me/g/2"},
+            {"text": "مراسلة", "url": "tg://user?id=1"},
+        ]]
 
     @pytest.mark.asyncio
     async def test_bot_path_buttons_in_one_row(self, monitor):
@@ -253,6 +270,6 @@ class TestBuildAlertButtons:
             msg_link="https://t.me/g/7", group_link="https://t.me/g",
         )
         assert built["buttons"] == [[
-            {"text": "مراسلة", "url": "https://t.me/ahmed_99"},
             {"text": "عرض الرسالة", "url": "https://t.me/g/7"},
+            {"text": "مراسلة", "url": "https://t.me/ahmed_99"},
         ]]

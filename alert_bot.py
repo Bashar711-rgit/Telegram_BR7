@@ -9,22 +9,21 @@ v11.2 (طلب المستخدم — نظام مراسلة المرسل): ContactT
 (MTProto) تمرر الكيانات جاهزة عبر formatting_entities فيبقى الاسم قابلًا
 للنقر بعد أن كان تيليثون يحذف tg://user?id صامتاً عند الـparse.
 
-القالب (مواصفة المستخدم §7 — v11.5 النهائي):
+القالب (مواصفة المستخدم v11.6 — القالب الحرفي):
 
-    👤: {اسم المرسل قابل للنقر}
+    المرسل: {اسم المرسل قابل للنقر}{ — @username}
     (سطر فارغ)
-    💬:
-    <blockquote>{النص الأصلي كاملاً - بلا حذف أجزاء}</blockquote>
+    نص الرسالة:
+    (سطر فارغ)
+    {النص الأصلي كاملاً - بلا حذف أجزاء وبلا إطار/اقتباس}
 
-    [ مراسلة ] [ عرض الرسالة ]
+    [ عرض الرسالة ] [ مراسلة ]   ← لوحة Inline فعلية أسفل التنبيه
 
-  * النسخ بالضغط على النص: النص داخل <blockquote> - في عملاء تيليجرام
-    الرسمية الضغط على منطقة quote يفتح قائمة فيها «Copy Text» (نسخ فعلي
-    للحافظة). هذه هي الآلية الرسمية الوحيدة لـ«الضغط على النص ليُنسخ» -
-    لا توجد أي API تجعل النص الحر يُنسخ بلمسة واحدة مباشرة.
-  * البطاقة (v11.5 §7): سطر «👤: الاسم» ثم (سطر فارغ) ثم سطر «💬:» ثم نص
-    الرسالة الأصلي كاملاً داخل <blockquote> — مع دعم العربية/RTL والحفاظ
-    على الأسطر والفقرات.
+  * بلا رموز 👤/💬 وبلا <blockquote> — النص الأصلي يظهر كما ورد (الأسطر
+    واللغة والرموز التعبيرية والروابط)، مهرباً HTML فقط كي تُعرض وسوم
+    المستخدم كنص عادي ولا تتلف بنية التنبيه.
+  * «— @username» نص مستقل بجانب الاسم يظهر فقط عند توفر username صالح —
+    لا يُختلق أبداً؛ والاسم وحده هو الرابط (ليس السطر كله ولا نص الرسالة).
   * النص الأصلي يُحفظ كاملاً (لا truncate(400)) - التقصير الوحيد المسموح
     هو حاجز حد تيليجرام 4096 حرفاً للرسالة كلها (مع "…" وتحذير في اللوج).
   * SENDER: username -> <a href="https://t.me/U">الاسم</a>؛ بدونه
@@ -99,9 +98,11 @@ from config import InputSanitizer
 # لا يُبنى رابط مرسل يدوياً في هذا الملف ولا في أي ملف آخر — ContactTarget
 # يقرر (username ← user_id ← لا شيء) ويستخدم الاسم والزر نفس selected_url.
 from contact_target import (  # noqa: E402
+    MSG_TEXT_LABEL,
     ContactTarget,
     SENDER_LABEL,
     build_alert_entity_pack,
+    build_username_suffix,
     metric_inc as _contact_metric,
     resolve_contact_target as _resolve_contact_target,
     utf16_len,
@@ -119,7 +120,8 @@ TELEGRAM_MAX_TEXT_LEN = 4096
 # داخل blockquote — الاسم نفسه رابط داخلي، والنسخ بالضغط على النص.
 MSG_LINK_UNAVAILABLE = "غير متاح"  # محتفظ به للتوافق الخلفي (لم يعد في النص)
 
-# نصوص الزرين (v11.1) — صف واحد: [ مراسلة ] [ عرض الرسالة ]
+# نصوص الزرين (v11.6) — صف واحد بالترتيب الحرفي للمواصفة:
+#     [ عرض الرسالة ] [ مراسلة ]
 BTN_CONTACT = "مراسلة"
 BTN_VIEW = "عرض الرسالة"
 
@@ -127,9 +129,12 @@ BTN_VIEW = "عرض الرسالة"
 # تبقى، ورابط الاسم يبقى في النص).
 BUTTON_USER_ERRORS = ("BUTTON_USER_INVALID", "BUTTON_USER_PRIVACY_RESTRICTED")
 
-# v11.0: أخطاء أزرار عامة أخرى — يُعاد الإرسال **بدون أزرار** (نص التنبيه
-# يبقى بروابطه القابلة للنقر في الترويسة) بدل إسقاط التنبيه كله على
-# المسار الاحتياطي. الهدف: التنبيه لا يضيع أبداً بسبب زر.
+# v11.6: أخطاء أزرار عامة أخرى — **لا يُعاد إرسال نسخة نصية بلا أزرار
+# باعتبارها نجاحاً** (مواصفة v11.6 §5.7). المحاولات بالترتيب:
+#   1) إعادة الإرسال بلوحة أزرار خالية من tg:// (t.me فقط — صالحة عالمياً)
+#   2) إن رُفضت هي الأخرى: فشل مؤكد → سلّم الإرسال الاحتياطي (AlertBotClient
+#      MTProto بالأزرار ثم حسابات المستخدمين) — التنبيه لا يضيع والأزرار
+#      لا تُسقط صامتة كنتيجة "نجاح".
 GENERIC_BUTTON_ERRORS = (
     "BUTTON_URL_INVALID",
     "BUTTON_DATA_INVALID",
@@ -212,12 +217,11 @@ def build_alert_buttons(
     contact_url: Optional[str] = None,
     sender_type: Optional[str] = None,
 ) -> List[List[Dict[str, Any]]]:
-    """══ الدالة المركزية الوحيدة لبناء أزرار التنبيه (v11.2) ══
+    """══ الدالة المركزية الوحيدة لبناء أزرار التنبيه (v11.6) ══
 
-    صف واحد بترتيب RTL («مراسلة» تظهر في أقصى اليمين في عملاء تيليجرام
-    العربية) — زران حسب مواصفة v11.1 + مصدر موحد v11.2:
+    صف واحد بالترتيب الحرفي لمواصفة v11.6:
 
-        [ مراسلة ] [ عرض الرسالة ]
+        [ عرض الرسالة ] [ مراسلة ]
 
     * الزر الذي تنعدم بياناته يُحذف كلياً (لا أزرار معطلة ولا روابط وهمية).
     * v11.2 (spec #16): contact_url من ContactTarget.selected_url — الاسم
@@ -238,7 +242,18 @@ def build_alert_buttons(
     except Exception:
         sid = 0
 
-    # 1) مراسلة — فتح محادثة المستخدم مباشرة (يمين الصف في عملاء RTL)
+    # 1) عرض الرسالة — الرسالة نفسها لا الصفحة الرئيسية؛ بدون رابط مباشر
+    #    نستخدم أفضل آلية متاحة (رابط القروب) بدل رابط وهمي.
+    #    (v11.6: الزر الأول في الصف حسب ترتيب المواصفة الحرفي.)
+    view_url = str(msg_link or "").strip()
+    if view_url in ("", "#"):
+        view_url = str(group_link or "").strip()
+    if view_url in ("", "#"):
+        view_url = ""
+    if view_url:
+        row.append({"text": BTN_VIEW, "url": view_url})
+
+    # 2) مراسلة — فتح محادثة المستخدم مباشرة.
     #    الزر لا يعتمد على username: بلا username يُستخدم tg://user?id
     #    (spec #15) أو الهدف الذي اختاره ContactTarget إن مرّر (spec #16).
     if include_user_button:
@@ -252,16 +267,6 @@ def build_alert_buttons(
             url = f"tg://user?id={sid}"
         if url:
             row.append({"text": BTN_CONTACT, "url": url})
-
-    # 2) عرض الرسالة — الرسالة نفسها لا الصفحة الرئيسية؛ بدون رابط مباشر
-    #    نستخدم أفضل آلية متاحة (رابط القروب) بدل رابط وهمي.
-    view_url = str(msg_link or "").strip()
-    if view_url in ("", "#"):
-        view_url = str(group_link or "").strip()
-    if view_url in ("", "#"):
-        view_url = ""
-    if view_url:
-        row.append({"text": BTN_VIEW, "url": view_url})
 
     return [row] if row else []
 
@@ -452,9 +457,11 @@ def build_alert_html(
     if len(display) > 128:
         display = display[:127] + "…"
 
-    # ── SENDER: سطر 1 ──
+    # ── سطر المرسل (v11.6): «المرسل: {اسم قابل للنقر}{ — @username}» ──
     # النص الظاهر ≠ الرابط (spec #14): لا يظهر للمستخدم أي https://t.me
-    # أو tg:// — الرابط يُحمل ككيان داخل الاسم فقط.
+    # أو tg:// — الرابط يُحمل كوسم anchor داخل الاسم حصراً (ليس السطر كله
+    # ولا نص الرسالة)، و«@username» نص مستقل بجانب الاسم لا يُختلق عند
+    # غيابه (مواصفة v11.6 §3.6/#3.7).
     if target.username_url:
         sender_html = f'<a href="{target.username_url}">{InputSanitizer.escape_html(display)}</a>'
         contact_method = "username"
@@ -464,6 +471,7 @@ def build_alert_html(
     else:
         sender_html = InputSanitizer.escape_html(display)
         contact_method = "text_only"
+    uname_suffix_html = build_username_suffix(target.username)
 
     # ── سطر «🏷 قاعدة» (ميزة محرك القواعد) — عند وجوده فقط ──
     rule_tag = (analysis or {}).get("rule_tag") if isinstance(analysis, dict) else None
@@ -471,17 +479,13 @@ def build_alert_html(
     if rule_tag:
         rule_part = f"\n\n🏷 قاعدة: {InputSanitizer.escape_html(str(rule_tag))}"
 
-    # ── بطاقة نص الرسالة: المحتوى الأصلي كاملاً (لا حذف أجزاء) ──
-    # الحاجز الوحيد: حد تيليجرام 4096 للرسالة كلها — يُقص المتجاوز فقط
-    # مع "…" وتحذير لوج (لا نقسم كيان HTML نصف مكتمل).
-    # v11.5 (مواصفة المستخدم §7 — القالب النهائي): سطر «💬:» مستعاد —
-    # 👤: الاسم ← (فارغ) ← 💬: ← blockquote للنص الأصلي كاملاً.
-    header = f"{SENDER_LABEL}{sender_html}"
-    msg_label = "\n\n💬:"
-    overhead = (
-        len(header) + len("<blockquote></blockquote>") + len(rule_part)
-        + len(msg_label) + 1 + 16
-    )
+    # ── قسم نص الرسالة (v11.6 — القالب الحرفي): بلا رموز 👤/💬 وبلا
+    # blockquote/اقتباس/إطار — النص الأصلي كما ورد (الأسطر واللغة والرموز
+    # والروابط)، مهرباً HTML فقط كي لا تُفسد وسوم المستخدم الشكل. الحاجز
+    # الوحيد: حد تيليجرام 4096 للرسالة كلها (قص مع "…" وتحذير لوج).
+    header = f"{SENDER_LABEL}{sender_html}{uname_suffix_html}"
+    msg_label = f"\n\n{MSG_TEXT_LABEL}\n\n"
+    overhead = len(header) + len(msg_label) + len(rule_part) + 16
     budget = max(TELEGRAM_MAX_TEXT_LEN - overhead, 256)
     safe_text = InputSanitizer.escape_html(str(data.get("text") or ""))
     if len(safe_text) > budget:
@@ -492,7 +496,7 @@ def build_alert_html(
             f"⚠️ alert text truncated to Telegram 4096 limit "
             f"(escaped_len={len(safe_text)} budget={budget})"
         )
-    text = f"{header}{msg_label}\n<blockquote>{safe_text}</blockquote>{rule_part}"
+    text = f"{header}{msg_label}{safe_text}{rule_part}"
 
     # ── روابط الرسالة/القروب الحقيقية (قيم المحلّل أولاً ثم البناء) ──
     link = str(msg_link or "").strip()
@@ -655,14 +659,24 @@ class AlertBot:
 
     # ── الإرسال ──
     def _build_payload(
-        self, built: Dict[str, Any], include_user_button: bool = True
+        self,
+        built: Dict[str, Any],
+        include_user_button: bool = True,
+        sanitize_tg: bool = False,
     ) -> Dict[str, Any]:
         """حمولة sendMessage — الدالة المركزية build_alert_buttons تبني
-        صف الأزرار الأربعة المصغّرة [مراسلة][عرض][نسخ][القروب] (v10.9.1).
+        صف الأزرار الموحد [ عرض الرسالة ][ مراسلة ] (v11.6).
         الزر بلا بيانات لا يُعرض إطلاقاً؛ include_user_button=False بعد
-        رفض tg://user (يسقط زر «مراسلة» فقط)."""
+        رفض tg://user (يسقط زر «مراسلة» فقط)؛ sanitize_tg=True بعد رفض
+        عام للوحة (يحذف أزرار tg:// ويبقي t.me الصالحة عالمياً)."""
         kwargs = dict(built.get("button_kwargs") or {})
         kb = build_alert_buttons(include_user_button=include_user_button, **kwargs)
+        if sanitize_tg:
+            kb = [
+                [b for b in row if not str(b.get("url") or "").startswith("tg://")]
+                for row in kb
+            ]
+            kb = [row for row in kb if row]
         payload: Dict[str, Any] = {
             "chat_id": self.chat_id,
             "text": built["text"],
@@ -822,18 +836,26 @@ class AlertBot:
                 )
                 continue
 
-            # ── v11.0: خطأ زر عام (URL/نوع/markup) → إعادة بدون أزرار —
-            # نص التنبيه يبقى بروابطه القابلة للنقر في الترويسة؛ التنبيه
-            # لا يُسلَّم للمسار الاحتياطي إلا إن فشلت هذه الإعادة أيضاً.
+            # ── v11.6: خطأ زر عام (URL/نوع/markup) — لا نسخة نصية بلا
+            # أزرار كنتيجة نجاح (مواصفة §5.7). أولاً: إعادة بلوحة t.me فقط
+            # (أزرار tg:// هي المشتبه الأرجح). إن رُفضت هي الأخرى: فشل
+            # مؤكد → سلّم الإرسال الاحتياطي (AlertBotClient MTProto
+            # بالأزرار ثم حسابات المستخدمين) — التنبيه لا يضيع.
             if not buttons_dropped and any(b in desc.upper() for b in GENERIC_BUTTON_ERRORS):
-                buttons_dropped = True
-                payload = self._build_payload(built)
-                payload.pop("reply_markup", None)
-                logger.warning(
-                    f"⚠️ AlertBot button rejected ({desc[:80]}) — إعادة الإرسال "
-                    "بدون أزرار (روابط الترويسة تبقى قابلة للنقر في النص)"
+                _kb_now = built.get("buttons") or []
+                _has_tg = any(
+                    str(b.get("url") or "").startswith("tg://")
+                    for row in _kb_now for b in row
                 )
-                continue
+                if _has_tg and not sender_dropped:
+                    sender_dropped = True  # إسقاط أزرار tg:// فقط — يبقى t.me
+                    payload = self._build_payload(built, sanitize_tg=True)
+                    logger.warning(
+                        f"⚠️ AlertBot button rejected ({desc[:80]}) — إعادة الإرسال "
+                        "بلوحة t.me فقط (بدون أزرار tg://)"
+                    )
+                    continue
+                buttons_dropped = True  # t.me فقط رُفضت أيضاً → فشل مؤكد أدناه
 
             self.last_error = f"bot_api_{status}:{desc[:120]}"
             # ── v11.0: طبقة الإرسال الاحتياطية بالأزرار — عميل البوت الحي
