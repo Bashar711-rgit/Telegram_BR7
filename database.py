@@ -594,11 +594,83 @@ class EnhancedDatabase:
         except Exception:
             return False
 
+    async def _close_resources(self) -> None:
+        """v11.7 (audit A-1): إغلاق الموارد فقط بلا أي إلغاء للمهام.
+
+        عكس close() الذي يُلغي _writer_task — وغير صالح للاستدعاء من
+        داخل مهمة الكاتب نفسها (RuntimeError: Task cannot await on
+        itself + إلغاء المهمة المستدعية يقتل الحلقة قبل إعادة الاتصال).
+        تُستخدم من _reconnect حصراً؛ close() يبقى لمسار الإطفاء الخارجي."""
+        current = asyncio.current_task()
+        for name in ("_backup_task", "_writer_task"):
+            task = getattr(self, name, None)
+            if task and task is not current:
+                if not task.done():
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception:
+                        pass
+            setattr(self, name, None)
+        self.is_connected = False
+        try:
+            await self._flush()
+        except Exception:
+            pass
+        try:
+            if self.db_type == "sqlite" and self._sqlite_conn:
+                await self._sqlite_conn.close()
+            elif self.db_type == "postgresql" and self._pool:
+                await self._pool.close()
+        except Exception:
+            pass
+        self._sqlite_conn = None
+        self._pool = None
+
     async def _reconnect(self) -> bool:
+        """v11.7 (audit A-1): إعادة اتصال ذاتية آمنة.
+
+        العيب المُثبت: النسخة السابقة كانت تستدعي close() التي تُلغي
+        _writer_task — وهي المهمة المستدعية نفسها من _writer_loop —
+        فكانت الحلقة تموت (RuntimeError أو CancelledError) قبل الوصول
+        إلى connect() أبداً: انقطاع عابر واحد = زومبي بلا كتابة للأبد
+        (is_connected=False → add_to_queue يعيد -2 → كل الرسائل تُرفض).
+        الإصلاح: إغلاق الموارد فقط (_close_resources) ثم connect()
+        الذي يُعيد بناء المهام (start_writer يتعامل مع done/None)."""
         logger.warning("Database reconnecting…")
-        await self.close()
+        await self._close_resources()
         await asyncio.sleep(2)
         return await self.connect()
+
+    # ─── SQL dialect helpers (v11.7 audit D-2/D-5) ─────────────────────────
+    def _sql_scalar_max(self, sql: str) -> str:
+        """MAX(a,b) ثنائية الوسائط: دالة قياسية على SQLite لكنها تجميعية على
+        PostgreSQL (خطأ بلا GROUP BY). تُبدّل إلى GREATEST على PG حصراً —
+        الإصلاح نفسه طُبّق يدوياً في مواضع أخرى سابقاً (database.py:2564).
+        الاستبدال آمن: النمط MAX(COALESCE( لا يظهر إلا في المقارنات القياسية."""
+        try:
+            if self.db_type == "postgresql":
+                return sql.replace("MAX(COALESCE(", "GREATEST(COALESCE(")
+        except Exception:
+            pass
+        return sql
+
+    def _sql_insert_ignore(self, sql: str) -> str:
+        """INSERT OR IGNORE بنية SQLite حصراً — PG يتطلب ON CONFLICT DO
+        NOTHING (نفس الفرق الموثق في فرع النسخ القديم 2424-2436). يُستخدم
+        للعبارات المشتركة بين المحركين حيث لا يوجد فرع لهجة صريح
+        (block_sender/block_chat — كانت القائمة المحجوبة تفشل كلياً على PG)."""
+        try:
+            if self.db_type == "postgresql" and "INSERT OR IGNORE INTO" in sql:
+                converted = sql.replace("INSERT OR IGNORE INTO", "INSERT INTO", 1).rstrip()
+                if "ON CONFLICT" not in converted.upper():
+                    return converted + " ON CONFLICT DO NOTHING"
+                return converted
+        except Exception:
+            pass
+        return sql
 
     # ─── Low-level exec ───────────────────────────────────────────────────────
     async def _execute(self, sql: str, params: tuple = ()) -> Any:
@@ -926,11 +998,23 @@ class EnhancedDatabase:
                         .replace("last_updated REAL,", "last_updated DOUBLE PRECISION,")
                         .replace("REAL DEFAULT (unixepoch())", "DOUBLE PRECISION DEFAULT EXTRACT(EPOCH FROM NOW())")
                         .replace("DATETIME DEFAULT CURRENT_TIMESTAMP", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+                        # v11.7 (audit D-1): DATETIME عارية بلا DEFAULT كانت
+                        # تنجو من التحويل → CREATE TABLE فاشل على PG (لا يوجد
+                        # نوع datetime في PostgreSQL إطلاقاً). قاعدة عامة أخيرة
+                        # تلتقط كل ما تبقى (last_login_at/deleted_at/updated_at…).
+                        .replace("DATETIME", "TIMESTAMP")
                         .replace("REAL NOT NULL", "DOUBLE PRECISION NOT NULL")
                         .replace("REAL DEFAULT", "DOUBLE PRECISION DEFAULT")
                         .replace("REAL,", "DOUBLE PRECISION,")
                     )
-                await self._execute(s)
+                # v11.7 (audit D-4): حارس لكل عبارة — النسخة السابقة كانت
+                # fail-fast: أي عيب لهجة واحد يُسقط connect() كاملاً ويمنع
+                # الإقلاع (كل الترحيلات الأخرى fail-soft). الآن عبارة فاشلة
+                # تُسجل وتُتجاوز — نفس عقد بقية المهاجرات.
+                try:
+                    await self._execute(s)
+                except Exception as stmt_err:
+                    logger.error(f"_create_tables statement failed ({self.db_type}): {type(stmt_err).__name__}: {str(stmt_err)[:200]} | stmt={s[:120]}")
         await self._commit()
 
     async def _migrate_bigint_ids(self) -> None:
@@ -1148,6 +1232,10 @@ class EnhancedDatabase:
         for name, decl in self._DASHBOARD_ACCOUNT_STATUS_COLUMNS:
             if name in existing:
                 continue
+            # v11.7 (audit D-1): DATETIME ليس نوعاً في PostgreSQL — نفس
+            # القاعدة العامة في _create_tables تُطبق على تصريحات ALTER.
+            if self.db_type == "postgresql":
+                decl = str(decl).replace("DATETIME", "TIMESTAMP")
             try:
                 if self.db_type == "postgresql":
                     await self._execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {name} {decl}")
@@ -2083,8 +2171,11 @@ class EnhancedDatabase:
         message in the group is PROOF of membership (is_member=1).
         Never raises."""
         try:
+            # v11.7 (audit D-2): MAX(a,b) القياسية تُغادر PG (دالة تجميعية
+            # بلا GROUP BY) — نفس عيب إنتاجي موثق سابقاً في v11.1؛
+            # _sql_scalar_max يبدّلها إلى GREATEST على PG حصراً.
             await self._execute(
-                """
+                self._sql_scalar_max("""
                 INSERT INTO group_memberships (chat_id, user_id, chat_title, chat_username,
                     chat_type, member_status, member_role, admin_permissions, joined_at,
                     is_member, is_admin, is_owner, is_banned, is_restricted, is_muted, updated_at)
@@ -2104,7 +2195,7 @@ class EnhancedDatabase:
                     is_restricted = MAX(COALESCE(group_memberships.is_restricted, 0), COALESCE(EXCLUDED.is_restricted, 0)),
                     is_muted = MAX(COALESCE(group_memberships.is_muted, 0), COALESCE(EXCLUDED.is_muted, 0)),
                     updated_at = EXCLUDED.updated_at
-                """,
+                """),
                 (
                     int(d.get("chat_id") or 0), int(d.get("user_id") or 0),
                     d.get("chat_title"), d.get("chat_username"), d.get("chat_type"),
@@ -2129,8 +2220,9 @@ class EnhancedDatabase:
         """v11.1 group_messages upsert (chat_id, message_id) — text COALESCE,
         edit flags refreshed on conflict. Never raises."""
         try:
+            # v11.7 (audit D-2): نفس معالجة MAX القياسية (GREATEST على PG)
             await self._execute(
-                """
+                self._sql_scalar_max("""
                 INSERT INTO group_messages (chat_id, message_id, user_id, message_text,
                     message_date, edit_date, message_link, reply_to_message_id, reply_to_user_id,
                     is_reply, is_forward, is_edited, is_deleted, is_pinned, views, forwards,
@@ -2163,7 +2255,7 @@ class EnhancedDatabase:
                     phone_numbers = COALESCE(EXCLUDED.phone_numbers, group_messages.phone_numbers),
                     msg_hash = COALESCE(EXCLUDED.msg_hash, group_messages.msg_hash),
                     updated_at = EXCLUDED.updated_at
-                """,
+                """),
                 (
                     int(d.get("chat_id") or 0), int(d.get("message_id") or 0), d.get("user_id"),
                     d.get("message_text"), d.get("message_date"), d.get("edit_date"),
@@ -2940,8 +3032,11 @@ class EnhancedDatabase:
 
     async def block_sender(self, sender_id: int, reason: str = "", by: str = "system") -> None:
         try:
+            # v11.7 (audit D-5): فرع لهجة — INSERT OR IGNORE فاشل على PG
             await self._execute(
-                "INSERT OR IGNORE INTO blocked_senders (sender_id, reason, blocked_by) VALUES (?, ?, ?)",
+                self._sql_insert_ignore(
+                    "INSERT OR IGNORE INTO blocked_senders (sender_id, reason, blocked_by) VALUES (?, ?, ?)"
+                ),
                 (sender_id, reason, by),
             )
             await self._commit()
@@ -2959,8 +3054,11 @@ class EnhancedDatabase:
 
     async def block_chat(self, chat_id: int, reason: str = "", by: str = "system") -> None:
         try:
+            # v11.7 (audit D-5): فرع لهجة — INSERT OR IGNORE فاشل على PG
             await self._execute(
-                "INSERT OR IGNORE INTO blocked_chats (chat_id, reason, blocked_by) VALUES (?, ?, ?)",
+                self._sql_insert_ignore(
+                    "INSERT OR IGNORE INTO blocked_chats (chat_id, reason, blocked_by) VALUES (?, ?, ?)"
+                ),
                 (chat_id, reason, by),
             )
             await self._commit()
@@ -3038,6 +3136,19 @@ class EnhancedDatabase:
             # we re-check close to the cooldown expiry.
             if not allowed:
                 ttl = min(ttl, 5.0)
+            # v11.7 (audit A-8): sweep منخفض التكلفة عند الإدخال — الإدخالات
+            # المنتهية لمرسلين لن يُنبّهوا مرة أخرى كانت تتراكم بلا حد
+            # (التسريب الوحيد غير المحصور المُثبت في مسار التشغيل).
+            if len(self._can_send_alert_cache) >= 4096:
+                try:
+                    expired = [k for k, (_a, exp) in self._can_send_alert_cache.items() if exp <= now]
+                    for k in expired:
+                        self._can_send_alert_cache.pop(k, None)
+                except Exception:
+                    pass
+                # ما زال ممتلئاً؟ إفراغ أقدم دفعة (حد أقصى مطلق).
+                if len(self._can_send_alert_cache) >= 8192:
+                    self._can_send_alert_cache.clear()
             self._can_send_alert_cache[sender_id] = (allowed, now + ttl)
             return allowed
         except Exception:
@@ -3147,6 +3258,18 @@ class EnhancedDatabase:
                 await self.cleanup_old_notifications(30 if notifications_days is None else max(1, int(notifications_days)))
             except Exception:
                 pass
+            # v11.7 (audit D-3): تقليم جداول intel غير المحصورة — عشرة جداول
+            # كانت تنمو بلا أي حد (لا DELETE لها في المستودع كله): كل رسالة
+            # تُحلَّل تكتب فيها، وبطاقة 256MB على SQLite تجعل شرط الضغط
+            # يتكرر كل دورة كتابة بلا إمكانية تخفيف (المسح الطارئ لا يمسّها).
+            # الافتراضي 90 يوماً — قابل للضبط بـ RETENTION_INTEL_DAYS،
+            # والقيمة 0 تعطل التقليم عمداً (سلوك قديم لمن يريد الأرشفة).
+            try:
+                intel_days = int(os.getenv("RETENTION_INTEL_DAYS", "90"))
+                if intel_days > 0:
+                    total += await self._cleanup_intel_tables(intel_days)
+            except Exception as intel_err:
+                logger.debug(f"intel retention skipped: {intel_err}")
             await self._commit()
             if total > 500 and self.db_type == "sqlite":
                 await self._execute("PRAGMA optimize")
@@ -3155,6 +3278,60 @@ class EnhancedDatabase:
         return total
 
     # ─── Resource pressure check (fix #12) ────────────────────────────────────
+
+    async def _cleanup_intel_tables(self, days: int) -> int:
+        """v11.7 (audit D-3): تقليم جداول التحليلات غير المحصورة.
+
+        المحصورة سابقاً: messages/alerts/spam_watch/audit/notifications/
+        dead_letters/alert_dedup. المتبقي بلا أي حد كان:
+          group_messages، message_analysis، filter_decisions  → تُحذف بالتاريخ
+              (الأحدث منها يغذي نشاط المستخدم وتقارير اللوحة — 90 يوماً
+              أوسع من أي نافذة عرض موجودة).
+          sender_contacts                      → تُحذف بالتاريخ (updated_at).
+        البقية (users/group_memberships/user_activity/sender_stats/
+        dashboard_accounts) ملفات هوية تراكمية بحجم صف واحد لكل كيان —
+        لا تُحذف بالتاريخ (حذفها يهوي الهوية نفسها لا السجل).
+
+        ⚠️ وعي الأنواع (مثبت): filter_decisions.created_at و
+        sender_contacts.updated_at تُكتب TEXT عبر CURRENT_TIMESTAMP
+        (إدراجها لا يمرر القيمة)، بينما group_messages.message_date و
+        message_analysis.created_at أرقام epoch حقيقية. مقارنة REAL <
+        TEXT في SQLite تجعل النص أكبر دائماً فلا يُحذف شيء صامتة —
+        لذلك قيمة المقارنة تُبنى حسب نوع العمود (نص UTC للنصية، رقم
+        للعددية، datetime لكليهما على PG).
+        فشل-آمن كلياً: أي خطأ جدول = تخطي وتسجيل debug فقط.
+        """
+        from datetime import datetime as _dt, timezone as _tz
+
+        cutoff = time.time() - max(1, int(days)) * 86400
+        cutoff_ts_str = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(cutoff))
+        cutoff_dt = _dt.fromtimestamp(cutoff, tz=_tz.utc)
+        removed = 0
+        plan = [
+            # (table, column, value_kind) — epoch: رقم؛ ts: نص CURRENT_TIMESTAMP
+            ("group_messages", "message_date", "epoch"),
+            ("message_analysis", "created_at", "epoch"),
+            ("filter_decisions", "created_at", "ts"),
+            ("sender_contacts", "updated_at", "ts"),
+        ]
+        for table, col, kind in plan:
+            try:
+                if self.db_type == "postgresql":
+                    cmp_val = cutoff_dt
+                else:
+                    cmp_val = cutoff if kind == "epoch" else cutoff_ts_str
+                cur = await self._execute(
+                    f"DELETE FROM {table} WHERE {col} IS NOT NULL AND {col} < ?",
+                    (cmp_val,),
+                )
+                n = cur.rowcount or 0
+                if n:
+                    logger.info(f"Intel retention: {table} −{n} rows (> {days}d)")
+                removed += n
+            except Exception as e:
+                logger.debug(f"intel retention {table} skipped: {type(e).__name__}: {str(e)[:100]}")
+        return removed
+
     # ─── v9.24 P5-1: مركز الإشعارات (Notifications) ───────────
     _NOTIF_SEVERITIES = ("info", "success", "warn", "critical")
 
@@ -4653,7 +4830,18 @@ class EnhancedDatabase:
                     if not await self._ping():
                         logger.warning("Database ping failed, attempting reconnect…")
                         self._db_healthy = False
-                        await self._reconnect()
+                        _ok_reconnect = await self._reconnect()
+                        if _ok_reconnect:
+                            # connect() أنشأ مهمة كاتب جديدة (start_writer) —
+                            # هذه الحلقة القديمة تتقاعد فوراً كي لا تتكرر
+                            # الكتابة من مهمتين على نفس الاتصال.
+                            break
+                        # فشلت المحاولة: ابقَ في الحلقة (v11.7 audit A-1) —
+                        # is_connected=True + db_healthy=False يحافظ على رفض
+                        # add_to_queue بأمان (-2) بينما تسمح للمحاولة القادمة
+                        # (بعد 60 ثانية) باسترداد القاعدة بعد انتهاء الانقطاع.
+                        self.is_connected = True
+                        await asyncio.sleep(5)
                     else:
                         # Reset health/backoff on successful ping
                         if not self._db_healthy:

@@ -1,0 +1,12 @@
+# requirements-dev.txt — test & QA dependencies (v11.7, audit §10-10).
+#
+# The production runtime deps live in requirements.txt. These are the
+# test-suite dependencies that were previously undeclared anywhere — the
+# 974-test suite could only run if they were hand-installed. Install with:
+#
+#     pip install -r requirements.txt -r requirements-dev.txt
+#
+pytest>=8.0,<10.0
+pytest-asyncio>=0.23,<2.0
+httpx>=0.27,<1.0
+beautifulsoup4>=4.12,<5.0

@@ -1224,16 +1224,25 @@ async def health(request: Request):
     snapshot, sender_intel, dedup, antispam, uptime) was moved to
     /health/full which requires dashboard auth — exposing counts, queue
     depths and engine internals to anyone who could reach the service
-    was an information-disclosure surface."""
+    was an information-disclosure surface.
+
+    v11.7 (audit A-2): قاعدة البيانات المنخرفة فعلياً (db غائب أو
+    is_connected=False) تعيد HTTP 503 بدلاً من 200 — Render يعيد
+    تشغيل العملية فتُستعاد الاتصالات من الصفر بدل الزومبي الأبدي.
+    "degraded" المتصل-but-unhealthy يبقى 200 عمداً (فشل flush عابر
+    لا يستحق إعادة تشغيل تفتقد الدُفعة)."""
     db = getattr(request.app.state, "db", None)
     db_ok = bool(db and getattr(db, "is_connected", False))
     db_healthy = bool(db and getattr(db, "db_healthy", True))
-    return JSONResponse({
+    payload = {
         "status": "ok" if (db_ok and db_healthy) else "degraded",
         "database": "ok" if db_ok else "down",
         "db_healthy": db_healthy,
         "time": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-    })
+    }
+    if not db_ok:
+        return JSONResponse(payload, status_code=503)
+    return JSONResponse(payload)
 
 
 @app.get("/health/full", dependencies=[Depends(verify_token)])

@@ -1,39 +1,78 @@
 # requirements.lock — pinned dependency versions for deterministic builds.
 #
-# v9.12 (audit Phase 12 / dependency audit): this file is generated from
-# requirements.txt by running:
+# v11.7 (audit §10-3): the previous version of this file was a PLACEHOLDER —
+# every pin was commented out, and its header claimed a
+# .github/workflows/ci.yml that does not exist (and that Render never reads
+# anyway). That was misleading: nothing was actually pinned.
 #
-#     pip install pip-tools
-#     pip-compile requirements.txt -o requirements.lock
+# This file is now a REAL freeze of the verified working environment
+# (Python 3.11.9 venv — the same tree that passes the full pytest suite and
+# runs the live Telegram verification). It records exactly which versions
+# were last verified together, for debugging "it worked yesterday" drift
+# and for reproducing the environment locally:
 #
-# Render's build will prefer this lockfile when present (see
-# .github/workflows/ci.yml). The loose ranges in requirements.txt remain
-# the source of truth for semantic compatibility; this file pins exact
-# versions so two builds from the same commit always produce the same
-# dependency tree, eliminating "it worked yesterday" drift between
-# Render deploys.
+#     python -m venv .venv && .venv/bin/pip install -r requirements.lock
 #
-# This file is intentionally NOT hand-edited. Re-generate after every
-# requirements.txt change. The commented-out lines below mirror
-# requirements.txt so the file is non-empty and git-trackable from the
-# start; run pip-compile to populate the real pins.
+# NOTE: Render's build uses requirements.txt (its buildCommand is explicit
+# in render.yaml); Render does NOT auto-prefer lockfiles.
+#
+# Re-generate after every dependency change with:
+#     .venv/bin/python -c "import importlib.metadata as md; print('\n'.join(sorted(f'{p.metadata[\"Name\"]}=={p.version}' for p in md.distributions())))"
+# (includes test-only deps: pytest/pytest-asyncio/httpx/beautifulsoup4)
 
-# telethon>=1.34.0,<2.0.0
-# python-dotenv>=1.0.0,<2.0.0
-# loguru>=0.7.0,<1.0.0
-# aiosqlite>=0.19.0,<1.0.0
-# asyncpg>=0.28.0,<1.0.0
-# cryptography>=41.0.0
-# orjson>=3.9.0,<4.0.0
-# rapidfuzz>=3.5.0,<4.0.0
-# langdetect>=1.0.9,<2.0.0
-# pyarabic>=0.6.11,<1.0.0
-# cachetools>=5.3.0,<6.0.0
-# psutil>=5.9.5,<6.0.0
-# uvloop>=0.19.0,<1.0.0
-# aiohttp>=3.9.0,<4.0.0
-# fastapi>=0.100.0,<1.0.0
-# uvicorn>=0.23.0,<1.0.0
-# websockets>=12.0,<13.0
-# python-multipart>=0.0.6,<1.0.0
-# itsdangerous>=2.1.0,<3.0.0
+PyArabic==0.6.15
+Pygments==2.21.0
+RapidFuzz==3.14.6
+Telethon==1.45.0
+aiohappyeyeballs==2.7.1
+aiohttp==3.14.5
+aiosignal==1.4.0
+aiosqlite==0.22.1
+annotated-doc==0.0.5
+annotated-types==0.8.0
+anyio==4.15.1
+asyncpg==0.32.0
+attrs==26.1.0
+beautifulsoup4==4.15.0
+cachetools==5.5.2
+certifi==2026.10.19
+cffi==2.1.1
+click==8.5.0
+cryptography==50.0.2
+fastapi==0.153.0
+frozenlist==1.8.0
+h11==0.16.0
+httpcore==1.0.9
+httpx==0.28.1
+idna==3.20
+iniconfig==2.3.1
+itsdangerous==2.2.0
+langdetect==1.0.9
+loguru==0.7.3
+multidict==7.1.0
+opentelemetry-api==1.45.1
+orjson==3.13.0
+packaging==26.3
+pluggy==1.7.0
+propcache==0.5.4
+psutil==5.9.8
+pyaes==1.6.1
+pyasn1==0.6.4
+pycparser==3.11
+pydantic==2.14.1
+pydantic_core==2.50.1
+pytest-asyncio==1.4.0
+pytest==9.1.1
+python-dotenv==1.2.4
+python-multipart==0.0.32
+qrcode==8.2
+rsa==4.9.1
+six==1.17.0
+soupsieve==3.0.3
+starlette==1.9.0
+typing-inspection==0.4.4
+typing_extensions==4.16.0
+uvicorn==0.54.0
+uvloop==0.23.0
+websockets==12.0
+yarl==1.25.1

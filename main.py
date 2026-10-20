@@ -996,6 +996,10 @@ class EnhancedTelegramBot:
 
         async def health_handler(request):
             health = await self.health.check()
+            # v11.7 (audit A-2): قاعدة بيانات منخرفة فعلياً = 503 كي يعيد
+            # Render تشغيل العملية بدل البقاء على زومبي (نفس سلوك /health
+            # في dashboard.py). "degraded" العابر يبقى 200.
+            db_down = not (self.db and getattr(self.db, "is_connected", False))
             return web.json_response({
                 "status": "ok" if health.is_healthy else "degraded",
                 "checks": health.checks,
@@ -1010,7 +1014,7 @@ class EnhancedTelegramBot:
                 "alert_latency": alert_latency.snapshot(),
                 "dedup": get_dedup_snapshot(),
                 "antispam": get_antispam_snapshot(),
-            })
+            }, status=503 if db_down else 200)
 
         app.router.add_get('/health', health_handler)
 

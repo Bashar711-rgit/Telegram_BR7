@@ -976,6 +976,23 @@ class DeadLetterQueue:
             self._scheduled_keys.add(key)
 
         delay = min(2 ** retry_count, 60)
+        # v11.7 (audit A-4): تأخير يفهم FloodWait — حين يطلب تيليجرام انتظار
+        # N ثانية (أو القاطع مفتوح بنافذة فيضان سارية) يجب احترامها: الإعادات
+        # السريعة (1/2/4/8/16 ثانية) تصطدم بـ CircuitBreakerOpen فوراً وتستنزف
+        # المحاولات الخمس فيُقتل التنبيه dead-letter بينما نافذة الفيضان لا
+        # تزال سارية. نستخرج الانتظار من FloodWaitError.seconds أو من رسالة
+        # القاطع ("FLOOD_WAIT active, X.Xs remaining") ونحترمه بحد أقصى 900s.
+        try:
+            import re as _re  # الوحدة لا تستورد re على مستوى الملف (نمط محلي معتمد)
+            _flood = int(getattr(error, "seconds", 0) or 0)
+            if _flood <= 0:
+                _m = _re.search(r"FLOOD_WAIT active,\s*([\d.]+)s remaining", str(error or ""))
+                if _m:
+                    _flood = int(float(_m.group(1))) + 1
+            if _flood > 0:
+                delay = max(delay, min(_flood, 900))
+        except Exception:
+            pass
         logger.warning(
             f"DLQ[{self._account_name}]: scheduling retry {retry_count + 1}/{self.max_retries} "
             f"for event {key} in {delay}s (reason: {type(error).__name__}: {str(error)[:150]})"
@@ -1143,9 +1160,32 @@ class ReconnectionManager:
                     if self._mon._connect_flood_until and now_ts >= self._mon._connect_flood_until:
                         self._mon._connect_flood_until = 0.0
                     last_error = self._mon._last_connect_error or ""
-                    if any(x in last_error for x in ["AuthKeyDuplicatedError", "SessionPasswordNeededError"]):
+                    # v11.7 (audit A-3): قائمة غير القابل للاسترداد موسّعة —
+                    # انتهاء الجلسة ("Session expired" من connect + AuthKey
+                    # غير مسجل + حساب معطل) لن يُصلحه أي reconnect: يلزم
+                    # إعادة دخول بشرية من /login. الحلقة اللانهائية كانت
+                    # تُنتج ضجيجاً ومرور API قد يصطدم بـ FloodWait بلا أمل.
+                    _UNRECOVERABLE_CONNECT_ERRORS = (
+                        "AuthKeyDuplicatedError",
+                        "SessionPasswordNeededError",
+                        "Session expired",
+                        "AuthKeyUnregistered",
+                        "UserDeactivatedError",
+                    )
+                    if any(x in last_error for x in _UNRECOVERABLE_CONNECT_ERRORS):
                         logger.error(f"Unrecoverable error for {self._mon.account['name']}, suspending retries")
                         self._mon._last_connect_error = f"Unrecoverable: {last_error[:100]}"
+                        try:
+                            await self._mon.db.record_notification(
+                                ntype="account_needs_relogin",
+                                title=f"الحساب {self._mon.account['name']} يحتاج إعادة دخول",
+                                body=f"توقفت محاولات إعادة الاتصال تلقائياً ({str(last_error)[:120]}). أعد تسجيل الدخول من صفحة الحسابات.",
+                                severity="warn",
+                                object_type="account",
+                                object_id=str(self._mon.account.get("name", "")),
+                            )
+                        except Exception:
+                            pass
                         await asyncio.sleep(3600); continue
                     self._consecutive_failures += 1
                     if self._consecutive_failures > self._max_consecutive_failures:
@@ -1306,12 +1346,22 @@ class EnhancedAccountMonitor:
                 # entity circuit breaker so a FloodWait here is gated per
                 # account instead of hammering Telegram repeatedly.
                 try:
-                    entity = await self._entity_cb.call(
-                        lambda: resolve_chat_entity(
-                            client,
-                            {"chat_id": chat_id, "chat_access_hash": chat_access_hash, "username": chat_username},
-                        )
+                    # v11.7 (audit A-6): مهلة صارمة على حل الكيان — resolve_chat_entity
+                    # قد يجري iter_dialogs(limit=200) + عدة get_entity بلا مهلة
+                    # داخلية؛ تعليق RPC واحد كان يحتجز عامل معالجة من اثنين
+                    # لوقت غير محدود ويؤخر كل التنبيهات خلفه.
+                    entity = await asyncio.wait_for(
+                        self._entity_cb.call(
+                            lambda: resolve_chat_entity(
+                                client,
+                                {"chat_id": chat_id, "chat_access_hash": chat_access_hash, "username": chat_username},
+                            )
+                        ),
+                        timeout=15.0,
                     )
+                except asyncio.TimeoutError:
+                    logger.warning(f"Entity resolution timed out after 15s [{self.account['name']}] chat={chat_id}")
+                    entity = None
                 except CircuitBreakerOpen as e:
                     logger.debug(f"Entity resolution circuit open [{self.account['name']}]: {e}")
                     entity = None
@@ -1586,6 +1636,7 @@ class EnhancedAccountMonitor:
                     except Exception as ins_err:
                         logger.debug(f"input_sender capture [{self.account['name']}]: {type(ins_err).__name__}")
                 event_data = await self._event_to_dict(event)
+                _event_queued = False  # v11.7 (audit A-5): حتى يُدرج فعلاً
                 if event_data.get("has_media"):
                     # Media is offloaded to a tracked background task instead
                     # of being processed inline here, so this handler stays
@@ -1605,6 +1656,7 @@ class EnhancedAccountMonitor:
                     return
                 priority = 7 if event_data.get("has_text") else 3
                 queue_result = await self.db.add_to_queue(event_data, priority=priority)
+                _event_queued = queue_result > 0  # v11.7 (audit A-5): هل دخل الطابور فعلاً؟
                 if queue_result > 0:
                     # نجح الإدراج فعلياً
                     await self._inc_stat("queue_processed")
@@ -1645,6 +1697,20 @@ class EnhancedAccountMonitor:
             except Exception as e:
                 logger.error(f"Handler error [{self.account['name']}]: {e}")
                 await self._inc_stat("errors"); self._stats["last_error"] = str(e)
+                # v11.7 (audit A-5): انهيار الـ Handler كان يُفقد الحدث بلا
+                # أي مسك DLQ — كل نقاط الفقد الأخرى في الخط محمية، وهذه
+                # النقطة كانت الثغرة الوحيدة. نوجه الحدث الخام إلى DLQ
+                # فقط إذا لم يكن قد دخل الطابور فعلاً (تفادياً للمعالجة
+                # المزدوجة) — فشل الـDLQ نفسه لا يرمي استثناءً جديداً.
+                try:
+                    if (not _event_queued) and event_data:
+                        await self._dlq.push(
+                            event_data,
+                            RuntimeError(f"handler_crash: {type(e).__name__}: {str(e)[:150]}"),
+                            retry_count=0,
+                        )
+                except Exception as dlq_e:
+                    logger.debug(f"DLQ push after handler crash failed: {dlq_e}")
         self._handler_func = _handler
         # v9.8: MessageDeleted diagnostics + recovery (fast capture).
         @self.client.on(events.MessageDeleted())

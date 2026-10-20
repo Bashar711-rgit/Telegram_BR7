@@ -93,6 +93,23 @@ def similarity_ratio(norm_a: str, norm_b: str, sh_a=None, sh_b=None) -> float:
         return 0.0
 
 
+# v11.7 (audit F-1): أداة المقارنة بعد حجب الأرقام — زوج نصوص متطابق
+# بعد استبدال الأرقام بعلامة = طلبان مختلفان فعلاً (درجات/أرقام/مواعيد):
+# «النهائية هي 95 من 100» و«النهائية هي 94 من 100» مطلبان مستقلان،
+# بينما difflib يعطيهما ~0.97 ويمنعهما كتكرار (عيب مُثبت بإعادة إنتاج حية).
+import re as _digit_re_mod
+
+_DIGIT_MASK_RE = _digit_re_mod.compile(r"\d")
+
+
+def _mask_digits(norm_text: str) -> str:
+    """يستبدل كل رقم بعلامة موحدة للمقارنة فقط (لا يغيّر النص المخزّن)."""
+    try:
+        return _DIGIT_MASK_RE.sub("#", norm_text or "")
+    except Exception:
+        return norm_text
+
+
 class SimilarityGate:
     """حاجز منع التنبيهات المتشابهة (نفس المرسل، إعادة صياغة، نافذة زمنية).
 
@@ -191,6 +208,10 @@ class SimilarityGate:
                     age = now - ts
                     if age > window:
                         continue
+                    # v11.7 (audit F-1): اختلاف بالأرقام فقط = رسالتان مختلفتان
+                    # (درجة/رقم/موعد) — لا يُعد تكراراً مهما بلغ تشابه الحروف.
+                    if _mask_digits(norm) == _mask_digits(key):
+                        continue
                     score = similarity_ratio(norm, key, sh, old_sh)
                     if score > best_score:
                         best_score = score
@@ -206,16 +227,21 @@ class SimilarityGate:
                     "age_seconds": round(best_age, 1),
                 }
 
-            # تسجيل النص الجديد دائماً (حتى الممنوع — تحديث الطابع الزمني)
-            if bucket is None:
-                bucket = OrderedDict()
-                self._recent[sid] = bucket
-                self._evict_sender()
-            bucket.pop(norm, None)
-            bucket[norm] = (sh, now)
-            while len(bucket) > self._keep:
-                bucket.popitem(last=False)
-            self._stats["recorded"] += 1
+            # v11.7 (audit F-1): تسجيل النص الجديد فقط عند المروّغ — النص
+            # الممنوع لا يُسجّل ولا يُجدَّد طابعه: النسخة السابقة كانت تُعيد
+            # تسجيل كل صيغة ممنوعة بطابع جديد فتنزلق نافذة الكبت إلى
+            # ما لا نهاية (مرسل يعيد المحاولة = كبت أبدي). النص الأصلي
+            # المسجّل مسبقاً ينتهي بانتهاء النافذة الطبيعية.
+            if hit is None:
+                if bucket is None:
+                    bucket = OrderedDict()
+                    self._recent[sid] = bucket
+                    self._evict_sender()
+                bucket.pop(norm, None)
+                bucket[norm] = (sh, now)
+                while len(bucket) > self._keep:
+                    bucket.popitem(last=False)
+                self._stats["recorded"] += 1
             return hit
         except Exception as e:
             logger.debug(f"similarity gate skipped: {type(e).__name__}: {e}")

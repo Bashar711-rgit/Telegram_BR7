@@ -195,6 +195,11 @@ def _run_of_arabic_before(text: str, start: int) -> int:
 
 _NEG_DELIMS = r"[\s.,!?؟،؛:;()\-/\"'«»…]"
 
+# v11.7 (audit F-6): حدود النفي عبر الترقيم فقط — بلا مسافات! المسافة
+# فاصل كلمات طبيعي («ما ابي حل») وليست حد جملة؛ إدراجها كان سيكسر كل
+# النفي المباشر. هذه الفئة للفحص بين النافي والطلب حصراً.
+_NEG_PUNCT_BOUNDARY_RE = re.compile(r"[.,!?؟،؛:;()\-/\"'«»…]")
+
 
 def _boundary_regex(negs: List[str]) -> Optional[re.Pattern]:
     """Compile a full-token alternation for negator phrases.
@@ -1190,6 +1195,10 @@ class EnhancedFilter:
         # v14.4: exclude mapping sources that are prefixes of known keywords —
         # phrase-level mapping inside a recognized keyword destroyed the match
         # ("مين يعرف"→"من يعرف" broke the keyword "مين يعرف احد").
+        # v11.7 (audit F-5): الحصر توسّع من «بادئة» إلى «أي موضع داخل» كلمة
+        # مفتاحية معروفة: "مره→جدا" كانت تفسد "الماده مره صعبه" (مره في
+        # المنتصف)، و"تورطت→تايه" كانت تقتل كلمة التائية "تورطت" المعلنة
+        # نفسها — كلها إعادة إنتاج حية (كلمات مفتاحية معلنة لا تُطابق أبداً).
         known = (
             getattr(self, "request_words", set())
             | getattr(self, "context_words", set())
@@ -1199,7 +1208,8 @@ class EnhancedFilter:
         sources = [
             src
             for src in self._dialect_map
-            if src and not any(k != src and k.startswith(src) for k in known)
+            if src
+            and not any(k != src and src in k for k in known)
         ]
         variants = sorted(sources, key=len, reverse=True)
         escaped = [re.escape(v) for v in variants if v]
@@ -1434,7 +1444,15 @@ class EnhancedFilter:
                     # a clause boundary between the negator and the intent
                     # starts a new clause — the negation does not cross it
                     between = text[neg_pos:intent_pos]
+                    # v11.7 (audit F-6): علامات الترقيم حدود جُمل أيضاً —
+                    # «لا، ابي حل واجب»: النفي هنا استئنافي (discourse-لا)
+                    # والفاصلة تفصله عن الطلب، لكن الفحص القديم كان يعتبر
+                    # حدود "لكن/بس/الا" فقط فيُكبت طلباً حقيقياً (إعادة
+                    # إنتاج حية). _NEG_DELIMS هو نفسه حصر الحدود المعجمي
+                    # فتبقى الدلالة متسقة داخل الوحدة.
                     if any(b in between for b in self._clause_boundaries):
+                        continue
+                    if _NEG_PUNCT_BOUNDARY_RE.search(between):
                         continue
                     dist = self._token_distance(text, neg_pos, intent_pos)
                     if dist > self.NEGATION_SCOPE_TOKENS:
