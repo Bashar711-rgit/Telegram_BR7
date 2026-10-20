@@ -134,6 +134,57 @@ except ImportError:
 
 
 # =============================================================================
+# v11.5.3: اختيار حساب لاعتماديات عميل أزرار التنبيهات (AlertUI)
+# الأولوية: حساب is_main، ثم أول حساب متصل فعلاً له api_id+api_hash
+# (نفس اختيار «Fallback main client»). None = لا اعتماديات → العميل
+# يبقى معطلاً بأمان (fallback يعمل).
+# =============================================================================
+def _pick_alertui_account(accounts: Any, monitors: Any) -> Optional[dict]:
+    acc = next((a for a in (accounts or []) if (a or {}).get("is_main")), None)
+    if acc is not None:
+        return acc
+    for m in (monitors or []):
+        a = getattr(m, "account", None) or {}
+        if getattr(m, "is_connected", False) and a.get("api_id") and a.get("api_hash"):
+            return a
+    return None
+
+
+# =============================================================================
+# v11.5.3: اختيار حساب لاعتماديات عميل أزرار التنبيهات (AlertUI)
+# الأولوية: حساب is_main، ثم أول حساب متصل فعلاً له api_id+api_hash
+# (نفس اختيار «Fallback main client»). None = لا اعتماديات → العميل
+# يبقى معطلاً بأمان (fallback يعمل).
+# =============================================================================
+def _pick_alertui_account(accounts: Any, monitors: Any) -> Optional[dict]:
+    acc = next((a for a in (accounts or []) if (a or {}).get("is_main")), None)
+    if acc is not None:
+        return acc
+    for m in (monitors or []):
+        a = getattr(m, "account", None) or {}
+        if getattr(m, "is_connected", False) and a.get("api_id") and a.get("api_hash"):
+            return a
+    return None
+
+
+# =============================================================================
+# v11.5.3: اختيار حساب لاعتماديات عميل أزرار التنبيهات (AlertUI)
+# الأولوية: حساب is_main، ثم أول حساب متصل فعلاً له api_id+api_hash
+# (نفس اختيار «Fallback main client»). None = لا اعتماديات → العميل
+# يبقى معطلاً بأمان (fallback يعمل).
+# =============================================================================
+def _pick_alertui_account(accounts: Any, monitors: Any) -> Optional[dict]:
+    acc = next((a for a in (accounts or []) if (a or {}).get("is_main")), None)
+    if acc is not None:
+        return acc
+    for m in (monitors or []):
+        a = getattr(m, "account", None) or {}
+        if getattr(m, "is_connected", False) and a.get("api_id") and a.get("api_hash"):
+            return a
+    return None
+
+
+# =============================================================================
 # Adaptive Rate Limiter (Token Bucket + Per-Account) — unchanged
 # =============================================================================
 class AdaptiveRateLimiter:
@@ -1684,6 +1735,18 @@ class EnhancedTelegramBot:
                     (a for a in (getattr(CFG, "ACCOUNTS", None) or []) if a.get("is_main")),
                     None,
                 )
+                # v11.5.3: لا حساب is_main في بيئة الإنتاج (بلاغ لوج Render:
+                # «api_id/api_hash مفقود — عميل أزرار التنبيهات معطّل») —
+                # الاختيار في _pick_alertui_account: is_main أولاً ثم أول
+                # حساب متصل فعلاً. تفعيل العميل يُشغّل: معالجات أزرار
+                # التنبيهات، طبقة الإرسال الاحتياطي بالأزرار، وتحقق تسليم
+                # timeout (v11.5.2) — وكلها لا تعمل بدونه.
+                _main_acc = _pick_alertui_account(
+                    getattr(CFG, "ACCOUNTS", None), getattr(self, "monitors", None))
+                if _main_acc is not None and not (_main_acc or {}).get("is_main"):
+                    logger.info(
+                        f"🤖 AlertUI creds from connected account: {_main_acc.get('name')}"
+                    )
                 _ui = AlertBotClient(
                     api_id=(_main_acc or {}).get("api_id") or 0,
                     api_hash=(_main_acc or {}).get("api_hash") or "",

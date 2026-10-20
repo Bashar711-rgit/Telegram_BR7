@@ -257,3 +257,40 @@ class TestStatsExposure:
         m = EnhancedAccountMonitor(account, db, None)
         stats = await m.get_stats()
         assert "echo_skipped" in stats
+
+
+# ═════════════════ 7) اختيار اعتماديات AlertUI — v11.5.3 ═════════════════
+# بلاغ لوج Render: «api_id/api_hash مفقود — عميل أزرار التنبيهات معطّل»
+# لأن لا حساباً يحمل is_main. الاختيار الجديد: is_main ثم أول حساب متصل.
+
+class TestPickAlertUIAccount:
+    def _mon(self, name, connected, api_id=None, api_hash=None):
+        from types import SimpleNamespace as NS
+        return NS(account={"name": name, "api_id": api_id or 0,
+                           "api_hash": api_hash or ""},
+                  is_connected=connected)
+
+    def test_main_account_wins(self):
+        from main import _pick_alertui_account
+        main_acc = {"name": "MAIN", "is_main": True, "api_id": 1, "api_hash": "h"}
+        others = [self._mon("OTHER", True, 2, "x")]
+        assert _pick_alertui_account([main_acc], others) is main_acc
+
+    def test_first_connected_with_creds(self):
+        from main import _pick_alertui_account
+        accs = [{"name": "A"}, {"name": "B"}]
+        mons = [self._mon("A", True, 0, ""),      # متصل بلا اعتماديات
+                self._mon("B", True, 111, "hh"),  # أول متصل بعتماديات
+                self._mon("C", True, 222, "zz")]
+        got = _pick_alertui_account(accs, mons)
+        assert got is not None and got["name"] == "B"
+
+    def test_disconnected_skipped(self):
+        from main import _pick_alertui_account
+        mons = [self._mon("A", False, 111, "hh")]
+        assert _pick_alertui_account([{"name": "A"}], mons) is None
+
+    def test_no_candidates_none(self):
+        from main import _pick_alertui_account
+        assert _pick_alertui_account([], []) is None
+        assert _pick_alertui_account(None, None) is None
