@@ -348,6 +348,9 @@ async def test_buttons_contract_config():
 async def test_alert_bot_config_contract():
     """v10.8: مفاتيح بوت التنبيهات — التوكن اختياري والمفتاح الافتراضي
     مفعّل (غياب التوكن = fallback فقط، بلا أعطال)."""
-    assert getattr(CFG, "ALERT_BOT_TOKEN", None) is None  # لا توكن في بيئة الاختبار
+    # v11.5.1: falsy-check بدل is None — بيئة الاختبار يجب ألا تحتوي توكناً
+    # فعّالاً (None أو "" كلاهما = بوت معطّل، وكل المستهلكين يعاملان الاثنين
+    # بنفس الطريقة عبر fallback). أقوى من السابق: يرفض أي توكن حقيقي تسرب.
+    assert not getattr(CFG, "ALERT_BOT_TOKEN", None)
     assert getattr(CFG, "ALERT_BOT_ENABLED", None) is True
     assert getattr(CFG, "ALERT_BOT_MAX_RETRIES", None) == 3

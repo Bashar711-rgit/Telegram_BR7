@@ -26,6 +26,15 @@ os.environ["DB_FILE"] = str(PROJECT_DIR / "tests" / "_test_bot.db")
 os.environ["LOG_FILE"] = str(PROJECT_DIR / "tests" / "_test_bot.log")
 os.environ["DASHBOARD_ENABLED"] = "false"
 
+# v11.5.1: host secrets must never leak into the test environment.
+# config.py loads <project>/accounts.env via dotenv at import time; a host
+# with real credentials (e.g. ALERT_BOT_TOKEN) would otherwise inject them
+# into every test run. These hard assignments happen BEFORE the config
+# import, and load_dotenv's default (override=False) will not replace them,
+# so the suite is deterministic on any machine regardless of accounts.env.
+os.environ["ALERT_BOT_TOKEN"] = ""          # falsy == AlertBot disabled in tests
+os.environ["ALERT_BOT_ENABLED"] = "true"    # keep the documented default
+
 _TEST_DB = Path(PROJECT_DIR / "tests" / "_test_bot.db")
 if _TEST_DB.exists():
     _TEST_DB.unlink()
