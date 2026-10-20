@@ -24,13 +24,27 @@ def flt():
     return EnhancedFilter()
 
 
+# v11.5 (مواصفة الطول §4): بوابة 6..65 تسبق بقية الفلاتر — نصوص
+# keywords.json الأطول من 65 لم تعد مدخلات قابلة للوصول (too_long).
+# العينان التاليتان مضغوطتان إلى ≤65 مع الحفاظ على نية التصنيف نفسها؛
+# keywords.json نفسه لم يُمَس (يبقى توثيقاً لنية الحالات الأصلية).
+_SPEC_SAMPLE_OVERRIDES = {
+    # كانت 72 حرفاً — طلب إيجابي مع رابط Drive
+    "positive-13": "رابط ملف المشروع drive.google.com/file/xyz مين يساعدني",
+    # كانت 371 حرفاً — طالب متعثر يطلب توجهاً
+    "borderline-6": "عندي تحليل احصائي للبيانات متعثرة فيه وياليت احد يوجهني",
+}
+
+
 def _kw_cases():
     with open(KW_FILE, encoding="utf-8") as f:
         kw = json.load(f)
     cases = []
     for group in ("positive", "negative", "borderline"):
         for i, case in enumerate(kw.get("test_cases", {}).get(group, [])):
-            cases.append((f"{group}-{i}", case["text"], case["expected"]))
+            cid = f"{group}-{i}"
+            text = _SPEC_SAMPLE_OVERRIDES.get(cid, case["text"])
+            cases.append((cid, text, case["expected"]))
     return cases
 
 
@@ -144,7 +158,8 @@ class TestAdvertisementPrecision:
         assert r["decision"] == "ignore", r
 
     async def test_academic_drive_link_ok(self, flt):
-        r = await flt.analyze("هذا رابط ملف المشروع https://drive.google.com/file/xyz مين يساعدني اكمله")
+        # v11.5: عينة ≤65 (كانت 72) — نفس نية: طلب مع رابط أكاديمي
+        r = await flt.analyze("رابط ملف المشروع drive.google.com/file/xyz مين يساعدني")
         assert r["decision"] != "ignore", r
 
 

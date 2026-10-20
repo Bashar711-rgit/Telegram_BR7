@@ -304,6 +304,84 @@ def _name_entity_missing(entities: Any) -> bool:
     return True
 
 
+# ══ v11.5 (مواصفة §16): سجل [ALERT] الموحد + عدادات السلالم ══
+# لوج تشخيصي واحد لكل تنبيه ناجح — يوضح أي مستوى من كل سلّم استُخدم.
+# بلا بيانات حساسة (لا هويات ولا روابط خام). فشل التسجيل لا يُسقط شيئاً.
+def _emit_alert_log(
+    built: Dict[str, Any],
+    method: str,
+    *,
+    sender_dropped: bool = False,
+    buttons_dropped: bool = False,
+    via_client: bool = False,
+    reply_fix: str = "PENDING",
+) -> str:
+    """يصنّف السلالم (T/N/B/V) من الحمولة الفعلية ويزيد العدادات ويسجل السطر.
+
+    تعيين صادق لواقع v11.5:
+      tier: T1 أول محاولة | T2 بعد إسقاط زر المراسلة | T3 بعد إسقاط
+            الأزرار كافة | T5 عبر العميل الحي (فشل Bot API).
+      name: N1 username | N2 tg://user (Bot API anchor) | N4 openmessage
+            | N5 نص عادي.
+      contact: B1 t.me | B2 tg://user | B4 رابط الرسالة | none.
+      view: V1 t.me/<u>/<id> | V2 t.me/c/... | V4 group/alert | none.
+      buttons: «n/2» — الزران الهدفان مراسلة+عرض.
+    """
+    try:
+        tgt = built.get("contact_target")
+        name = "N5"
+        if tgt is not None:
+            if getattr(tgt, "username_url", None):
+                name = "N1"
+            elif getattr(tgt, "user_id_url", None):
+                name = "N2"
+            elif getattr(tgt, "openmessage_url", None):
+                name = "N4"
+        if via_client:
+            tier = "T5"
+        elif buttons_dropped:
+            tier = "T3"
+        elif sender_dropped:
+            tier = "T2"
+        else:
+            tier = "T1"
+
+        msg_link = str(built.get("msg_link") or "").strip()
+        if method == "username":
+            contact = "B1"
+        elif method == "mention_button":
+            contact = "B2"
+        elif msg_link and msg_link != "#":
+            contact = "B4"
+        else:
+            contact = "none"
+
+        if msg_link and msg_link != "#":
+            view = "V2" if "/c/" in msg_link else "V1"
+        elif str(built.get("group_link") or "").strip() not in ("", "#", "None"):
+            view = "V4"
+        else:
+            view = "none"
+
+        kb = ((built.get("buttons") or []) or [[]])
+        buttons_count = len(kb[0]) if kb else 0
+
+        # v11.5: عدادات reply_fix_* تصدر من وحدة reply_fix نفسها بعد جريها
+        # (وليس من لحظة الإرسال) — هنا السطر التوضيحي فقط.
+        for key in (f"tier_{tier}", f"name_{name}", f"contact_{contact}",
+                    f"view_{view}"):
+            if key.split("_")[-1] != "none":
+                _contact_metric(key)
+        line = (
+            f"[ALERT] tier={tier} name={name} contact={contact} view={view} "
+            f"buttons={buttons_count}/2 reply_fix={reply_fix}"
+        )
+        logger.info(line)
+        return line
+    except Exception:
+        return ""
+
+
 def build_alert_html(
     data: Dict[str, Any],
     analysis: Optional[Dict[str, Any]] = None,
@@ -395,9 +473,14 @@ def build_alert_html(
     # ── بطاقة نص الرسالة: المحتوى الأصلي كاملاً (لا حذف أجزاء) ──
     # الحاجز الوحيد: حد تيليجرام 4096 للرسالة كلها — يُقص المتجاوز فقط
     # مع "…" وتحذير لوج (لا نقسم كيان HTML نصف مكتمل).
-    # v11.3 (مواصفة المستخدم): بلا سطر «💬:» — الاسم ثم (فارغ) ثم النص.
+    # v11.5 (مواصفة المستخدم §7 — القالب النهائي): سطر «💬:» مستعاد —
+    # 👤: الاسم ← (فارغ) ← 💬: ← blockquote للنص الأصلي كاملاً.
     header = f"{SENDER_LABEL}{sender_html}"
-    overhead = len(header) + len("<blockquote></blockquote>") + len(rule_part) + 1 + 16
+    msg_label = "\n\n💬:"
+    overhead = (
+        len(header) + len("<blockquote></blockquote>") + len(rule_part)
+        + len(msg_label) + 1 + 16
+    )
     budget = max(TELEGRAM_MAX_TEXT_LEN - overhead, 256)
     safe_text = InputSanitizer.escape_html(str(data.get("text") or ""))
     if len(safe_text) > budget:
@@ -408,7 +491,7 @@ def build_alert_html(
             f"⚠️ alert text truncated to Telegram 4096 limit "
             f"(escaped_len={len(safe_text)} budget={budget})"
         )
-    text = f"{header}\n\n<blockquote>{safe_text}</blockquote>{rule_part}"
+    text = f"{header}{msg_label}\n<blockquote>{safe_text}</blockquote>{rule_part}"
 
     # ── روابط الرسالة/القروب الحقيقية (قيم المحلّل أولاً ثم البناء) ──
     link = str(msg_link or "").strip()
@@ -469,6 +552,10 @@ class AlertBot:
         self.bot_id: Optional[int] = None
         self.bot_username: Optional[str] = None
         self.last_error: Optional[str] = None
+        # v11.5: مستوى السلّم الفعلي لآخر إرسال ناجح (يقرؤه monitors للتوثيق)
+        self.last_tier: Optional[str] = None
+        # v11.5: message_id لآخر تنبيه ناجح عبر Bot API — يستخدمه الرد التعويضي F
+        self.last_alert_message_id: Optional[int] = None
         # v11.0: عميل البوت الحي (alert_ui.AlertBotClient) — طبقة إرسال
         # احتياطية بالأزرار عند فشل Bot API. يُربط من main.initialize.
         self._client: Any = None
@@ -632,6 +719,13 @@ class AlertBot:
                 return False, "", f"network_error:{type(e).__name__}"
 
             if status == 200 and body.get("ok"):
+                # v11.5: حفظ message_id التنبيه — يلزمه الرد التعويضي F (reply_to)
+                try:
+                    self.last_alert_message_id = int(
+                        ((body.get("result") or {}).get("message_id") or 0) or 0
+                    ) or None
+                except Exception:
+                    self.last_alert_message_id = None
                 # ══ v11.3: فحص قابلية نقر الاسم بعد الوصول + إصلاح ذاتي ══
                 # الاستجابة نفسها تحمل الكيانات الناجية — غياب text_link
                 # عند موضع الاسم = الاسم وصل نصاً عادياً (الشكوى الأصلية)
@@ -681,6 +775,13 @@ class AlertBot:
                 _contact_metric(
                     "contact_button_success" if method in ("username", "mention_button")
                     else "contact_button_failure"
+                )
+                # v11.5 (spec §16): سجل [ALERT] الموحد — يصنّف السلالم فعلياً
+                self.last_tier = ("T3" if buttons_dropped else "T2" if sender_dropped else "T1")
+                _emit_alert_log(
+                    built, method,
+                    sender_dropped=sender_dropped,
+                    buttons_dropped=buttons_dropped,
                 )
                 return True, method, ""
 
@@ -779,6 +880,9 @@ class AlertBot:
                             "🤖 Alert delivered via AlertBotClient (Bot API failed) | "
                             f"contact_method={method} | bot_api_reason={self.last_error[:80]}"
                         )
+                        # v11.5: العميل الحي = T5 (سلّم فشل Bot API كامل)
+                        self.last_tier = "T5"
+                        _emit_alert_log(built, method, via_client=True)
                         return True, method, ""
                 except Exception as _cl_err:
                     logger.debug(

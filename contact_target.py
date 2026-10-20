@@ -114,6 +114,12 @@ _METRIC_KEYS = (
     "clickable_sender_failure",
     "contact_button_success",
     "contact_button_failure",
+    # ── v11.5 (مواصفة §16): عدادات السلالم والرد التعويضي ──
+    "name_N1", "name_N2", "name_N3", "name_N4", "name_N5",
+    "tier_T1", "tier_T2", "tier_T3", "tier_T4", "tier_T5",
+    "contact_B1", "contact_B2", "contact_B3", "contact_B4", "contact_B5",
+    "view_V1", "view_V2", "view_V3", "view_V4",
+    "reply_fix_success", "reply_fix_failure", "reply_fix_skipped",
 )
 
 
@@ -434,13 +440,15 @@ def build_alert_entity_pack(
     if len(raw) > max(64, int(plain_budget)):
         raw = raw[: max(64, int(plain_budget)) - 1].rstrip() + "…"
 
-    plain_text = f"{SENDER_LABEL}{display}\n\n{raw}"
+    plain_text = f"{SENDER_LABEL}{display}\n\n💬:\n{raw}"
     entities: List[Any] = []
 
     try:
         name_off = utf16_len(SENDER_LABEL)
         name_len = utf16_len(display)
-        text_off = name_off + name_len + utf16_len("\n\n")
+        # v11.5 (مواصفة §7): سطر «💬:» مستعاد بين الاسم والنص —
+        # 👤: الاسم ← (فارغ) ← 💬: ← النص. إزاحة النص = بعد "\n\n💬:\n".
+        text_off = name_off + name_len + utf16_len("\n\n💬:\n")
         name_url = (str(name_url_override).strip() if name_url_override else None) or (
             target.selected_url if target is not None else None
         )

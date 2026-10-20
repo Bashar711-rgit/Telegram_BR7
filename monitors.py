@@ -266,6 +266,7 @@ from contact_target import (                                           # v11.2 �
     log_sender_resolution as _log_sender_resolution,
     metric_inc as _contact_metric,
 )
+from reply_fix import get_reply_fixer as _get_reply_fixer              # v11.5 الرد التعويضي F (مواصفة §11)
 
 
 # (نفس الدوال المساعدة من النسخة الأصلية: resolve_chat_entity, build_telegram_links)
@@ -3130,8 +3131,24 @@ class EnhancedAccountMonitor:
                 if _ok:
                     logger.info(
                         f"🤖 Alert delivered via AlertBot [{account_name}] | "
-                        f"sender={sender_id} | contact_method={_method}"
+                        f"sender={sender_id} | contact_method={_method} | "
+                        f"tier={getattr(alert_bot, 'last_tier', None)}"
                     )
+                    # ══ v11.5 (مواصفة §11): الرد التعويضي F ══
+                    # مرسل بلا username (user/bot) + access_hash لحساب
+                    # المراقبة نفسه → رد Text Mention على التنبيه. مهمة
+                    # خلفية مستقلة — لا تؤخر ولا تُسقط التنبيه أبداً.
+                    try:
+                        self._schedule_reply_fix(
+                            data=data, sender=sender, account_name=account_name,
+                            target_chat_id=getattr(alert_bot, "chat_id", 0),
+                            alert_msg_id=getattr(alert_bot, "last_alert_message_id", None),
+                        )
+                    except Exception as _rf_sched_err:
+                        logger.debug(
+                            f"reply_fix schedule skipped: "
+                            f"{type(_rf_sched_err).__name__}: {_rf_sched_err}"
+                        )
                     # الوسائط لا تُرسل عبر sendMessage — forward supplement
                     # (ميزة v10.7 القائمة) يضمن وصول الوسائط لقناة الهدف.
                     if user_media is not None:
@@ -3431,6 +3448,77 @@ class EnhancedAccountMonitor:
                 chat_id, sender_id, display_name,
                 contact_method=(outcome.get("method") or "link"),
             )
+
+    def _schedule_reply_fix(
+        self,
+        *,
+        data: Dict[str, Any],
+        sender: Dict[str, Any],
+        account_name: str,
+        target_chat_id: int,
+        alert_msg_id: Optional[int],
+    ) -> None:
+        """══ v11.5 (مواصفة §11): جدولة الرد التعويضي F ══
+
+        الشروط (كلها إلزامية — أي فشل شرط = SKIP مسجَّل داخل الوحدة):
+          * sender_type ∈ {user, bot} — لا F للقنوات/المجهول/المحذوف.
+          * بلا username (وجوده يعني أن الاسم قابل للنقر أصلًا).
+          * user_id موجب + access_hash متاح لحساب المراقبة هذا.
+          * وجهة الهدف معروفة + عميل الحساب متصل.
+
+        مهمة خلفية (create_task) — فاصل 2–5 ث داخلها؛ لا تحجب خط
+        المعالجة ولا تؤثر على نتيجة التنبيه إطلاقاً."""
+        fixer = _get_reply_fixer()
+        sender_type = str(data.get("sender_type") or "").strip().lower()
+        if sender_type not in ("", "user", "bot"):
+            _contact_metric("reply_fix_skipped")
+            logger.debug(f"[ALERT] reply_fix=SKIP reason=sender_kind:{sender_type}")
+            return
+        if sender.get("username"):
+            _contact_metric("reply_fix_skipped")
+            logger.debug("[ALERT] reply_fix=SKIP reason=username_present")
+            return
+        sender_id = int(sender.get("id") or 0)
+        access_hash = sender.get("access_hash")
+        if sender_id <= 0 or access_hash is None:
+            _contact_metric("reply_fix_skipped")
+            logger.debug("[ALERT] reply_fix=SKIP reason=no_id_or_hash")
+            return
+        if not target_chat_id:
+            _contact_metric("reply_fix_skipped")
+            logger.debug("[ALERT] reply_fix=SKIP reason=no_target")
+            return
+        client = self.client
+        if client is None:
+            _contact_metric("reply_fix_skipped")
+            logger.debug("[ALERT] reply_fix=SKIP reason=no_client")
+            return
+
+        async def _run() -> None:
+            try:
+                await fixer.run(
+                    client,
+                    chat_id=int(target_chat_id),
+                    reply_to_msg_id=alert_msg_id,
+                    user_id=sender_id,
+                    access_hash=access_hash,
+                    owner_account=account_name,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # فشل-آمن مطلق — لا يؤثر على التنبيه
+                logger.debug(f"reply_fix task error: {type(e).__name__}: {str(e)[:100]}")
+
+        task = asyncio.create_task(_run())
+
+        def _swallow(t: asyncio.Task) -> None:
+            if t.cancelled():
+                return
+            exc = t.exception()
+            if exc is not None:
+                logger.debug(f"reply_fix task crashed: {type(exc).__name__}")
+
+        task.add_done_callback(_swallow)
 
     async def _record_sent_alert(
         self,

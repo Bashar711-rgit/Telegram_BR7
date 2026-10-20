@@ -205,10 +205,10 @@ class TestBuildAlertButtons:
                 "id": -100123, "message_id": 7, "username": "g"}
         alert, buttons = monitor._build_alert(sender, chat, "ك", "نص", {"msg_hash": "x"})
         assert buttons is None
-        # القالب الموحد: رابط المرسل في الترويسة + النص بلا سطر «💬:»
+        # القالب الموحد v11.5 (spec §7): الترويسة ثم «💬:» ثم النص
         assert 'href="https://t.me/ahmed_99"' in alert
-        assert '\n\n<blockquote>نص</blockquote>' in alert
-        assert '💬' not in alert
+        assert '\n\n💬:\n<blockquote>نص</blockquote>' in alert
+        assert '💬:' in alert  # v11.5: سطر 💬 مستعاد وفق §7
         assert "رابط الرسالة" not in alert
 
     @pytest.mark.asyncio

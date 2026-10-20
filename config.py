@@ -401,6 +401,12 @@ class _ConfigData:
     ALERT_MAX_TEXT_LEN: int
     ALERT_WITH_COPY_BUTTON: bool
     ALERT_WITH_CONTACT_BUTTON: bool
+    # v11.5: الرد التعويضي F (مواصفة §11)
+    REPLY_FIX_ENABLED: bool
+    REPLY_FIX_HOURLY_PER_USER: int
+    REPLY_FIX_DAILY_CAP: int
+    REPLY_FIX_JITTER_MIN: float
+    REPLY_FIX_JITTER_MAX: float
     # v10.7: user ACCOUNTS cannot send inline buttons (Telegram only renders
     # them for bots) — alerts therefore ship as TEXT links only. The whole
     # button assembly (build_dynamic_buttons + copy/contact rows) is kept
@@ -721,8 +727,15 @@ class Config:
             SESSIONS_DIR=sessions_dir,
             SECURE_SESSIONS=SecretManager.get_bool("SECURE_SESSIONS", False),
             # ========== الرسائل ==========
-            MAX_MESSAGE_LENGTH=SecretManager.get_int("MAX_MESSAGE_LENGTH", 5000, required=False),
-            MIN_MESSAGE_LENGTH=SecretManager.get_int("MIN_MESSAGE_LENGTH", 10, required=False),
+            # v11.5 (مواصفة المستخدم 2026-10 — فلترة الطول): القاعدة المركزية
+            # "6 <= len(text) <= 65" على النص الأصلي (نقاط Unicode — لا UTF-16
+            # ولا محارف مرئية). القيم الافتراضية القديمة (10/5000) كانت تُدخل
+            # نصوصاً 66..5000 حرفاً إلى مسار التنبيه وترفض 6..9. كل البوابات
+            # (monitors 3 نقاط + filter_engine + InputSanitizer) تقرأ هاتين
+            # القيمتين — الاستعادة من الطابور وإعادة المحاولة تعيد الفحص
+            # تلقائياً (_validate_event في كل pipeline). لا يغيّر بقية الفلاتر.
+            MAX_MESSAGE_LENGTH=SecretManager.get_int("MAX_MESSAGE_LENGTH", 65, required=False),
+            MIN_MESSAGE_LENGTH=SecretManager.get_int("MIN_MESSAGE_LENGTH", 6, required=False),
             MAX_WORDS_COUNT=SecretManager.get_int("MAX_WORDS_COUNT", 20, required=False),
             # ========== الكاش والطابور ==========
             MAX_CACHE_SIZE=SecretManager.get_int("MAX_CACHE_SIZE", 10000, required=False),
@@ -801,6 +814,17 @@ class Config:
             ALERT_WITH_COPY_BUTTON=SecretManager.get_bool("ALERT_WITH_COPY_BUTTON", True),
             # زر «تواصل مع المرسل» (المرحلة الأولى): يفتح قائمة الرسائل الجاهزة
             ALERT_WITH_CONTACT_BUTTON=SecretManager.get_bool("ALERT_WITH_CONTACT_BUTTON", True),
+            # ══ v11.5: الرد التعويضي F (مواصفة المستخدم §11) ══
+            # بعد نجاح تنبيه AlertBot لمرسل بلا username: حساب المراقبة
+            # يرد على التنبيه بكيان Text Mention (InputMessageEntityMentionName
+            # بـhash حساب المراقبة نفسه — hash معزول لكل حساب). لا يُسقط
+            # التنبيه أبداً؛ فشله يُسجل فقط. الحدود: مرة/ساعة لكل user_id،
+            # حد يومي، فاصل عشوائي 2–5 ث، تجاوز آمن لأخطاء الكتابة.
+            REPLY_FIX_ENABLED=SecretManager.get_bool("REPLY_FIX_ENABLED", True),
+            REPLY_FIX_HOURLY_PER_USER=SecretManager.get_int("REPLY_FIX_HOURLY_PER_USER", 1, required=False),
+            REPLY_FIX_DAILY_CAP=SecretManager.get_int("REPLY_FIX_DAILY_CAP", 100, required=False),
+            REPLY_FIX_JITTER_MIN=SecretManager.get_float("REPLY_FIX_JITTER_MIN", 2.0, required=False),
+            REPLY_FIX_JITTER_MAX=SecretManager.get_float("REPLY_FIX_JITTER_MAX", 5.0, required=False),
             # ========== مكافحة السبام (المرحلة الثانية) ==========
             # Watch List (10 دقائق مراقبة) → Spam Confirmation → Permanent Ignore.
             # لا يتجاهل ولا يحظر أحداً عند المراقبة — فقط بعد تأكيد السبام.
@@ -958,7 +982,7 @@ class Config:
 # =============================================================================
 # Bot version — single source of truth (v10.2 Send Rotation)
 # =============================================================================
-BOT_VERSION: Final = "11.3.0"
+BOT_VERSION: Final = "11.5.0"
 BOT_CODENAME: Final = "Sender Intelligence"
 
 # =============================================================================

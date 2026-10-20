@@ -195,9 +195,9 @@ class TestClickableName:
         assert name_ent.offset == utf16_len("👤: ") == 4
         assert name_ent.length == utf16_len("نواف محمد")
         assert name_ent.url == f"tg://user?id={SENDER_ID}"
-        # القالب نفسه (v11.3: بلا سطر «💬:» — الاسم ثم (فارغ) ثم النص)
-        assert pack["plain_text"].startswith("👤: نواف محمد\n\nنص الرسالة")
-        assert "💬" not in pack["plain_text"]
+        # القالب نفسه (v11.5 spec §7: الاسم ← (فارغ) ← 💬: ← النص)
+        assert pack["plain_text"].startswith("👤: نواف محمد\n\n💬:\nنص الرسالة")
+        assert "💬:" in pack["plain_text"]
 
     def test_entity_pack_without_target_plain(self):
         """بلا هدف → نص عادي بلا كيان رابط (فشل-آمن)."""
@@ -221,8 +221,8 @@ class TestClickableName:
         assert len(name_ents) == 1
         assert name_ents[0].url == "https://t.me/c/1234567890/77"
         assert name_ents[0].offset == 4
-        # النص الظاهر لا يتغير إطلاقاً — الرابط الداخلي فقط
-        assert pack["plain_text"] == "👤: نواف محمد\n\nنص الرسالة"
+        # النص الظاهر لا يتغير إطلاقاً — الرابط الداخلي فقط (v11.5: مع سطر 💬)
+        assert pack["plain_text"] == "👤: نواف محمد\n\n💬:\nنص الرسالة"
 
     def test_entity_pack_rule_tag_appended(self):
         pack = build_alert_entity_pack("نواف", "نص",
@@ -366,8 +366,8 @@ class TestAlertBotSend:
             for e in ents
         )
         # النص الظاهر في الطبقة الاحتياطية يطابق القالب (بلا وسوم HTML)
-        # v11.3: بلا سطر «💬:» — الاسم ثم (فارغ) ثم النص مباشرة
-        assert call["text"].startswith("👤: نواف محمد\n\n")
+        # v11.5 (spec §7): الاسم ثم «💬:» ثم النص مباشرة
+        assert call["text"].startswith("👤: نواف محمد\n\n💬:\n")
 
     @pytest.mark.asyncio
     async def test_no_token_safe_fallback(self):
@@ -694,9 +694,9 @@ class TestMetrics:
 
 class TestFinalTemplate:
     def test_exact_shape(self):
-        """الشكل النهائي الفعّال (v11.3): 👤: الاسم ← (فارغ) ← النص ← [مراسلة][عرض]."""
+        """الشكل النهائي الفعّال (v11.5 spec §7): 👤: الاسم ← (فارغ) ← 💬: ← النص ← [مراسلة][عرض]."""
         built = build_alert_html(_data())
-        expected_head = "👤: <a href=\"tg://user?id=5601276336\">نواف محمد</a>\n\n<blockquote>نص الرسالة الأصلي</blockquote>"
+        expected_head = "👤: <a href=\"tg://user?id=5601276336\">نواف محمد</a>\n\n💬:\n<blockquote>نص الرسالة الأصلي</blockquote>"
         assert built["text"] == expected_head
         assert [[b["text"] for b in row] for row in built["buttons"]] == [
             ["مراسلة", "عرض الرسالة"]
@@ -716,6 +716,6 @@ class TestFinalTemplate:
                                         last_name="محمد")
         text, buttons = m._build_alert(sender, chat, "واجب", "النص", {},
                                        contact_target=target)
-        assert text == ("👤: <a href=\"tg://user?id=5601276336\">نواف محمد</a>\n\n"
+        assert text == ("👤: <a href=\"tg://user?id=5601276336\">نواف محمد</a>\n\n💬:\n"
                         "<blockquote>النص</blockquote>")
         assert buttons is None  # الأزرار من بوت التنبيهات فقط (عقد v10.8)

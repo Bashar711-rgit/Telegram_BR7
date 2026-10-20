@@ -5,6 +5,7 @@
                               بدونه: <a href="tg://user?id=ID">الاسم</a>
       سطر 2: <b>المرسل :</b> ID {id}
       (فارغ) <b>نص الرسالة:</b>
+      💬:
       <blockquote>{النص الأصلي كاملاً — لا truncate(400)}
   * أزرار Inline في صف واحد (ترتيب RTL: «مراسلة» أقصى اليمين):
       [ مراسلة ] [ عرض ] [ نسخ ] [ القروب ]   (v10.9.1 نصوص مصغّرة)
@@ -94,9 +95,9 @@ class TestBuildAlertHtml:
         )
         assert built["contact_method"] == "username"
         assert built["text"].startswith('👤: <a href="https://t.me/Lara507">هناء العنزي</a>\n\n')
-        # v11.3: الاسم ثم (سطر فارغ) ثم المحتوى داخل blockquote — بلا «💬:»
-        assert "\n\n<blockquote>" in built["text"]
-        assert "💬" not in built["text"]
+        # v11.5 (spec §7): الاسم ثم «💬:» ثم المحتوى داخل blockquote
+        assert "\n\n💬:\n<blockquote>" in built["text"]
+        assert "💬:" in built["text"]
         assert built["text"].rstrip().endswith("</blockquote>")
         # الروابط انتقلت من سطر النص إلى الأزرار
         assert "رابط الرسالة" not in built["text"]
@@ -135,7 +136,7 @@ class TestBuildAlertHtml:
         assert {"text": "مراسلة", "url": f"tg://user?id={SENDER_ID}"} in row
         assert all(b["text"] not in ("عرض الرسالة", "القروب") for b in row)
         assert built["msg_link"] is None
-        assert "\n\n<blockquote>" in built["text"] and "💬" not in built["text"]
+        assert "\n\n💬:\n<blockquote>" in built["text"] and "💬:" in built["text"]
 
     def test_view_button_falls_back_to_group_link(self):
         """بدون رابط رسالة مباشر → عرض يستخدم أفضل آلية متاحة
@@ -192,7 +193,7 @@ class TestBuildAlertHtml:
 
     def test_never_raises_on_garbage(self):
         built = build_alert_html({"sender_id": "x", "chat_id": None, "message_id": None, "text": None})
-        assert "👤: " in built["text"] and "💬" not in built["text"]
+        assert "👤: " in built["text"] and "💬:" in built["text"]
         # لا مرسل ولا روابط → كل الأزرار تُحذف بصدق (لا أزرار معطلة)
         assert built["buttons"] == []
 

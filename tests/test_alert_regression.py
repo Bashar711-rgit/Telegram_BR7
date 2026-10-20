@@ -4,11 +4,12 @@
 deploys. These tests pin the EXACT expected text/buttons produced by
 the current code.
 
-⚠️ v11.3 (2026-10) — GOLDEN UPDATED BY EXPLICIT USER REQUEST (بلا سطر «💬:»):
+⚠️ v11.5 (2026-10) — GOLDEN UPDATED BY EXPLICIT USER SPEC §7 (سطر «💬:» مستعاد):
 نمط واجهة موحد لكل التنبيهات دون استثناء (parse_mode=HTML):
 
     سطر 1:  👤: {SENDER}
     (سطر فارغ)
+    💬:
     <blockquote>{النص الأصلي كاملاً — نسخ بالضغط (Copy Text)}</blockquote>
 
     [ مراسلة ]   [ عرض الرسالة ]
@@ -54,7 +55,7 @@ GOLDEN = {
     "S1_username_chat": {
         "alert": (
             '👤: <a href="https://t.me/ahmed_99">أحمد محمد</a>'
-            '\n\n'
+            '\n\n💬:\n'
             '<blockquote>أبي مساعدة في واجب الاحصاء ضروري</blockquote>'
         ),
         # أزرار بوت التنبيهات: صف واحد بترتيب RTL
@@ -66,7 +67,7 @@ GOLDEN = {
     "S2_private_chat": {
         "alert": (
             '👤: <a href="tg://user?id=777000222">سارة</a>'
-            '\n\n'
+            '\n\n💬:\n'
             '<blockquote>أبي مساعدة في واجب الاحصاء ضروري</blockquote>'
         ),
         "bot_buttons": [
@@ -77,7 +78,7 @@ GOLDEN = {
     "S3_no_username_hash": {
         "alert": (
             '👤: <a href="tg://user?id=888000333">خالد</a>'
-            '\n\n'
+            '\n\n💬:\n'
             '<blockquote>أبي مساعدة في واجب الاحصاء ضروري</blockquote>'
         ),
         # بلا روابط → يختفي زر «عرض الرسالة» بصدق (لا روابط وهمية)
@@ -88,7 +89,7 @@ GOLDEN = {
     "S4_unknown_title": {
         "alert": (
             '👤: <a href="https://t.me/user_x">مستخدم</a>'
-            '\n\n'
+            '\n\n💬:\n'
             '<blockquote>أبي مساعدة في واجب الاحصاء ضروري</blockquote>'
         ),
         "bot_buttons": [
