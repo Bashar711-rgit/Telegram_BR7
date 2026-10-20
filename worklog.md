@@ -19,3 +19,26 @@ Work Log:
 Stage Summary:
 - المتبقي على المستخدم: (1) الدفع إلى GitHub يتطلب توكلاً صالحاً (المحاولات السابقة 401) — أو دفع 04ac29f بنفسه؛ (2) ALERT_BOT_TOKEN في Render + البوت أدمن في TARGET_GROUP_ID؛ (3) التحقق الحي E2E على تيليجرام حقيقي لم يُنفَّذ (mocks فقط — بروتوكول §9 يمنع رسائل الإنتاج).
 - القيود: خريطة حد الساعة لF بذاكرة العملية (تصفّر بعد restart — موثق داخل الوحدة).
+
+---
+Task ID: 3 (توكنات المستخدم — دفع النشر + عزل الاختبارات)
+Agent: Z.ai Code (main orchestrator)
+Task: استلام توكن GitHub وتوكن بوت التنبيهات، دفع commits محلية، إعادة التحقق من خط الأساس، ومطابقة v11.5 مع المواصفة
+
+Work Log:
+- استلام التوكنين من المستخدم؛ التحقق من توكن البوت عبر getMe → صالح: @BZ711BR_bot (id 7886937106).
+- تخزين آمن: accounts.env (gitignored) يحمل ALERT_BOT_TOKEN + ALERT_BOT_ENABLED=true للبيئة المحلية؛ توكن GitHub في /home/z/.secrets/ خارج المستودع (لا أسرار في worklog أو الكود).
+- دفع الـcommits المحلية المعلّقة: 0db8941..be4fdf2 (v11.5 Length gate 6-65 + قالب «💬:» + reply-fix F) → تفعيل نشر Render تلقائياً.
+- إعادة بناء بيئة الاختبار في هذه الآلة (uv venv .venv + requirements + pytest pytest-asyncio httpx beautifulsoup4).
+- اكتشاف وإصلاح ثغرة عزل حقيقية: مع وجود accounts.env على المضيف، توكن حقيقي تسرب إلى بيئة الاختبار وفشل test_alert_bot_config_contract (كان يفترض لا-توكن). الإصلاح (v11.5.1): conftest.py يثبّت ALERT_BOT_TOKEN="" و ALERT_BOT_ENABLED="true" قبل استيراد config (load_dotenv بلا override لا يجلبهما)، وعقد الاختبار صار falsy-check (أقوى: يرفض أي توكن فعّال). أيضاً تحديث docstring المتقادمة في alert_bot.py لقالب §7 (سطر «💬:» مستعاد).
+- مطابقة المواصفة (قراءة الكود فعلياً):
+  * حد النص 6..65 على النص الخام: config MIN=6/MAX=65؛ monitors._validate_event (قبل التنبيه)؛ validated_text في _store_message؛ مسار إعادة المحاولة DLQ → process_event_from_queue → _process_event_pipeline → _validate_event يعيد الفحص فعلاً؛ اختبار test_queue_restore_reruns_gate يغطيه.
+  * قالب §7: 👤 + (فارغ) + 💬: + blockquote للنص الأصلي + [ مراسلة ][ عرض الرسالة]؛ بلا «تنبيه جديد»؛ لا معرفات/روابط ظاهرة (الرابط داخل href فقط)؛ حد 4096 مع «…».
+  * F: سقف ساعي/يومي، jitter 2–5 ث، تعطيل بث القنوات، ChatWriteForbidden/FloodWait آمنة، التحقق من كيان MentionName بعد الإرسال، عزل hash لكل owner_account.
+- التحقق: 911/911 اختبار PASS (بعد الإصلاح)؛ py_compile سليم؛ دفع 2ba57ef → origin/main.
+
+Stage Summary:
+- origin/main = 2ba57ef (v11.5.1). خط الأساس موثّق: 911/911 PASS.
+- **إجراء مطلوب من المستخدم (إنتاج):** أضف في لوحة Render → Environment → ALERT_BOT_TOKEN=توكن البوت (ALERT_BOT_ENABLED افتراضياً true). بدونها يعمل fallback بلا أزرار. لا أملك RENDER_API_KEY لأضيفها تلقائياً.
+- حالة نشر Render: مفعّل بالدفع (autoDeploy) — لم يُتحقق من نجاحه من هنا (لا مفتاح Render) — يُتحقق عبر لوحة Render أو /health/full بعد الإقلاع.
+- تأكد أن @BZ711BR_bot عضو (يفضل admin) في TARGET_GROUP_ID الإنتاجي — يُفحص تلقائياً عند الإقلاع ويسجّل تحذيراً.
