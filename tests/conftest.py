@@ -39,6 +39,19 @@ _TEST_DB = Path(PROJECT_DIR / "tests" / "_test_bot.db")
 if _TEST_DB.exists():
     _TEST_DB.unlink()
 
+
+# v11.7.1: ذاكرة tg://user المحظورين (message_context._TG_USER_BLOCKED)
+# حالة وحدوية عبر الاختبارات — اختبار يحاكي BUTTON_USER_INVALID لمعرّف
+# يلوّث اختبارات لاحقة لنفس المعرّف (ملفات القالب تشترك في SENDER_ID).
+# إعادة تعيين إلزامية قبل/بعد كل اختبار.
+@pytest.fixture(autouse=True)
+def _reset_v11_7_1_singleton_state():
+    from message_context import reset_tg_user_blocked
+    reset_tg_user_blocked()
+    yield
+    reset_tg_user_blocked()
+
+
 from database import EnhancedDatabase  # noqa: E402
 
 

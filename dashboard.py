@@ -1318,6 +1318,31 @@ async def health_full(request: Request):
         alert_latency_snap = alert_latency.snapshot()
     except Exception:
         alert_latency_snap = {"samples": 0}
+    # v11.7.1 (المهمة الهندسية §2.5): حالة الكاتب/الطابور/DLQ — أقل قدر
+    # لازم من المعلومات التشخيصية الآمنة: عدّادات وحالة مهمة فقط. لا نصوص
+    # رسائل ولا معرّفات مستخدمين ولا أسرار. كل فشل يُبتلع بأمان (fields=0).
+    db_writer = {
+        "writer_running": False,
+        "writer_queue_size": 0,
+        "dead_letters_total": 0,
+        "dead_letters_unresolved": 0,
+    }
+    try:
+        if db:
+            wtask = getattr(db, "_writer_task", None)
+            db_writer["writer_running"] = bool(wtask and not wtask.done())
+            try:
+                db_writer["writer_queue_size"] = int(await db.queue_size())
+            except Exception:
+                pass
+            try:
+                dlq_counts = await db.get_dead_letter_counts()
+                db_writer["dead_letters_total"] = int(dlq_counts.get("total", 0))
+                db_writer["dead_letters_unresolved"] = int(dlq_counts.get("unresolved", 0))
+            except Exception:
+                pass
+    except Exception:
+        pass
     return JSONResponse({
         "status": "ok" if (db_ok and db_healthy) else "degraded",
         "database": "ok" if db_ok else "down",
@@ -1334,6 +1359,7 @@ async def health_full(request: Request):
         "alert_latency": alert_latency_snap,
         "dedup": dedup,
         "antispam": antispam,
+        "db_writer": db_writer,
         "uptime": uptime,
         "time": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     })

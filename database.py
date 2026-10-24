@@ -1546,6 +1546,22 @@ class EnhancedDatabase:
         except ValueError:
             return time.time()
 
+    async def get_dead_letter_counts(self) -> Dict[str, int]:
+        """v11.7.1: عدّادات DLQ الدنيا لـ/health/full (المهمة الهندسية §2.5 —
+        «أقل قدر لازم من المعلومات التشخيصية الآمنة»). عدّادات فقط —
+        بلا نصوص أحداث ولا معرّفات ولا أسرار. لا ترفع استثناءً أبداً."""
+        out = {"total": 0, "unresolved": 0}
+        try:
+            row = await self._fetchone("SELECT COUNT(*) AS cnt FROM dead_letters")
+            out["total"] = int(row["cnt"]) if row and row["cnt"] is not None else 0
+            row = await self._fetchone(
+                "SELECT COUNT(*) AS cnt FROM dead_letters WHERE resolved = 0"
+            )
+            out["unresolved"] = int(row["cnt"]) if row and row["cnt"] is not None else 0
+        except Exception as e:
+            logger.debug(f"get_dead_letter_counts deferred: {e}")
+        return out
+
     async def get_dead_letters(self, limit: int = 100, only_unresolved: bool = True) -> List[DeadLetterRecord]:
         try:
             condition = "WHERE resolved = 0" if only_unresolved else ""

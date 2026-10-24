@@ -1386,7 +1386,7 @@ class EnhancedAccountMonitor:
         return {"entity": entity, "title": title, "group_link": links["group"], "msg_link": links["message"]}
 
 
-    def _build_alert(self, sender: Dict, chat: Dict, keyword: str, text: str, analysis: Dict = None, contact_target: Any = None) -> Tuple[str, Optional[List]]:
+    def _build_alert(self, sender: Dict, chat: Dict, keyword: str, text: str, analysis: Dict = None, contact_target: Any = None, context: Any = None) -> Tuple[str, Optional[List]]:
         """══ v11.6 — القالب الموحد (parse_mode=HTML) ══
 
             سطر 1:  المرسل: {اسم المرسل قابل للنقر}{ — @username}
@@ -1422,6 +1422,7 @@ class EnhancedAccountMonitor:
             msg_link=chat.get("msg_link"),
             group_link=chat.get("group_link"),
             contact_target=contact_target,  # v11.2: هدف واحد للاسم والزر
+            context=context,  # v11.7.1: كائن السياق الموحد (fill-if-absent)
         )
         # v11.6: الأزرار الحقيقية تُعاد لكل المسارات — مسار البوت يرسلها
         # عبر Bot API (الأساسي)، ومسار حسابات المستخدمين الاحتياطي يحاول
@@ -3156,9 +3157,10 @@ class EnhancedAccountMonitor:
             is_bot=data.get("sender_is_bot"),
             is_deleted=data.get("sender_is_deleted"),
         )
-        # الاسم المعروض (spec #17): أول+أخير ← أول ← username ← fallback
+        # الاسم المعروض (spec #17): أول+أخير ← أول ← username ← «مرسل غير محدد»
+        # v11.7.1: لا معرفات رقمية ظاهرة (المهمة §5.1) — «مستخدم (id)» أُزيل.
         if not display_name:
-            display_name = sender_target.display_name or f"مستخدم ({sender_id})"
+            display_name = sender_target.display_name or "مرسل غير محدد"
         # v11.2 (spec #23): قابلية النقر تُحسب مرة واحدة لكل تنبيه
         try:
             _contact_metric(
@@ -3173,8 +3175,26 @@ class EnhancedAccountMonitor:
                   "access_hash": sender_access_hash,
                   # v10.8: كل usernames المرسل النشطة (تغذي زر/رابط t.me)
                   "usernames": data.get("sender_usernames")}
+        # ══ v11.7.1 (المهمة §3/§5.3): جامع السياق المركزي — مرة واحدة هنا ══
+        # الطبقة الرقيقة فوق _event_to_dict/sender_resolver/contact_target؛
+        # فشل الجمع لا يُسقط التنبيه إطلاقاً (سياق None = سلوك قديم حرفياً).
+        _ctx: Optional[Dict[str, Any]] = None
+        try:
+            from message_context import collect_message_context as _collect_ctx
+            _ctx = await _collect_ctx(
+                data, analysis=analysis, account_name=account_name,
+                overrides={"sender_username": (
+                    nav_sender_username or sender_username
+                    or data.get("sender_username"))},
+            )
+        except Exception as _ctx_err:
+            logger.debug(
+                f"message_context collect skipped [{account_name}]: "
+                f"{type(_ctx_err).__name__}"
+            )
+            _ctx = None
         alert_text, buttons = self._build_alert(sender, chat_info, keyword, text, analysis,
-                                                contact_target=sender_target)
+                                                contact_target=sender_target, context=_ctx)
         # ══ v11.2: [SENDER] — سطر التشخيص الموحد (spec #22) ══
         # لوج فقط — لا يدخل نص التنبيه أبداً؛ بلا بيانات حساسة.
         try:
@@ -3402,6 +3422,7 @@ class EnhancedAccountMonitor:
                     chat_username=chat_username,
                     sender_username=sender.get("username"),
                     contact_target=sender_target,
+                    context=_ctx,
                 )
                 if _ok:
                     logger.info(
@@ -3855,7 +3876,11 @@ class EnhancedAccountMonitor:
             return
         sender_id = int(sender.get("id") or 0)
         access_hash = sender.get("access_hash")
-        if sender_id <= 0 or access_hash is None:
+        # v11.7.1 (6.2): بلا hash لم يعد تخطياً نهائياً — سلّم
+        # _resolve_mention_input_users (يشمل InputUserFromMessage) لا يحتاج
+        # hash؛ الحكم النهائي داخل fixer.run (SKIP:no_access_hash إن لم ينتج
+        # السلّم شيئاً). لا هوية إطلاقاً (sender_id<=0) تبقى مرفوضة.
+        if sender_id <= 0:
             _contact_metric("reply_fix_skipped")
             logger.debug("[ALERT] reply_fix=SKIP reason=no_id_or_hash")
             return
@@ -3871,6 +3896,34 @@ class EnhancedAccountMonitor:
 
         async def _run() -> None:
             try:
+                # ══ v11.7.1 (6.2): سلّم _resolve_mention_input_users ══
+                # نفس السلّم المستخدم في مسار الـmention — إعادة استخدام لا
+                # سلّم جديد متكرر. InputUserFromMessage لا يحتاج access_hash.
+                ladder: List[Tuple[str, Any]] = []
+                try:
+                    ladder = await self._resolve_mention_input_users(client, data)
+                except Exception as _ladder_err:
+                    logger.debug(
+                        f"reply_fix ladder resolve failed: "
+                        f"{type(_ladder_err).__name__}"
+                    )
+                    ladder = []
+                _sending_account = ""
+                try:
+                    _sending_account = self._account_name_for_client(client) or ""
+                except Exception:
+                    _sending_account = ""
+
+                def _on_tier_fail(tier: str, err_name: str) -> None:
+                    # ذاكرة سلبية بالدرجة — بلا هويات في اللوج (أسماء درجات فقط)
+                    try:
+                        mention_negative.mark(_sending_account or "?", sender_id, tier)
+                    except Exception:
+                        pass
+                    logger.debug(
+                        f"[ALERT] reply_fix tier_fail tier={tier} err={err_name}"
+                    )
+
                 await fixer.run(
                     client,
                     chat_id=int(target_chat_id),
@@ -3878,6 +3931,8 @@ class EnhancedAccountMonitor:
                     user_id=sender_id,
                     access_hash=access_hash,
                     owner_account=account_name,
+                    ladder=ladder or None,
+                    on_tier_fail=_on_tier_fail,
                 )
             except asyncio.CancelledError:
                 raise

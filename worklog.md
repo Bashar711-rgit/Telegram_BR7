@@ -147,3 +147,21 @@ Stage Summary:
 - v11.7.0: أصلع نظام إعادة اتصال DB، /health صادق (503)، DLQ يفهم الفيضان، جلسات ميتة تُعلّق مع إشعار إداري، بوابة تشابه عادلة، توافق PG حقيقي، احتفاظ intel، فلترة أدق (3 فئات FN مثبتة أُصلحت).
 - حدود موثقة: باب 65 حرفاً هو مواصفة مستخدم سابقة — لم يُمس؛ لوحتا الإدارة مقصودتان؛ لا تغييرات Schema؛ لا اعتماديات جديدة إنتاجية.
 - التحقق الإنتاجي (Render/الشارة/اللوج) محجوب من البيئة — يحتاج عنوان الخدمة أو موافقة مستخدم من لوحة Render.
+
+---
+Task ID: 15 (v11.7.1 إعادة بناء كاملة + أول دفع ناجح — بيئة أعيد تعيينها)
+Agent: Z.ai Code (main orchestrator)
+Task: البيئة أُعيد تعيينها وفُقدت الالتزامات المحلية غير المدفوعة (d316780→7424465) — إعادة بناء المهمة كاملة من الأدلة ودفعها فوراً
+
+Work Log:
+- استنساخ جديد عند 9c3a3f0 (v11.7.0) بتوكن المالك (متغير بيئة لحظي فقط — لا أسرار في المستودع).
+- خط الأساس: 997+1 فشل بيئي وحيد (test_local_git_state_failsafe يثبّت فرع main) → أُصلح يقارن بالفرع الفعلي (subprocess rev-parse).
+- إعادة بناء v11.7.1 كاملة: message_context.py جديد (جامع + ذاكرة tg://user TTL 6h + 3 دوال وجهات + context_from_contact_target)؛ antispam (observe allow لـsid=0، confirm_spam(0) مرفوض، setup يتجاهل صفوف 0، شرط (هـ) خلف إعداد ANTISPAM_CONFIRM_SPAM_INDICATOR_REQUIRED الافتراضي المغلق)؛ alert_bot (text_mention مقبول، استيراد الذاكرة، pre-heal قبل أول إرسال، تعليم الذاكرة عند الرفض، _sync_built_buttons للعدّ الفعلي، context= fill-if-absent، «مرسل غير محدد»)؛ reply_fix (ladder + on_tier_fail مع بقاء المسار القديم حرفياً)؛ monitors (جمع السياق مرة في _send_alert → _build_alert → AlertBot.send، سلّم الرد التعويضي من _resolve_mention_input_users داخل المهمة الخلفية مع mention_negative، الاسم الاحتياطي)؛ contact_target («مرسل غير محدد»)؛ config (BOT_VERSION 11.7.1).
+- تصحيحات صدق أثناء البناء: await get_sender الحي (كان coroutine غير منتظر)؛ عزل حقل sender_usernames (فشله أسقط الجامع كله)؛ account_language NOT_APPLICABLE (لا اسم حساب كيُقرأ لغة).
+- اختبارات: test_v11_7_1_regressions (14)، test_message_context (47)، test_antispam_edges (12)، conftest autouse reset. دوْر إثبات فشل على القديم (worktree) مؤجل بعد الدفع — الأولوية حماية العمل.
+- المجموعة الكاملة: 1071/1071 ثم 1072/1072 بعد إضافة db_writer (/health/full: writer_running/writer_queue_size/dead_letters_total/unresolved + get_dead_letter_counts في database.py + اختبار). exit=0 في التشغيلين.
+- **الدفع الأول ناجح ومُتحقق**: v11.7.1-engineering=1ceb731 على origin (فشل سابق كان متغير بيئة فارغاً فقط — التوكن سليم بصلاحية Contents write مثبتة بـ422 وليس 401).
+
+Stage Summary:
+- v11.7.1 مدفوعة إلى GitHub على فرع منفصل: جامع مركزي + إصلاحات الإنتاج الخمسة + 74 اختباراً جديداً.
+- التالي: PR → دمج → Render deploy → تحقق /health.

@@ -111,6 +111,14 @@ from contact_target import (  # noqa: E402
 # حسابات المستخدمين (v10.6) أصبحت تُستخدم لمسار البوت أيضاً.
 from nav_resolver import harden_sender_anchor  # noqa: E402
 
+# v11.7.1 (إصلاح 3): الذاكرة السلبية لـ tg://user — BUTTON_USER_INVALID قيد
+# تيليجرام حقيقي؛ التذكّر 6 ساعات يجعل التنبيه التالي لنفس المرسل يبدأ
+# من رابط الرسالة المصدر مباشرة (pre-heal) بدل إرسال/تعديل مهدورين.
+from message_context import (  # noqa: E402
+    is_tg_user_blocked as _tg_user_is_blocked,
+    mark_tg_user_blocked as _mark_tg_user_blocked,
+)
+
 BOT_API_BASE = "https://api.telegram.org"
 # حد تيليجرام الأقصى لنص الرسالة — الحاجز الوحيد المسموح لتقصير المحتوى
 TELEGRAM_MAX_TEXT_LEN = 4096
@@ -294,12 +302,17 @@ _NAME_OFFSET_UTF16 = utf16_len(SENDER_LABEL)  # 👤 وحدتا UTF-16 + ": " �
 
 
 def _name_entity_missing(entities: Any) -> bool:
-    """True = لا يوجد كيان text_link عند موضع اسم المرسل (وصل نصاً عادياً).
+    """True = لا يوجد كيان رابط عند موضع اسم المرسل (وصل نصاً عادياً).
+
+    v11.7.1 (إصلاح جذر موثّق): Bot API يعيد text_mention — وليس text_link
+    — لوسم tg://user?id حين يعرف البوت المستخدم. الكود القديم كان يعدّ
+    الاسم الناجح فاشلاً ويدمّره editMessageText برابط الرسالة (السبب
+    الجذري الأرجح لشكوى «المشكلة ما زالت قائمة» لمن تفاعل مع البوت).
 
     فشل قراءة الاستجابة لا يُعاقب عليه (False) — الفحص ميزة لا حكم."""
     try:
         for e in entities or []:
-            if str(e.get("type") or "") == "text_link":
+            if str(e.get("type") or "") in ("text_link", "text_mention"):
                 if (
                     int(e.get("offset") or -1) == _NAME_OFFSET_UTF16
                     and int(e.get("length") or 0) > 0
@@ -308,6 +321,17 @@ def _name_entity_missing(entities: Any) -> bool:
     except Exception:
         return False
     return True
+
+
+def _sync_built_buttons(built: Dict[str, Any], payload: Dict[str, Any]) -> None:
+    """v11.7.1 (إصلاح 4): built["buttons"] يُزامن مع اللوحة الفعلية بعد كل
+    إعادة بناء حمولة — [ALERT] يعرض العدد المسلَّم فعلاً (1/2 لا 2/2 عند
+    إسقاط زر) لا المتوقع قبل البناء."""
+    try:
+        kb = ((payload or {}).get("reply_markup") or {}).get("inline_keyboard") or []
+        built["buttons"] = kb
+    except Exception:
+        pass
 
 
 # ══ v11.5 (مواصفة §16): سجل [ALERT] الموحد + عدادات السلالم ══
@@ -388,6 +412,51 @@ def _emit_alert_log(
         return ""
 
 
+def _ctxv(section: Any, key: str) -> Any:
+    """قراءة حقل من قسم السياق — UNAVAILABLE/NOT_APPLICABLE تعني None
+    (لا قيم تمثيلية تتسرب إلى التنبيه)."""
+    try:
+        v = (section or {}).get(key)
+    except Exception:
+        return None
+    if v is None or (isinstance(v, str) and v in ("UNAVAILABLE", "NOT_APPLICABLE")):
+        return None
+    return v
+
+
+def _fill_from_context(data: Dict[str, Any], context: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """v11.7.1 (المهمة §5.3): املأ مفاتيح data الغائبة من كائن السياق —
+    fill-if-absent حصراً: المستدعون القدامى بلا سياق كما هم، والحقول
+    الموجودة في data تبقى المرجع (القيم المحلّلة تتفوق)."""
+    if not isinstance(context, dict):
+        return data
+    try:
+        s = context.get("sender") or {}
+        m = context.get("message") or {}
+        c = context.get("chat") or {}
+        merged = dict(data)
+        pairs = (
+            ("sender_id", _ctxv(s, "user_id")),
+            ("sender_username", _ctxv(s, "username")),
+            ("sender_first_name", _ctxv(s, "first_name")),
+            ("sender_last_name", _ctxv(s, "last_name")),
+            ("sender_type", _ctxv(s, "sender_type")),
+            ("text", _ctxv(m, "message_text")),
+            ("message_id", _ctxv(m, "message_id")),
+            ("chat_id", _ctxv(c, "chat_id")),
+            ("chat_username", _ctxv(c, "chat_username")),
+            ("topic_id", _ctxv(c, "topic_id")),
+        )
+        for k, v in pairs:
+            if v is None:
+                continue
+            if merged.get(k) in (None, "", "#"):
+                merged[k] = v
+        return merged
+    except Exception:
+        return data
+
+
 def build_alert_html(
     data: Dict[str, Any],
     analysis: Optional[Dict[str, Any]] = None,
@@ -397,6 +466,7 @@ def build_alert_html(
     chat_username: Optional[str] = None,
     sender_username: Optional[str] = None,
     contact_target: Optional[ContactTarget] = None,
+    context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """يبني القالب الموحد للتنبيه (HTML) + الأزرار الأربعة (صف واحد).
 
@@ -413,6 +483,10 @@ def build_alert_html(
     تتفوق على قيم data (هي نتيجة محلل v10.5 المُحسَّن). لا يرفع استثناء
     أبداً — فشل-آمن: بيانات ناقصة تعني أزراراً محذوفة بصدق.
     """
+    try:
+        data = _fill_from_context(data, context)
+    except Exception:
+        pass
     try:
         sender_id = int(data.get("sender_id") or 0)
     except Exception:
@@ -449,10 +523,12 @@ def build_alert_html(
     # ── الاسم المعروض (سقف 128 حرفاً — حماية حد 4096) ──
     # ── الاسم المعروض (spec #17) — الأولوية: display ← أول+أخير ←
     #    username ← fallback؛ سقف 128 حرفاً حمايةً لحد 4096 ──
+    # v11.7.1: لا معرفات رقمية ظاهرة في البطاقة (المهمة §5.1) —
+    # «مستخدم (id)» أُزيل؛ المعرف يبقى داخل السياق حصراً.
     display = (
         str(data.get("sender_display") or "").strip()
         or (target.display_name or "").strip()
-        or (f"مستخدم ({sender_id})" if sender_id else "مستخدم")
+        or "مرسل غير محدد"
     )
     if len(display) > 128:
         display = display[:127] + "…"
@@ -697,8 +773,12 @@ class AlertBot:
         chat_username: Optional[str] = None,
         sender_username: Optional[str] = None,
         contact_target: Optional[ContactTarget] = None,
+        context: Optional[Dict[str, Any]] = None,
     ) -> Tuple[bool, str, str]:
         """يرسل تنبيهاً واحداً عبر Bot API بالقالب الموحد.
+
+        v11.7.1: context اختياري (كائن collect_message_context) —
+        fill-if-absent في build_alert_html؛ المستدعون القدامى كما هم.
 
         يعيد (ok, contact_method, reason):
           ok=True  → contact_method = username | mention_button | text_only
@@ -715,7 +795,7 @@ class AlertBot:
                 data, analysis,
                 msg_link=msg_link, group_link=group_link,
                 chat_username=chat_username, sender_username=sender_username,
-                contact_target=contact_target,
+                contact_target=contact_target, context=context,
             )
         except Exception as e:
             return False, "", f"build_error:{type(e).__name__}"
@@ -723,7 +803,30 @@ class AlertBot:
         base_method = built["contact_method"]
         sender_dropped = False
         buttons_dropped = False
-        payload = self._build_payload(built, include_user_button=True)
+
+        # ══ v11.7.1 (إصلاح 3): pre-heal عبر الذاكرة السلبية ══
+        # BUTTON_USER_INVALID معروف مسبقاً لهذا المرسل → لا إرسال مهدور:
+        # نبدأ بلا زر «مراسلة» والاسم مُرسيٌّ على رابط الرسالة المصدر مباشرة.
+        try:
+            _psid = int((built.get("button_kwargs") or {}).get("sender_id") or 0)
+        except Exception:
+            _psid = 0
+        _preheal = bool(_psid and _tg_user_is_blocked(_psid))
+        if _preheal:
+            sender_dropped = True
+            _ph_url = str(built.get("msg_link") or "").strip()
+            if _ph_url and _ph_url != "#":
+                _hardened = harden_sender_anchor(built["text"], _psid, _ph_url)
+                if _hardened != built["text"]:
+                    built["text"] = _hardened
+            payload = self._build_payload(built, include_user_button=False)
+            logger.info(
+                "[SENDER] tg_user_blocked=PREHEAL start=source_link "
+                "contact_button=omitted (memory ttl=6h)"
+            )
+        else:
+            payload = self._build_payload(built, include_user_button=True)
+        _sync_built_buttons(built, payload)
 
         for attempt in range(1, self.max_retries + 1):
             try:
@@ -828,7 +931,19 @@ class AlertBot:
                 and any(b in desc.upper() for b in BUTTON_USER_ERRORS)
             ):
                 sender_dropped = True
+                # v11.7.1 (إصلاح 3): علّم الذاكرة السلبية — التنبيه التالي
+                # لنفس المرسل يبدأ من رابط الرسالة المصدر (pre-heal).
+                try:
+                    _bsid = int((built.get("button_kwargs") or {}).get("sender_id") or 0)
+                except Exception:
+                    _bsid = 0
+                if _bsid and _mark_tg_user_blocked(_bsid):
+                    logger.warning(
+                        "[SENDER] tg_user_blocked=MARKED ttl=6h "
+                        "(future alerts start from source message link)"
+                    )
                 payload = self._build_payload(built, include_user_button=False)
+                _sync_built_buttons(built, payload)
                 logger.warning(
                     f"⚠️ AlertBot sender button rejected ({desc[:80]}) — إعادة "
                     "الإرسال بدون زر «مراسلة» (رابط الاسم يبقى في النص وتبقى "
@@ -850,6 +965,7 @@ class AlertBot:
                 if _has_tg and not sender_dropped:
                     sender_dropped = True  # إسقاط أزرار tg:// فقط — يبقى t.me
                     payload = self._build_payload(built, sanitize_tg=True)
+                    _sync_built_buttons(built, payload)
                     logger.warning(
                         f"⚠️ AlertBot button rejected ({desc[:80]}) — إعادة الإرسال "
                         "بلوحة t.me فقط (بدون أزرار tg://)"
