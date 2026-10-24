@@ -180,10 +180,20 @@ class ReplyFixer:
         user_id: int,
         access_hash: Optional[int],
         owner_account: str = "",
+        ladder: Optional[list] = None,
+        on_tier_fail: Optional[Any] = None,
     ) -> str:
         """ينفذ F كاملاً. يعيد OK | FAIL:سبب | SKIP:سبب — لا يرفع استثناءً.
 
-        client = عميل تيليجرام لحساب المراقبة المالك للـaccess_hash."""
+        client = عميل تيليجرام لحساب المراقبة المالك للـaccess_hash.
+
+        v11.7.1 (بروتوكول المهلة 6.2): `ladder` — سلّم درجات InputUser
+        جاهز [(tier_name, InputUser|InputUserFromMessage), …] من
+        monitors._resolve_mention_input_users (يشمل InputUserFromMessage
+        الذي لا يحتاج access_hash إطلاقاً). تُجرّب الدرجات بالترتيب، وكل
+        فشل يُمرر لـon_tier_fail(tier, error_name) لتغذية الذاكرة السلبية
+        mention_negative — بلا أسماء هويات في اللوج (أسماء درجات فقط).
+        المسار القديم (بلا ladder) يعمل حرفياً كما كان — توافق خلفي كامل."""
         uid = int(user_id or 0)
         if not _TELETHON_TYPES:
             metric_inc("reply_fix_skipped")
@@ -193,7 +203,9 @@ class ReplyFixer:
         if uid <= 0:
             metric_inc("reply_fix_skipped")
             return "SKIP:no_user_id"
-        if access_hash is None:
+        # v11.7.1: access_hash اختياري **مع سلّم** (InputUserFromMessage لا
+        # يحتاج hash) — المسار القديم بلا سلّم يبقى ملتزماً بالشرط حرفياً.
+        if access_hash is None and not ladder:
             metric_inc("reply_fix_skipped")
             return "SKIP:no_access_hash"
 
@@ -214,6 +226,88 @@ class ReplyFixer:
             raise
 
         # 4) بناء الكيان — InputUser بحساب المراقبة نفسه حصراً
+        # ══ v11.7.1: مسار السلّم — الدرجات بالترتيب مع ذاكرة سلبية ══
+        if ladder:
+            last_err = "empty_ladder"
+            for tier_name, iu in (ladder or []):
+                if iu is None:
+                    continue
+                try:
+                    entity = InputMessageEntityMentionName(
+                        offset=0, length=_REPLY_LEN_UTF16, user_id=iu,
+                    )
+                except Exception as e:
+                    last_err = f"entity_build:{type(e).__name__}"
+                    if on_tier_fail is not None:
+                        try:
+                            on_tier_fail(tier_name, type(e).__name__)
+                        except Exception:
+                            pass
+                    logger.debug(
+                        f"[ALERT] reply_fix tier={tier_name} FAIL {last_err} "
+                        f"owner={owner_account}"
+                    )
+                    continue
+                try:
+                    self._record_attempt(uid)
+                    if reply_to_msg_id:
+                        sent = await client.send_message(
+                            chat_id, _REPLY_TEXT,
+                            reply_to=reply_to_msg_id,
+                            formatting_entities=[entity],
+                        )
+                    else:
+                        sent = await client.send_message(
+                            chat_id, _REPLY_TEXT,
+                            formatting_entities=[entity],
+                        )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    ename = type(e).__name__
+                    last_err = ename
+                    if _TELETHON_ERRORS and isinstance(e, (ChatWriteForbiddenError, SlowModeWaitError)):
+                        metric_inc("reply_fix_skipped")
+                        return f"SKIP:write_forbidden_or_slowmode:{ename}"
+                    if _TELETHON_ERRORS and isinstance(e, FloodWaitError):
+                        metric_inc("reply_fix_skipped")
+                        return f"SKIP:floodwait_{int(getattr(e, 'seconds', 0) or 0)}"
+                    if on_tier_fail is not None:
+                        try:
+                            on_tier_fail(tier_name, ename)
+                        except Exception:
+                            pass
+                    logger.debug(
+                        f"[ALERT] reply_fix tier={tier_name} FAIL {last_err} "
+                        f"owner={owner_account}"
+                    )
+                    continue
+                sent_entities = list(getattr(sent, "entities", None) or [])
+                has_mention = any(
+                    type(e).__name__ == "MessageEntityMentionName" for e in sent_entities
+                )
+                if not has_mention:
+                    last_err = "entity_missing"
+                    if on_tier_fail is not None:
+                        try:
+                            on_tier_fail(tier_name, "entity_missing")
+                        except Exception:
+                            pass
+                    logger.debug(
+                        f"[ALERT] reply_fix tier={tier_name} FAIL entity_missing "
+                        f"owner={owner_account}"
+                    )
+                    continue
+                logger.info(
+                    f"[ALERT] reply_fix=OK tier={tier_name} owner={owner_account} "
+                    "(mention delivered)"
+                )
+                metric_inc("reply_fix_success")
+                return "OK"
+            metric_inc("reply_fix_failure")
+            return f"FAIL:{last_err}"
+
+        # المسار القديم (بلا سلّم) — حرفياً كما كان (توافق خلفي)
         try:
             entity = InputMessageEntityMentionName(
                 offset=0, length=_REPLY_LEN_UTF16,

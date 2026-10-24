@@ -172,6 +172,7 @@ class AntiSpamEngine:
             "direct_spam": 0,
             "ignored_skipped": 0,
             "ignored_db_misses": 0,
+            "no_identity_skipped": 0,  # v11.7.1: رسائل بلا هوية مرسل
             "errors": 0,
         }
 
@@ -192,9 +193,18 @@ class AntiSpamEngine:
                 if rows:
                     for r in rows:
                         try:
-                            self._ignored[int(r.get("sender_id") or r["sender_id"])] = True
+                            _rid = int(r.get("sender_id") or r["sender_id"])
                         except Exception:
                             continue
+                        # v11.7.1 (إصلاح sender=0): صفوف المعرّف 0 القديمة ليست
+                        # مستخدماً حقيقياً — كل الرسائل بلا هوية كانت تُدمج
+                        # تحت المعرّف 0 وتُصنّف «سبام» وتُكتب هنا. لا يُحمل
+                        # الصف 0 في الذاكرة إطلاقاً (التنظيف اليدوي الموثق:
+                        # SELECT ... WHERE sender_id = 0 ثم /unspam 0).
+                        if _rid == 0:
+                            self.stats.setdefault("no_identity_skipped", 0)
+                            continue
+                        self._ignored[_rid] = True
             logger.info(
                 f"AntiSpam engine ready: {len(self._ignored)} permanently-ignored "
                 f"sender(s) loaded into LRU | enabled={CFG.ANTISPAM_ENABLED} | "
@@ -272,8 +282,22 @@ class AntiSpamEngine:
             return False
 
     async def confirm_spam(self, sender_id: Any, reasons: List[str], evidence: Optional[Dict] = None) -> None:
-        """نفّذ الإجراء النهائي: تصنيف + تجاهل دائم + تسجيل السبب بالتفصيل."""
+        """نفّذ الإجراء النهائي: تصنيف + تجاهل دائم + تسجيل السبب بالتفصيل.
+
+        v11.7.1 (إصلاح sender=0): المعرّف 0 ليس هوية — قنوات/مشرف مجهول/
+        أحداث بلا مرسل كانت تُدمج كلها تحت 0 كأنها مستخدم واحد وتُحظر
+        دائماً بصف دائم وهمي في spam_ignore. الرفض هنا صامت وسجل فقط
+        (فشل-آمن: لا يمنع رسالة حقيقية — observe() لا يصل لهذا المسار
+        بمعرّف 0 بعد الإصلاح)."""
         sid = int(sender_id or 0)
+        if sid == 0:
+            self.stats.setdefault("no_identity_skipped", 0)
+            self.stats["no_identity_skipped"] += 1
+            logger.warning(
+                "🚫 AntiSpam confirm_spam(0) REFUSED — sender_id=0 ليست هوية "
+                "(قناة/مجهول/حدث بلا مرسل) — لا صف دائم ولا حظر وهمي"
+            )
+            return
         self._ignored[sid] = True
         # Remove from the negative cache in case we previously cached a
         # "not ignored" decision for this sender.
@@ -322,6 +346,15 @@ class AntiSpamEngine:
             if not CFG.ANTISPAM_ENABLED:
                 return "allow", info
             sid = int(sender_id or 0)
+            if not sid:
+                # v11.7.1 (السبب الجذري لإصلاح sender=0): رسالة بلا مرسل
+                # (قناة/مشرف مجهول/حدث بلا هوية) ليست «مستخدماً واحداً» —
+                # دمجها تحت المعرّف 0 كان يراقبها ويصنّفها سباماً ويكتب
+                # صف spam_ignore دائم وهمياً. allow فوري بلا تتبع.
+                self.stats.setdefault("no_identity_skipped", 0)
+                self.stats["no_identity_skipped"] += 1
+                info["reasons"] = ["بلا هوية مرسل (sender_id=0) — بلا مراقبة"]
+                return "allow", info
             if sid and sid in self._ignored:
                 self.stats["ignored_skipped"] += 1
                 # مصنّف مسبقاً — لا معالجة ولا تنبيه (تجاهل دائم قائم)
@@ -586,9 +619,30 @@ class AntiSpamEngine:
             reasons.append(f"طلبات من فئات مختلفة خلال فترة قصيرة: {'، '.join(sorted(cats_window))}")
 
         # (هـ) 5 رسائل خلال 10 دقائق أو 3 مجموعات خلال 10 دقائق
-        if len(recent_10m) >= max(2, CFG.ANTISPAM_CONFIRM_MESSAGES):
+        # v11.7.1 (المهمة §2.3 — خطر موثق بلا تغيير سلوك): العدّ يشمل كل
+        # الرسائل (العادية بلا مؤشر ضمناً) — قد يؤكد حظر مستخدم قام فقط
+        # بـ5 رسائل عادية بعد إدراجه مراقبة. عند تفعيل
+        # ANTISPAM_CONFIRM_SPAM_INDICATOR_REQUIRED=True تُحصى فقط الرسائل
+        # ذات مؤشر سبام (فئة طلب / تشابه مع سوابق). **الافتراضي False =
+        # السلوك الحالي حرفياً** (قرار المالك — لا تفعيل تلقائي).
+        _confirm_pool = recent_10m
+        if getattr(CFG, "ANTISPAM_CONFIRM_SPAM_INDICATOR_REQUIRED", False):
+            _pool: List = []
+            for _r in recent_10m:
+                if _r[3]:
+                    _pool.append(_r)
+                    continue
+                _sim_hit = any(
+                    _pr[2] and (_pr[2] == _r[2]
+                                or self._ratio(_r[2], _pr[2]) >= CFG.ANTISPAM_SIMILARITY_THRESHOLD)
+                    for _pr in recent_10m if _pr is not _r and _pr[0] < _r[0]
+                )
+                if _sim_hit:
+                    _pool.append(_r)
+            _confirm_pool = _pool
+        if len(_confirm_pool) >= max(2, CFG.ANTISPAM_CONFIRM_MESSAGES):
             reasons.append(
-                f"{len(recent_10m)} رسائل خلال {CFG.ANTISPAM_CONFIRM_ACTIVITY_WINDOW_SECONDS // 60} دقائق"
+                f"{len(_confirm_pool)} رسائل خلال {CFG.ANTISPAM_CONFIRM_ACTIVITY_WINDOW_SECONDS // 60} دقائق"
             )
         if len(chats_10m) >= max(2, CFG.ANTISPAM_CONFIRM_GROUPS):
             reasons.append(

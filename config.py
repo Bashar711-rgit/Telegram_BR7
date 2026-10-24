@@ -451,6 +451,7 @@ class _ConfigData:
     ANTISPAM_CONFIRM_MESSAGES: int
     ANTISPAM_CONFIRM_GROUPS: int
     ANTISPAM_CONFIRM_ACTIVITY_WINDOW_SECONDS: int
+    ANTISPAM_CONFIRM_SPAM_INDICATOR_REQUIRED: bool
     ANTISPAM_MEMORY_PER_USER: int
     ANTISPAM_MAX_TRACKED_USERS: int
 
@@ -849,6 +850,12 @@ class Config:
             ANTISPAM_CONFIRM_MESSAGES=SecretManager.get_int("ANTISPAM_CONFIRM_MESSAGES", 5, required=False),
             ANTISPAM_CONFIRM_GROUPS=SecretManager.get_int("ANTISPAM_CONFIRM_GROUPS", 3, required=False),
             ANTISPAM_CONFIRM_ACTIVITY_WINDOW_SECONDS=SecretManager.get_int("ANTISPAM_CONFIRM_ACTIVITY_WINDOW_SECONDS", 600, required=False),
+            # v11.7.1 (المهمة §2.3): خيار سياسة — شرط التأكيد (هـ) يحتسب حالياً
+            # كل الرسائل خلال 10 دقائق (حتى العادية بلا أي مؤشر سبام). عندما
+            # True: تشترط أن تحمل الرسائل المحسوبة مؤشر سبام (فئة طلب أو
+            # تشابه مع سوابق). **الافتراضي False = السلوك الحالي حرفياً** —
+            # تغيير السياسة قرار مالك (لا يُفعّل تلقائياً أبداً).
+            ANTISPAM_CONFIRM_SPAM_INDICATOR_REQUIRED=SecretManager.get_bool("ANTISPAM_CONFIRM_SPAM_INDICATOR_REQUIRED", False),
             # حدود الذاكرة لسجل النشاط لكل مستخدم
             ANTISPAM_MEMORY_PER_USER=SecretManager.get_int("ANTISPAM_MEMORY_PER_USER", 50, required=False),
             ANTISPAM_MAX_TRACKED_USERS=SecretManager.get_int("ANTISPAM_MAX_TRACKED_USERS", 5000, required=False),
@@ -982,7 +989,7 @@ class Config:
 # =============================================================================
 # Bot version — single source of truth (v10.2 Send Rotation)
 # =============================================================================
-BOT_VERSION: Final = "11.6.0"
+BOT_VERSION: Final = "11.7.1"
 BOT_CODENAME: Final = "Sender Intelligence"
 
 # =============================================================================

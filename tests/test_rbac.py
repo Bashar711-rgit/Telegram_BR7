@@ -12,6 +12,7 @@
 import base64
 import hmac as hmac_mod
 import json
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -447,9 +448,17 @@ class TestGithubPanel:
     def test_local_git_state_failsafe(self):
         from webadmin.github_api import local_git_state
         st = local_git_state(str(PROJ_DIR))
-        # داخل المستودع: يجب أن يعيد sha + فرع + owner/repo من origin.
+        # داخل المستودع: يجب أن يعيد sha + الفرع الفعلي + owner/repo من origin.
+        # v11.7.1: يقارن بالفرع الفعلي للمستودع بدل تثبيت "main" — العقد
+        # (إعادة الفرع الحقيقي) محفوظ، والربط البيئي بفرع بعينه أُزيل حتى
+        # تعمل المجموعة على فروع العمل دون كسر عقد الدالة نفسها.
         assert st["head"] and len(st["head"]) == 40
-        assert st["branch"] == "main"
+        _br = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=str(PROJ_DIR), capture_output=True, text=True, timeout=10,
+        )
+        _expected = (_br.stdout or "").strip() or "HEAD"
+        assert st["branch"] == _expected
         assert "Telegram_BR7" in st["repo"]
 
     def test_overview_not_configured_shape(self, monkeypatch):
