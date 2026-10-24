@@ -165,3 +165,18 @@ Work Log:
 Stage Summary:
 - v11.7.1 مدفوعة إلى GitHub على فرع منفصل: جامع مركزي + إصلاحات الإنتاج الخمسة + 74 اختباراً جديداً.
 - التالي: PR → دمج → Render deploy → تحقق /health.
+
+---
+Task ID: 16 (النشر الإنتاجي — PR #1 مدموج + Render live + شارة الإصدار)
+Agent: Z.ai Code (main orchestrator)
+Task: PR → دمج → نشر Render → تحقق حي
+
+Work Log:
+- PR #1 أُنشئ (v11.7.1-engineering → main) **ودُمج بنجاح**: main=78ca82e (merge commit).
+- Render API (بادئة rnd_ صغيرة الحرف — المفتاح المرسل بـRnd_ رُفض 401): الخدمة srv-daau2me7bikc73ccfffg "Telegram_BR7" — النشر التلقائي انطلق فور الدمج: dep-dbehsbe7bikc73b9vkr0 commit=78ca82ec0 → **live خلال ~70 ثانية** (السابق live كان 9c3a3f061 v11.7.0 — يؤكد ما وثق سابقاً).
+- تحقق حي: /health → HTTP 200 {"status":"ok","database":"ok","db_healthy":true} مرتين — عقد 503 محفوظ.
+- اكتشاف حي: شارة اللوحة "BR7 · v11.6" نص ثابت مهجور في templates/dashboard.html (جلسة v11.7.0 أغفلها وسجلها يشير لذلك) → إصلاح: حقن BOT_VERSION الفعلي عند تحميل القالب + اختبار test_index_badge_shows_bot_version. المجموعة: 1073/1073.
+- هذا الالتزام + PR #2 لدفع إصلاح الشارة.
+
+Stage Summary:
+- v11.7.1 حية على الإنتاج (78ca82ec0) وصحتها خضراء — يتبقى دمج إصلاح الشارة.

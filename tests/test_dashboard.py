@@ -83,6 +83,14 @@ class TestPublicEndpoints:
         assert "event_data" not in blob and "session" not in blob
 
     @pytest.mark.asyncio
+    async def test_index_badge_shows_bot_version(self, client):
+        # v11.7.1: شارة الإصدار تعرض BOT_VERSION الفعلي — لا نص ثابت مهجور.
+        from config import BOT_VERSION
+        r = await client.get("/")
+        assert r.status_code == 200
+        assert f"BR7 · v{BOT_VERSION}" in r.text
+
+    @pytest.mark.asyncio
     async def test_login_page_served(self, client):
         r = await client.get("/login")
         assert r.status_code == 200
