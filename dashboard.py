@@ -1158,6 +1158,19 @@ try:
     if os.path.exists(_DASHBOARD_TEMPLATE_PATH):
         with open(_DASHBOARD_TEMPLATE_PATH, "r", encoding="utf-8") as _f:
             _DASHBOARD_TEMPLATE_CONTENT = _f.read()
+        # v11.7.1: شارة الإصدار تعرض BOT_VERSION الفعلي بدل نص ثابت مهجور
+        # (كان عالقاً على v11.6 رغم تقدم الإصدار — توثيق صادق للإقلاع).
+        try:
+            from config import BOT_VERSION as _BOT_VERSION
+            _ver = str(_BOT_VERSION).strip()
+            if _ver:
+                _DASHBOARD_TEMPLATE_CONTENT = _DASHBOARD_TEMPLATE_CONTENT.replace(
+                    '<div class="brand-ver" id="brandVer">BR7 · v11.6</div>',
+                    f'<div class="brand-ver" id="brandVer">BR7 · v{_ver}</div>',
+                    1,
+                )
+        except Exception as _badge_err:  # noqa: BLE001
+            logger.debug(f"version badge inject skipped: {_badge_err}")
     else:
         logger.warning(f"dashboard template not found at {_DASHBOARD_TEMPLATE_PATH}")
 except Exception as _tpl_err:  # noqa: BLE001
