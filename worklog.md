@@ -180,3 +180,16 @@ Work Log:
 
 Stage Summary:
 - v11.7.1 حية على الإنتاج (78ca82ec0) وصحتها خضراء — يتبقى دمج إصلاح الشارة.
+
+---
+Task ID: 17 (تحقق نهائي حي — النسخة v11.7.1 كاملة على الإنتاج)
+Agent: Z.ai Code (main orchestrator)
+
+Work Log:
+- النشر الثاني (0abd5ac — إصلاح الشارة) live خلال ~30 ثانية: dep-dbehv3u7bikc73ba32rg.
+- التحقق الحي النهائي: /health → HTTP 200 {"status":"ok","database":"ok","db_healthy":true}؛ شارة اللوحة الحية: **BR7 · v11.7.1** (بعد تبديل المثيل خلف موازن الحمل — تأخير ~45 ث طبيعي).
+- خط الأنابيب الكامل مكتمل ومثبت بالأدلة: إعادة بناء → 1073/1073 → دفع → PR #1+#2 → دمج → Render autoDeploy → live → فحص صحة حي.
+
+Stage Summary:
+- v11.7.1 على الإنتاج بالكامل: main=0abd5ac، الخدمة live، الصحة خضراء، الشارة صادقة.
+- ملاحظة أمان للمالك: التوكنان شاركا في المحادثة — **يُنصح بتدويرهما** (GitHub: Settings → Developer settings → Fine-grained tokens؛ Render: Account Settings → API Keys) بعد قراءة هذا السجل.
