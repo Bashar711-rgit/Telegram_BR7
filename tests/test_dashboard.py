@@ -60,6 +60,29 @@ class TestPublicEndpoints:
         assert "monitors_total" in body
 
     @pytest.mark.asyncio
+    async def test_health_full_exposes_writer_queue_dlq(self, client):
+        # v11.7.1 (المهمة الهندسية §2.5): حالة الكاتب/الطابور/DLQ ظاهرة —
+        # عدّادات آمنة فقط (بلا نصوص رسائل ولا معرّفات). الحقول موجودة دائماً
+        # حتى لو فشل مصدر العد (قيم 0 الصادقة) — العرض لا يُسقط الصحة.
+        r = await client.get("/health/full", headers=AUTH)
+        assert r.status_code == 200
+        body = r.json()
+        dw = body.get("db_writer")
+        assert isinstance(dw, dict)
+        assert set(dw.keys()) == {
+            "writer_running", "writer_queue_size",
+            "dead_letters_total", "dead_letters_unresolved",
+        }
+        assert isinstance(dw["writer_running"], bool)
+        assert isinstance(dw["writer_queue_size"], int) and dw["writer_queue_size"] >= 0
+        assert isinstance(dw["dead_letters_total"], int) and dw["dead_letters_total"] >= 0
+        assert isinstance(dw["dead_letters_unresolved"], int)
+        assert dw["dead_letters_unresolved"] <= dw["dead_letters_total"]
+        # PII leak guards: the writer block carries counts only.
+        blob = repr(dw)
+        assert "event_data" not in blob and "session" not in blob
+
+    @pytest.mark.asyncio
     async def test_login_page_served(self, client):
         r = await client.get("/login")
         assert r.status_code == 200
