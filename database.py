@@ -565,11 +565,18 @@ class EnhancedDatabase:
     async def _connect_postgresql(self) -> None:
         dsn = os.getenv("DATABASE_URL")
         if dsn:
+            # v11.8 (مرحلة التنفيذ 3.4): statement_cache_size يُقرأ من البيئة
+            # والافتراضي 0 — آمن مع Session Pooler وTransaction Pooler معاً
+            # (6543 يكسر prepared statements عبر backends متعددة). ضبط
+            # DB_STATEMENT_CACHE_SIZE=200 يستعيد الكاش على اتصال مباشر.
             self._pool = await asyncpg.create_pool(
                 dsn=dsn,
                 min_size=CFG.DB_POOL_MIN,
                 max_size=CFG.DB_POOL_MAX,
                 command_timeout=CFG.CONNECTION_TIMEOUT,
+                statement_cache_size=max(
+                    0, int(os.getenv("DB_STATEMENT_CACHE_SIZE", "0") or 0)
+                ),
                 server_settings={
                     "statement_timeout": "30000",
                     "idle_in_transaction_session_timeout": "60000",
@@ -977,6 +984,11 @@ class EnhancedDatabase:
                 ON filter_decisions (created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_filter_decisions_decision
                 ON filter_decisions (decision);
+            CREATE TABLE IF NOT EXISTS app_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
         """
         for stmt in stmts.split(";"):
             s = stmt.strip()
