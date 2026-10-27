@@ -1,19 +1,21 @@
 -- ══════════════════════════════════════════════════════════════════
--- v11.8 — Supabase RLS hardening (execution phase 5)
--- يشغَّل مرة واحدة في Supabase SQL Editor (أو عبر اتصال DATABASE_URL)
--- بعد أول ترحيل ناجح وقبل فتح أي وصول خارجي.
+-- v11.8.1 — Supabase RLS hardening (execution phase 5, REVISED)
+-- يشغَّل مرة واحدة عبر Supabase SQL endpoint / SQL Editor
+-- بعد أول إقلاع ناجح للتطبيق (الجداول موجودة) وقبل فتح أي وصول خارجي.
 --
--- السياق الموثق (تقرير §RLS Design):
---  * التطبيق يتصل بـ DATABASE_URL مباشرة بدور postgres (supabase_admin /
---    postgres) — الأدوار المتميزة تتجاوز RLS بتصميم Postgres، لذلك RLS
---    هنا حزام أمان إضافي يحمي من وصول Keys API (anon/service_role عبر
---    PostgREST) لا من التطبيق نفسه.
+-- السياق المُحدَّث (تصحيح v11.8 الأصلي):
+--  * التطبيق يتصل الآن بدور مخصص أقل صلاحيات: br7_app (ليس postgres).
+--    br7_app هو مالك الجداول — وFORCE RLS يجعل المالك خاضعاً لـ RLS،
+--    لذلك نُنشئ سياسة صريحة لـ br7_app (كل الصفوف) وإلا قرأ 0 صفوف.
+--  * FORCE RLS + سياسة br7_app = أقوى وضع: أي دور آخر (حتى لو مُنحت
+--    GRANTs بالخطأ لاحقاً) يخضع لـ RLS بلا سياسات = رفض شامل.
 --  * لا يعتمد التطبيق على Data API إطلاقاً (صفر مراجع SUPABASE* في
---    الكود — مُثبت بـ rg)؛ فسياسات anon تُقفل كل شيء افتراضياً.
+--    الكود — مُثبت بـ rg)؛ REVOKE من anon/authenticated/service_role
+--    يقفل بوابة PostgREST بالكامل (service_role يمتلك BYPASSRLS لذا
+--    الـ REVOKE على مستوى الجداول هو ما يوقفه فعلاً).
 -- ══════════════════════════════════════════════════════════════════
 
--- 1) RLS مفعّل على كل جداول التطبيق مع "لا سياسات" = رفض شامل لأي دور
---    خاضع لـ RLS (anon/authenticated عبر PostgREST).
+-- 1) RLS مفروض على كل جداول التطبيق + سياسة كاملة لدور التطبيق
 DO $$
 DECLARE t text;
 BEGIN
@@ -24,26 +26,31 @@ BEGIN
     'allowed_entities','features','notifications','audit_logs',
     'dashboard_users','dashboard_accounts','filter_decisions',
     'users','group_memberships','group_messages','message_analysis',
-    'user_activity','sender_access','app_settings'
+    'user_activity','sender_access','sender_account_hashes','app_settings'
   ]
   LOOP
     IF EXISTS (SELECT 1 FROM information_schema.tables
                WHERE table_schema='public' AND table_name = t) THEN
       EXECUTE format('ALTER TABLE public.%I ENABLE ROW LEVEL SECURITY', t);
       EXECUTE format('ALTER TABLE public.%I FORCE ROW LEVEL SECURITY', t);
+      -- سياسة دور التطبيق: وصول كامل (التطبيق هو الطبقة التي تُطبق
+      -- قواعد العمل/RBAC — لا يتوقع أي تصفية صفوف على مستوى DB).
+      EXECUTE format('DROP POLICY IF EXISTS br7_app_full ON public.%I', t);
+      EXECUTE format(
+        'CREATE POLICY br7_app_full ON public.%I FOR ALL TO br7_app USING (true) WITH CHECK (true)', t);
     END IF;
   END LOOP;
 END $$;
 
--- 2) منع الصلاحيات العامة على الجداول الحساسة (دفاع في العمق —
---    Revoking حتى لو أُضيفت سياسات لاحقاً بالخطأ).
-REVOKE ALL ON ALL TABLES IN SCHEMA public FROM anon, authenticated;
-REVOKE ALL ON ALL FUNCTIONS IN SCHEMA public FROM anon, authenticated;
+-- 2) منع الصلاحيات العامة على الجداول (دفاع في العمق — يشمل
+--    service_role الذي يتجاوز RLS بسمة BYPASSRLS).
+REVOKE ALL ON ALL TABLES IN SCHEMA public FROM anon, authenticated, service_role;
+REVOKE ALL ON ALL FUNCTIONS IN SCHEMA public FROM anon, authenticated, service_role;
+REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM anon, authenticated, service_role;
 
--- 3) حماية الأعمدة الحساسة من الظهور في أي Log/خطأ عام:
---    (session_string / api_hash تعيش في dashboard_accounts — تأكيد
---    أنها لا تُقرأ إلا من التطبيق نفسه; لا EXPOSE policy تُضاف أبداً).
+-- 3) منع إنشاء جداول جديدة من الأدوار العامة (br7_app فقط له CREATE).
+REVOKE CREATE ON SCHEMA public FROM PUBLIC;
 
--- 4) توثيق: دور الاتصال المباشر (postgres) يظل بصلاحيات كاملة —
+-- 4) توثيق: دور الاتصال (br7_app) مالك الجداول بسياسة كاملة؛
 --    أقل الصلاحيات على مستوى التطبيق تُدار عبر RBAC لوحة التحكم
---    (5 أدوات دورية موثقة في dashboard.py:398) لا على مستوى DB.
+--    (5 أدوار دورية موثقة في dashboard.py:398) لا على مستوى DB.
