@@ -880,6 +880,19 @@ class EnhancedFilter:
             if isinstance(action_verbs_data.get(key), list):
                 self._action_verbs.update(_norm_set(action_verbs_data.get(key, [])))
 
+        # v11.8 (F-06): help-VERB anchor trie — grammar-only help verbs
+        # (يساعدني/ساعدوني/...) used to be skipped entirely by the v14.5
+        # early-exit when no intent/implicit keyword existed. This conservative
+        # sub-list (verb forms only, NOT generic nouns like مساعدة/دعم)
+        # anchors the intent so real help cries enter the full scoring path.
+        _help_anchor_terms: Set[str] = _norm_set(
+            {"يساعدني", "تساعدني", "يسعفني", "فزعوا لي", "فزعوا"}
+        )
+        for _imp in (action_verbs_data.get("imperative_forms") or []):
+            if isinstance(_imp, str):
+                _help_anchor_terms.add(self._normalize_term(_imp))
+        self._help_anchor_trie = WeightedTrie(_help_anchor_terms)
+
         # Subject markers
         subject_data = kw.get("subject_markers", {})
         self._subject_markers: Set[str] = set()
@@ -1344,7 +1357,7 @@ class EnhancedFilter:
         if strong_count > 0 or individual_count > 0:
             ad_score += 0.3
             reasons.append("provider_detected")
-        elif weak_count >= _cfg("AD_WEAK_PROVIDER_THRESHOLD", 3):
+        elif weak_count >= _cfg("AD_WEAK_PROVIDER_THRESHOLD", 2):
             ad_score += 0.25
             reasons.append("weak_provider_multiple")
 
@@ -1372,6 +1385,36 @@ class EnhancedFilter:
                 if term in text:
                     ad_score += 0.15
                     reasons.append(f"institution_term: {term}")
+
+        # v11.8 (F-01): commercial-prefix rule — a first-person-plural
+        # provider verb (نقدم/نوفر/نسوي/…) combined with explicit COMMERCIAL
+        # context (price/discount/CTA/institution/payment signals) is the
+        # «نقدم حل واجبات… اسعار مميزه» ad shape that literal substring
+        # matching missed (the 0.956 accept FP). Word-bounded verb check +
+        # a genuine-collective guard (نحتاج/مع بعض/…) keeps student groups
+        # («نحتاج نسوي بحث تخرج») safe. Placed AFTER every context loop so
+        # the reason list is complete when evaluated.
+        if weak_count > 0 and strong_count == 0 and individual_count == 0:
+            commercial_context = any(
+                r.startswith(("medium_ad_signal", "cta_signal", "payment_signal",
+                              "institution_term", "url_signal"))
+                for r in reasons
+            )
+            if commercial_context:
+                _wp_terms = [p for p in weak_providers if p in text]
+                _word_bounded = any(
+                    re.search(rf"(^|\s){re.escape(p)}(\s|$|\d)", text)
+                    for p in _wp_terms
+                )
+                _collective_guard = any(
+                    g in text for g in (
+                        "نحتاج", "مع بعض", "مع بعضنا", "مشروعنا", "واجبنا",
+                        "بحثنا", "قروبنا", "مجموعتنا",
+                    )
+                )
+                if _word_bounded and not _collective_guard:
+                    ad_score += 0.4
+                    reasons.append("commercial_prefix")
 
         for pattern in self._ad_blockers:
             if pattern in text:
@@ -1771,6 +1814,7 @@ class EnhancedFilter:
         ) or (
             implicit_match[0] if implicit_match else None
         )
+        help_anchored = False  # v11.8 (F-06)
         if not keyword:
             result = FilterResult()
             result.original_text = original
@@ -1785,14 +1829,28 @@ class EnhancedFilter:
                     None,
                     None,
                 )
-            result.valid = False
-            result.reason = "no_keyword"
-            return (
-                self._convert_result(result, is_arabic, arabic_ratio, 0.0, start),
-                stats_inc,
-                None,
-                None,
-            )
+            # v11.8 (F-06): help-verb anchor fallback — «احد يساعدني» /
+            # «ساعدوني» carry no intent/implicit keyword but ARE requests.
+            # Anchor the intent at the help-verb position (conservative
+            # weight 0.65) so the full scoring path runs. Generic help
+            # nouns (مساعدة/دعم) deliberately do NOT anchor — they stay
+            # no_keyword to avoid review-queue noise (documented limitation).
+            help_anchor = self._search_first_valid(self._help_anchor_trie, cleaned)
+            if help_anchor is not None:
+                keyword = help_anchor[0]
+                intent_pos = help_anchor[2]
+                intent_weight = _cfg("HELP_ANCHOR_INTENT_WEIGHT", 0.65)
+                is_implicit = True
+                help_anchored = True
+            else:
+                result.valid = False
+                result.reason = "no_keyword"
+                return (
+                    self._convert_result(result, is_arabic, arabic_ratio, 0.0, start),
+                    stats_inc,
+                    None,
+                    None,
+                )
         # ── كلمة مفتاحية موجودة — المتابعة بالمسار الكامل كما هو ──
         urgency_match = self._search_first_valid(self._urgency_trie, cleaned)
         boost_match = self._search_first_valid(self._boost_trie, cleaned)
@@ -1934,6 +1992,8 @@ class EnhancedFilter:
             result.reasons.append(f"urgency: {urgency_marker}")
         if is_implicit:
             result.reasons.append("implicit_request")
+        if help_anchored:
+            result.reasons.append("help_anchor")
         if help_match:
             result.reasons.append(f"help_expression: {help_match[0]}")
         if is_negated:
@@ -1956,12 +2016,24 @@ class EnhancedFilter:
 
         if is_negated:
             result.confidence *= (1 - neg_score * 0.7)
-        result.confidence *= (1 - ad_score * 0.9)
+        # v11.8 (F-01): penalty coefficient 0.9 → 1.1 — the old value cut
+        # only 18% per 0.2 of ad evidence, letting request-shaped ads land
+        # at 0.956. Combined with commercial_prefix (+0.4) and the boost
+        # gate below, that shape now hard-ignores.
+        result.confidence *= (1 - ad_score * 1.1)
 
         # v14.4: template boost is gated — ad-like texts get nothing, and
         # patterns over generic/expert context only give a weak bump.
+        # v11.8 (F-01): the gate is now EVIDENCE-based — any provider /
+        # commercial-prefix signal (or ad_score ≥ 0.2) disables the boost
+        # entirely; «ابي احد» must not rescue a commercial offer.
         boost = 0.0
-        if boost_match and ad_score <= 0.3:
+        _ad_evidence = ad_score >= 0.2 or any(
+            r.startswith(("commercial_prefix", "provider_detected",
+                          "weak_provider_multiple"))
+            for r in ad_reasons
+        )
+        if boost_match and not _ad_evidence:
             specific = (
                 self._academic_weights.get(academic_word, 0.0) >= 0.75
                 if academic_word else False
@@ -1994,10 +2066,19 @@ class EnhancedFilter:
         # ── v14.4 calibration caps ────────────────────────────────────
         # 1) bare intents ("ابي", "محتاج", "مين يساعد") bottom out at
         #    review: never silently ignored, never auto-accepted.
+        #    v11.8 (F-04): the floor now also covers 3-token short intents
+        #    («تكفون أحد يساعدني» = 0.383 ignore FN) and 4-token messages
+        #    anchored by the implicit/help fallback (no explicit intent
+        #    verb) — «من يعرف شخص يساعدني». Explicit-intent 4-token texts
+        #    («ودي اسافر هالصيف») stay below the cap by design.
         if (
             result.decision != "accept"
-            and not academic_word and not help_match
-            and token_count <= 2
+            and not academic_word
+            and (
+                token_count <= 2
+                or (token_count == 3 and (help_match is not None or help_anchored))
+                or (intent_word is None and is_implicit and token_count <= 4)
+            )
         ):
             result.confidence = max(result.confidence, _cfg("CONFIDENCE_REVIEW_THRESHOLD", 0.40) + 0.05)
             result.decision = "review"

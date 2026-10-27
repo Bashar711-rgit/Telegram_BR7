@@ -790,6 +790,13 @@ class AlertBot:
         """
         if not self.enabled:
             return False, "", "no_alert_bot_token"
+        # v11.8 (F-08): invalidate the SHARED last_alert_message_id at the
+        # start of EVERY call — the T5 fallback path (Telethon client) never
+        # sets it, so a stale id from a PREVIOUS alert made reply_fix (F)
+        # reply to the WRONG message. After this reset, a T5 delivery
+        # leaves None (reply-fix runs unthreaded — reply_fix.py handles
+        # None safely) and a Bot API delivery sets its own id below.
+        self.last_alert_message_id = None
         try:
             built = build_alert_html(
                 data, analysis,
@@ -838,12 +845,19 @@ class AlertBot:
 
             if status == 200 and body.get("ok"):
                 # v11.5: حفظ message_id التنبيه — يلزمه الرد التعويضي F (reply_to)
+                # v11.8 (F-08): الختم داخل data يجعل القيمة لكل استدعاء
+                # (race-free) — المستدعي يقرأ ختمه الخاص فور عودة await.
                 try:
                     self.last_alert_message_id = int(
                         ((body.get("result") or {}).get("message_id") or 0) or 0
                     ) or None
                 except Exception:
                     self.last_alert_message_id = None
+                if self.last_alert_message_id is not None:
+                    try:
+                        data["_alert_message_id"] = self.last_alert_message_id
+                    except Exception:
+                        pass
                 # ══ v11.3: فحص قابلية نقر الاسم بعد الوصول + إصلاح ذاتي ══
                 # الاستجابة نفسها تحمل الكيانات الناجية — غياب text_link
                 # عند موضع الاسم = الاسم وصل نصاً عادياً (الشكوى الأصلية)

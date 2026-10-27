@@ -478,8 +478,12 @@ class TestRecoverySenderFields:
         assert rebuilt["sender_last_name"] == "محمد"
 
     async def test_recovery_db_fallback_fills_missing_only(self, monitor, enable_capture):
-        """DB fallback fills ONLY missing fields; existing values survive."""
-        # store a full contact for the sender
+        """DB fallback fills ONLY missing fields; existing values survive.
+
+        v11.8 (F-07): access_hash is account-scoped — the global
+        sender_contacts row no longer feeds sender_access_hash; only THIS
+        account's sender_access view may fill it (or it stays None)."""
+        # store a full contact for the sender (global identity row)
         await monitor.db.upsert_sender_contact({
             "sender_id": 555000111, "username": "db_username",
             "access_hash": 999, "first_name": "قاعدة", "last_name": "البيانات",
@@ -492,10 +496,20 @@ class TestRecoverySenderFields:
 
         empty = {"sender_id": 555000111, "sender_username": None,
                  "sender_access_hash": None, "sender_first_name": None}
+        # بلا صف sender_access لهذا الحساب → الـhash يبقى None (لا تسريب
+        # من رؤية حساب آخر)، والهوية العامة (username/names) تُملأ كما هي.
         await monitor._enrich_sender_from_db(empty)
         assert empty["sender_username"] == "db_username"
-        assert empty["sender_access_hash"] == 999
+        assert empty["sender_access_hash"] is None
         assert empty["sender_first_name"] == "قاعدة"
+
+        # بعد تسجيل hash لحساب المالك نفسه → يُملأ من sender_access حصراً
+        await monitor.db.upsert_sender_access(555000111, ACCOUNT, 999)
+        refilled = {"sender_id": 555000111, "sender_username": None,
+                    "sender_access_hash": None, "sender_first_name": None}
+        await monitor._enrich_sender_from_db(refilled)
+        assert refilled["sender_access_hash"] == 999
+        assert refilled["sender_username"] == "db_username"
 
     async def test_event_to_dict_additive_keys(self, monitor, enable_capture):
         """Requirement #4: all existing keys stay, additive sender_* keys join."""
