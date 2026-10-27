@@ -440,11 +440,14 @@ services:
       - key: BLOOM_FILTER_FP
         value: "0.001"
 
+      # v11.8 (F-03): unified with config.py v11.5 central spec 6..65 —
+      # the previous 10/5000 drift meant any Blueprint re-apply would kill
+      # short high-signal requests («أبي حل», 6 chars) before the engine.
       - key: MAX_MESSAGE_LENGTH
-        value: "5000"
+        value: "65"
 
       - key: MIN_MESSAGE_LENGTH
-        value: "10"
+        value: "6"
 
       # ════════════════════════════════════════════════════════════
       # Resilience

@@ -2089,7 +2089,22 @@ class EnhancedAccountMonitor:
             if not data.get("sender_username"):
                 data["sender_username"] = row.get("username")
             if data.get("sender_access_hash") is None:
-                data["sender_access_hash"] = row.get("access_hash")
+                # v11.8 (F-07): access_hash is ACCOUNT-SCOPED — the global
+                # sender_contacts row may have been captured by a DIFFERENT
+                # account, and feeding that hash into Tier-1
+                # («event_sender_hash») of this account produced recurring
+                # USER_ID_INVALID + spurious negative learning. Only THIS
+                # account's stored view (sender_access) may fill the field;
+                # if absent it stays None and the mention ladder skips
+                # Tier-1 (Tiers 2-5 remain available).
+                try:
+                    _own_hash = await self.db.get_sender_access_hash(
+                        str(self.account.get("name") or ""), int(sender_id)
+                    )
+                except Exception:
+                    _own_hash = None
+                if _own_hash is not None:
+                    data["sender_access_hash"] = _own_hash
             if not data.get("sender_first_name"):
                 data["sender_first_name"] = row.get("first_name")
             if not data.get("sender_last_name"):
@@ -3438,7 +3453,13 @@ class EnhancedAccountMonitor:
                         self._schedule_reply_fix(
                             data=data, sender=sender, account_name=account_name,
                             target_chat_id=getattr(alert_bot, "chat_id", 0),
-                            alert_msg_id=getattr(alert_bot, "last_alert_message_id", None),
+                            # v11.8 (F-08): per-call stamp first — the shared
+                            # attribute may already belong to a concurrent
+                            # alert; the stamp is race-free.
+                            alert_msg_id=(
+                                data.get("_alert_message_id")
+                                or getattr(alert_bot, "last_alert_message_id", None)
+                            ),
                         )
                     except Exception as _rf_sched_err:
                         logger.debug(

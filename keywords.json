@@ -116,7 +116,8 @@
       "19) Merged an externally-provided keyword list into request_phrases / implicit_request_patterns / high_confidence_boost_patterns.",
       "20) explainability.example.reasons updated to match the ACTUAL reason-string formats produced by filter_engine.py's analyze().",
       "21) Nothing was deleted from request/advertisement/ignore/action_verbs/subject_markers/implicit_request_patterns/solve_actions/help_expressions content itself beyond character-level normalization fixes and duplicate removal."
-    ]
+    ],
+    "v11_8_execution_note": "F-05/F-06/F-15 fixes (execution phase 2026-10): bare 'واتساب' removed from hard_signals (context-free generic word — cta/hard commercial phrases cover ads); 'من يعرف'/'مين يعرف' added to availability_question; verb help forms (يساعدني/تساعدني/يسعفني) added to help_expressions with filter_engine help-anchor fallback (F-06)."
   },
   "templates": {
     "_description": "Word sets for template-based pattern generation. Engine combines them according to template_patterns at load time. Only 'need','person','action','expert','availability' are read by filter_engine.py v14.1's _generate_template_patterns(); 'urgency' is kept as a reserved/documented word bank for a future engine version that adds <urgency> tag support — it is NOT currently consumed by the generator. See design_principles for the known limitation that template_boost is not academic-context-gated at the engine level.",
@@ -337,7 +338,9 @@
       "مين يحل",
       "من يحل",
       "مين يقدر",
-      "من يقدر"
+      "من يقدر",
+      "من يعرف",
+      "مين يعرف"
     ],
     "problem_state": [
       "عندي مشروع",
@@ -910,7 +913,10 @@
     "مختص",
     "خبير",
     "دعم",
-    "مساعده عاجله"
+    "مساعده عاجله",
+    "يساعدني",
+    "تساعدني",
+    "يسعفني"
   ],
   "urgency_markers": {
     "time_references": [
@@ -1290,7 +1296,6 @@
       "سعر مميز",
       "للتواصل",
       "راسلنا",
-      "واتساب",
       "تيليجرام",
       "انستقرام",
       "تواصل معنا",
