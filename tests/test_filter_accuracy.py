@@ -35,6 +35,14 @@ _SPEC_SAMPLE_OVERRIDES = {
     "borderline-6": "عندي تحليل احصائي للبيانات متعثرة فيه وياليت احد يوجهني",
 }
 
+# v11.8.1 (F-14): سقف «حل + طلب جديد» (calibration cap 3) يُطبق الآن حتى
+# بعد clause_rescore — كانت الترقية تتجاوز السقف عمداً (accept 0.891 حية
+# وثّقتها المراجعة F-14 كخلل). توقّع borderline-5 الأصلي كان يوثّق السلوك
+# القديم؛ السلوك المقصود الجديد: review بثقة مرتفعة (لا accept صامت).
+_EXPECTED_OVERRIDES = {
+    "borderline-5": "review",
+}
+
 
 def _kw_cases():
     with open(KW_FILE, encoding="utf-8") as f:
@@ -44,7 +52,8 @@ def _kw_cases():
         for i, case in enumerate(kw.get("test_cases", {}).get(group, [])):
             cid = f"{group}-{i}"
             text = _SPEC_SAMPLE_OVERRIDES.get(cid, case["text"])
-            cases.append((cid, text, case["expected"]))
+            expected = _EXPECTED_OVERRIDES.get(cid, case["expected"])
+            cases.append((cid, text, expected))
     return cases
 
 

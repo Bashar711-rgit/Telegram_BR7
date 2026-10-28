@@ -203,14 +203,19 @@ def flt():
 
 class TestClauseRescore:
     @pytest.mark.asyncio
-    async def test_resolution_plus_new_request_upgraded(self, flt):
-        # الحالة الموثقة في keywords.json: بند استرسال + بند طلب جديد
+    async def test_resolution_plus_new_request_capped_v11_8_1(self, flt):
+        # v11.8.1 (F-14): بند استرسال + بند طلب جديد — clause_rescore قد
+        # يرفع الثقة لكنه لا يعد القرار إلى accept فوق السقف المقصود (cap 3).
+        # كان القديم: accept 0.891 عبر الثغرة الموثقة في المراجعة F-14.
         text = "لقيت حل للواجب ما قصرتوا، بس عندي تقرير ثاني محتاج مساعدة فيه"
         r = await flt.analyze(text)
-        assert r["decision"] == "accept"
-        assert any(
-            str(x).startswith("clause_rescore") for x in (r.get("reasons") or [])
+        assert r["decision"] == "review", (
+            f"expected review (capped), got {r['decision']} conf={r['confidence']:.3f}"
         )
+        assert any(
+            str(x).startswith("capped: rescore_respects_resolution_ceiling")
+            for x in (r.get("reasons") or [])
+        ), r.get("reasons")
 
     @pytest.mark.asyncio
     async def test_plain_request_unaffected(self, flt):

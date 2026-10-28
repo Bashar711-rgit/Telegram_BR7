@@ -238,6 +238,7 @@ from telethon.tl.types import (
     MessageEntityMentionName,
 )
 from config import CFG, InputSanitizer, fast_hash
+from task_util import spawn_bg  # v11.8.1 (F-17): مرجع محفوظ لمهام background
 from database import EnhancedDatabase, MessageRecord, AlertRecord, DeadLetterRecord
 from filter_engine import EnhancedFilter
 from dedup import content_fingerprint, get_deduplicator, normalize_for_fingerprint  # v9.10 dedup + v11.5.2 verify
@@ -736,6 +737,11 @@ _early_delivery_dedup: LRUCache = LRUCache(maxsize=_EARLY_DELIVERY_DEDUP_SIZE)
 #      be improved; nothing here changes any alert).
 # ═══════════════════════════════════════════════════════════════════════════
 _RECENT_INPUT_SENDERS_MAX = 500
+# v11.8.1 (F-19): TTL on read — access_hash captured hours ago is not
+# trustworthy input for mention tier-2 (entity hashes go stale after
+# reconnects); entries now expire after 10 minutes even if the 500-cap
+# never evicts them.
+_RECENT_INPUT_SENDERS_TTL = 600.0
 _recent_input_senders: "OrderedDict[Tuple[int, int], Dict[str, Any]]" = OrderedDict()
 _post_capable_accounts: Set[str] = set()
 # v10.7 §5: accounts already warned about missing TARGET_GROUP_ID membership
@@ -1488,7 +1494,7 @@ class EnhancedAccountMonitor:
                     # في إرسال التنبيهات وفي الـmention من أساسه.
                     if getattr(CFG, "TARGET_MEMBERSHIP_CHECK", True):
                         try:
-                            asyncio.create_task(self.check_target_membership())
+                            spawn_bg(self.check_target_membership(), name=f"membership_check_{self.account['name']}")  # v11.8.1 (F-17)
                         except Exception:
                             pass
                     return True
@@ -1617,8 +1623,9 @@ class EnhancedAccountMonitor:
                             _ah = getattr(_snd, "access_hash", None)
                             if isinstance(_ah, int) and _ah != 0:
                                 if account_hash_store.record(self.account["name"], int(_sid), _ah):
-                                    asyncio.create_task(
-                                        self._persist_account_hash(int(_sid), _ah)
+                                    spawn_bg(  # v11.8.1 (F-17): مرجع محفوظ — GC لا يجمعها
+                                        self._persist_account_hash(int(_sid), _ah),
+                                        name=f"persist_hash_{self.account['name']}_{_sid}",
                                     )
                     except Exception as cap_err:
                         logger.debug(f"account_hash capture [{self.account['name']}]: {type(cap_err).__name__}")
@@ -2844,7 +2851,11 @@ class EnhancedAccountMonitor:
                     pass
 
         # Tier 2: locally-captured input sender of the CAPTURING account
+        # v11.8.1 (F-19): TTL check on read — stale captures are dropped.
         cap_entry = _recent_input_senders.get((data.get("chat_id"), data.get("message_id")))
+        if cap_entry and (time.time() - float(cap_entry.get("ts", 0))) > _RECENT_INPUT_SENDERS_TTL:
+            _recent_input_senders.pop((data.get("chat_id"), data.get("message_id")), None)
+            cap_entry = None
         if cap_entry and cap_entry.get("account") == src_account and sending_account == src_account:
             isp = cap_entry.get("input_sender")
             iu = _input_user_from_input_peer(isp)

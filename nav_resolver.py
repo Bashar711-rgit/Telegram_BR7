@@ -99,6 +99,7 @@ except Exception:  # pragma: no cover — extremely old Telethon fallback
     GetUsersRequest = None  # type: ignore[assignment]
 
 from config import CFG
+from task_util import spawn_bg  # v11.8.1 (F-17): مرجع محفوظ لمهام background
 
 __version__ = "1.1.0"
 
@@ -471,8 +472,9 @@ class NavigationResolver:
                         acct = monitor._account_name_for_client(client)
                         if isinstance(ah, int) and ah != 0 and acct:
                             _ahs.record(acct, sender_id, ah)
-                            asyncio.create_task(
-                                monitor._persist_account_hash(sender_id, ah)
+                            spawn_bg(  # v11.8.1 (F-17): مرجع محفوظ — GC لا يجمعها
+                                monitor._persist_account_hash(sender_id, ah),
+                                name=f"persist_hash_discovery_{sender_id}",
                             )
                     except Exception as e:
                         report.notes.append(f"discovery:hash:{type(e).__name__}")

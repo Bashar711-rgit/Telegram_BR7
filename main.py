@@ -1942,6 +1942,11 @@ class EnhancedTelegramBot:
         if self.alert_ui_client is not None:
             await self.alert_ui_client.stop()
             self.alert_ui_client = None
+        # v11.8.1 (F-24): إغلاق جلسة HTTP الدائمة لـAlertBot
+        try:
+            await self.alert_bot.aclose()
+        except Exception:
+            pass
         await self.db.close()
         logger.info("✅ Shutdown complete")
 

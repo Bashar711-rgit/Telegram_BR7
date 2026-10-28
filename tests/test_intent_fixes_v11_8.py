@@ -157,7 +157,9 @@ async def test_f03_over_max_is_explicitly_too_long(f: EnhancedFilter):
 
 @pytest.mark.asyncio
 async def test_keywords_contract_no_regression(f: EnhancedFilter):
-    """42 حالة العقد — المسموح الفاشل: حالتا الطول >65 فقط (F-09 قيد واعٍ)."""
+    """42 حالة العقد — المسموح الفاشل: حالتا الطول >65 فقط (F-09 قيد واعٍ)
+    + borderline-5 (v11.8.1 F-14: سقف resolution+طلب جديد يُطبق حتى بعد
+    clause_rescore — التوقع الأصلي كان يوثق الثغرة القديمة accept 0.891)."""
     import json
     kw = json.load(open(PROJECT_DIR / "keywords.json"))
     allowed_fail = set()
@@ -165,11 +167,17 @@ async def test_keywords_contract_no_regression(f: EnhancedFilter):
         for item in kw["test_cases"].get(group, []):
             if len(item["text"]) > 65:
                 allowed_fail.add(item["text"])
+    f14_review_override = set()
+    for item in kw["test_cases"].get("borderline", []):
+        if "تقرير ثاني محتاج مساعدة" in item["text"]:
+            f14_review_override.add(item["text"])
     fails = []
     for group in ("positive", "negative", "borderline"):
         for item in kw["test_cases"].get(group, []):
             r = await f.analyze(item["text"])
             dec, exp = r["decision"], item["expected"]
+            if item["text"] in f14_review_override:
+                exp = "review"  # v11.8.1 (F-14) — سلوك مقصود موثق
             ok = (dec == exp) if exp in ("accept", "ignore") else (dec in ("accept", "review"))
             if not ok and item["text"] not in allowed_fail:
                 fails.append(f"{item['text'][:40]!r}: {dec} != {exp}")

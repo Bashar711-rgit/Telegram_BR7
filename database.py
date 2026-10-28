@@ -3011,6 +3011,26 @@ class EnhancedDatabase:
             return 0
 
     # ─── Blocklists ───────────────────────────────────────────────────────────
+    # v11.8.1 (F-10): cache entries expire logically but were never evicted —
+    # on a long-lived PostgreSQL process the dicts grew without bound (one
+    # entry per unique sender/chat ever checked). Prune expired entries once
+    # the cache exceeds _BLOCKED_CACHE_PRUNE_SIZE.
+    _BLOCKED_CACHE_PRUNE_SIZE = 5000
+
+    @staticmethod
+    def _prune_blocked_cache(cache: Dict[int, Tuple[bool, float]]) -> None:
+        _cap = EnhancedDatabase._BLOCKED_CACHE_PRUNE_SIZE
+        if len(cache) <= _cap:
+            return
+        now = time.time()
+        for k in [k for k, (_, exp) in cache.items() if exp <= now]:
+            cache.pop(k, None)
+        # still oversized (all fresh)? keep the newest half by expiry
+        if len(cache) > _cap:
+            keep = sorted(cache.items(), key=lambda kv: kv[1][1], reverse=True)[: _cap // 2]
+            cache.clear()
+            cache.update(keep)
+
     async def is_blocked_sender(self, sender_id: int) -> bool:
         # v9.12 (audit H-01): short TTL cache for the hot-path blocklist
         # check. Blocklists rarely change; the cache absorbs the per-message
@@ -3027,6 +3047,7 @@ class EnhancedDatabase:
             blocked = row is not None
             ttl = max(5.0, float(os.getenv("BLOCKLIST_CACHE_TTL", "30")))
             self._blocked_senders_cache[sender_id] = (blocked, now + ttl)
+            self._prune_blocked_cache(self._blocked_senders_cache)  # v11.8.1 (F-10)
             return blocked
         except Exception:
             # On any error fall back to direct DB check.
@@ -3050,6 +3071,7 @@ class EnhancedDatabase:
             blocked = row is not None
             ttl = max(5.0, float(os.getenv("BLOCKLIST_CACHE_TTL", "30")))
             self._blocked_chats_cache[chat_id] = (blocked, now + ttl)
+            self._prune_blocked_cache(self._blocked_chats_cache)  # v11.8.1 (F-10)
             return blocked
         except Exception:
             row = await self._fetchone(
