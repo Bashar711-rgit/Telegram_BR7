@@ -187,9 +187,37 @@ class AlertBotClient:
         async def _copy_cb(event: Any) -> None:  # pragma: no cover - wiring only
             await self._handle_copy_callback(event)
 
+    @staticmethod
+    def _same_chat(a: Any, b: Any) -> bool:
+        """v11.8.2 (F-26): مقارنة معرّف محادثة متسامحة مع الصيغتين
+        (-100…) والداخلية — أي صيغة لا تُقارن (None/غير رقمي) = غير متطابق."""
+        def inner(x: Any):
+            try:
+                v = int(x)
+            except (TypeError, ValueError):
+                return None
+            s = str(v)
+            if s.startswith("-100") and len(s) > 4:
+                return int(s[4:])
+            return v
+        ia, ib = inner(a), inner(b)
+        return ia is not None and ia == ib
+
     async def _handle_copy_callback(self, event: Any) -> None:
-        """نافذة منبثقة بنص التنبيه الأصلي — استجابة حقيقية لضغطة الزر."""
+        """نافذة منبثقة بنص التنبيه الأصلي — استجابة حقيقية لضغطة الزر.
+
+        v11.8.2 (F-26): فحص هوية المحادثة المستقبِلة قبل كشف أي محتوى —
+        أزرار copy_ تُولد حصراً على تنبيهات مجموعة الهدف؛ أي ضغطة من
+        محادثة أخرى (إعادة توجيه/دردشة أخرى/زر مصنوع) تجيب رفضاً عاماً
+        بلا أي نص من قاعدة البيانات."""
         try:
+            if not self._same_chat(getattr(event, "chat_id", None), self.target_chat_id):
+                logger.warning(
+                    "copy_ callback from UNEXPECTED chat "
+                    f"(chat_id={getattr(event, 'chat_id', '?')}) — denied (F-26)"
+                )
+                await event.answer("غير متاح هنا", alert=True)
+                return
             h = bytes(event.data).decode("utf-8", "ignore").split("_", 1)[1]
             text = None
             if self.db is not None:

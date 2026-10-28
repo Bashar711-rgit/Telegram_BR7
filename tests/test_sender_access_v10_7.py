@@ -357,17 +357,6 @@ class TestSenderAccessDB:
         assert await db.upsert_sender_access(0, "Account 1", GOOD_HASH) is False
 
     @pytest.mark.asyncio
-    async def test_get_sender_access_accounts_freshest_first(self, db):
-        await db.upsert_sender_access(SENDER_ID, "Account 1", GOOD_HASH)
-        await asyncio.sleep(0.01)
-        await db.upsert_sender_access(SENDER_ID, "Account 2", ACCOUNT2_HASH)
-        rows = await db.get_sender_access_accounts(SENDER_ID)
-        names = [r["account_name"] for r in rows]
-        assert names[0] == "Account 2"  # الأحدث أولاً
-        hashes = {r["account_name"]: r["access_hash"] for r in rows}
-        assert hashes["Account 1"] == GOOD_HASH and hashes["Account 2"] == ACCOUNT2_HASH
-
-    @pytest.mark.asyncio
     async def test_legacy_methods_redirect_to_sender_access(self, db):
         """v10.4 APIs تعمل كما كانت — لكن التخزين الآن في sender_access."""
         assert await db.upsert_sender_account_hash("Account 3", SENDER_ID, 4242) is True

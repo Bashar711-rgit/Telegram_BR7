@@ -138,40 +138,8 @@ except ImportError:
 # الأولوية: حساب is_main، ثم أول حساب متصل فعلاً له api_id+api_hash
 # (نفس اختيار «Fallback main client»). None = لا اعتماديات → العميل
 # يبقى معطلاً بأمان (fallback يعمل).
-# =============================================================================
-def _pick_alertui_account(accounts: Any, monitors: Any) -> Optional[dict]:
-    acc = next((a for a in (accounts or []) if (a or {}).get("is_main")), None)
-    if acc is not None:
-        return acc
-    for m in (monitors or []):
-        a = getattr(m, "account", None) or {}
-        if getattr(m, "is_connected", False) and a.get("api_id") and a.get("api_hash"):
-            return a
-    return None
-
-
-# =============================================================================
-# v11.5.3: اختيار حساب لاعتماديات عميل أزرار التنبيهات (AlertUI)
-# الأولوية: حساب is_main، ثم أول حساب متصل فعلاً له api_id+api_hash
-# (نفس اختيار «Fallback main client»). None = لا اعتماديات → العميل
-# يبقى معطلاً بأمان (fallback يعمل).
-# =============================================================================
-def _pick_alertui_account(accounts: Any, monitors: Any) -> Optional[dict]:
-    acc = next((a for a in (accounts or []) if (a or {}).get("is_main")), None)
-    if acc is not None:
-        return acc
-    for m in (monitors or []):
-        a = getattr(m, "account", None) or {}
-        if getattr(m, "is_connected", False) and a.get("api_id") and a.get("api_hash"):
-            return a
-    return None
-
-
-# =============================================================================
-# v11.5.3: اختيار حساب لاعتماديات عميل أزرار التنبيهات (AlertUI)
-# الأولوية: حساب is_main، ثم أول حساب متصل فعلاً له api_id+api_hash
-# (نفس اختيار «Fallback main client»). None = لا اعتماديات → العميل
-# يبقى معطلاً بأمان (fallback يعمل).
+# v11.8.2 (F-21): كانت معرفة ثلاث مرات متطابقة — بقي تعريف واحد
+# (التعريفان السابقان كانا كوداً ميتاً تُغطّيه الثالثة).
 # =============================================================================
 def _pick_alertui_account(accounts: Any, monitors: Any) -> Optional[dict]:
     acc = next((a for a in (accounts or []) if (a or {}).get("is_main")), None)
@@ -995,10 +963,33 @@ class EnhancedTelegramBot:
         app = web.Application()
 
         async def health_handler(request):
+            # v11.8.2 (F-11): توحيد عقد /health مع dashboard.py حرفياً —
+            # الحد الأدنى للـ liveness فقط (status/database/db_healthy/time)
+            # بنفس دلالة 503. الـ snapshot التشغيلي الكامل كان يُفضي هنا
+            # بلا مصادقة (نقلته L-08 عمداً إلى /health/full في اللوحة) —
+            # صار الآن على /health/full أدناه بنفس الاسم والمسار.
             health = await self.health.check()
-            # v11.7 (audit A-2): قاعدة بيانات منخرفة فعلياً = 503 كي يعيد
-            # Render تشغيل العملية بدل البقاء على زومبي (نفس سلوك /health
-            # في dashboard.py). "degraded" العابر يبقى 200.
+            db_down = not (self.db and getattr(self.db, "is_connected", False))
+            db_healthy = bool(getattr(self.db, "db_healthy", True))
+            payload = {
+                "status": "ok" if (not db_down and db_healthy) else "degraded",
+                "database": "down" if db_down else "ok",
+                "db_healthy": db_healthy,
+                "time": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            }
+            return web.json_response(payload, status=503 if db_down else 200)
+
+        async def health_full_handler(request):
+            # v11.8.2 (F-11): نفس مسار اللوحة /health/full. توكن اختياري
+            # (HEALTH_FULL_TOKEN) للنشرات المكشوفة؛ بلا توكن يبقى متاحاً
+            # كما كان المحتوى سابقاً على /health في وضع اللوحة المعطلة.
+            token = os.getenv("HEALTH_FULL_TOKEN", "")
+            if token:
+                supplied = (request.headers.get("Authorization", "")
+                            .replace("Bearer ", "").strip()) or request.query.get("token", "")
+                if supplied != token:
+                    return web.json_response({"error": "unauthorized"}, status=401)
+            health = await self.health.check()
             db_down = not (self.db and getattr(self.db, "is_connected", False))
             return web.json_response({
                 "status": "ok" if health.is_healthy else "degraded",
@@ -1017,6 +1008,7 @@ class EnhancedTelegramBot:
             }, status=503 if db_down else 200)
 
         app.router.add_get('/health', health_handler)
+        app.router.add_get('/health/full', health_full_handler)
 
         # Render Web Service: MUST bind to $PORT (default 10000)
         port = int(os.getenv("PORT", 10000))
@@ -1625,6 +1617,16 @@ class EnhancedTelegramBot:
             logger.error("Database connection failed - aborting")
             return False
 
+        # v11.8.2 (F-18): ترطيب الذاكرة السلبية (tg_user_blocked + حدود
+        # reply_fix) من app_settings بعد الاتصال مباشرة — قبل أي مراقب،
+        # فلا تُعاد إعادة إرسال tg://user المرفوض ولا تُستهلك حصص
+        # reply_fix من جديد بعد إعادة التشغيل. فشل-آمن (تجاهل مسجّل).
+        try:
+            import negative_memory as _negmem
+            await _negmem.hydrate_all(self.db)
+        except Exception as _nm_err:
+            logger.warning(f"negative_memory hydrate skipped: {type(_nm_err).__name__}")
+
         # v9.10: تهيئة حاجز منع تكرار التنبيهات (بعد اتصال DB مباشرة —
         # singleton مشترك بين كل المراقبين، وجدول alert_dedup يُنشأ ضمن
         # _create_tables في connect()).
@@ -1911,6 +1913,14 @@ class EnhancedTelegramBot:
         self._shutdown_event.set()
 
         logger.info("Shutting down gracefully...")
+
+        # v11.8.2 (F-18): تفريغ أخير للذاكرة السلبية قبل انفصال DB
+        # (يلتقط ما تبقى من وسَخة لم تُفرَّغ بعد خلال نافذة التأجيل)
+        try:
+            import negative_memory as _negmem
+            await _negmem.flush_now(self.db)
+        except Exception:
+            pass
 
         # M-05/M-16: cancel every tracked background task uniformly,
         # rather than an explicit hand-maintained list that could miss a

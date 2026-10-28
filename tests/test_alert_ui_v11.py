@@ -149,8 +149,12 @@ class TestButtonConversion:
 
 # ══ ══ ══ المعالج الحي: نافذة نص التنبيه ══ ══ ══
 class _FakeCallbackEvent:
-    def __init__(self, data: bytes):
+    # v11.8.2 (F-26): بوابة هوية المحادثة — chat_id أصبح جزءاً من العقد.
+    _TGT = -100555000444  # مجموعة هدف اختبارية ثابتة
+
+    def __init__(self, data: bytes, chat_id: Optional[int] = None):
         self.data = data
+        self.chat_id = self._TGT if chat_id is None else chat_id
         self.answered: List[tuple] = []
 
     async def answer(self, text: str, alert: bool = False):
@@ -163,8 +167,10 @@ class _FakeDb:
         self.alert_text = alert_text
         self.msg_text = msg_text
         self.raise_on_alert = raise_on_alert
+        self.alert_text_calls = 0  # v11.8.2 (F-26): لاختبار «لا استعلام عند الرفض»
 
     async def get_alert_text_by_hash(self, h: str) -> Optional[str]:
+        self.alert_text_calls += 1
         if self.raise_on_alert:
             raise RuntimeError("db down")
         return self.alert_text
@@ -177,7 +183,8 @@ class TestCopyCallbackHandler:
     @pytest.mark.asyncio
     async def test_answers_with_alert_text_from_db(self):
         c = AlertBotClient(api_id=1, api_hash="h", token="123:ABC",
-                           db=_FakeDb(alert_text="نص التنبيه الأصلي"))
+                           db=_FakeDb(alert_text="نص التنبيه الأصلي"),
+                           target_chat_id=_FakeCallbackEvent._TGT)
         ev = _FakeCallbackEvent(b"copy_abc123")
         await c._handle_copy_callback(ev)
         assert ev.answered == [("نص التنبيه الأصلي", True)]
@@ -185,14 +192,16 @@ class TestCopyCallbackHandler:
     @pytest.mark.asyncio
     async def test_falls_back_to_message_text(self):
         c = AlertBotClient(api_id=1, api_hash="h", token="123:ABC",
-                           db=_FakeDb(msg_text="نص الرسالة الخام"))
+                           db=_FakeDb(msg_text="نص الرسالة الخام"),
+                           target_chat_id=_FakeCallbackEvent._TGT)
         ev = _FakeCallbackEvent(b"copy_hash9")
         await c._handle_copy_callback(ev)
         assert ev.answered == [("نص الرسالة الخام", True)]
 
     @pytest.mark.asyncio
     async def test_unknown_hash_honest_answer(self):
-        c = AlertBotClient(api_id=1, api_hash="h", token="123:ABC", db=_FakeDb())
+        c = AlertBotClient(api_id=1, api_hash="h", token="123:ABC", db=_FakeDb(),
+                           target_chat_id=_FakeCallbackEvent._TGT)
         ev = _FakeCallbackEvent(b"copy_nope")
         await c._handle_copy_callback(ev)
         assert ev.answered == [("النص غير متوفر", True)]
@@ -200,10 +209,33 @@ class TestCopyCallbackHandler:
     @pytest.mark.asyncio
     async def test_db_error_never_raises(self):
         c = AlertBotClient(api_id=1, api_hash="h", token="123:ABC",
-                           db=_FakeDb(raise_on_alert=True))
+                           db=_FakeDb(raise_on_alert=True),
+                           target_chat_id=_FakeCallbackEvent._TGT)
         ev = _FakeCallbackEvent(b"copy_x")
         await c._handle_copy_callback(ev)
         assert ev.answered == [("حدث خطأ", True)]
+
+    @pytest.mark.asyncio
+    async def test_f26_foreign_chat_denied_without_db(self):
+        """v11.8.2 (F-26): ضغطة من محادثة غير مجموعة الهدف = رفض عام
+        بلا أي كشف محتوى وبلا أي استعلام DB."""
+        db = _FakeDb(alert_text="سري")
+        c = AlertBotClient(api_id=1, api_hash="h", token="123:ABC",
+                           db=db, target_chat_id=_FakeCallbackEvent._TGT)
+        ev = _FakeCallbackEvent(b"copy_abc", chat_id=-1009998887776)
+        await c._handle_copy_callback(ev)
+        assert ev.answered == [("غير متاح هنا", True)]
+        assert db.alert_text_calls == 0
+
+    @pytest.mark.asyncio
+    async def test_f26_inner_chat_id_form_accepted(self):
+        """الصيغة الداخلية (بلا -100) لنفس المجموعة مقبولة."""
+        c = AlertBotClient(api_id=1, api_hash="h", token="123:ABC",
+                           db=_FakeDb(alert_text="نص"),
+                           target_chat_id=_FakeCallbackEvent._TGT)
+        ev = _FakeCallbackEvent(b"copy_abc", chat_id=555000444)
+        await c._handle_copy_callback(ev)
+        assert ev.answered == [("نص", True)]
 
 
 # ══ ══ ══ روابط المنتديات (topics) الحقيقية ══ ══ ══

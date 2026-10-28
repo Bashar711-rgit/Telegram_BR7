@@ -1243,7 +1243,13 @@ async def health(request: Request):
     is_connected=False) تعيد HTTP 503 بدلاً من 200 — Render يعيد
     تشغيل العملية فتُستعاد الاتصالات من الصفر بدل الزومبي الأبدي.
     "degraded" المتصل-but-unhealthy يبقى 200 عمداً (فشل flush عابر
-    لا يستحق إعادة تشغيل تفتقد الدُفعة)."""
+    لا يستحق إعادة تشغيل تفتقد الدُفعة).
+
+    v11.8.2 (F-11): هذا العقد الأدنى هو المرجع الموحد — الخادم
+    البديل في main.py (_health_server عند تعطيل اللوحة) أصبح يعيد
+    نفس المفاتيح ونفس دلالة 503 حرفياً، والتفاصيل الكاملة عند
+    المسارين على /health/full (هنا بمصادقة اللوحة، وهناك بتوكن
+    HEALTH_FULL_TOKEN اختياري)."""
     db = getattr(request.app.state, "db", None)
     db_ok = bool(db and getattr(db, "is_connected", False))
     db_healthy = bool(db and getattr(db, "db_healthy", True))
