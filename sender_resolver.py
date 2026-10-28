@@ -1016,13 +1016,19 @@ class AccountAccessHashStore:
 
     access_hash is PER-ACCOUNT knowledge: account A may hold a valid hash
     for user X while account B cannot resolve X at all. Keyed by account
-    (NOT sender_id alone), bounded, LRU. record() returns True when the
-    value is new/changed so the caller can write-behind to the
-    sender_account_hashes table without an INSERT per message."""
+    (NOT sender_id alone), bounded, LRU, **TTL'd** (v11.8.1 F-16: an
+    unbounded-age hash could be served forever after the upstream entity
+    changed; entries now expire and force re-resolution). record()
+    returns True when the value is new/changed so the caller can
+    write-behind to the sender_account_hashes table without an INSERT per
+    message."""
 
-    def __init__(self, maxsize: int = 20000):
-        self._data: "OrderedDict[Tuple[str, int], int]" = OrderedDict()
+    DEFAULT_TTL = 7 * 86400.0
+
+    def __init__(self, maxsize: int = 20000, ttl: float = DEFAULT_TTL):
+        self._data: "OrderedDict[Tuple[str, int], Tuple[int, float]]" = OrderedDict()
         self._maxsize = max(100, int(maxsize))
+        self._ttl = max(60.0, float(ttl))
         self.records = 0
 
     def record(self, account_name: Optional[str], sender_id: Any, access_hash: Any) -> bool:
@@ -1031,10 +1037,10 @@ class AccountAccessHashStore:
                 return False
             key = (str(account_name), int(sender_id))
             old = self._data.get(key)
-            if old == access_hash:
+            if old is not None and old[0] == access_hash:
                 self._data.move_to_end(key)
                 return False
-            self._data[key] = access_hash
+            self._data[key] = (access_hash, time.time())
             self._data.move_to_end(key)
             while len(self._data) > self._maxsize:
                 self._data.popitem(last=False)
@@ -1047,9 +1053,16 @@ class AccountAccessHashStore:
         try:
             if not account_name or not sender_id:
                 return None
-            val = self._data.get((str(account_name), int(sender_id)))
-            if val is not None:
-                self._data.move_to_end((str(account_name), int(sender_id)))
+            key = (str(account_name), int(sender_id))
+            entry = self._data.get(key)
+            if entry is None:
+                return None
+            val, ts = entry
+            if (time.time() - ts) > self._ttl:
+                # v11.8.1 (F-16): expired → drop and force re-resolution
+                self._data.pop(key, None)
+                return None
+            self._data.move_to_end(key)
             return val
         except Exception:
             return None

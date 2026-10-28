@@ -640,6 +640,26 @@ class AlertBot:
         # v11.0: عميل البوت الحي (alert_ui.AlertBotClient) — طبقة إرسال
         # احتياطية بالأزرار عند فشل Bot API. يُربط من main.initialize.
         self._client: Any = None
+        # v11.8.1 (F-24): جلسة HTTP دائمة — كانت _post تفتح TLS handshake
+        # جديداً لكل استدعاء (getMe/sendMessage/...) — إهدار زمن ومآخذ.
+        self._session: Optional[Any] = None
+
+    async def _get_session(self) -> Any:
+        """جلسة مشتركة معاد استخدامها (F-24) — يُعاد إنشاؤها إن أُغلقت."""
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=self.timeout)
+            )
+        return self._session
+
+    async def aclose(self) -> None:
+        """إغلاق الجلسة الدائمة — يُستدعى من main.stop."""
+        if self._session is not None and not self._session.closed:
+            try:
+                await self._session.close()
+            except Exception:
+                pass
+        self._session = None
 
     # ── الحالة ──
     @property
@@ -658,19 +678,19 @@ class AlertBot:
         الرد غير-JSON لا يرفع استثناء (يُغلف في description)."""
         url = f"{BOT_API_BASE}/bot{self.token}/{method}"
         timeout = aiohttp.ClientTimeout(total=self.timeout)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(url, json=payload) as resp:
+        session = await self._get_session()  # v11.8.1 (F-24): reuse TLS
+        async with session.post(url, json=payload, timeout=timeout) as resp:
+            try:
+                body = await resp.json(content_type=None)
+                if not isinstance(body, dict):
+                    body = {"description": str(body)[:200]}
+            except Exception:
                 try:
-                    body = await resp.json(content_type=None)
-                    if not isinstance(body, dict):
-                        body = {"description": str(body)[:200]}
+                    raw = await resp.text()
                 except Exception:
-                    try:
-                        raw = await resp.text()
-                    except Exception:
-                        raw = ""
-                    body = {"description": raw[:200]}
-                return resp.status, body
+                    raw = ""
+                body = {"description": raw[:200]}
+            return resp.status, body
 
     async def get_me(self) -> Optional[Dict[str, Any]]:
         """getMe — يتحقق من صلاحية التوكن ويخزّن هوية البوت (id/username)."""

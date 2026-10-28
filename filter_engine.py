@@ -529,6 +529,15 @@ class EnhancedFilter:
         {"أ": "ا", "إ": "ا", "آ": "ا", "ة": "ه", "ى": "ي", "ئ": "ي", "ؤ": "و"}
     )
     NEGATION_SCOPE_TOKENS: Final[int] = 6
+
+    # v11.8.1 (F-13): post_clause negators whose verb is a WANT-verb —
+    # a request right after them is their negated OBJECT («ما ابي حل»),
+    # not a new request. Aspectual withdrawals («ما عاد», "ما بقى»)
+    # canonically refer to an EARLIER request and keep the soft path.
+    _POST_CLAUSE_WANT_NEGATORS: Final[Tuple[str, ...]] = (
+        "ما ابي", "ما ابغى", "ما اريد", "ما احتاج",
+        "ما عاد ابي", "ما عاد اريد",
+    )
     # v14.4: the analyzer's own floor — the ops-level CFG.MIN_MESSAGE_LENGTH
     # (10 chars) silently killed short high-signal requests ("ابي حل").
     FILTER_MIN_MESSAGE_CHARS: Final[int] = 3
@@ -1473,6 +1482,46 @@ class EnhancedFilter:
                 if _exception_near(neg_pos):
                     continue
                 if intent_pos is not None and intent_pos > neg_pos:
+                    # v11.8.1 (F-13): «ما ابي حل» — with WANT-verbs the
+                    # intent right after the negator is the negated OBJECT
+                    # itself, not a fresh request. Same clause + short
+                    # distance ⇒ strong negation (0.8). A clause boundary
+                    # (or a far intent) keeps the v14.4 "new request wins"
+                    # soft path so «ما عاد ابي مساعدتك، بس ابي حل واجبي»
+                    # still reaches clause_rescore for the second clause.
+                    between = text[neg_pos:intent_pos]
+                    _same_clause = not any(
+                        b in between for b in self._clause_boundaries
+                    ) and not _NEG_PUNCT_BOUNDARY_RE.search(between)
+                    if (
+                        _same_clause
+                        and any(
+                            w in m.group()
+                            for w in self._POST_CLAUSE_WANT_NEGATORS
+                        )
+                        and self._token_distance(text, neg_pos, intent_pos)
+                        <= self.NEGATION_SCOPE_TOKENS
+                    ):
+                        # v11.8.1 (F-13 follow-up): do NOT strong-kill when a
+                        # LATER clause carries a fresh request —
+                        # «ما عاد ابي مساعدتك، بس ابي حل واجبي»: the
+                        # withdrawal covers the object clause only; the
+                        # post-boundary clause is a genuine request and
+                        # keeps the v14.4 soft path (clause_rescore may
+                        # then upgrade it).
+                        _tail = text[intent_pos:]
+                        _later_intent = False
+                        for b in self._clause_boundaries:
+                            p = _tail.find(b)
+                            if p != -1 and self._search_first_valid(
+                                self._request_trie, _tail[p + len(b):]
+                            ):
+                                _later_intent = True
+                                break
+                        if not _later_intent:
+                            return True, 0.8, [
+                                f"post_clause_negates_object: {m.group()}"
+                            ]
                     # request AFTER the withdrawal phrase → new request wins
                     return True, 0.2, [f"post_clause_with_new_request: {m.group()}"]
                 return True, 0.8, [f"post_clause_negator: {m.group()}"]
@@ -2114,6 +2163,23 @@ class EnhancedFilter:
                     result.decision = "accept"
                     result.reasons.extend(up_reasons)
                     result.score_details["clause_rescore"] = round(up_conf, 4)
+                    # v11.8.1 (F-14): the rescore may raise confidence but
+                    # never the DECISION past a deliberate calibration cap.
+                    # The resolution+new-request ceiling (cap 3) fired
+                    # before the rescore ran — enforce it again so
+                    # «لقيت حل الواجب ... عندي تقرير محتاج مساعدة» cannot
+                    # land at accept 0.891 through the back door.
+                    if any(
+                        r.startswith((
+                            "resolution_phrase_with_new_request",
+                            "post_clause_with_new_request",
+                        ))
+                        for r in result.reasons
+                    ):
+                        result.decision = "review"
+                        result.reasons.append(
+                            "capped: rescore_respects_resolution_ceiling"
+                        )
 
         # ===== الإصلاح الحاسم: مزامنة valid مع القرار النهائي =====
         result.valid = (result.decision == "accept")
