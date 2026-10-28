@@ -2645,27 +2645,9 @@ class EnhancedDatabase:
             logger.debug(f"get_sender_access_hash error: {type(e).__name__}")
         return None
 
-    async def get_sender_access_accounts(self, sender_id: int, limit: int = 8) -> List[Dict[str, Any]]:
-        """All accounts that have a stored hash for this sender, freshest
-        first — the spec's Level-3 fallback list. Bounded and never raises."""
-        try:
-            rows = await self._fetchall(
-                "SELECT account_name, access_hash FROM sender_access "
-                "WHERE sender_id = ? ORDER BY updated_at DESC LIMIT ?",
-                (int(sender_id), max(1, min(int(limit), 16))),
-            )
-            out: List[Dict[str, Any]] = []
-            for r in rows or []:
-                try:
-                    ah = int(r.get("access_hash"))
-                    if ah != 0 and r.get("account_name"):
-                        out.append({"account_name": str(r["account_name"]), "access_hash": ah})
-                except Exception:
-                    continue
-            return out
-        except Exception as e:
-            logger.debug(f"get_sender_access_accounts error: {type(e).__name__}")
-            return []
+    # v11.8.2 (F-28): get_sender_access_accounts حُذفت — كود ميت
+    # (لم تُستدعَ من أي مسار إنتاج؛ سلّم الـmention يستخدم
+    # get_sender_access_hash/_resolve_mention_input_users مباشرة).
 
     async def recent_chat_ids(self, limit: int = 30) -> List[int]:
         """Most-recently-seen source chat ids (cache warm-up, bounded)."""

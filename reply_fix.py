@@ -24,9 +24,12 @@ reply_fix.py — الرد التعويضي F (v11.5 — مواصفة المست�
     المراقبة المعني (المحذوف/القناة/المجهول → SKIP مسجَّل).
 
 القيود الموثقة (حدود النظام لا ادعاءات):
-  * خريطة التقييد بالساعة **بذاكرة العملية** — تعود صفرية بعد إعادة
-    تشغيل العملية. المقاومة للتكرار عبر إعادة التشغيل محسّنة قدر الإمكان
-    (لا يُعاد F إلا إذا مرت ساعة كاملة، وفشل الإرسال لا يحجز الحصة).
+  * v11.8.2 (F-18): خريطة التقييد بالساعة والعدّاد اليومي كانا بذاكرة
+    العملية فقط — الآن يُرطّبان من app_settings عند الإقلاع ويُفرّغان
+    مؤجّلاً عند كل حجز حصة (negative_memory) فلا تُصفّر بعد إعادة
+    التشغيل (طوابع monotonic تُحوّل لepoch عند التخزين والعكس عند
+    الترطيب، وما تجاوز ساعته يُسقط). أي فشل DB = تجاهل صامت
+    (الذاكرة تبقى الحقيقة التشغيلية — فشل-آمن كما هو).
 """
 
 from __future__ import annotations
@@ -163,6 +166,82 @@ class ReplyFixer:
         history.append(time.monotonic())
         self._rollover_day()
         self._day_count += 1
+        # v11.8.2 (F-18): حجز الحصة يُفرَّغ مؤجّلاً إلى app_settings
+        try:
+            import negative_memory as _negmem
+            _negmem.mark_dirty("reply_fix")
+        except Exception:
+            pass
+
+    # ── v11.8.2 (F-18): استمرارية الحدود عبر إعادة التشغيل ──
+    _PERSIST_WINDOW_S = 3600.0
+
+    def snapshot_state(self) -> Dict[str, Any]:
+        """لقطة قابلة للتخزين: طوابع epoch (وليس monotonic) + عدّاد اليوم.
+        ما تجاوز نافذة الساعة يُسقط هنا مباشرة (لا يُخزّن هدراً)."""
+        now_m = time.monotonic()
+        now_e = time.time()
+        users: Dict[str, list] = {}
+        for uid, hist in self._hour_history.items():
+            kept = [round(now_e - (now_m - ts), 3) for ts in hist
+                    if (now_m - ts) <= self._PERSIST_WINDOW_S]
+            if kept:
+                users[str(uid)] = kept
+        same_day = (time.gmtime().tm_yday == self._day_key)
+        return {
+            "v": 1,
+            "users": users,
+            "day_key": self._day_key if same_day else time.gmtime().tm_yday,
+            "day_count": self._day_count if same_day else 0,
+        }
+
+    def restore_state(self, data: Any) -> None:
+        """دمج لقطة محفوظة في الحالة الحالية — الأحدث يفوز، فشل-آمن.
+
+        epoch → monotonic: ts_m = now_m - (now_e - ts_e)؛ ما تجاوز
+        الساعة يُسقط، وعدد المستخدمين مقيّد بـ_max_tracked_users،
+        وعدّاد اليوم يُقبل فقط لنفس يوم السنة (وإلا صفر)."""
+        try:
+            if not isinstance(data, dict) or int(data.get("v", 0)) != 1:
+                return
+            now_m = time.monotonic()
+            now_e = time.time()
+            users = data.get("users")
+            if isinstance(users, dict):
+                for k, lst in list(users.items())[: self._max_tracked_users]:
+                    try:
+                        uid = int(k)
+                    except (TypeError, ValueError):
+                        continue
+                    if not isinstance(lst, list):
+                        continue
+                    hist = self._hour_history.get(uid)
+                    if hist is None:
+                        if len(self._hour_history) >= self._max_tracked_users:
+                            break
+                        hist = deque(maxlen=max(8, self.hourly_per_user * 4))
+                        self._hour_history[uid] = hist
+                    for ts_e in lst:
+                        try:
+                            ts_m = now_m - (now_e - float(ts_e))
+                        except (TypeError, ValueError):
+                            continue
+                        if (now_m - ts_m) <= self._PERSIST_WINDOW_S:
+                            hist.append(ts_m)
+            try:
+                dk = int(data.get("day_key", -1))
+                dc = int(data.get("day_count", 0))
+            except (TypeError, ValueError):
+                return
+            if dk == time.gmtime().tm_yday and dc > self._day_count:
+                self._day_key = dk
+                self._day_count = dc
+        except Exception as e:  # noqa: BLE001 — الترطيب لا يرفع استثناءً أبداً
+            try:
+                from loguru import logger as _lg
+                _lg.debug(f"reply_fix restore_state skipped: {type(e).__name__}")
+            except Exception:
+                pass
 
     def disable_for_broadcast(self, reason: str = "") -> None:
         """تعطيل تلقائي: وجهة التنبيه قناة بث لا تقبل الردود المناسبة."""
@@ -374,6 +453,14 @@ def get_reply_fixer() -> ReplyFixer:
     global _instance
     if _instance is None:
         _instance = ReplyFixer()
+        # v11.8.2 (F-18): سجّل الـsingleton لدى negative_memory —
+        # الترطيب عند الإقلاع + تفريغ مؤجل عند كل _record_attempt.
+        try:
+            import negative_memory as _negmem
+            _negmem.register_store(
+                "reply_fix", _instance.snapshot_state, _instance.restore_state)
+        except Exception:
+            pass
     return _instance
 
 

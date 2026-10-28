@@ -103,7 +103,11 @@ from task_util import spawn_bg  # v11.8.1 (F-17): مرجع محفوظ لمهام
 
 __version__ = "1.1.0"
 
-_USERNAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{3,63}$")
+# v11.8.2 (F-27): المصدر القانوني الوحيد لنمط اسم المستخدم — {3,31}
+# (الحد الأقصى الموثق لتيليجرام 32 حرفاً). كان {3,63} هنا و{3,31} في
+# message_context و{3,63} في sender_resolver — الوحدة الثلاث الآن موحدة
+# على نفس النمط (تشديد أمان فقط: لا يوجد مستخدم تيليجرام حقيقي أطول من 32).
+_USERNAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{3,31}$")
 
 
 # =============================================================================
@@ -408,9 +412,19 @@ class NavigationResolver:
             return None
 
         # bounded single-flight per sender (concurrent alerts share one call)
+        # v11.8.2 (F-30): الإخلاء كان pop(أول مفتاح) — قد يزيل قفلاً محتجزاً
+        # قيد الطيران فيبني المتزامن التالي لنفس المرسل قفلاً جديداً وينفذ
+        # بالتوازي (انكسار single-flight نظري فوق 4096). الآن: يُخلّى أول
+        # قفل «حر» فقط؛ إن كانت كلها محتجزة تبقى الخريطة فوق السقف مؤقتاً
+        # (مقيدة عملياً بالمرسلين الفعليين قيد الطيران).
         if len(self._discovery_locks) > self.DISCOVERY_LOCK_MAX:
             try:
-                self._discovery_locks.pop(next(iter(self._discovery_locks)))
+                victim = next(
+                    (k for k, lk in self._discovery_locks.items() if not lk.locked()),
+                    None,
+                )
+                if victim is not None:
+                    self._discovery_locks.pop(victim, None)
             except Exception:
                 pass
         lock = self._discovery_locks.setdefault(int(sender_id), asyncio.Lock())

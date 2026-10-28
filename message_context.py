@@ -54,6 +54,42 @@ _TG_USER_BLOCKED_MAX = 8192          # سقف مقيد (LRU بسيط)
 _TG_USER_BLOCKED: Dict[int, float] = {}
 
 
+# ── v11.8.2 (F-18): استمرارية الذاكرة السلبية عبر إعادة التشغيل ──
+# L1 هو هذه الخريطة نفسها (قراءة متزامنة كما هي)؛ الترطيب عند الإقلاع
+# + تفريغ مؤجل عند كل mark. أي فشل DB = تجاهل صامت (فشل-آمن).
+try:
+    import negative_memory as _negmem
+
+    def _tg_user_blocked_snapshot() -> Dict[str, Any]:
+        now = time.time()
+        return {
+            str(k): v for k, v in _TG_USER_BLOCKED.items()
+            if now - v <= _TG_USER_BLOCKED_TTL
+        }
+
+    def _tg_user_blocked_hydrate(data: Any) -> None:
+        now = time.time()
+        if not isinstance(data, dict):
+            return
+        for k, v in data.items():
+            try:
+                sid = int(k)
+                ts = float(v)
+            except (TypeError, ValueError):
+                continue
+            if sid <= 0 or now - ts > _TG_USER_BLOCKED_TTL:
+                continue
+            cur = _TG_USER_BLOCKED.get(sid)
+            if cur is None or ts > cur:
+                _TG_USER_BLOCKED[sid] = ts  # الأحدث يفوز
+
+    _negmem.register_store("tg_user_blocked",
+                           _tg_user_blocked_snapshot,
+                           _tg_user_blocked_hydrate)
+except Exception:  # pragma: no cover — الوحدة اختيارية (فشل-آمن)
+    _negmem = None
+
+
 def mark_tg_user_blocked(sender_id: Any) -> bool:
     """سجّل رفض tg://user لهذا المعرّف (TTL 6h). لا يرفع استثناءً."""
     try:
@@ -70,6 +106,11 @@ def mark_tg_user_blocked(sender_id: Any) -> bool:
             _TG_USER_BLOCKED.pop(k, None)
     while len(_TG_USER_BLOCKED) > _TG_USER_BLOCKED_MAX:
         _TG_USER_BLOCKED.pop(next(iter(_TG_USER_BLOCKED)))
+    if _negmem is not None:
+        try:
+            _negmem.mark_dirty("tg_user_blocked")
+        except Exception:
+            pass
     return True
 
 

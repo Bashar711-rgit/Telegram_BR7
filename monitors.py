@@ -96,7 +96,7 @@ v9.10 (this pass) — Cross-Account Dedup + Dynamic Alert Buttons:
   * الأزرار الديناميكية (v10.9): أزيلت نهائياً من مسار التنبيهات —
     الأزرار الأربعة المصغّرة [مراسلة][عرض][نسخ][القروب] (v10.9.1)
     تُبنى حصراً عبر alert_bot.build_alert_buttons وتُرسل عبر بوت التنبيهات
-    (Bot API). build_dynamic_buttons كدالة ميزة محفوظة لم يُحذف.
+    (Bot API). v11.8.2 (F-28): بقايا build_dynamic_buttons الميتة حُذفت.
   * المسار الكامل: Event → Extract → msg_hash dedup (DB) → فلترة →
     rate-limit → **content dedup (هنا)** → بناء التنبيه + الأزرار → إرسال.
 
@@ -190,8 +190,8 @@ v10.9 (تاريخية) — نمط الواجهة الموحد للتنبيهات
     معالجاتها في main.py تبقى (ميزة الرد اليدوي لم تُحذف). جمع بيانات
     المرسل من v10.7 (get_sender/usernames المتعددة/تمرير msg_link و
     group_link إلى upsert_sender_contact) كما هو دون أي مساس.
-  * build_dynamic_buttons كدالة ميزة محفوظة لم يُحذف — لم يعد يُستخدم في
-    مسار التنبيهات. الفلترة والـrate limiter لم يُمَسّا.
+  * v11.8.2 (F-28): build_dynamic_buttons (كود ميت منذ v10.9) حُذفت
+    بالكامل. الفلترة والـrate limiter لم يُمَسّا.
 
 See the accompanying engineering report for the full list of changes,
 the retry_count propagation fix (process_event_from_queue / _send_alert),
@@ -431,80 +431,10 @@ def _verify_mention_entity(sent_msg: Any, sender_id: int) -> Tuple[bool, str]:
 
 
 # ============================================================================
-# v9.11 — Dynamic alert buttons (المرحلة الأولى: الأزرار الثلاثة المطلوبة)
-#
-# أسفل كل تنبيه صفّان من الأزرار:
-#   الصف 1: [ عرض الرسالة ]  [ تواصل مع المرسل ]
-#   الصف 2: [ مراسلة ]  [ 📋 نسخ النص (ميزة قائمة — اختيارية) ]
-#
-# القواعد:
-#   * عرض الرسالة  → URL: t.me/{chat}/{msg} عامة أو t.me/c/{inner}/{msg} خاصة
-#                    (أفضل حل متاح ضمن Telethon للمجموعات الخاصة — يعمل لأعضائها)
-#   * تواصل مع المرسل → Inline callback (cnt_{msg_hash}): يفتح قائمة الرسائل
-#                    الجاهزة ليختار المشرف واحدة فتُرسل إلى صاحب الطلب مباشرة
-#   * مراسلة       → URL: t.me/{username} أو tg://openmessage?user_id={id}
-#   * بيانات ناقصة → الزر المكسور لا يُعرض إطلاقاً (لا أزرار مكسورة)
-# ============================================================================
-def build_dynamic_buttons(sender: dict, chat: dict, msg_hash: str = None) -> list | None:
-    rows: list = []
-    row1 = []
-    row2 = []
-
-    sender_id = sender.get("id")
-    username = (sender.get("username") or "").strip().lstrip("@")
-
-    # ── زر «عرض الرسالة» (الأول — فتح الرسالة الأصلية في مصدرها) ──
-    chat_id = chat.get("id")
-    message_id = chat.get("message_id")
-    chat_uname = (chat.get("username") or "").strip().lstrip("@")
-
-    msg_url = None
-    if chat_uname and message_id:
-        msg_url = f"https://t.me/{chat_uname}/{message_id}"
-    elif chat_id and message_id:
-        # v10.5 (link-construction fix): t.me/c/{inner} exists ONLY for
-        # -100<inner> supergroup/channel ids. The old replace("-100", "", 1)
-        # produced dead links like t.me/c/-1234567/… for basic groups and
-        # t.me/c//… for the -100 edge id. Basic groups have NO message
-        # links in Telegram — the button is now honestly omitted instead.
-        inner = _nav_inner_id(chat_id)
-        if inner:
-            msg_url = f"https://t.me/c/{inner}/{message_id}"
-    if msg_url:
-        row1.append(Button.url("عرض الرسالة", msg_url))
-
-    # ── زر «تواصل مع المرسل» (الثاني — قائمة الرسائل الجاهزة) ──
-    if msg_hash and sender_id and CFG.ALERT_WITH_CONTACT_BUTTON:
-        # بيانات الاستدعاء: cnt_ + بصمة الرسالة (32 حرفاً = 36 بايت ≤ 64)
-        row1.append(Button.inline("تواصل مع المرسل", f"cnt_{msg_hash}"))
-
-    if row1:
-        rows.append(row1)
-
-    # ── زر «مراسلة» — سلّم الوصول الأقصى (v10.6):
-    # الهدف أن كل نقرة تصل لمكان حقيقي يقود لملف المرسل حتى لو كانت
-    # مراسلته مغلقة بإعدادات الخصوصية:
-    #   1) t.me/username      — يفتح الملف/الدردشة مباشرة (عالمي، كل العملاء)
-    #   2) رابط الرسالة المصدر — HTTPS يعمل على كل العملاء: يفتح الرسالة
-    #      نفسها، واللمس على صورة المرسل يفتح ملفه الشخصي — أضمن مسار
-    #      مصرّح به في تيليجرام لأي مستخدم أرسل رسالة في مجموعة نراقبها
-    #   3) tg://openmessage    — الشكل القديم (ديسكتوب فقط) كخيار أخير
-    if username:
-        contact_url = f"https://t.me/{username}"
-    elif msg_url:
-        contact_url = msg_url
-    elif sender_id:
-        contact_url = f"tg://openmessage?user_id={sender_id}"
-    else:
-        contact_url = None
-    if contact_url:
-        row2.append(Button.url("مراسلة", contact_url))
-
-    if row2:
-        rows.append(row2)
-
-    return rows if rows else None
-
+# v11.8.2 (F-28): build_dynamic_buttons حُذفت — كود ميت: الأزرار في مسار
+# التنبيهات تُبنى حصراً عبر alert_bot.build_alert_buttons منذ v10.9،
+# وهذه الدالة القديمة لم تعد تُستدعى من أي مسار إنتاج (اختباراتها
+# كانت الاختبار الوحيد لها فحُذفت معها: tests/test_buttons.py).
 
 # =============================================================================
 # FastCaptureBuffer — save-first protection against deletion bots (v9.8)
@@ -1245,6 +1175,11 @@ class EnhancedAccountMonitor:
         self._stats: Dict[str, Any] = {
             "messages_processed": 0, "alerts_sent": 0, "errors": 0, "duplicates": 0, "rate_limited": 0,
             "echo_skipped": 0,   # v11.5.2: بطاقاتنا/هويّاتنا لا تُعاد معالجتها (صدى)
+            # v11.8.2 (F-22 + إصلاح كامن): source_skipped/spam_skipped كانت تُستدعى
+            # في _validate_event لكنها لم تكن في هذا القاموس — _inc_stat يتجاهل
+            # المفاتيح الغائبة فكانت الزيادات تُهمَل صامتة. length_rejected عداد
+            # مخصص لرفض بوابة الطول بدل حصره في errors العام.
+            "source_skipped": 0, "spam_skipped": 0, "length_rejected": 0,
             "send_errors": 0, "queue_processed": 0, "media_processed": 0, "avg_processing_time_ms": 0.0,
             "total_processing_time_ms": 0.0, "last_error": None, "last_alert_time": 0.0,
             "connect_attempts": 0, "reconnect_attempts": 0,
@@ -2422,7 +2357,9 @@ class EnhancedAccountMonitor:
             await self._inc_stat("echo_skipped")
             return False
         if text and not (CFG.MIN_MESSAGE_LENGTH <= len(text) <= CFG.MAX_MESSAGE_LENGTH):
-            await self._inc_stat("errors"); return False
+            # v11.8.2 (F-22): عداد مخصص لرفض الطول بدل errors العام —
+            # رفض الطول ترشيح طبيعي وليس خطأ تشغيلاً.
+            await self._inc_stat("length_rejected"); return False
         return True
 
 
@@ -3543,58 +3480,13 @@ class EnhancedAccountMonitor:
                     except Exception:
                         pass
                     return
-                # ══ v11.5.2: النتيجة المجهولة — لا إعادة إرسال أعمى أبداً ══
-                # timeout = الطلب ربما وصل وقد سلّم فعلاً (unknown result).
-                # إعادة الإرسال الفوري عبر حساب المستخدم = تنبيه مكرر (بلاغ
-                # الإنتاج الحقيقي). أولاً: تحقق عبر عميل AlertUI (MTProto
-                # بنفس هوية البوت — يقرر آخر رسائل مجموعة الهدف). وُجدت
-                # بطاقتنا حديثاً → سُلّم فعلاً → لا fallback. لم توجد → فشل
-                # مؤكد → fallback كالمعتاد. بلا عميل تحقق: timeout = لا
-                # إعادة إرسال (متطلب المواصفة: unknown ≠ confirmed failure)،
-                # أما network_error فيُرجّح عدم الوصول أصلاً → fallback.
-                _unk_reason = str(_reason or "")
-                if _unk_reason.startswith("timeout_attempt") or _unk_reason.startswith("network_error"):
-                    _ui = getattr(self._bot_ref, "alert_ui_client", None) if self._bot_ref is not None else None
-                    _expected = normalize_for_fingerprint(alert_text or "")[:48]
-                    if _ui is not None:
-                        _verified = False
-                        try:
-                            _verified = await self._verify_alertbot_delivery(_ui, _expected)
-                        except Exception as _ver_err:
-                            logger.debug(f"alert delivery verify error [{account_name}]: {type(_ver_err).__name__}")
-                        if _verified:
-                            logger.info(
-                                f"AlertBot {_unk_reason.split(':')[0]} but delivery VERIFIED via AlertUI "
-                                f"[{account_name}] — no fallback resend (duplicate prevented)"
-                            )
-                            try:
-                                await self.db.mark_alert_dispatched(
-                                    msg_hash, status="delivered", error="verified_after_unknown")
-                            except Exception:
-                                pass
-                            await self._record_sent_alert(
-                                None, data, msg_hash, account_name, keyword, alert_text,
-                                chat_id, sender_id, display_name,
-                                contact_method="bot_verified",
-                            )
-                            return
-                        logger.info(
-                            f"AlertBot {_unk_reason.split(':')[0]} and NOT found in target "
-                            f"[{account_name}] — confirmed failure → user-account fallback"
-                        )
-                        # فشل مؤكد — نسقط للـfallback الطبيعي أدناه
-                    elif _unk_reason.startswith("timeout_attempt"):
-                        logger.warning(
-                            f"AlertBot timeout with no AlertUI verifier [{account_name}] — "
-                            f"NOT resending (unknown result; blind-resend forbidden)"
-                        )
-                        try:
-                            await self.db.mark_alert_dispatched(
-                                msg_hash, status="unknown", error="timeout_no_verifier")
-                        except Exception:
-                            pass
-                        return
-                    # network_error بلا مُحقّق: الأغلبية اتصال لم يُقطع أصلاً → fallback
+                # ══ v11.8.2 (F-12): إزالة الكتلة المكررة ══
+                # سياسة النتيجة المجهولة كانت مكررة مرتين (تحقق AlertUI
+                # فعلي مزدوج). unknown_send_result_policy أعلاه تغطي كل
+                # المسارات: verify+found→return / verify+not-found→سقوط
+                # للـfallback / stop→return / fallback→سقوط للـfallback.
+                # الكتلة القديمة المحرفة بـstartswith حُذفت؛ السقوط للتحذير
+                # أدناه هو نفس سلوك fallback السابق بلا تحقق مزدوج.
                 logger.warning(
                     f"AlertBot failed → user-account fallback [{account_name}] "
                     f"(msg_hash={msg_hash}): {_reason}"
@@ -3830,10 +3722,13 @@ class EnhancedAccountMonitor:
                 # المسار الرئيسي)؛ السلوك القديم parse_mode=None بقي كمحاولة
                 # أخيرة كي لا تضيع التنبيهات أبداً.
                 try:
-                    fallback_sent_msg = await fb_client.send_message(CFG.TARGET_GROUP_ID, _hardened_alert_text(), buttons=buttons, parse_mode="html", link_preview=False)
+                    # v11.8.2 (F-25): المسار الاحتياطي كان يعيد إرفاق الأزرار
+                    # بعد رفض الخادم لها (تجاوز _kb_for_this_send). الآن نفس
+                    # بوابة اللوحة: None عند الرفض/الغياب بدل إعادة رفض مؤكد.
+                    fallback_sent_msg = await fb_client.send_message(CFG.TARGET_GROUP_ID, _hardened_alert_text(), buttons=_kb_for_this_send(), parse_mode="html", link_preview=False)
                 except Exception as _fb_html_err:
                     logger.debug(f"Fallback html send failed [{account_name}]: {type(_fb_html_err).__name__} — plain-text fallback")
-                    fallback_sent_msg = await fb_client.send_message(CFG.TARGET_GROUP_ID, alert_text, buttons=buttons, parse_mode=None, link_preview=False)
+                    fallback_sent_msg = await fb_client.send_message(CFG.TARGET_GROUP_ID, alert_text, buttons=_kb_for_this_send(), parse_mode=None, link_preview=False)
                 if outcome.get("method") is None:
                     outcome["method"] = "link"
             except Exception as fe:
@@ -4139,7 +4034,9 @@ class HealthMonitor:
         if self._bot:
             try:
                 if self._bot.db.is_connected:
-                    await self._bot.db._fetchone("SELECT 1 AS ping"); checks["database"] = "ok"
+                    # v11.8.2 (F-23): _ping هو عقد فحص الصحة الرسمي (يدعم
+                    # postgresql وsqlite معاً) بدل _fetchone الخاص.
+                    await self._bot.db._ping(); checks["database"] = "ok"
                 else: checks["database"] = "disconnected"
                 up = sum(1 for m in self._bot.monitors if m.is_connected); total = len(self._bot.monitors)
                 checks["monitors_up"] = up; checks["monitors_total"] = total

@@ -28,7 +28,7 @@ if str(PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR))
 
 from config import CFG  # noqa: E402
-from monitors import EnhancedAccountMonitor, build_dynamic_buttons  # noqa: E402
+from monitors import EnhancedAccountMonitor  # noqa: E402  # v11.8.2 (F-28): build_dynamic_buttons حُذفت (كود ميت)
 from nav_resolver import (  # noqa: E402
     NavReport,
     NavigationResolver,
@@ -408,24 +408,6 @@ class TestEntryPoint:
 # 6) تكامل البنّاء المتجمّد — الأزرار والتنبيه من بيانات المُحلّل
 # ═══════════════════════════════════════════════════════════════════════════
 class TestFrozenBuilderIntegration:
-    def test_basic_group_button_omitted_not_dead_link(self):
-        """إصلاح بناء المعرف: مجموعة أساسية كانت تُنتج t.me/c/-1234567/…
-        الميتة — الآن الزر يُحذف بصدق (لا أزرار مكسورة)."""
-        rows = build_dynamic_buttons(
-            sender={"id": 5, "username": None},
-            chat={"id": -1234567, "message_id": 42, "username": None},
-        )
-        urls = [s for row in rows or [] for s in _all_specs(row)]
-        assert all(not u.startswith("https://t.me/c/") for u in urls)
-
-    def test_minus100_button_still_canonical(self):
-        rows = build_dynamic_buttons(
-            sender={"id": 5, "username": None},
-            chat={"id": -1001234567890, "message_id": 456, "username": None},
-        )
-        urls = [s for row in rows or [] for s in _all_specs(row)]
-        assert "https://t.me/c/1234567890/456" in urls
-
     async def test_alert_from_enriched_chat_info(self, monitor):
         """التنبيه النهائي من بيانات مُحلّى: رابط المرسل + بطاقة «نص
         الرسالة:» الموحدة (v10.9) — والأزرار من بوت التنبيهات فقط.
@@ -854,31 +836,3 @@ class TestHardenSenderAnchor:
 # ═══════════════════════════════════════════════════════════════════════════
 # 11) v10.6 — سلّم زر «مراسلة»: كل نقرة تصل لمكان حقيقي
 # ═══════════════════════════════════════════════════════════════════════════
-class TestContactButtonLadder:
-    def test_username_still_wins(self):
-        rows = build_dynamic_buttons(
-            sender={"id": 5, "username": "ahmed_99"},
-            chat={"id": -1001234567890, "message_id": 42, "username": None},
-        )
-        assert "https://t.me/ahmed_99" in [u for row in rows or [] for u in _all_specs(row)]
-
-    def test_no_username_falls_back_to_source_message(self):
-        """بلا username: زر مراسلة يفتح الرسالة المصدر (HTTPS يعمل على كل
-            العملاء) — اللمس على صورة المرسل يفتح ملفه الشخصي دائماً."""
-        rows = build_dynamic_buttons(
-            sender={"id": 5, "username": None},
-            chat={"id": -1001234567890, "message_id": 42, "username": None},
-        )
-        urls = [u for row in rows or [] for u in _all_specs(row)]
-        assert "https://t.me/c/1234567890/42" in urls  # مراسلة = رابط الرسالة
-
-    def test_basic_group_keeps_openmessage_last_resort(self):
-        """مجموعة أساسية (لا روابط رسائل في تيليجرام) → الشكل القديم
-            tg://openmessage يبقى آخر خيار متاح بصدق."""
-        rows = build_dynamic_buttons(
-            sender={"id": 5, "username": None},
-            chat={"id": -1234567, "message_id": 42, "username": None},
-        )
-        urls = [u for row in rows or [] for u in _all_specs(row)]
-        assert "tg://openmessage?user_id=5" in urls
-        assert all(not u.startswith("https://t.me/c/") for u in urls)

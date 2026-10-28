@@ -308,7 +308,9 @@ def parse_telegram_link(link: str) -> ParsedLink:
     global _USERNAME_RE
     import re
     if _USERNAME_RE is None:
-        _USERNAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{3,63}$")
+        # v11.8.2 (F-27): موحد مع nav_resolver/message_context على {3,31}
+        # (حد تيليجرام 32 حرفاً) — كان {3,63} غير متسق مع البقية.
+        _USERNAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{3,31}$")
 
     if not link or not isinstance(link, str):
         return ParsedLink(raw=str(link or ""), kind="invalid", reason=FailureReason.INVALID_LINK)
