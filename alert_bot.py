@@ -94,6 +94,8 @@ import aiohttp
 from loguru import logger
 
 from config import InputSanitizer
+# v12.0 unified_alerts: عقد سلامة البطاقة — فحص/إصلاح قبل كل إرسال Bot API
+from unified_alerts.card import validate_and_repair_card  # noqa: E402
 # v11.2: نظام مراسلة المرسل — المصدر الوحيد لاختيار رابط المرسل (spec #8).
 # لا يُبنى رابط مرسل يدوياً في هذا الملف ولا في أي ملف آخر — ContactTarget
 # يقرر (username ← user_id ← لا شيء) ويستخدم الاسم والزر نفس selected_url.
@@ -826,6 +828,29 @@ class AlertBot:
             )
         except Exception as e:
             return False, "", f"build_error:{type(e).__name__}"
+
+        # ══ v12.0 unified_alerts: عقد سلامة البطاقة (مسار Bot API) ══
+        # قبل أي payload: نص فارغ → فشل صادق (المستدعي يسجل ويسقط)؛
+        # وسوم/طول/أزرار → إصلاح ذاتي في built نفسه قبل البناء.
+        try:
+            _card = validate_and_repair_card(
+                built.get("text"), built.get("buttons"))
+            if not _card.ok:
+                logger.warning(
+                    f"[ALERT] card contract failed (bot path) — dropped honestly | "
+                    f"reasons={_card.reasons} (unified_alerts)"
+                )
+                return False, "", "card_contract_failed"
+            if _card.repaired_text:
+                built["text"] = _card.repaired_text
+                logger.info(
+                    f"[ALERT] card repaired (bot path) | reasons={_card.reasons} "
+                    f"(unified_alerts)"
+                )
+            if _card.repaired_buttons is not None:
+                built["buttons"] = _card.repaired_buttons
+        except Exception as _card_err:  # فشل-آمن: خلل الفحص لا يمنع الإرسال
+            logger.debug(f"card contract skipped: {type(_card_err).__name__}")
 
         base_method = built["contact_method"]
         sender_dropped = False

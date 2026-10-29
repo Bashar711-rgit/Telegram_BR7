@@ -1510,6 +1510,50 @@ class EnhancedDatabase:
             logger.error(f"purge_queue error: {e}")
             return 0
 
+    async def purge_stale_queue_rows(self, max_age_seconds: int = 7200) -> int:
+        """v12.0 unified_alerts: حذف صفوف الطابور الأقدم من max_age_seconds فقط.
+
+        الطابور مخزن تشغيلي عابر (ليس بيانات مستخدم). الصفوف الأقدم من الحد
+        لن تصلح تنبيهاتها أبداً (بوابة العمر في unified_alerts ستُسقطها عند
+        pop) وتشغل سعة MESSAGE_QUEUE_SIZE فتدفع evictions تضيّر أحداثاً
+        جديدة. الحذف بالعمر حصراً — لا يمس الصفوف الحية إطلاقاً.
+        يعيد عدد الصفوف المحذوفة (فشل → 0 بلا استثناء).
+        """
+        try:
+            try:
+                max_age_seconds = max(60, int(max_age_seconds))
+            except Exception:
+                max_age_seconds = 7200
+            if self.db_type == "sqlite":
+                cursor = await self._execute(
+                    "DELETE FROM processing_queue WHERE created_at < datetime('now', ?)",
+                    (f"-{max_age_seconds} seconds",),
+                )
+                deleted = cursor.rowcount or 0
+                await self._commit()
+            else:
+                async with self._pool.acquire() as conn:
+                    # asyncpg يعيد سلسلة الحالة "DELETE <n>" — نحللها كما في purge_queue
+                    status = await conn.execute(
+                        "DELETE FROM processing_queue WHERE created_at < now() - ($1 || ' seconds')::interval",
+                        str(max_age_seconds),
+                    )
+                    try:
+                        deleted = int(str(status).split()[1])
+                    except Exception:
+                        deleted = 0
+            if deleted:
+                async with self._queue_lock:
+                    self._queue_size_mirror = max(0, self._queue_size_mirror - deleted)
+                    self._queue_mirror_dirty = True
+                logger.info(
+                    f"purge_stale_queue_rows: removed {deleted} rows older than {max_age_seconds}s"
+                )
+            return deleted
+        except Exception as e:
+            logger.debug(f"purge_stale_queue_rows failed (fail-safe): {type(e).__name__}: {e}")
+            return 0
+
     # ─── Dead Letters (fix #11) ───────────────────────────────────────────────
     async def add_dead_letter(self, record: DeadLetterRecord) -> bool:
         try:

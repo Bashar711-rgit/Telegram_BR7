@@ -27,6 +27,10 @@ _SCHEMA: Dict[str, Dict[str, Any]] = {
     "max_message_length":  {"cfg": "MAX_MESSAGE_LENGTH",  "type": int,   "min": 10,  "max": 50000,    "live": True},
     "max_words_count":     {"cfg": "MAX_WORDS_COUNT",     "type": int,   "min": 1,   "max": 1000,     "live": True},
     "cooldown_per_sender": {"cfg": "ALERT_COOLDOWN",      "type": int,   "min": 0,   "max": 86400,    "live": True},
+    # v12.0 unified_alerts — بوابة العمر وسلامة البطاقة (تسري فوراً)
+    "max_event_age_seconds": {"cfg": "MAX_EVENT_AGE_SECONDS", "type": int, "min": 0, "max": 604800, "live": True},
+    "alert_card_max_chars":  {"cfg": "ALERT_CARD_MAX_CHARS",  "type": int, "min": 256, "max": 4000,  "live": True},
+    "queue_stale_purge_seconds": {"cfg": "QUEUE_STALE_PURGE_SECONDS", "type": int, "min": 60, "max": 604800, "live": True},
     "max_lines":           {"cfg": None,                  "type": int,   "min": 1,   "max": 500,      "live": False},
     "max_image_size_mb":   {"cfg": None,                  "type": float, "min": 0.1, "max": 100.0,    "live": False},
     "max_video_size_mb":   {"cfg": None,                  "type": float, "min": 0.1, "max": 2000.0,   "live": False},
@@ -39,6 +43,10 @@ def _defaults() -> Dict[str, Any]:
         "max_message_length": CFG.MAX_MESSAGE_LENGTH,
         "max_words_count": CFG.MAX_WORDS_COUNT,
         "cooldown_per_sender": CFG.ALERT_COOLDOWN,
+        # v12.0 unified_alerts (نفس قراءة CFG الحية — 0 تعطيل بوابة العمر)
+        "max_event_age_seconds": getattr(CFG, "MAX_EVENT_AGE_SECONDS", 1800),
+        "alert_card_max_chars": getattr(CFG, "ALERT_CARD_MAX_CHARS", 4000),
+        "queue_stale_purge_seconds": getattr(CFG, "QUEUE_STALE_PURGE_SECONDS", 7200),
         "max_lines": 50,
         "max_image_size_mb": 10.0,
         "max_video_size_mb": 50.0,

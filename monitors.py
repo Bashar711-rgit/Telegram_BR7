@@ -244,6 +244,9 @@ from filter_engine import EnhancedFilter
 from dedup import content_fingerprint, get_deduplicator, normalize_for_fingerprint  # v9.10 dedup + v11.5.2 verify
 from similarity import get_similarity_gate  # v10.0 Precision: near-duplicate gate
 from antispam import get_antispam  # v9.11 anti-spam (Watch List → Permanent Ignore)
+# v12.0 unified_alerts — التنبيهات الموحدة: بوابة العمر + عقد سلامة البطاقة.
+# كل الاستدعاءات فشل-آمنة (خلل الحزمة يفتح المسار ولا يُسقط تنبيهات صالحة).
+from unified_alerts import get_alert_gate, validate_and_repair_card  # v12.0
 from sender_resolver import (
     extract_flat as _sender_extract_flat,
     extract_sender as _sender_extract,
@@ -2287,6 +2290,23 @@ class EnhancedAccountMonitor:
 
 
     async def _process_event_pipeline(self, data: Dict[str, Any]):
+        # ══ v12.0 unified_alerts: بوابة العمر — أقرب نقطة إسقاط ══
+        # أحداث الـcatch-up بعد انقطاع طويل (أو اعتقاق الطابور أثناء
+        # الازدحام) تُسقط هنا قبل الإثراء وقبل أي كتابة DB — هذا يوقف
+        # تنبيهات «رسائل عمرها ساعات» ويحرر الطابور فوراً (الإسقاط
+        # ميكروثواني بلا I/O). فشل-آمن: خلل البوابة يفتح المسار.
+        try:
+            _gate_dec = get_alert_gate().evaluate_event(data, stage="pipeline")
+            if not _gate_dec.allowed:
+                _m = _gate_dec.meta or {}
+                logger.info(
+                    f"⏳ stale event dropped [pipeline] | chat={_m.get('chat_id')} "
+                    f"msg={_m.get('message_id')} | age={_m.get('age_seconds')}s "
+                    f"> limit={_m.get('limit_seconds')}s (unified_alerts age gate)"
+                )
+                return
+        except Exception as _gate_err:  # فشل-آمن مطلق
+            logger.debug(f"unified gate pipeline skipped: {type(_gate_err).__name__}")
         # v9.12 (audit H-03): if the NewMessage handler deferred sender
         # enrichment (because event.sender was None and we no longer do
         # network calls in the capture hot path), run the resolver here
@@ -2356,10 +2376,25 @@ class EnhancedAccountMonitor:
         if is_self_sender(sender_id) or is_alert_card_echo(text):
             await self._inc_stat("echo_skipped")
             return False
-        if text and not (CFG.MIN_MESSAGE_LENGTH <= len(text) <= CFG.MAX_MESSAGE_LENGTH):
-            # v11.8.2 (F-22): عداد مخصص لرفض الطول بدل errors العام —
-            # رفض الطول ترشيح طبيعي وليس خطأ تشغيلاً.
-            await self._inc_stat("length_rejected"); return False
+        if text:
+            # v12.0: توحيد دلالة الطول مع InputSanitizer.validate_message_text —
+            # العد على النص بعد strip (كان سابقاً على النص الخام، فمرّر نصاً
+            # مكوَّناً من فراغات/محارف صفرية العرض ثم انكسر لاحقاً عند
+            # validate_message_text → "تنبيه بنص فارغ"). الحدود شاملة:
+            # MIN_MESSAGE_LENGTH <= الطول <= MAX_MESSAGE_LENGTH (6..65).
+            _stripped = str(text).strip()
+            try:
+                _cfg_min_len = int(getattr(CFG, "MIN_MESSAGE_LENGTH", 6) or 6)
+            except Exception:
+                _cfg_min_len = 6
+            try:
+                _cfg_max_len = int(getattr(CFG, "MAX_MESSAGE_LENGTH", 65) or 65)
+            except Exception:
+                _cfg_max_len = 65
+            if not (_cfg_min_len <= len(_stripped) <= _cfg_max_len):
+                # v11.8.2 (F-22): عداد مخصص لرفض الطول بدل errors العام —
+                # رفض الطول ترشيح طبيعي وليس خطأ تشغيلاً.
+                await self._inc_stat("length_rejected"); return False
         return True
 
 
@@ -3033,6 +3068,21 @@ class EnhancedAccountMonitor:
         process_event_from_queue).
         """
         if not self._bot_ref: return
+        # ══ v12.0 unified_alerts: بوابة العمر عند الإرسال (طبقة ثانية) ══
+        # الحدث قد يكون جديداً عند الالتقاط لكنه اعتق في processing_queue
+        # أثناء الازدحام — هنا الفحص الأخير قبل الخروج للمستخدم. فشل-آمن.
+        try:
+            _send_gate_dec = get_alert_gate().evaluate_event(data, stage="send")
+            if not _send_gate_dec.allowed:
+                _sm = _send_gate_dec.meta or {}
+                logger.info(
+                    f"⏳ stale alert blocked [send] | chat={data.get('chat_id')} "
+                    f"msg={data.get('message_id')} | age={_sm.get('age_seconds')}s "
+                    f"> limit={_sm.get('limit_seconds')}s (unified_alerts age gate)"
+                )
+                return
+        except Exception as _send_gate_err:
+            logger.debug(f"unified gate send skipped: {type(_send_gate_err).__name__}")
         account_name = data.get("account_name", self.account["name"])
         chat_id = data["chat_id"]; message_id = data["message_id"]; sender_id = data["sender_id"]
         sender_username = data.get("sender_username"); sender_first_name = data.get("sender_first_name")
@@ -3158,6 +3208,33 @@ class EnhancedAccountMonitor:
             _ctx = None
         alert_text, buttons = self._build_alert(sender, chat_info, keyword, text, analysis,
                                                 contact_target=sender_target, context=_ctx)
+        # ══ v12.0 unified_alerts: عقد سلامة البطاقة ══
+        # «لا يصل المستخدم تنبيه لم يُبنَ صحيحاً»: نص فارغ → إسقاط صادق؛
+        # وسوم <a> غير متوازنة / تجاوز حد UTF-16 → إصلاح ذاتي؛ أزرار
+        # معطوبة → تنظيف. يخدم مسار البوت (سجل alerts) ومسار fallback.
+        try:
+            _card = validate_and_repair_card(alert_text, buttons)
+            if not _card.ok:
+                logger.warning(
+                    f"[ALERT] card contract failed — alert dropped honestly "
+                    f"[{account_name}] | reasons={_card.reasons} (unified_alerts)"
+                )
+                try:
+                    await self.db.mark_alert_dispatched(
+                        msg_hash, status="failed", error="card_contract_failed")
+                except Exception:
+                    pass
+                return
+            if _card.repaired_text:
+                alert_text = _card.repaired_text
+                logger.info(
+                    f"[ALERT] card repaired [{account_name}] | "
+                    f"reasons={_card.reasons} (unified_alerts)"
+                )
+            if _card.repaired_buttons is not None:
+                buttons = _card.repaired_buttons
+        except Exception as _card_err:  # فشل-آمن: خلل الفحص لا يمنع التنبيه
+            logger.debug(f"card contract check skipped: {type(_card_err).__name__}")
         # ══ v11.2: [SENDER] — سطر التشخيص الموحد (spec #22) ══
         # لوج فقط — لا يدخل نص التنبيه أبداً؛ بلا بيانات حساسة.
         try:

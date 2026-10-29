@@ -401,6 +401,16 @@ class _ConfigData:
     ALERT_MAX_TEXT_LEN: int
     ALERT_WITH_COPY_BUTTON: bool
     ALERT_WITH_CONTACT_BUTTON: bool
+    # v12.0 unified_alerts: بوابة العمر — أقصى عمر لحدث يستحق تنبيهاً.
+    # بعد انقطاع طويل يعيد تيليجرام تسليم تحديثات قديمة (catch-up) —
+    # بوابة العمر تُسقطها قبل الإثراء وقبل الإرسال (0 = تعطيل البوابة).
+    MAX_EVENT_AGE_SECONDS: int
+    # v12.0 unified_alerts: حد نص بطاقة التنبيه (وحدات UTF-16) — أضيق من
+    # حد Bot API الصلب (4096) هامشاً للكيانات؛ يتجاوزه → قصّ آمن ذاتي.
+    ALERT_CARD_MAX_CHARS: int
+    # v12.0 unified_alerts: حذف صفوف processing_queue الأقدم من هذا العمر
+    # عند الإقلاع ودورياً — الطابور مخزن تشغيلي عابر (ليس بيانات مستخدم).
+    QUEUE_STALE_PURGE_SECONDS: int
     # v11.5: الرد التعويضي F (مواصفة §11)
     REPLY_FIX_ENABLED: bool
     REPLY_FIX_HOURLY_PER_USER: int
@@ -753,6 +763,10 @@ class Config:
             FUZZY_MATCH_THRESHOLD=SecretManager.get_int("FUZZY_MATCH_THRESHOLD", 85, required=False),
             SPAM_SCORE_THRESHOLD=spam,
             ALERT_COOLDOWN=SecretManager.get_int("ALERT_COOLDOWN", 300, required=False),
+            # v12.0 unified_alerts (تفاصيلها أعلاه في التعريفات)
+            MAX_EVENT_AGE_SECONDS=SecretManager.get_int("MAX_EVENT_AGE_SECONDS", 1800, required=False),
+            ALERT_CARD_MAX_CHARS=SecretManager.get_int("ALERT_CARD_MAX_CHARS", 4000, required=False),
+            QUEUE_STALE_PURGE_SECONDS=SecretManager.get_int("QUEUE_STALE_PURGE_SECONDS", 7200, required=False),
             LANGUAGE_FILTER=SecretManager.get_bool("LANGUAGE_FILTER", True),
             MIN_ARABIC_CONFIDENCE=SecretManager.get_float("MIN_ARABIC_CONFIDENCE", 0.7, required=False),
             BLOOM_FILTER_SIZE=SecretManager.get_int("BLOOM_FILTER_SIZE", 50000, required=False),

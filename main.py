@@ -105,6 +105,7 @@ from config import (
 )
 from database import EnhancedDatabase
 from dedup import get_dedup_snapshot, init_deduplicator
+from unified_alerts import run_startup_maintenance, unified_snapshot  # v12.0 unified_alerts
 from antispam import get_antispam, setup_antispam, get_antispam_snapshot
 from filter_engine import EnhancedFilter
 from monitors import (
@@ -1004,6 +1005,7 @@ class EnhancedTelegramBot:
                 "sender_contact": get_contact_metrics_snapshot(),  # v11.2 مراسلة المرسل
                 "alert_latency": alert_latency.snapshot(),
                 "dedup": get_dedup_snapshot(),
+                "unified_gate": unified_snapshot(),  # v12.0 unified_alerts
                 "antispam": get_antispam_snapshot(),
             }, status=503 if db_down else 200)
 
@@ -1187,6 +1189,13 @@ class EnhancedTelegramBot:
                 dl_cleaned = await self.db.cleanup_dead_letters(days=CFG.DEAD_LETTER_CLEANUP_DAYS)
                 if dl_cleaned:
                     logger.info(f"Dead letter cleanup: {dl_cleaned} records removed")
+                # v12.0 unified_alerts: purge دوري لصفوف الطابور المنتهية
+                # (نفس سياسة الإقلاع — يمنع تراكم backlog منعّم قبل بوابة العمر)
+                try:
+                    from unified_alerts.maintenance import purge_stale_queue_rows as _purge_q
+                    await _purge_q(self.db)
+                except Exception as _pq_err:
+                    logger.debug(f"queue purge skipped: {type(_pq_err).__name__}")
                 gc.collect()
             except asyncio.CancelledError:
                 break
@@ -1631,6 +1640,18 @@ class EnhancedTelegramBot:
         # singleton مشترك بين كل المراقبين، وجدول alert_dedup يُنشأ ضمن
         # _create_tables في connect()).
         init_deduplicator(self.db)
+
+        # v12.0 unified_alerts: صيانة الإقلاع — purge صفوف processing_queue
+        # الأقدم من QUEUE_STALE_PURGE_SECONDS (مخزن تشغيلي عابر). بعد
+        # انقطاع/إعادة نشر قد يظل الطابور ممتلئاً بأحداث لن تصلح تنبيهاتها
+        # (بوابة العمر ستُسقطها عند pop) — التنظيف هنا يمنع evictions
+        # تضيّر أحداثاً جديدة. فشل-آمن بلا استثناءات للإقلاع.
+        try:
+            _maint = await run_startup_maintenance(self.db)
+            if _maint.get("purged_queue_rows"):
+                logger.info(f"unified_alerts startup maintenance: {_maint}")
+        except Exception as _maint_err:
+            logger.debug(f"startup maintenance skipped: {type(_maint_err).__name__}")
 
         # v9.11: تهيئة محرك مكافحة السبام وتحميل قائمة التجاهل الدائم من DB
         # (قبل تشغيل أي مراقب — حتى تُتجاهل رسائل المصنفين كمزعجين منذ اللحظة الأولى).
