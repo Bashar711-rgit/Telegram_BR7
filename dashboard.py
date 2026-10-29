@@ -1337,6 +1337,12 @@ async def health_full(request: Request):
         alert_latency_snap = alert_latency.snapshot()
     except Exception:
         alert_latency_snap = {"samples": 0}
+    # v12.0 unified_alerts: بوابة العمر + عقد البطاقة + الصيانة (additive).
+    try:
+        from unified_alerts import unified_snapshot as _u_snap
+        unified_gate = _u_snap()
+    except Exception:
+        unified_gate = {"enabled": False, "version": "12.0.0"}
     # v11.7.1 (المهمة الهندسية §2.5): حالة الكاتب/الطابور/DLQ — أقل قدر
     # لازم من المعلومات التشخيصية الآمنة: عدّادات وحالة مهمة فقط. لا نصوص
     # رسائل ولا معرّفات مستخدمين ولا أسرار. كل فشل يُبتلع بأمان (fields=0).
@@ -1377,6 +1383,7 @@ async def health_full(request: Request):
         "sender_contact": sender_contact,
         "alert_latency": alert_latency_snap,
         "dedup": dedup,
+        "unified_gate": unified_gate,  # v12.0 unified_alerts
         "antispam": antispam,
         "db_writer": db_writer,
         "uptime": uptime,
