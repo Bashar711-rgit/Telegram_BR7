@@ -47,8 +47,11 @@ Public API:
 from __future__ import annotations
 
 import asyncio
+import ipaddress as _ipaddress
+import os as _os
 import re
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from typing import Any, Final, List, Optional, Union
 
@@ -272,3 +275,102 @@ async def safe_search_async(pattern: _PatternLike, text: str) -> Optional["re.Ma
 async def safe_findall_async(pattern: _PatternLike, text: str) -> List[Any]:
     """Async variant of safe_findall — does NOT block the event loop."""
     return await _get_default_executor().findall_async(pattern, text)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v12.2.0 — Client IP resolution behind reverse proxies (audit S-1)
+#
+# المشكلة (مواصفة §11: "Trust forwarding headers only when they come from
+# explicitly configured trusted proxies"):
+#   dashboard._AuthGuard.client_ip كانت تأخذ أول قيمة X-Forwarded-For حرفياً —
+#   والقيمة الأولى يتحكم بها العميل نفسه عندما لا يستبدل البروكسي الترويسة:
+#     * ترويش القفل: المهاجم يبدّل XFF في كل طلب → لا يبلغ عتبة القفل أبداً.
+#     * سَمّ المفتاح: فشلات مزوّرة باسم IP الضحية → قفل إداري (DoS).
+#   webadmin._LoginGuard أُصلحت سابقاً (v9.12 audit M-12) بنمط TRUSTED_PROXIES
+#   — والنمط الصحيح يُوحَّد هنا لكل الطبقات (بلا تبعيات تطبيقية حتى يبقى
+#   استيراده من dashboard.py وwebadmin معاً آمناً معماریاً).
+#
+# الخوارزمية (المعيار العملي للبروكسيات العكسية):
+#   1. إن لم يكن الاتصال المباشر من بروكسي موثوق → XFF يتحكم به العميل →
+#      يُتجاهل كلياً ويُعاد عنوان الاتصال المباشر (لا يمكن تزويره).
+#   2. وإلا تمشٍّ سلسلة XFF من اليمين لليسار متخطياً قفزات البروكسي الموثوقة —
+#      أول عنوان غير موثوق هو العميل الحقيقي (يضعه البروكسي، لا العميل).
+#   3. سلسلة كلها موثوقة/فارغة → الاتصال المباشر.
+#
+# الافتراضي عند غياب TRUSTED_PROXIES: قفزات الوكيل المعيارية الشائعة
+# (loopback + شبكات 10/8 الداخلية — نمط Render/AWS/Docker). القيمة الصريحة
+# في البيئة تُلغي الافتراضي كلياً. الإعداد موثق في render.yaml.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# مفتاح كاش إعدادات البروكسي (60 ثانية — تعديل env يسري دون إعادة تشغيل)
+_PROXY_CACHE_TTL = 60.0
+_proxy_cache_lock = threading.Lock()
+_proxy_cache: tuple = (0.0, ())  # (ts, tuple[_BaseNetwork, ...])
+
+# الافتراضي: قفزات بروكسي معيارية (loopback + نطاق داخلي 10/8)
+_DEFAULT_TRUSTED_PROXIES = "127.0.0.0/8,10.0.0.0/8,::1/128"
+
+_XFF_KEY_MAX_LEN = 64  # سقف طول المفتاح (نفس سلوك dashboard السابق)
+
+
+def parse_trusted_proxies(raw: str) -> tuple:
+    """تحويل قائمة CIDR مفصولة بفواصل إلى شبكات — الفاسد يُتخطى بأمان."""
+    nets = []
+    for piece in (raw or "").split(","):
+        piece = piece.strip()
+        if not piece:
+            continue
+        try:
+            nets.append(_ipaddress.ip_network(piece, strict=False))
+        except ValueError:
+            logger.warning(f"trusted proxies: invalid CIDR skipped: {piece!r}")
+    return tuple(nets)
+
+
+def trusted_proxy_networks() -> tuple:
+    """شبكات البروكسي الموثوقة — من TRUSTED_PROXIES أو الافتراضي (كاش 60s)."""
+    global _proxy_cache
+    now = time.time()
+    with _proxy_cache_lock:
+        cached_ts, cached = _proxy_cache
+        if (now - cached_ts) < _PROXY_CACHE_TTL and cached_ts > 0:
+            return cached
+    raw = _os.getenv("TRUSTED_PROXIES", "").strip() or _DEFAULT_TRUSTED_PROXIES
+    nets = parse_trusted_proxies(raw)
+    with _proxy_cache_lock:
+        _proxy_cache = (time.time(), nets)
+    return nets
+
+
+def _ip_in_trusted(ip: str, nets: tuple) -> bool:
+    if not ip or not nets:
+        return False
+    try:
+        addr = _ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return any(addr in net for net in nets)
+
+
+def resolve_client_ip(direct: str, xff: str) -> str:
+    """العنوان الحقيقي للعميل خلف بروكسيات موثوقة — انظر التوثيق أعلاه.
+
+    direct: عنوان الاتصال المباشر (request.client.host / websocket.client.host)
+    xff:    قيمة ترويسة X-Forwarded-For الخام (قد تكون فارغة)
+    """
+    try:
+        direct = (direct or "unknown").strip() or "unknown"
+        nets = trusted_proxy_networks()
+        # 1) الاتصال المباشر ليس من بروكسي موثوق → XFF يتحكم به العميل
+        if not _ip_in_trusted(direct, nets):
+            return direct[:_XFF_KEY_MAX_LEN]
+        # 2) بروكسي موثوق → أول عنوان غير موثوق من اليمين
+        parts = [p.strip() for p in (xff or "").split(",") if p.strip()]
+        for hop in reversed(parts):
+            if not _ip_in_trusted(hop, nets):
+                return hop[:_XFF_KEY_MAX_LEN]
+        # 3) كل السلسلة موثوقة/فارغة → الاتصال المباشر
+        return direct[:_XFF_KEY_MAX_LEN]
+    except Exception:
+        # فشل-آمن: عنوان الاتصال المباشر لا يمكن تزويره
+        return (direct or "unknown")[:_XFF_KEY_MAX_LEN]

@@ -117,6 +117,13 @@ try:
 except ImportError:
     PYARABIC_AVAILABLE = False
 
+# v12.2.0 (audit F-14): مسار احتياطي لإزالة التشكيل/التطويل عند غياب
+# pyarabic — نفس فئات المحارف التي تغطيها araby.strip_tashkeel +
+# araby.strip_tatweel (حركات قصيرة 064B-065F، سكون صغير 0670، تطويل 0640).
+# مطابق دلالياً للحالات العملية؛ يمنع انهيار المطابقة بصمت في أي بيئة
+# لم تُثبّت فيها التبعية (ثبت بفشل خط الأساس في بيئة نظيفة).
+_FALLBACK_TASHKEEL_RE = re.compile(r"[\u064B-\u065F\u0670\u0640]")
+
 
 # --------------------------------------------------------------------------
 # Config accessors with safe defaults.
@@ -1253,6 +1260,14 @@ class EnhancedFilter:
                 text = araby.strip_tatweel(text)
             except Exception as exc:
                 logger.debug("pyarabic normalization failed: {}", exc)
+        else:
+            # v12.2.0 (audit F-14): غياب pyarabic كان يُسقط إزالة التشكيل
+            # والتطويل بصمت — رسالة مشكولة («اِحْتَـاجُ حَـلّ») لا تطابق
+            # الكلمة المفتاحية («احتاج حل») → تنبيه صالح يُفقد (FN).
+            # أُثبت بفشل 12 اختباراً في بيئة نظيفة بلا pyarabic. المسار
+            # الاحتياطي regex يغطي نفس المحارف تماماً (حركات 064B-065F +
+            # سكون 0670 + تطويل 0640) — نفس دلالة araby بدون تبعية.
+            text = _FALLBACK_TASHKEEL_RE.sub("", text)
         return text
 
     def _apply_dialect_mapping(self, text: str) -> str:

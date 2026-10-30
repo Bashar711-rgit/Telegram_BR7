@@ -241,3 +241,40 @@ Work Log:
   مع المواصفة (نصوص < 6 خارج ظرف المحرك). الملفات الحرجة: 195 passed.
 - **قاعدة البيانات الفعلية (Supabase)**: فحص حي — 30 جدولاً، 321 تنبيهاً،
   32,535 رسالة؛ ترحيل 0003 طُبّق فعلياً (status/claimed_at/attempts + فهارس).
+
+---
+
+Task ID: 19 (v12.2.0 — العقد الهندسي الرئيسي: تدقيق كامل + إصلاح أمني S-1 + مرونة فلترة F-14)
+Agent: Z.ai Code (main orchestrator)
+Task: تنفيذ دورة التدقيق الكاملة على v12.1.0 (خط الأساس) وإصلاح ما ثبت أثره باختبارات فعلية
+
+Work Log:
+- خط الأساس: v12.1.0 (c518e0a) متزامن مع origin، شجرة نظيفة. **1133/1133 PASS** بعد استكمال
+  4 اعتماديات ناقصة في venv المضيف (langdetect/pyarabic/uvloop/itsdangerous — كلها في
+  requirements.txt؛ فشل الـ12 الظاهري كان بيئياً وأثبت نمطين مكشوفين لغياب تبعية).
+- **S-1 (أمن — أُصلح)**: dashboard._AuthGuard.client_ip كانت تأكم أول قيمة XFF (يملكها
+  المهاجم: ترويش قفل brute-force + سَمّ ضحية). المُحلّل الموحد security.resolve_client_ip
+  (نظير غير موثوق→تجاهل XFF كلياً؛ وإلا أقصى يمين غير موثوق) استهلكه dashboard + webadmin
+  معاً؛ حذف النسخة المكررة من webadmin؛ TRUSTED_PROXIES موثق في render.yaml. 17 اختباراً
+  جديداً (tests/test_client_ip_security.py) — اختبارا الترويش والسَمّ يفشلان على القديم.
+  حادثة موثقة: أول تشغيل فشل بسبب غياب global _proxy_cache + import time في security.py
+  (الفشل-الآمن كتمه) — أُصلح والاختبارات تثبت المسار السليم فعلاً الآن.
+- **F-14 (موثوقية — أُصلح)**: غياب pyarabic كان يُسقط إزالة التشكيل/التطويل بصمت (FN).
+  مسار احتياطي regex بنفس دلالة araby + اختبار يفرض غياب التبعية.
+- **S-3**: 5 F821 (تعليقات أنواع) أُصلحت — deque صريح في monitors + Dict في maintenance.
+- **D-1 (مفتوح — قرار مالك)**: مخطط br7 (44 جدولاً) على Supabase موازٍ غير مستخدم بلا
+  صلاحيات لـbr7_app؛ التطبيق الحي على public (alerts=336، messages=34012، alert_dedup=77،
+  dead_letters=0، queue=6) — **ترحيل 0003 (status/claimed_at/attempts) مُتحقق حياً ✓**.
+- **S-4/W-1/W-2/V12-D**: موثقة في FINDINGS_REGISTER بلا تغيير كود (نطاق مقيد بالثابت).
+- نظافة: إصلاح تحذير pytest (علامة asyncio على اختبار متزامن في test_features.py).
+- BOT_VERSION → 12.2.0 (الشارة تُحقن ديناميكياً).
+- **الوثائق الـ13 كاملة**: docs/audit/{BASELINE,FINDINGS_REGISTER,TEST_REPORT,REMEDIATION_LOG,
+  SECURITY_AUDIT,DATABASE_AUDIT,FUNCTION_AUDIT}.md + docs/architecture/{ARCHITECTURE,
+  FILE_INVENTORY}.md + docs/development/DEVELOPMENT_PLAN.md + docs/deployment/
+  {DEPLOYMENT_GUIDE,RELEASE_CHECKLIST}.md + docs/operations/RECOVERY_AND_BACKUP.md.
+- المجموعة النهائية: **1151/1151 PASS** (EXIT=0) — py_compile كامل PASS.
+
+Stage Summary:
+- الالتزام محلي (لا دفع — §25 يتطلب تصريح المالك للدفع إلى main → Render autoDeploy).
+- مطلوب من المالك بعد الدفع: تأكيد /health + شارة BR7·v12.2.0 + قرارات D-1 (المخطط) وتدوير الأسرار.
+- لم يُختبَر حياً: تيليجرام إنتاجي (ممنوع §2) — كل تغطية الإرسال محاكاة.

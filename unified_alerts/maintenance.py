@@ -19,7 +19,7 @@ unified_alerts/maintenance.py — الصيانة الذاتية (v12.0.0)
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 from loguru import logger
 

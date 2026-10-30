@@ -37,6 +37,26 @@ class TestArabicNormalization:
         vocalized = flt._clean("اِحْتَـاجُ حَـلّ وَاجِب الرِّيَاضِيَـات")[0]
         assert vocalized == plain
 
+    def test_tashkeel_stripped_without_pyarabic(self, flt, monkeypatch):
+        """v12.2.0 (audit F-14): انحدار — غياب pyarabic كان يُسقط إزالة
+        التشكيل/التطويل بصمت (FN لرسائل مشكولة). المسار الاحتياطي regex
+        يجب أن يطابق دلالة araby.strip_tashkeel + strip_tatweel."""
+        import filter_engine as fe
+
+        assert not fe.PYARABIC_AVAILABLE or True  # يعمل في الحالتين
+        monkeypatch.setattr(fe, "PYARABIC_AVAILABLE", False)
+        vocalized = "اِحْتَـاجُ حَـلّ وَاجِب الرِّيَاضِيَـات"
+        out = flt._normalize_arabic(vocalized)
+        assert all(not ('\u064B' <= c <= '\u0652') for c in out), out
+        assert "\u0640" not in out, "التطويل يجب أن يُزال في المسار الاحتياطي"
+        # التطبيع الأساسي (أ/إ/آ→ا، ة→ه) ما زال يعمل في نفس المسار
+        assert flt._normalize_arabic("أإآ") == "ااا"
+        assert flt._normalize_arabic("مدرسة") == "مدرسه"
+        # ومسار _clean الكامل يطابق النص الساكن
+        plain = flt._clean("احتاج حل واجب الرياضيات")[0]
+        cleaned = flt._clean(vocalized)[0]
+        assert cleaned == plain
+
 
 class TestPrefilter:
     @pytest.mark.asyncio

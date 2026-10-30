@@ -607,15 +607,18 @@ class _AuthGuard:
 
     @staticmethod
     def client_ip(request: Request) -> str:
-        xff = request.headers.get("x-forwarded-for", "")
-        if xff:
-            first = xff.split(",")[0].strip()
-            if first:
-                return first[:64]
+        # v12.2.0 (audit S-1): كان هنا اعتماد حرفي على أول قيمة X-Forwarded-For —
+        # القيمة الأولى يتحكم بها العميل عندما لا يستبدل البروكسي الترويسة:
+        # ترويش قفل brute-force بتبديل XFF كل طلب + سَمّ مفتاح قفل الضحية.
+        # الآن: مُحلّل موحد في security.resolve_client_ip (TRUSTED_PROXIES،
+        # مشي يمين-يسار متخطياً القفزات الموثوقة، وسقوط آمن للاتصال المباشر) —
+        # نفس منطق webadmin._LoginGuard (v9.12 M-12) من مصدر واحد.
         try:
+            from security import resolve_client_ip
+        except Exception:  # فشل-آمن أرضي: عنوان الاتصال المباشر لا يُزوَّر
             return request.client.host if request.client else "unknown"
-        except Exception:
-            return "unknown"
+        direct = request.client.host if request.client else "unknown"
+        return resolve_client_ip(direct, request.headers.get("x-forwarded-for", ""))
 
     def locked_seconds_left(self, ip: str) -> int:
         until = self._lockout_until.get(ip, 0.0)

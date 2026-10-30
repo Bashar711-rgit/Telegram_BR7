@@ -12,8 +12,11 @@ import monitors as monitors_module
 from database import EnhancedDatabase
 
 
-@pytest.mark.asyncio
+# v12.2.0: علامة asyncio على مستوى الفصل كانت تُلصق اختباراً متزامناً
+# (test_monitors_guards_subset_of_registry) — تُزال وتوضع صراحة على
+# الاختبارات غير المتزامنة فقط (نظافة تحذيرات pytest).
 class TestFeatureRegistry:
+    @pytest.mark.asyncio
     async def test_registry_defaults(self, db):
         items = await db.list_features()
         keys = {f["key"] for f in items}
@@ -23,6 +26,7 @@ class TestFeatureRegistry:
             assert f["overridden"] is False
             assert f["impact"]
 
+    @pytest.mark.asyncio
     async def test_toggle_cycle_and_overrides(self, db):
         ok = await db.set_feature_enabled("rule_engine", False, by="qa")
         assert ok is True
@@ -35,10 +39,12 @@ class TestFeatureRegistry:
         await db.set_feature_enabled("rule_engine", True)
         assert await db.is_feature_enabled("rule_engine") is True
 
+    @pytest.mark.asyncio
     async def test_unknown_key_fail_safe_true(self, db):
         assert await db.is_feature_enabled("does_not_exist") is True
         assert await db.set_feature_enabled("does_not_exist", False) is False
 
+    @pytest.mark.asyncio
     async def test_corrupt_row_fail_safe_true(self, db):
         """A corrupt override must fail open (feature considered enabled)."""
         await db.set_feature_enabled("allowlist", False)
@@ -52,6 +58,7 @@ class TestFeatureRegistry:
         db._features_cache.clear()
         assert await db.is_feature_enabled("allowlist") is True  # fail-safe
 
+    @pytest.mark.asyncio
     async def test_notifications_gate_at_db_level(self, db):
         """v9.25: one gate inside record_notification covers both panels."""
         assert await db.record_notification(ntype="t", title="hello") is True

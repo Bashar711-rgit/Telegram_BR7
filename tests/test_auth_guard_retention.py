@@ -160,20 +160,35 @@ class TestAuthGuardUnit:
         g._lockout_until["3.3.3.3"] = time.time() - 1
         assert g.record_failure("3.3.3.3") == 900  # never exceeds max
 
-    def test_client_ip_prefers_xff_first_hop(self):
+    def test_client_ip_rightmost_untrusted_xff(self):
+        """v12.2.0 (audit S-1): السلوك المصحح — أقصى اليمين غير الموثوق هو
+        العميل (وليس أول قيمة يتحكم بها المهاجم)، والاتصال المباشر غير
+        الموثوق يتجاهل XFF كلياً. كان الاختبار القديم يرمّز السلوك الضعيف
+        (أول قفزة) — حُدّث ليطابق الخوارزمية الموحدة في security.py."""
         from starlette.requests import Request as StarletteRequest
 
-        def make(headers):
+        def make(headers, client=("127.0.0.1", 1000)):
             scope = {
                 "type": "http", "method": "GET", "path": "/", "headers": headers,
-                "query_string": b"", "client": ("9.9.9.9", 1000), "server": ("s", 80),
+                "query_string": b"", "client": client, "server": ("s", 80),
             }
             return StarletteRequest(scope)
 
+        # peer موثوق (127.0.0.1 افتراضياً) + سلسلة → أقصى اليمين غير الموثوق
         req = make([(b"x-forwarded-for", b"1.2.3.4, 5.6.7.8")])
-        assert _AuthGuard.client_ip(req) == "1.2.3.4"
+        assert _AuthGuard.client_ip(req) == "5.6.7.8"
+        # قفزة واحدة عامة → هي العميل
+        req1 = make([(b"x-forwarded-for", b"1.2.3.4")])
+        assert _AuthGuard.client_ip(req1) == "1.2.3.4"
+        # بلا XFF → الاتصال المباشر
         req2 = make([])
-        assert _AuthGuard.client_ip(req2) == "9.9.9.9"
+        assert _AuthGuard.client_ip(req2) == "127.0.0.1"
+        # سلسلة كلها قفزات موثوقة → الاتصال المباشر
+        req3 = make([(b"x-forwarded-for", b"10.0.0.5, 127.0.0.1")])
+        assert _AuthGuard.client_ip(req3) == "127.0.0.1"
+        # peer غير موثوق (9.9.9.9) → XFF يُتجاهل كلياً حتى لو بدت سليمه
+        req4 = make([(b"x-forwarded-for", b"1.2.3.4")], client=("9.9.9.9", 1000))
+        assert _AuthGuard.client_ip(req4) == "9.9.9.9"
 
 
 # ---------------------------------------------------------------------------

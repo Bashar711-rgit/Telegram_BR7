@@ -203,7 +203,7 @@ import json
 import os
 import secrets
 import time
-from collections import defaultdict, OrderedDict
+from collections import defaultdict, deque, OrderedDict
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple, Set
 from cachetools import LRUCache, TTLCache
 from loguru import logger
@@ -689,8 +689,10 @@ class AlertLatencyTracker:
     T2 = now − message.date at alert-send success (total lag)."""
 
     def __init__(self, maxlen: int = 2000):
-        self._recv: "deque[float]" = __import__("collections").deque(maxlen=maxlen)
-        self._total: "deque[float]" = __import__("collections").deque(maxlen=maxlen)
+        # v12.2.0 (S-3): استيراد صريح بدل __import__ — نفس السلوك، تعليقات
+        # أنواع صحيحة حللياً (كانت F821 في ruff).
+        self._recv: "deque[float]" = deque(maxlen=maxlen)
+        self._total: "deque[float]" = deque(maxlen=maxlen)
         self._n = 0
 
     def record(self, receive_lag_ms: Any, msg_date_ts: Any) -> None:
