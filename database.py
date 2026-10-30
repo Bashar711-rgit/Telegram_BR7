@@ -1142,13 +1142,11 @@ class EnhancedDatabase:
         for st in stmts:
             table = st.split()[2]
             column = st.split("ALTER COLUMN ")[1].split()[0]
-            ok = False
             for attempt in (1, 2):  # محاولتان — منافسة الأقفال عابرة غالباً
                 try:
                     await self._execute(st)
                     applied += 1
-                    ok = True
-                    break
+                    break  # v12.3 W-2: حُذف ok الميت — break يحمل الدلالة وحده
                 except Exception as e:
                     if attempt == 1:
                         await asyncio.sleep(2.0)  # مهلة قصيرة قبل إعادة المحاولة

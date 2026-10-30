@@ -980,7 +980,9 @@ class EnhancedTelegramBot:
             # بنفس دلالة 503. الـ snapshot التشغيلي الكامل كان يُفضي هنا
             # بلا مصادقة (نقلته L-08 عمداً إلى /health/full في اللوحة) —
             # صار الآن على /health/full أدناه بنفس الاسم والمسار.
-            health = await self.health.check()
+            # v12.3 W-2: النتيجة لا تُقرأ هنا لكن الاستدعاء مقصود — يحدّث
+            # _consecutive_fail ويجري db._ping (أثر جانبي حقيقي للمراقبة).
+            await self.health.check()
             db_down = not (self.db and getattr(self.db, "is_connected", False))
             db_healthy = bool(getattr(self.db, "db_healthy", True))
             payload = {

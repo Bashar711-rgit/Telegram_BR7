@@ -220,11 +220,8 @@ def build_display_name(
     uname = _clean_username(username)
     if uname:
         return uname  # بلا @ — الاسم نفسه قابل للنقر
-    try:
-        sid = int(user_id or 0)
-    except Exception:
-        sid = 0
     # v11.7.1 (المهمة §5.1): لا معرفات رقمية ظاهرة كبطاقة — «مرسل غير محدد»
+    # (v12.3 W-2: حُذف حساب sid الميت — كان يُحسب ولا يُقرأ أبداً)
     return "مرسل غير محدد"
 
 
