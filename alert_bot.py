@@ -228,11 +228,11 @@ def build_alert_buttons(
     contact_url: Optional[str] = None,
     sender_type: Optional[str] = None,
 ) -> List[List[Dict[str, Any]]]:
-    """══ الدالة المركزية الوحيدة لبناء أزرار التنبيه (v11.6) ══
+    """══ الدالة المركزية الوحيدة لبناء أزرار التنبيه (v11.6 → v13.0) ══
 
-    صف واحد بالترتيب الحرفي لمواصفة v11.6:
+    صف واحد بترتيب مواصفة v13.0 (تخطيط الأزرار المعتمد حرفياً):
 
-        [ عرض الرسالة ] [ مراسلة ]
+        [ مراسلة ] [ عرض الرسالة ]
 
     * الزر الذي تنعدم بياناته يُحذف كلياً (لا أزرار معطلة ولا روابط وهمية).
     * v11.2 (spec #16): contact_url من ContactTarget.selected_url — الاسم
@@ -253,18 +253,7 @@ def build_alert_buttons(
     except Exception:
         sid = 0
 
-    # 1) عرض الرسالة — الرسالة نفسها لا الصفحة الرئيسية؛ بدون رابط مباشر
-    #    نستخدم أفضل آلية متاحة (رابط القروب) بدل رابط وهمي.
-    #    (v11.6: الزر الأول في الصف حسب ترتيب المواصفة الحرفي.)
-    view_url = str(msg_link or "").strip()
-    if view_url in ("", "#"):
-        view_url = str(group_link or "").strip()
-    if view_url in ("", "#"):
-        view_url = ""
-    if view_url:
-        row.append({"text": BTN_VIEW, "url": view_url})
-
-    # 2) مراسلة — فتح محادثة المستخدم مباشرة.
+    # 1) مراسلة — فتح محادثة المستخدم مباشرة (الزر الأول حسب مواصفة v13).
     #    الزر لا يعتمد على username: بلا username يُستخدم tg://user?id
     #    (spec #15) أو الهدف الذي اختاره ContactTarget إن مرّر (spec #16).
     if include_user_button:
@@ -278,6 +267,16 @@ def build_alert_buttons(
             url = f"tg://user?id={sid}"
         if url:
             row.append({"text": BTN_CONTACT, "url": url})
+
+    # 2) عرض الرسالة — الرسالة نفسها لا الصفحة الرئيسية؛ بدون رابط مباشر
+    #    نستخدم أفضل آلية متاحة (رابط القروب) بدل رابط وهمي.
+    view_url = str(msg_link or "").strip()
+    if view_url in ("", "#"):
+        view_url = str(group_link or "").strip()
+    if view_url in ("", "#"):
+        view_url = ""
+    if view_url:
+        row.append({"text": BTN_VIEW, "url": view_url})
 
     return [row] if row else []
 

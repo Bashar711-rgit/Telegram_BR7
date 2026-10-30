@@ -49,6 +49,12 @@ _BASE: Dict[str, int] = {
     "recovered_resend": 0,
     # أحداث مستردة وصلها إيصال تنبيه سابق (أُرسلت قبل الانهيار) — تخطٍّ صادق
     "recovered_dupe_skip": 0,
+    # ══ v12.4.0 سد نافذة التكرار ══
+    # أحداث مستردة فُحص إيصالها عند الإرسال (قبل فك الحجز) — إيصال موجود
+    # → إسقاط صادق بلا إعادة إرسال (بوابة الإيصال قبل الفك)
+    "recovered_dupe_skip_send": 0,
+    # إيصالات كُتبت فوراً لحظة نجاح الإرسال (add_alert_immediate)
+    "receipts_immediate": 0,
     # أخطاء ack/recover (فشل-آمن)
     "inflight_errors": 0,
     # ══ v12.1.0 سياسة الفلترة الموحدة ══
@@ -96,7 +102,7 @@ def unified_snapshot() -> Dict[str, Any]:
     try:
         snap = _singleton.snapshot()
         snap["enabled"] = True
-        snap["version"] = "12.1.0"
+        snap["version"] = "12.4.0"
         return snap
     except Exception:
         out = dict(_BASE)

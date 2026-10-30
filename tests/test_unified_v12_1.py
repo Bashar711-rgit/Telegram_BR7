@@ -252,25 +252,27 @@ class TestCardBothAnchorsLinked:
 
     def test_username_suffix_is_linked_too(self):
         built = self._build()
-        header = built["text"].split("\n")[0]
+        header = built["text"].split("\n")[1]  # v13: السطر 0 هو اسم البوت
         # رابطان في سطر الترويسة: الاسم + @username
         assert header.count('<a href="https://t.me/l8i18l">') == 2
         assert ">@l8i18l</a>" in header
         assert "نص الرسالة:" in built["text"]
+        assert built["text"].split("\n")[0] == "B_Bot"
 
     def test_plain_text_layout_unchanged(self):
-        # البنية الحرفية نفسها: المرسل: {display} — @user (فارغ) نص الرسالة:
+        # البنية الحرفية v13: B_Bot (فارغ) المرسل: {display} — @user (فارغ) نص الرسالة:
         built = self._build()
         import re
         plain = re.sub(r"<[^>]+>", "", built["text"])
         lines = plain.split("\n")
-        assert lines[0].startswith("المرسل: ")
-        assert "— @l8i18l" in lines[0]
-        assert lines[1] == "" and lines[2] == "نص الرسالة:" and lines[3] == ""
+        assert lines[0] == "B_Bot"
+        assert lines[1].startswith("المرسل: ")
+        assert "— @l8i18l" in lines[1]
+        assert lines[2] == "" and lines[3] == "نص الرسالة:" and lines[4] == ""
 
     def test_no_username_keeps_plain_suffix(self):
         built = self._build(sender_username=None)
-        header = built["text"].split("\n")[0]
+        header = built["text"].split("\n")[1]  # v13: السطر 0 هو اسم البوت
         # بلا username: لا ذيل @ — لا اختلاق (عقد v11.6 §3.6)
         assert "— @" not in header
 

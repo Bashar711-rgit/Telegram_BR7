@@ -495,6 +495,9 @@ class _ConfigData:
     # ── Alert Dedup (v9.10 — cross-account/re-send alert barrier) ──
     DEDUP_ENABLED: bool
     DEDUP_WINDOW_SECONDS: int
+    # v13.0: أقل عمر لحجز dedup قبل أن يستولي عليه حدث مسترد (_recovered)
+    # بلا إيصال إرسال — حماية CAS من سباق عاملين مستردّين لنفس المحتوى.
+    DEDUP_RECOVERY_STEAL_MIN_AGE_SECONDS: int
 
     # ── v10.0 Precision: clause re-scoring (تقييم البنود المستقلة) ──
     CLAUSE_RESCORE_ENABLED: bool
@@ -911,6 +914,8 @@ class Config:
             # للتعديل الحي من لوحة التحكم (DEDUP_ENABLED / DEDUP_WINDOW_SECONDS).
             DEDUP_ENABLED=SecretManager.get_bool("DEDUP_ENABLED", True),
             DEDUP_WINDOW_SECONDS=SecretManager.get_int("DEDUP_WINDOW_SECONDS", 86400, required=False),
+            DEDUP_RECOVERY_STEAL_MIN_AGE_SECONDS=SecretManager.get_int(
+                "DEDUP_RECOVERY_STEAL_MIN_AGE_SECONDS", 120, required=False),
             # v10.0 Precision: تقييم البنود المستقلة — يرفع الرسائل متعددة
             # الأفكار عندما يحقق بند قوي ثقة القبول (فشل-آمن، قابل للتعطيل).
             CLAUSE_RESCORE_ENABLED=SecretManager.get_bool("CLAUSE_RESCORE_ENABLED", True),
@@ -1014,7 +1019,7 @@ class Config:
 # =============================================================================
 # Bot version — single source of truth (v10.2 Send Rotation)
 # =============================================================================
-BOT_VERSION: Final = "12.3.0"
+BOT_VERSION: Final = "13.0.0"
 BOT_CODENAME: Final = "Sender Intelligence"
 
 # =============================================================================

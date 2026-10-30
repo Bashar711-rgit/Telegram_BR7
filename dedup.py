@@ -25,12 +25,18 @@ dedup.py — Cross-Account Alert Deduplication v1.0 (v9.10)
                الحماية قائمة" ضمن نافذة الـ TTL).
 
 بصمة الرسالة (content fingerprint):
-  fast_hash("v1:{sender_id}:{normalized_text}")
+  fast_hash("v1:{sender_id}:{media}:{normalized_text}")
   * sender_id مُضمن: مرسلان مختلفان بنفس النص = طلبان مختلفان يجب أن
     يصلا (لا يُحذفان) — بينما نفس المرسل بنفس النص = مكرر.
+  * v13.0 — المرسل بلا معرف (sender_id falsy): يُدار بمجال مستقل لكل
+    محادثة ("v1:anon:{chat_id}:...") كي لا يُدمج مرسلان مجهولان مختلفان
+    بنفس النص في بصمة واحدة (حماية متطلب «عدم الدمج التلقائي») — وبقاؤه
+    محصوراً بالمحادثة نفسها يمنع تكرار الحسابات لنفس حدث المجموعة.
+  * v13.0 — بصمة المرفقات: نوع الوسائط يدخل مجال البصمة؛ نص متطابق
+    بمرفق مختلف = هوية محتوى مختلفة (اختبار 9: لا دمج خاطئ).
   * normalized_text: تطبيع مضغوط (بدون تأثير على الفلتر):
     lower + إزالة التشكيل والتطويل + توحيد أ/إ/آ→ا وة→ه وى→ي وئ/ؤ
-    + تقليص تكرار الحروف العربية (2+ → 1) + تقليص المسافات.
+    + تقليص تكرار الحروف العربية (3+ → 1) + تقليص المسافات.
     "مرررررا" و"مررا" لنفس المرسل = نفس البصمة، بينما "ابي حل" و
     "ابي حلل" يبقيان مختلفتين (حماية متطلب "المتشابهة جزئياً لا تُحذف").
 
@@ -84,10 +90,31 @@ def normalize_for_fingerprint(text: str) -> str:
     return t
 
 
-def content_fingerprint(sender_id: Any, text: str) -> str:
-    """بصمة محتوى مستقرة: (sender_id, normalized_text)."""
+def content_fingerprint(
+    sender_id: Any,
+    text: str,
+    chat_id: Any = None,
+    media_kind: Any = None,
+) -> str:
+    """بصمة محتوى مستقرة: (sender_id, media_kind, normalized_text).
+
+    v13.0:
+      * media_kind يدخل المجال — نص متطابق بمرفق مختلف = هوية مختلفة
+        (اختبار 9: اختلاف المرفقات يمنع الدمج الخاطئ).
+      * المرسل بلا معرف (0/None): مجال anon لكل محادثة — مرسلان مجهولان
+        مختلفان لا تُدمج بصمتهما، ونفس حدث المجموعة يبقى مكرراً واحداً.
+    """
     norm = normalize_for_fingerprint(text or "")
-    return fast_hash(f"v1:{int(sender_id or 0)}:{norm}")
+    try:
+        sid = int(sender_id or 0)
+    except (TypeError, ValueError):
+        sid = 0
+    if sid:
+        domain = f"v1:{sid}"
+    else:
+        domain = f"v1:anon:{int(chat_id or 0) if chat_id else 0}"
+    media = str(media_kind or "").strip().lower()
+    return fast_hash(f"{domain}:{media}:{norm}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -119,6 +146,8 @@ class AlertDeduplicator:
             "db_errors": 0,     # فشل DB (فشل-آمن: نثق بالذاكرة)
             "expired": 0,       # بصمات انتهت نافذتها (ذاكرة)
             "db_cleaned": 0,    # صفوف DB حذفها التنظيف الدوري
+            "stolen": 0,        # v13.0: استيلاء ناجح على حجز عتيق (مسار مسترد)
+            "steal_denied": 0,  # v13.0: رفض الاستيلاء (حجز طازج لعامل آخر)
         }
 
     # ── إعدادات حية (تُقرأ من CFG عند كل استدعاء — لوحة التحكم تُغيّرها فوراً)
@@ -194,7 +223,7 @@ class AlertDeduplicator:
         return True
 
     async def release(self, fingerprint: str) -> None:
-        """فك الحجز عند فشل الإرسال — تسمح لإعادة محاولة DLQ بإرساله لاحقاً."""
+        """فك الحجز عند فشل الإرسال — تسمح بإعادة محاولة DLQ بإرساله لاحقاً."""
         self._mem_release(fingerprint)
         self._stats["released"] += 1
         if self.db is not None:
@@ -202,6 +231,47 @@ class AlertDeduplicator:
                 await self.db.release_alert_fingerprint(fingerprint)
             except Exception as e:
                 logger.debug(f"dedup: DB release failed: {type(e).__name__}")
+
+    async def steal_if_stale(
+        self, fingerprint: str, min_age_seconds: float = 120.0
+    ) -> bool:
+        """══ v13.0 — استيلاء ذري مشروط على حجز عتيق (مسار المسترد فقط) ══
+
+        يستخدم بدل الفك غير المشروط قبل المطالبة الذي كان يفتح سباقاً:
+        عاملان مستردّان لنفس المحتوى يفك كلٌّ منهما حجز الآخر الطازج
+        فينتج تنبيهان (TOCTOU مثبت في التدقيق — RC-1).
+
+        الدلالة:
+          True  → الحجز كان عتيقاً (last_seen أقدم من min_age) وحُذف
+                  ذرياً من DB — أعد check_and_claim لإتمام المطالبة.
+          False → الحجز طازج (عامل آخر يمتلكه ويرسل الآن) أو فشل DB —
+                  انسحاب: لا تنبيه من هذه النسخة.
+
+        الحارس الزمني (الافتراضي 120s) أقصر بمراحل من عمر الاسترداد نفسه
+        (QUEUE_INFLIGHT_MAX_AGE_SECONDS=600s) — الحجز الميت من محاولة
+        منهارة يكون عتيقاً فعلاً عند وصول المسترد، والحجز الطازج لعامل
+        حي لا يُلمس أبداً."""
+        # الذاكرة أولاً — فك محلي ثم حذف شرطي ذري في DB هو الحكم الوحيد
+        self._mem_release(fingerprint)
+        if self.db is None:
+            # بلا DB (وضع الاختبار) — الثقة بالذاكرة فقط: استيلاء مقبول
+            self._stats["stolen"] += 1
+            return True
+        try:
+            stolen = bool(
+                await self.db.steal_stale_alert_fingerprint(
+                    fingerprint, min_age_seconds=min_age_seconds
+                )
+            )
+        except Exception as e:
+            logger.debug(f"dedup: steal failed (deny): {type(e).__name__}")
+            self._stats["steal_denied"] += 1
+            return False
+        if stolen:
+            self._stats["stolen"] += 1
+        else:
+            self._stats["steal_denied"] += 1
+        return stolen
 
     async def cleanup_expired(self) -> int:
         """حذف البصمات المنتهية من DB — يستدعيه _cleanup_loop في main.py."""
@@ -225,6 +295,7 @@ class AlertDeduplicator:
             base = {
                 "claimed": 0, "blocked": 0, "released": 0,
                 "db_errors": 0, "expired": 0, "db_cleaned": 0,
+                "stolen": 0, "steal_denied": 0,
             }
             return {
                 "enabled": self.enabled,

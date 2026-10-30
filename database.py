@@ -1777,11 +1777,27 @@ class EnhancedDatabase:
         المنهارة + لها إيصال = أُرسلت فعلاً → تخطٍّ صادق (لا ازدواج)؛
         بلا إيصال = انهار بين الحجز والإرسال → أعد الإرسال (لا فقدان).
         فشل-آمن: أي خلل → False (مسار إعادة الإرسال، dedup اللاحق يحكم).
-        """
+
+        v12.4.0 (RC-2): الدفعة المعلقة تُرى أيضاً — إيصال أُرسل وقع في
+        _batch ولم يُفرَّغ بعد (نافذة DB_BATCH_INTERVAL) كان alert_exists
+        يعتبره غير موجود → حدث مسترد متزامن داخل نفس العملية يعيد
+        الإرسال = مكرر. الآن تفحص الـbuffer أولاً (قراءة قفل واحدة بلا
+        I/O) ثم الجدول. أي خلل → الجدول فقط (السلوك السابق)."""
+        h = str(msg_hash or "")
+        try:
+            async with self._batch_lock:
+                for item in self._batch:
+                    try:
+                        if item and item[0] == "alert" and item[1] == h:
+                            return True
+                    except Exception:
+                        continue
+        except Exception:
+            pass
         try:
             row = await self._fetchone(
                 "SELECT 1 AS one FROM alerts WHERE message_hash = ? LIMIT 1",
-                (str(msg_hash or ""),),
+                (h,),
             )
             return row is not None
         except Exception:
@@ -3310,6 +3326,49 @@ class EnhancedDatabase:
         except Exception as e:
             logger.debug(f"release_alert_fingerprint error: {e}")
 
+    async def steal_stale_alert_fingerprint(
+        self, fingerprint: str, min_age_seconds: float = 120.0
+    ) -> bool:
+        """══ v13.0 — استيلاء CAS ذري على حجز dedup عتيق ══
+
+        المسار المسترد (_recovered) بعد انهيار عاملٍ بين الحجز والإرسال:
+        الحجز القديم كان سيمنع إعادة إرسال التنبيه للأبد. الفك غير المشروط
+        (release ثم claim) فتح سباق TOCTOU: عاملان مستردّان لنفس المحتوى
+        يفك كلٌّ منهما حجز الآخر الطازج فينشأ تنبيهان.
+
+        الحل: حذف شرطي واحد ذري — ينجح فقط عندما يكون الحجز عتيقاً فعلاً
+        (last_seen أقدم من min_age_seconds). حجز عاملٍ آخر طازج (يرسل الآن)
+        لا يُمسّ → العامل الثاني ينسحب بلا تنبيه مكرر؛ والحجز الميت من
+        محاولة منهارة (عمره ≥ عمر الاسترداد نفسه 600s) يُحذف فيُسمح
+        بمحاولة جديدة.
+
+        Returns: True إذا استُبعد الحجز العتيق (يمكن المطالبة من جديد).
+        SQLite/PostgreSQL نفس الدلالة: DELETE ... WHERE last_seen < cutoff
+        rowcount=1 هو الـ CAS الوحيد — بلا check-then-act."""
+        try:
+            cutoff = time.time() - max(1.0, float(min_age_seconds))
+            if self.db_type == "sqlite":
+                cursor = await self._execute(
+                    "DELETE FROM alert_dedup WHERE fingerprint = ? AND last_seen < ?",
+                    (fingerprint, cutoff),
+                )
+                stolen = bool(cursor.rowcount)
+                if stolen:
+                    await self._commit()
+                return stolen
+            result = await self._pool.execute(
+                "DELETE FROM alert_dedup WHERE fingerprint = $1 AND last_seen < $2",
+                fingerprint, cutoff,
+            )
+            # asyncpg returns a status string like "DELETE 1"
+            try:
+                return int(str(result).split()[-1]) > 0
+            except Exception:
+                return False
+        except Exception as e:
+            logger.error(f"steal_stale_alert_fingerprint error: {e}")
+            return False
+
     async def cleanup_alert_fingerprints(self, max_age_seconds: int = 86400) -> int:
         """Delete fingerprints older than the dedup window (called from
         main.py's single cleanup loop). Returns the number of removed rows."""
@@ -3481,6 +3540,101 @@ class EnhancedDatabase:
                 (rec.contact_method or "")[:20],
             ))
         return True
+
+    async def add_alert_immediate(self, rec: AlertRecord) -> bool:
+        """══ v12.4.0 — إيصال التنبيه الفوري (سد نافذة التكرار RC-1) ══
+
+        الجذر: add_alert كان يدفع الإيصال للكاتب الدفعي الذي يفرغ كل
+        DB_BATCH_INTERVAL (افتراضي 5s). انهيار العملية (نشر/إعادة تشغيل/
+        سكون Render) بين نجاح الإرسال والإفراغ = فقدان الإيصال → صف
+        in_flight يُسترد لاحقاً بوسم _recovered → alert_exists=False →
+        إعادة إرسال → تنبيه مكرر يراه المستخدم.
+
+        الحل: كتابة صف alerts فوراً (INSERT آحادي ملتزم حالاً بلا دفعي)
+        عند لحظة نجاح الإرسال — نافذة فقدان الإيصال تنكمش من ~5 ثوانٍ
+        إلى مدة INSERT واحدة (مليّ ثوانٍ). الإحصاءات (sender_stats) تطبق
+        هنا مباشرة بنفس دلالات _flush، والصف نفسه محمي بـmessage_hash
+        UNIQUE (INSERT OR IGNORE / ON CONFLICT DO NOTHING) فلا يتضاعف
+        إن مرّ لاحقاً عبر الكاتب الدفعي.
+
+        عائد bool: True = الإيصال سُجل الآن (أول مرة)؛ False = مكرر
+        (إيصال سابق موجود) أو فشل الكتابة (فشل-آمن: لا يرفع استثناءً —
+        الإرسال نفسه نجح ولا يجوز عقاب التنبيه على خلل تسجيل).
+        """
+        try:
+            async with self._stats_lock:
+                self.stats["alerts_sent"] += 1
+            params = (
+                rec.message_hash, rec.chat_id, rec.sender_id, rec.account_name,
+                rec.keyword, rec.alert_text, rec.timestamp, rec.decision,
+                rec.confidence, (rec.reasons or "")[:500], rec.intent_verb,
+                rec.academic_object, rec.negation_detected, rec.advert_score,
+                (rec.contact_method or "")[:20],
+            )
+            changed = 0
+            if self.db_type == "sqlite":
+                cursor = await self._execute(
+                    "INSERT OR IGNORE INTO alerts "
+                    "(message_hash, chat_id, sender_id, account_name, keyword, alert_text, timestamp, "
+                    " decision, confidence, reasons, intent_verb, academic_object, negation_detected, advert_score, "
+                    " contact_method) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    params,
+                )
+                changed = cursor.rowcount or 0
+            else:
+                result = await self._pool.execute(
+                    "INSERT INTO alerts "
+                    "(message_hash, chat_id, sender_id, account_name, keyword, alert_text, timestamp, "
+                    " decision, confidence, reasons, intent_verb, academic_object, negation_detected, advert_score, "
+                    " contact_method) "
+                    "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) "
+                    "ON CONFLICT (message_hash) DO NOTHING",
+                    *params,
+                )
+                # نفس نمط try_insert_message (audit L-04): تحليل ذيل سلسلة
+                # الحالة ("INSERT 0 1" / "INSERT 0 0") بلا مطابقة نصية هشة.
+                try:
+                    parts = str(result).split()
+                    changed = int(parts[-1]) if parts and parts[-1].isdigit() else 0
+                except Exception:
+                    changed = 0
+            if changed:
+                try:
+                    sid = int(rec.sender_id or 0)
+                    ts = float(rec.timestamp or time.time())
+                    if self.db_type == "sqlite":
+                        await self._execute(
+                            "UPDATE sender_stats "
+                            "SET alerts_sent = alerts_sent + 1, last_alert_time = ? "
+                            "WHERE sender_id = ?",
+                            (ts, sid),
+                        )
+                    else:
+                        await self._pool.execute(
+                            "UPDATE sender_stats "
+                            "SET alerts_sent = alerts_sent + 1, last_alert_time = $1 "
+                            "WHERE sender_id = $2",
+                            ts, sid,
+                        )
+                except Exception as ss_err:
+                    logger.debug(f"add_alert_immediate sender_stats skipped: {type(ss_err).__name__}")
+                self._invalidate_can_send_alert(int(rec.sender_id or 0))
+                try:
+                    from unified_alerts.stats import get_unified_stats as _gus
+                    _gus().inc("receipts_immediate")
+                except Exception:
+                    pass
+            await self._commit()
+            return bool(changed)
+        except Exception as e:
+            logger.error(f"add_alert_immediate failed (receipt may be delayed to batch): {type(e).__name__}: {str(e)[:120]}")
+            # فشل-آمن: ادفع للكاتب الدفعي كشبكة أمان أخيرة حتى لا يضيع الإيصال كلياً
+            try:
+                await self.add_alert(rec)
+            except Exception:
+                pass
+            return False
 
     async def can_send_alert(self, sender_id: int) -> bool:
         # v9.12 (audit H-01): short-TTL cache for the per-message cooldown

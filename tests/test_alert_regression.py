@@ -50,34 +50,34 @@ from alert_bot import build_alert_html  # noqa: E402
 import pytest  # noqa: E402
 
 
-# ── GOLDEN OUTPUT (v12.1.0 — صيغة الصورة المرجعية: الاسم و@username كلاهما رابط) ──
+# ── GOLDEN OUTPUT (v13.0 — بطاقة باسم البوت + أزرار [مراسلة][عرض الرسالة]) ──
 GOLDEN = {
     "S1_username_chat": {
         "alert": (
-            'المرسل: <a href="https://t.me/ahmed_99">أحمد محمد</a> — <a href="https://t.me/ahmed_99">@ahmed_99</a>'
+            'B_Bot\nالمرسل: <a href="https://t.me/ahmed_99">أحمد محمد</a> — <a href="https://t.me/ahmed_99">@ahmed_99</a>'
             '\n\nنص الرسالة:\n\n'
             'أبي مساعدة في واجب الاحصاء ضروري'
         ),
-        # أزرار بوت التنبيهات: صف واحد بالترتيب الحرفي v11.6
+        # أزرار بوت التنبيهات: صف واحد بترتيب مواصفة v13
         "bot_buttons": [
-            {"text": "عرض الرسالة", "url": "https://t.me/mygroup/123"},
             {"text": "مراسلة", "url": "https://t.me/ahmed_99"},
+            {"text": "عرض الرسالة", "url": "https://t.me/mygroup/123"},
         ],
     },
     "S2_private_chat": {
         "alert": (
-            'المرسل: <a href="tg://user?id=777000222">سارة</a>'
+            'B_Bot\nالمرسل: <a href="tg://user?id=777000222">سارة</a>'
             '\n\nنص الرسالة:\n\n'
             'أبي مساعدة في واجب الاحصاء ضروري'
         ),
         "bot_buttons": [
-            {"text": "عرض الرسالة", "url": "https://t.me/c/1234567890/456"},
             {"text": "مراسلة", "url": "tg://user?id=777000222"},
+            {"text": "عرض الرسالة", "url": "https://t.me/c/1234567890/456"},
         ],
     },
     "S3_no_username_hash": {
         "alert": (
-            'المرسل: <a href="tg://user?id=888000333">خالد</a>'
+            'B_Bot\nالمرسل: <a href="tg://user?id=888000333">خالد</a>'
             '\n\nنص الرسالة:\n\n'
             'أبي مساعدة في واجب الاحصاء ضروري'
         ),
@@ -88,13 +88,13 @@ GOLDEN = {
     },
     "S4_unknown_title": {
         "alert": (
-            'المرسل: <a href="https://t.me/user_x">مستخدم</a> — <a href="https://t.me/user_x">@user_x</a>'
+            'B_Bot\nالمرسل: <a href="https://t.me/user_x">مستخدم</a> — <a href="https://t.me/user_x">@user_x</a>'
             '\n\nنص الرسالة:\n\n'
             'أبي مساعدة في واجب الاحصاء ضروري'
         ),
         "bot_buttons": [
-            {"text": "عرض الرسالة", "url": "https://t.me/eng_group/789"},
             {"text": "مراسلة", "url": "https://t.me/user_x"},
+            {"text": "عرض الرسالة", "url": "https://t.me/eng_group/789"},
         ],
     },
 }
@@ -305,13 +305,13 @@ class TestAlertRegression:
         assert "editMessageText" in methods
         edit_payload = next(p for m, p in bot.methods if m == "editMessageText")
         # نفس النص لكن رابط الاسم صار رابط الرسالة المصدر (قالب v11.6)
-        assert edit_payload["text"].startswith('المرسل: <a href="https://t.me/c/1234567890/456">سارة</a>')
+        assert edit_payload["text"].startswith('B_Bot\nالمرسل: <a href="https://t.me/c/1234567890/456">سارة</a>')
         assert "نص الرسالة:" in edit_payload["text"]
         assert "<blockquote>" not in edit_payload["text"]
-        # نفس الأزرار بقيت على الرسالة المعدّلة — الزران (عرض ثم مراسلة)
+        # نفس الأزرار بقيت على الرسالة المعدّلة — الزران (مراسلة ثم عرض — ترتيب v13)
         row = edit_payload["reply_markup"]["inline_keyboard"][0]
-        assert row[0]["url"] == "https://t.me/c/1234567890/456"
-        assert "tg://user?id=777000222" in [b["url"] for b in row]
+        assert row[0]["url"] == "tg://user?id=777000222"
+        assert "https://t.me/c/1234567890/456" in [b["url"] for b in row]
 
     @pytest.mark.asyncio
     async def test_bot_api_no_edit_when_name_entity_present(self, monitor):

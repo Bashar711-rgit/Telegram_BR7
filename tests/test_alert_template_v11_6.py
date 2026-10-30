@@ -31,6 +31,7 @@ if str(PROJECT_DIR) not in sys.path:
 
 from alert_bot import AlertBot, build_alert_buttons, build_alert_html  # noqa: E402
 from contact_target import (  # noqa: E402
+    BOT_NAME_LINE,
     MSG_TEXT_LABEL,
     SENDER_LABEL,
     build_alert_entity_pack,
@@ -73,11 +74,17 @@ def _visible(text: str) -> str:
 
 def _assert_template_contract(text: str, *, username: str = None,
                               name: str = None, body: str = None) -> None:
-    """العقد الحرفي v11.6 — مشترك بين كل الحالات."""
+    """العقد الحرفي v13 — مشترك بين كل الحالات.
+
+    البطاقة تبدأ بسطر اسم البوت (B_Bot) ثم سطر المرسل ثم قسم نص
+    الرسالة ثم النص الأصلي (مواصفة v13 §9: اسم البوت ← المرسل ←
+    «نص الرسالة:» ← المحتوى)."""
+    from contact_target import BOT_NAME_LINE as _BNL
     visible = _visible(text)
-    # 1) الترتيب: سطر المرسل ← (فارغ) ← نص الرسالة: ← (فارغ) ← النص
+    # 1) الترتيب: اسم البوت ← سطر المرسل ← (فارغ) ← نص الرسالة: ← (فارغ) ← النص
     lines = visible.split("\n")
-    assert lines[0].startswith("المرسل: "), f"سطر المرسل مفقود: {lines[0]!r}"
+    assert lines[0] == _BNL, f"سطر اسم البوت مفقود: {lines[0]!r}"
+    assert lines[1].startswith("المرسل: "), f"سطر المرسل مفقود: {lines[1]!r}"
     assert "\n\nنص الرسالة:\n\n" in visible, "قسم «نص الرسالة:» بترتيبه مطلوب"
     # 2) بلا رموز قديمة وبلا اقتباس
     assert "👤" not in text and "💬" not in text
@@ -90,7 +97,7 @@ def _assert_template_contract(text: str, *, username: str = None,
         assert "— @" not in visible
     # 4) الاسم في موضع الاسم (بعد الترويسة مباشرة)
     if name:
-        assert visible.startswith(f"المرسل: {name}") or f"المرسل: {name}" in visible
+        assert f"المرسل: {name}" in visible
     # 5) النص الأصلي كاملاً بعد التسمية (أسطره كما وردت)
     if body:
         body_section = visible.split("\n\nنص الرسالة:\n\n", 1)[1]
@@ -234,10 +241,11 @@ class TestContentCases:
         assert visible.endswith("نص الرسالة:") or visible.rstrip("\n").endswith("نص الرسالة:")
         assert "<blockquote>" not in built["text"]
         assert len(_row(built)) >= 1
-        # حزمة الكيانات للمسار الاحتياطي بنفس القالب
+        # حزمة الكيانات للمسار الاحتياطي بنفس القالب (v13: باسم البوت)
         t = resolve_contact_target(sender_id=SENDER_ID)
         pack = build_alert_entity_pack("محمد العمري", "", t)
-        assert pack["plain_text"].startswith("المرسل: محمد العمري\n\nنص الرسالة:")
+        assert pack["plain_text"].startswith(
+            f"{BOT_NAME_LINE}\nالمرسل: محمد العمري\n\nنص الرسالة:")
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -283,7 +291,7 @@ class TestFailureAndRetryCases:
         assert len(bot.calls) == 2
         for call in bot.calls:
             kb = call["payload"]["reply_markup"]["inline_keyboard"]
-            assert kb and [b["text"] for b in kb[0]] == ["عرض الرسالة", "مراسلة"]
+            assert kb and [b["text"] for b in kb[0]] == ["مراسلة", "عرض الرسالة"]
             assert call["payload"]["parse_mode"] == "HTML"
 
     @pytest.mark.asyncio
@@ -375,7 +383,7 @@ class TestAllSendPathsCase:
         """الدالة المركزية وحدها تبني اللوحة — لا بناء يدوي في أي مسار."""
         kb = build_alert_buttons(sender_id=SENDER_ID, sender_username="user1",
                                  msg_link="https://t.me/g/9", group_link="https://t.me/g")
-        assert [b["text"] for b in kb[0]] == ["عرض الرسالة", "مراسلة"]
+        assert [b["text"] for b in kb[0]] == ["مراسلة", "عرض الرسالة"]
         # بلا بيانات → لوحة فارغة بصدق
         assert build_alert_buttons(sender_id=0) == []
         # include_user_button=False بعد رفض الخصوصية → عرض فقط
@@ -388,7 +396,7 @@ class TestAllSendPathsCase:
         t = resolve_contact_target(sender_id=SENDER_ID, username="user1",
                                    first_name="محمد", last_name="العمري")
         pack = build_alert_entity_pack("محمد العمري", ORIG, t)
-        expected = ("المرسل: محمد العمري — @user1\n\nنص الرسالة:\n\n" + ORIG)
+        expected = (f"{BOT_NAME_LINE}\nالمرسل: محمد العمري — @user1\n\nنص الرسالة:\n\n" + ORIG)
         assert pack["plain_text"] == expected
         ents = pack["formatting_entities"]
         name_ent = next(e for e in ents if type(e).__name__ == "MessageEntityTextUrl")
@@ -411,8 +419,8 @@ class TestAllSendPathsCase:
         assert p["link_preview_options"] == {"is_disabled": True}
         kb = p["reply_markup"]["inline_keyboard"]
         assert kb == [[
-            {"text": "عرض الرسالة", "url": f"https://t.me/mygroup/{MSG_ID}"},
             {"text": "مراسلة", "url": "https://t.me/user1"},
+            {"text": "عرض الرسالة", "url": f"https://t.me/mygroup/{MSG_ID}"},
         ]]
         _assert_template_contract(p["text"], username="user1",
                                   name="محمد العمري", body=ORIG)
@@ -433,6 +441,6 @@ class TestAllSendPathsCase:
         _assert_template_contract(text, username="user1",
                                   name="محمد العمري", body=ORIG)
         assert buttons == [[
-            {"text": "عرض الرسالة", "url": f"https://t.me/mygroup/{MSG_ID}"},
             {"text": "مراسلة", "url": "https://t.me/user1"},
+            {"text": "عرض الرسالة", "url": f"https://t.me/mygroup/{MSG_ID}"},
         ]]

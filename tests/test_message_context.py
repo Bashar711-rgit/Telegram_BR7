@@ -431,7 +431,7 @@ class TestAlertShapeViaContext:
         )
         assert ok is True and method == "username"
         kb = _buttons_of(bot.calls[0]["payload"])
-        assert [b["text"] for b in kb] == ["عرض الرسالة", "مراسلة"]
+        assert [b["text"] for b in kb] == ["مراسلة", "عرض الرسالة"]  # ترتيب v13
 
     @pytest.mark.asyncio
     async def test_single_button_when_one_target(self):
@@ -486,7 +486,7 @@ class TestAlertShapeViaContext:
         )
         assert ok is True
         txt = bot.calls[0]["payload"]["text"]
-        assert txt.startswith("المرسل: ")
+        assert txt.startswith("B_Bot\nالمرسل: ")  # قالب v13 باسم البوت
         assert "نص الرسالة:" in txt
         # لا معرفات رقمية في النص الظاهر (روابط tg:// تحمل المعرف داخل
         # href — غير مرئية للمستلم؛ الفحص بعد إزالة الوسوم)
@@ -521,8 +521,8 @@ class TestAlertShapeViaContext:
         ents = [{"type": "text_mention", "offset": utf16_len(SENDER_LABEL),
                  "length": 4, "user": {"id": SID}}]
         assert ab._name_entity_missing(ents) is False
-        # إيموجي داخل الاسم لا يكسر فحص الموضع
-        header = built["text"].split("\n")[0]
+        # إيموجي داخل الاسم لا يكسر فحص الموضع (v13: السطر 1 بعد اسم البوت)
+        header = built["text"].split("\n")[1]
         assert "نورة" in header
 
     @pytest.mark.asyncio

@@ -201,6 +201,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import secrets
 import time
 from collections import defaultdict, deque, OrderedDict
@@ -268,6 +269,7 @@ from contact_target import (                                           # v11.2 �
     resolve_contact_target as _resolve_contact_target,
     log_sender_resolution as _log_sender_resolution,
     metric_inc as _contact_metric,
+    BOT_NAME_LINE as _CARD_BOT_NAME_LINE,  # v12.4: سطر اسم البوت أعلى البطاقة (v12.1.0+)
 )
 from reply_fix import get_reply_fixer as _get_reply_fixer              # v11.5 الرد التعويضي F (مواصفة §11)
 
@@ -317,24 +319,36 @@ def is_self_sender(sender_id) -> bool:
 
 
 # ── تواقيع بطاقة التنبيه (v11.6: القالب الجديد + القديم للتوافق) ──
+# v12.4.0 (RC-4): منذ v12.1.0 البطاقة تبدأ بسطر اسم البوت «B_Bot» ثم
+# سطر المرسل — كان التوقيع يفحص «المرسل:» فقط فأخفق في التعرف على
+# البطاقات الحالية: حاجز الصدى لم يكتشفها (بطاقة منسوخة في مجموعة
+# مراقبة قد تولّد تنبيهاً جديداً) والمُحقّق لم يعتبرها بطاقتنا أبداً.
+# الآن الثلاث تواقيع معترف بها: (B_Bot\nالمرسل:) | (المرسل:) | (👤:).
 _ALERT_CARD_HEADER = "المرسل:"
+_ALERT_CARD_NAME_LINE = _CARD_BOT_NAME_LINE  # "B_Bot"
 _ALERT_CARD_MSG_LABEL = "نص الرسالة:"
-_ECHO_SCAN_WINDOW = 256  # الاسم ≤128 + لاحقة « — @username» + هامش
+_ECHO_SCAN_WINDOW = 300  # سطر الاسم + الاسم ≤128 + لاحقة username + هامش
 _LEGACY_CARD_HEADER = "👤:"
 _LEGACY_CARD_MSG_LABEL = "💬:"
+
+
+def _is_current_card_header(t: str) -> bool:
+    """True إذا بدأ النص بترويسة بطاقة الإنتاج الحالية (باسم البوت أو بدونه)."""
+    return t.startswith(f"{_ALERT_CARD_NAME_LINE}\n{_ALERT_CARD_HEADER}") or t.startswith(_ALERT_CARD_HEADER)
 
 
 def is_alert_card_echo(text) -> bool:
     """True إذا كان النص نفسه بطاقة تنبيه منتجرة (صدى) — فحص نصي فقط.
 
-    عقد القالب (v11.6): البطاقة تبدأ دائماً بـ«المرسل:» ثم تحوي «نص
-    الرسالة:» خلال أول 256 حرفاً. رسائل المستخدمين العادية لا تبدأ بهذا
-    الترويسة. توقيع القالب القديم (👤: + 💬: خلال 64) يبقى مُكتشفاً
-    للبطاقات السابقة التي قد تُمرَّر/تُنسخ في المجموعة."""
+    عقد القالب (v12.4): البطاقة تبدأ بسطر «B_Bot» ثم «المرسل:» (أو
+    «المرسل:» مباشرة في النسخ الأقدم) وتحوي «نص الرسالة:» خلال أول 300
+    حرف. رسائل المستخدمين العادية لا تبدأ بهذه الترويسة. توقيع القالب
+    القديم (👤: + 💬: خلال 64) يبقى مُكتشفاً للبطاقات السابقة التي قد
+    تُمرَّر/تُنسخ في المجموعة."""
     if not text:
         return False
     t = str(text).lstrip()
-    if t.startswith(_ALERT_CARD_HEADER):
+    if _is_current_card_header(t):
         return _ALERT_CARD_MSG_LABEL in t[:_ECHO_SCAN_WINDOW]
     if t.startswith(_LEGACY_CARD_HEADER):
         return _LEGACY_CARD_MSG_LABEL in t[:64]
@@ -357,6 +371,23 @@ def unknown_send_result_policy(reason: str, has_verifier: bool) -> str:
     if has_verifier:
         return "verify"
     return "stop" if r.startswith("timeout_attempt") else "fallback"
+
+
+# ══ v12.4.0 (FIX-3a/RC-3): إصلاح جذري للمُحقّق — كان معطوباً بنيوياً ══
+# expected كان يُحسب من بطاقة HTML (تحوي <a href=...>) بينما visible من
+# تيليجرام نص خام بلا وسوم → التطابق مستحيل 100% → كل timeout/network
+# يُحكم "فشل مؤكد" → fallback يعيد الإرسال حتى لو وصلت البطاقة فعلاً =
+# المكرر المرئي الأرجح في الإنتاج. الحل: النص الظاهر يُشتق من الجهتين
+# بنفس التحويل الحرفي (نزع الوسوم ثم unescape) ثم تطبيع البصمة نفسها.
+def visible_card_text(card_text: str) -> str:
+    """النص الظاهر للبطاقة: نزع وسوم HTML ثم فك الترميز — نفس ما يعيد
+    تيليجرام نصاً خاماً. تُستخدم لحساب بادئة المطابقة في مُحقّق التسليم
+    ومن جهة المقارنة فيه (جهة واحدة للحقيقة)."""
+    import html as _html_mod
+    return _html_mod.unescape(_TAG_STRIP_RE.sub("", str(card_text or "")))
+
+
+_TAG_STRIP_RE: "re.Pattern[str]" = re.compile(r"<[^>]+>")
 
 
 
@@ -2253,6 +2284,20 @@ class EnhancedAccountMonitor:
         text = event_data.get("_dlq_text") or ""
         msg_hash = event_data.get("_dlq_msg_hash") or ""
         analysis = event_data.get("_dlq_analysis") or {}
+        # ══ v13.0 (RC-3): حارس الإيصال قبل إعادة الإرسال ══
+        # صف alert_resend يعاد فقط لفشل إرسال مؤكد. لو بيّن الإيصال أن
+        # التنبيه وصل فعلاً (نتيجة مجهولة سُجلت لاحقاً كناجحة) فإعادة
+        # الإرسال بطاقة مكررة — نفحص الجدول قبل أي محاولة. فشل الفحص
+        # نفسه لا يمنع المحاولة (فشل-آمن: dedup اللاحق يحكم).
+        try:
+            if await self.db.alert_exists(msg_hash):
+                logger.info(
+                    f"DLQ[{self.account['name']}]: alert resend SKIPPED — receipt "
+                    f"exists for msg_hash={msg_hash} (v13 RC-3, duplicate prevented)"
+                )
+                return
+        except Exception as _rcpt_err:
+            logger.debug(f"DLQ receipt check skipped: {type(_rcpt_err).__name__}")
         logger.info(
             f"DLQ[{self.account['name']}]: retrying alert send for msg_hash={msg_hash} (attempt {retry_count})"
         )
@@ -3071,19 +3116,22 @@ class EnhancedAccountMonitor:
         """v11.5.2: هل سلّم بوت التنبيهات رسالته فعلاً إلى مجموعة الهدف؟
 
         عميل AlertUI هو MTProto بنفس هوية البوت — رسائل البوت فيه out=True.
-        نفحص آخر 10 رسائل: صادرة من البوت + تبدأ بترويسة بطاقتنا «👤:» +
-        خلال آخر 180 ثانية + تطابق بادئة النص الظاهر (بعد نزع وسوم HTML
-        وفك الترميز — لأن alert_text يحوي وسوماً بينما telethon يعيد نصاً
-        خاماً). أي فشل/شك = False (المتصل يقرر: False مع timeout = fallback)."""
+        نفحص آخر رسائل الهدف: صادرة من البوت + تبدأ بترويسة بطاقتنا
+        «المرسل:» + خلال آخر 300 ثانية + تطابق بادئة النص الظاهر (بعد نزع
+        وسوم HTML وفك الترميز — لأن alert_text يحوي وسوماً بينما telethon
+        يعيد نصاً خاماً). أي فشل/شك = False (المتصل يقرر: False مع timeout
+        = fallback).
+
+        v12.4.0 (FIX-3/RC-3): 10 رسائل/180 ثانية كانت ضيقة — مجموعة نشطة
+        تتجاوز 10 رسائل بين الإرسال والتحقق فيُجهل بطاقة موصلة فعلاً →
+        fallback يعيد الإرسال = مكرر مرئي. الحد الآن 25 رسالة/300 ثانية
+        (تغطية المجموعات النشطة؛ تكلفة get_messages نفسها مهملة)."""
         if ui_client is None:
             return False
         try:
-            msgs = await ui_client.get_messages(CFG.TARGET_GROUP_ID, limit=10)
+            msgs = await ui_client.get_messages(CFG.TARGET_GROUP_ID, limit=25)
         except Exception:
             return False
-        import re as _re
-        import html as _html_mod
-        _tag_re = _re.compile(r"<[^>]+>")
         now = time.time()
         try:
             for m in (msgs or []):
@@ -3091,17 +3139,21 @@ class EnhancedAccountMonitor:
                     continue
                 raw = str(getattr(m, "message", "") or "")
                 _raw_stripped = raw.lstrip()
+                # v12.4.0 (RC-4): بطاقات v12.1.0+ تبدأ بسطر «B_Bot» — كان
+                # الفحص «المرسل:» فقط فيتجاهل المُحقّق بطاقاتنا الموصلة فعلاً.
                 if not (
-                    _raw_stripped.startswith(_ALERT_CARD_HEADER)
+                    _is_current_card_header(_raw_stripped)
                     or _raw_stripped.startswith(_LEGACY_CARD_HEADER)
                 ):
                     continue
                 dt = getattr(m, "date", None)
-                if dt is not None and (now - dt.timestamp()) > 180:
+                if dt is not None and (now - dt.timestamp()) > 300:
                     continue
                 if not expected_norm_prefix:
                     return True
-                visible = _html_mod.unescape(_tag_re.sub("", raw))
+                # v12.4.0 (FIX-3a): جهة المقارنة عبر visible_card_text نفسها —
+                # تحويل واحد موحد للنص الظاهر على الجهتين (صيانة واحدة للحقيقة)
+                visible = visible_card_text(raw)
                 if expected_norm_prefix in normalize_for_fingerprint(visible):
                     return True
         except Exception:
@@ -3158,21 +3210,77 @@ class EnhancedAccountMonitor:
         # scarce per-minute send budget on no-ops. The new order ensures
         # duplicates never reach the rate limiter; the limiter's budget is
         # spent only on alerts that will actually be sent.
-        # نفس المرسل بنفس النص عبر أي حساب من الحسابات الستة = تنبيه واحد فقط.
+        # نفس المرسل بنفس النص عبر أي حساب من الحسابات السبعة = تنبيه واحد فقط.
         # الحجز آتومي (ذاكرة + DB) — وعند فشل الإرسال يُفك لإعادة المحاولة.
-        dedup_fp = content_fingerprint(sender_id, text)
-        # ══ v12.1.0: الحدث المسترد — فك حجز المحاولة المنهارة أولاً ══
-        # الانهيار وقع بعد الحجز وقبل الإرسال (بلا إيصال — البوابة أعلاه
-        # تحققت): الحجز القديم كان سيمنع إرسال التنبيه للأبد. الفك هنا
-        # آمن: لا إيصال = لم يصل التنبيه للمستخدم من هذه المحاولة.
-        # (نافذة ازدواج ميليمترية نظرياً: إرسال نجح + انهار قبل الإيصال —
-        # مقبولة بصدق مقابل فقدان التنبيه كلياً؛ at-least-once.)
+        # v13.0: البصمة تشمل مجال المرسل المجهول + نوع الوسائط (اختبار 4/9:
+        # لا دمج مرسلين مختلفين ولا دمج محتوى بمرفقات مختلفة).
+        dedup_fp = content_fingerprint(sender_id, text, chat_id=chat_id,
+                                       media_kind=data.get("media_type"))
+        # ══ v13.0 — المسار المسترد: إيصال ← استيلاء CAS مشروط، بلا فك أعمى ══
+        # (يدمج بوابة الإيصال v12.4.0 مع إصلاح سباق الفك غير المشروط):
+        # 1) إيصال موجود (الفوري v12.4.0 يكتبه لحظة النجاح) → الحدث أُرسل
+        #    فعلاً قبل الانهيار → إسقاط صادق بلا أي فك ولا إعادة إرسال.
+        # 2) لا إيصال + حجز عتيق (محاولة منهارة قبل الإرسال) → استيلاء
+        #    CAS ذري (DELETE ... WHERE last_seen < cutoff) ثم مطالبة من جديد.
+        # 3) لا إيصال + حجز طازج (عامل حي يرسل الآن) → انسحاب — لا تكرار.
+        # الفك غير المشروط القديم كان يفتح سباق TOCTOU: عاملان مستردّان
+        # لنفس المحتوى يفك كلٌّ منهما حجز الآخر الطازج → تنبيهان.
         if data.get("_recovered"):
             try:
-                await get_deduplicator().release(dedup_fp)
+                _receipt_pre = await self.db.alert_exists(msg_hash)
+            except Exception:
+                _receipt_pre = False
+            if _receipt_pre:
+                from unified_alerts.stats import get_unified_stats as _gus
+                _gus().inc("recovered_dupe_skip_send")
+                await self._inc_stat("duplicates")
+                logger.info(
+                    f"♻️ recovered event has alert receipt — skip BEFORE claim release "
+                    f"[chat={chat_id} msg={message_id}] (v12.4 duplicate-proof)"
+                )
+                return
+        # ══ v13.0 (تصحيح التدفق): المطالبة ثم الاستيلاء المشروط بشكل خطي ══
+        # النسخة المدمجة السابقة كانت تُسقط بعد نجاح الاستيلاء في حاجز
+        # «Duplicate alert blocked» الخارجي (الاستيلاء كان يعمل ويُسجل ثم
+        # يُقتل) — المسار المسترد العتيق كان معطلاً فعلياً. الآن: متغير
+        # قرار واحد claimed والانسحاب مرة واحدة في النهاية.
+        claimed = await get_deduplicator().check_and_claim(dedup_fp)
+        if not claimed and data.get("_recovered"):
+            _steal_min_age = 120.0
+            try:
+                _steal_min_age = float(max(
+                    1, int(getattr(CFG, "DEDUP_RECOVERY_STEAL_MIN_AGE_SECONDS", 120))))
             except Exception:
                 pass
-        if not await get_deduplicator().check_and_claim(dedup_fp):
+            _stolen = False
+            try:
+                _stolen = await get_deduplicator().steal_if_stale(
+                    dedup_fp, min_age_seconds=_steal_min_age
+                )
+            except Exception as _steal_err:
+                logger.debug(
+                    f"dedup steal skipped [{account_name}]: {type(_steal_err).__name__}")
+            if _stolen:
+                claimed = await get_deduplicator().check_and_claim(dedup_fp)
+                if claimed:
+                    logger.warning(
+                        f"♻️ recovered event took over STALE dedup claim "
+                        f"[{account_name}] | msg_hash={msg_hash} | "
+                        f"min_age={_steal_min_age:.0f}s "
+                        f"(v13 CAS steal — previous attempt crashed pre-send)"
+                    )
+                else:
+                    # سباق ضيق: عامل آخر استولى وحجز بين خطوتينا — انسحاب بصدق
+                    logger.info(
+                        f"Recovered steal re-claim lost [{account_name}] "
+                        f"(another worker owns the claim) — no duplicate"
+                    )
+            else:
+                logger.info(
+                    f"Recovered duplicate blocked on FRESH claim [{account_name}] "
+                    f"| msg_hash={msg_hash} (active worker is sending — no duplicate)"
+                )
+        if not claimed:
             await self._inc_stat("duplicates")
             logger.info(
                 f"Duplicate alert blocked [{account_name}] | msg_hash={msg_hash} | "
@@ -3588,7 +3696,11 @@ class EnhancedAccountMonitor:
                 _ui = getattr(self._bot_ref, "alert_ui_client", None) if self._bot_ref is not None else None
                 _policy = unknown_send_result_policy(_unk_reason, _ui is not None)
                 if _policy == "verify":
-                    _expected = normalize_for_fingerprint(alert_text or "")[:48]
+                    # v12.4.0 (FIX-3a): البادئة المتوقعة من النص الظاهر
+                    # (بلا وسوم) — نفس تحويل جهة المقارنة حرفياً. الحساب
+                    # القديم من بطاقة HTML كان يجعل التطابق مستحيلاً.
+                    _expected = normalize_for_fingerprint(
+                        visible_card_text(alert_text or ""))[:48]
                     _verified = False
                     try:
                         _verified = await self._verify_alertbot_delivery(_ui, _expected)
@@ -3838,12 +3950,14 @@ class EnhancedAccountMonitor:
                 logger.error(f"DLQ push failed [{account_name}]: {push_err}")
             await self._inc_stat("send_errors")
 
+        # ══ v13.0 (RC-2): الإرسال والتسجيل عمليتان منفصلتان ══
+        # القديم كان يجمعهما في try واحد: إرسال ناجح فعلياً ثم استثناء DB
+        # في _record_sent_alert كان يدخل فرع الـexcept فيرسل نسخة احتياطية
+        # = بطاقة مكررة مرئية (وثيقة في بلاغ الإنتاج). الآن فشل الإرسال فقط
+        # يفعّل الـfallback؛ وفشل التسجيل يُسجَّل بصدق ولا يعيد الإرسال أبداً
+        # (التنبيه وصل — إعادة الإرسال عقابٌ للمستخدم على خلل كتابة).
         try:
             sent_msg = await self._send_cb.call(do_send)
-            await self._record_sent_alert(
-                sent_msg, data, msg_hash, account_name, keyword, alert_text, chat_id, sender_id, display_name,
-                contact_method=(outcome.get("method") or "link"),
-            )
         except (FloodWaitError, CircuitBreakerOpen) as e:
             logger.warning(
                 f"Alert send throttled [{account_name}] msg_hash={msg_hash}: {type(e).__name__}: {e}"
@@ -3912,10 +4026,39 @@ class EnhancedAccountMonitor:
             # did mark_alerted and silently skipped add_alert + _note_alert_message,
             # leaving the alert untracked in DB (broken copy button, broken
             # stats, broken reply-button mapping for the fallback path).
+            # v13.0: فشل التسجيل هنا أيضاً لا يعيد الإرسال — التنبيه وصل.
+            try:
+                await self._record_sent_alert(
+                    fallback_sent_msg, data, msg_hash, account_name, keyword, alert_text,
+                    chat_id, sender_id, display_name,
+                    contact_method=(outcome.get("method") or "link"),
+                )
+            except Exception as _fb_rec_err:
+                from unified_alerts.stats import get_unified_stats as _gus_r
+                try: _gus_r().inc("record_after_send_failed")
+                except Exception: pass
+                logger.error(
+                    f"Alert WAS delivered via fallback but post-send recording failed "
+                    f"[{account_name}] msg_hash={msg_hash}: "
+                    f"{type(_fb_rec_err).__name__}: {str(_fb_rec_err)[:150]} — NOT resending (v13 RC-2)"
+                )
+            return
+        # الإرسال الأساسي نجح فعلياً — التسجيل الآن بمعزل تام عن الإرسال:
+        # أي استثناء DB هنا يُسجل بصدق ولا يفعّل أي fallback (كان ينتج
+        # بطاقة ثانية مكررة — RC-2).
+        try:
             await self._record_sent_alert(
-                fallback_sent_msg, data, msg_hash, account_name, keyword, alert_text,
-                chat_id, sender_id, display_name,
+                sent_msg, data, msg_hash, account_name, keyword, alert_text, chat_id, sender_id, display_name,
                 contact_method=(outcome.get("method") or "link"),
+            )
+        except Exception as _rec_err:
+            from unified_alerts.stats import get_unified_stats as _gus_r
+            try: _gus_r().inc("record_after_send_failed")
+            except Exception: pass
+            logger.error(
+                f"Alert WAS delivered but post-send recording failed "
+                f"[{account_name}] msg_hash={msg_hash}: "
+                f"{type(_rec_err).__name__}: {str(_rec_err)[:150]} — NOT resending (v13 RC-2)"
             )
 
     def _schedule_reply_fix(
@@ -4066,9 +4209,19 @@ class EnhancedAccountMonitor:
         safe_keyword = keyword
         if isinstance(safe_keyword, (tuple, list)): safe_keyword = safe_keyword[0] if safe_keyword else ""
         if not isinstance(safe_keyword, str): safe_keyword = str(safe_keyword) if safe_keyword is not None else ""
-        await self.db.add_alert(AlertRecord(message_hash=msg_hash, chat_id=chat_id, sender_id=sender_id,
-            account_name=account_name, keyword=safe_keyword, alert_text=alert_text, timestamp=time.time(),
-            contact_method=(contact_method or "")[:20]))
+        # ══ v12.4.0 (FIX-1/RC-1): إيصال فوري غير دفعي ══
+        # كان add_alert يدفع للكاتب الدفعي (فراغ كل DB_BATCH_INTERVAL=5s):
+        # انهيار العملية في النافذة = فقدان الإيصال → الحدث المسترد لاحقاً
+        # يرسل التنبيه ثانية (المكرر المرئي). الآن الإيصال يُلزم لحظة
+        # نجاح الإرسال — نافذة الفقد تنكمش إلى مدة INSERT واحدة.
+        try:
+            await self.db.add_alert_immediate(AlertRecord(message_hash=msg_hash, chat_id=chat_id, sender_id=sender_id,
+                account_name=account_name, keyword=safe_keyword, alert_text=alert_text, timestamp=time.time(),
+                contact_method=(contact_method or "")[:20]))
+        except Exception as _air_err:
+            # فشل-آمن: خلل الإيصال لا يكسر ما بعد الإرسال — add_alert_immediate
+            # يدفع للكاتب الدفعي داخلياً كشبكة أمان
+            logger.debug(f"immediate receipt failed [{account_name}]: {type(_air_err).__name__}")
         # ══ v11.1: سجل الإرسال — الحالة + الزمن + الوجهة + روابط الأزرار ══
         # add_alert دفعي (writer) — التحديث بـmessage_hash يطبق عند وصول الصف.
         try:
