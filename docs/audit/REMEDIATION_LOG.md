@@ -4,6 +4,42 @@
 
 ---
 
+# REMEDIATION LOG — جلسة v12.3.0 (نشر + إغلاق P2)
+
+## 1) نشر v12.2.0 إلى الإنتاج (P1-2)
+
+* دفع `906dd7a` → origin/main (بتوكن المالك المخزن في /home/z/.secrets — بلا عرض) → Render autoDeploy `dep-dbi177p7` → **live**.
+* تحقق حي: `/health` → status=ok، database=ok (PostgreSQL متصل)، db_healthy=true.
+* خط الأساس قبل الدفع: **1151/1151 PASS** (EXIT=0) + فحص أسرار على الفرق (سالب) + py_compile.
+
+## 2) V12-D — حصر سباق ازدواجية dead-letter (كان موثقاً «لم يتغير عمداً»)
+
+**الملفات:**
+* `database.py::_execute_affected` (جديد): عدد الصفوف المتأثرة على المحركين (sqlite rowcount / asyncpg tag "UPDATE n") — فشل → 0 (الاتجاه الآمن).
+* `database.py::_dead_letter_row` (جديد): claim ذرّي CAS على attempts (`WHERE id=? AND status='in_flight' AND attempts=?` ثم `attempts=attempts+1`) → الفائز وحده يكتب INSERT+DELETE (معاملة واحدة على PG؛ قفل _queue_lock + commit فوري على SQLite).
+* `database.py::recover_stale_inflight`: الفرع الميت يفوض لـ_dead_letter_row؛ فرع الاسترداد صار CAS أيضاً (لا يطمس حجز مستهلك حديث — المستهلك يزيد attempts أيضاً). الزيادة في الاسترداد تعني: attempts يحصي كل بدء معالجة → حدّ QUEUE_INFLIGHT_MAX_ATTEMPTS يُنهي أحداث السمّ بدل الارتداد الأبدي pending↔in_flight.
+* `tests/test_v12_3_race_and_health.py` (جديد، 6 اختبارات V12-D): سباق متزامن حقيقي (asyncio.gather) → حرف ميت واحد بالضبط؛ استرداد متزامن → مرة واحدة؛ CAS يخسر بقيمة قديمة بلا كتابة؛ عقد retry_count=attempts محفوظ؛ حدث السمّ ينتهي؛ _execute_affected صادق.
+
+**السبب**: مسارا استرداد متزامنان يقرآن نفس الصفوف العالقة → حرف ميت مكرر لنفس الحدث (السجل السابق قيّده «نافذة ميليمترية بلا أثر» — صُحح الآن لأن الإصلاح أمكن بلا معاملة معقدة: CAS وحيد + بنية معاملة موجودة).
+**الاختبارات**: 1160/1160 PASS (كان 1151 + 9 جدد). **ترحيل**: لا شيء (دلالة retry_count القائمة محفوظة عمداً).
+
+## 3) S-4 — شفافية تركيب webadmin في /health/full
+
+**الملفات:**
+* `dashboard.py` (كتلة التركيب): `app.state.webadmin_mounted` (False قبل المحاولة، True بعد النجاح) + `app.state.webadmin_mount_error` (نص الخطأ عند الفشل) — التحذير في اللوج بقي.
+* `dashboard.py::health_full`: حقلا `webadmin_mounted` (bool) و`webadmin_mount_error` (مقطوع 200 حرفاً) — فشل التركيب لم يعد صامتاً في التشخيص.
+* `tests/test_v12_3_race_and_health.py` (3 اختبارات S-4): المفتاحان موجودان بنوعيهما؛ العلم مضبوط عند الاستيراد؛ الصدق السلوكي (العلم True ⇒ GET /admin لا يعيد 404).
+
+## 4) اكتشاف تدقيقي جديد F-15 (DOCUMENTED — لا خلل سلوك)
+
+**FastAPI 0.162.0**: خاصية `app.routes` لم تعد تعكس مسارات `include_router` (أظهرت 78 مساراً بلا أي مسار /admin بينما GET /admin يستجيب 200 فعلاً — أُعيد إنتاجها ثلاث مرات بتتبع include_router: before=77/after=78 بينما الراوتر يحمل 35). كل تحقق هيكلي قائم على app.routes في الكود/الاختبارات يجب أن يكون سلوكياً (طلب HTTP حقيقي). موثق في docstring الاختبار.
+
+## 5) bump الإصدار
+
+`config.py`: BOT_VERSION "12.2.0" → "12.3.0".
+
+---
+
 ## 1) S-1 — توحيد حل عنوان العميل خلف البروكسيات
 
 **الملفات:**
@@ -54,4 +90,4 @@
 
 * جدول `br7` الموازي على Supabase (D-1 — يحتاج قرار مالك).
 * استيرادات/متغيرات ميتة موثقة (W-1/W-2) — تقليل تشويش الفروقات.
-* سباق dead-letter المزدوج النظري (V12-D) — نافذة ميليمترية بلا أثر مستخدم؛ الإصلاح يجر معاملة معقدة.
+* ~~سباق dead-letter المزدوج النظري (V12-D)~~ — **أُغلق في v12.3.0** بقفل CAS ذرّي (انظر قسم v12.3.0 أعلاه).

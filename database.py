@@ -687,6 +687,76 @@ class EnhancedDatabase:
         else:
             return await self._pool.execute(_pg(sql), *params)
 
+    async def _execute_affected(self, sql: str, params: tuple = ()) -> int:
+        """v12.3 (V12-D): عدد الصفوف المتأثرة على المحركين — أساس CAS.
+
+        sqlite: cursor.rowcount.  postgresql: asyncpg يعيد وسم الحالة
+        ("UPDATE 1" / "INSERT 0 1") — يُفكك رقمياً. فشل → 0 (المتسابق
+        يخسر — الاتجاه الآمن: لا تكرار أبداً بفشل القفل)."""
+        try:
+            if self.db_type == "sqlite":
+                cursor = await self._sqlite_conn.execute(sql, params)
+                return int(cursor.rowcount or 0)
+            tag = await self._pool.execute(_pg(sql), *params)
+            try:
+                return int(str(tag).split()[-1])
+            except Exception:
+                return 0
+        except Exception:
+            return 0
+
+    async def _dead_letter_row(self, rid: Any, attempts: int, raw: Any, err: str) -> bool:
+        """══ v12.3 (V12-D) — حصر سباق ازدواجية dead-letter ══
+
+        السباق المُثبت: مسارا استرداد متزامنان يقرآن نفس الصفوف العالقة
+        ثم يجريان INSERT→DELETE — حرف ميت مكرر لنفس الحدث.
+        الإصلاح: claim ذرّي (CAS) على attempts:
+          UPDATE ... SET attempts = attempts + 1
+          WHERE id = ? AND status = 'in_flight' AND attempts = ?
+        المتسابق الأول فقط يحصل rowcount=1؛ الخاسر يتخطى بلا كتابة.
+        INSERT+DELETE بعدها في معاملة واحدة (PG) أو ضمن قفل الاتصال
+        الواحد مع commit فوري (SQLite — نفس الاتصال يرى كل شيء).
+        انهيار بين الخطوات: الصف يبقى in_flight بـattempts+1 → المسار
+        التالي يطالبه مرة واحدة بالضبط (لا تكرار ولا فقدان ولا عالق).
+
+        يعيد True إن فاز هذا المتسابق بالصف فعلاً."""
+        payload = raw if isinstance(raw, (str, bytes)) else json_dumps(raw or {})
+        retry_count = int(attempts)  # محاولات التسليم عند انتهاء الصلاحية (عقد قائم)
+        claim_sql = (
+            "UPDATE processing_queue SET attempts = attempts + 1 "
+            "WHERE id = ? AND status = 'in_flight' AND attempts = ?"
+        )
+        insert_sql = (
+            "INSERT INTO dead_letters (event_data, error_text, retry_count) "
+            "VALUES (?, ?, ?)"
+        )
+        delete_sql = "DELETE FROM processing_queue WHERE id = ? AND status = 'in_flight'"
+        try:
+            if self.db_type == "sqlite":
+                async with self._queue_lock:
+                    cursor = await self._sqlite_conn.execute(claim_sql, (rid, attempts))
+                    if not (cursor.rowcount or 0):
+                        return False  # سبقه مسار آخر — لا تكرار
+                    await self._sqlite_conn.execute(insert_sql, (payload, err, retry_count))
+                    await self._sqlite_conn.execute(delete_sql, (rid,))
+                    await self._sqlite_conn.commit()
+                return True
+            async with self._pool.acquire() as conn:
+                async with conn.transaction():
+                    tag = str(await conn.execute(_pg(claim_sql), rid, attempts))
+                    won = tag.startswith("UPDATE") and tag.split()[-1] == "1"
+                    if not won:
+                        return False  # سبقه مسار آخر — لا تكرار
+                    await conn.execute(_pg(insert_sql), payload, err, retry_count)
+                    await conn.execute(_pg(delete_sql), rid)
+            return True
+        except Exception as e:
+            logger.debug(
+                f"_dead_letter_row {rid} failed (no DL written, row stays "
+                f"in_flight): {type(e).__name__}: {e}"
+            )
+            return False
+
     async def _fetchone(self, sql: str, params: tuple = ()) -> Optional[Dict[str, Any]]:
         if self.db_type == "sqlite":
             cursor = await self._sqlite_conn.execute(sql, params)
@@ -1649,19 +1719,14 @@ class EnhancedDatabase:
                 try:
                     if attempts >= max_attempts:
                         # Dead-letter صادق — منع دورة إعادة أبدية
+                        # v12.3 (V12-D): claim ذرّي — مسارا استرداد متزامنان
+                        # لا يكتبان حرفاً ميتاً مكرراً لنفس الصف أبداً.
                         err = (
                             f"inflight_expired: no ack within {max_age_seconds}s "
                             f"(attempts={attempts})"
                         )
-                        await self._execute(
-                            "INSERT INTO dead_letters (event_data, error_text, retry_count) "
-                            "VALUES (?, ?, ?)",
-                            (raw if isinstance(raw, (str, bytes)) else json_dumps(raw or {}), err, attempts),
-                        )
-                        await self._execute(
-                            "DELETE FROM processing_queue WHERE id = ? AND status = 'in_flight'",
-                            (rid,),
-                        )
+                        if not await self._dead_letter_row(rid, attempts, raw, err):
+                            continue  # خسر السباق أو فشل آمن — الصف يبقى كما هو
                         stats_out["dead"] += 1
                         self._queue_size_mirror = max(0, self._queue_size_mirror - 1)
                     else:
@@ -1679,13 +1744,20 @@ class EnhancedDatabase:
                             payload = json_dumps(data)
                         else:
                             payload = raw if isinstance(raw, (str, bytes)) else "{}"
-                        await self._execute(
+                        # v12.3 (V12-D): CAS على attempts — يستعيد الصف المتسابق
+                        # الأول فقط، ولا يطمس حجزاً حديثاً لمستهلك (المستهلك
+                        # يزيد attempts عند الحجز أيضاً). الزيادة هنا تعني:
+                        # attempts يحصي كل بدء معالجة — حدّ
+                        # QUEUE_INFLIGHT_MAX_ATTEMPTS يُنهي أحداث السمّ بدل
+                        # الارتداد الأبدي pending↔in_flight.
+                        claimed = await self._execute_affected(
                             "UPDATE processing_queue SET status = 'pending', "
-                            "claimed_at = NULL, event_data = ? "
-                            "WHERE id = ? AND status = 'in_flight'",
-                            (payload, rid),
+                            "claimed_at = NULL, event_data = ?, attempts = attempts + 1 "
+                            "WHERE id = ? AND status = 'in_flight' AND attempts = ?",
+                            (payload, rid, attempts),
                         )
-                        stats_out["recovered"] += 1
+                        if claimed == 1:
+                            stats_out["recovered"] += 1
                 except Exception as row_err:
                     from unified_alerts.stats import get_unified_stats as _gus
                     _gus().inc("inflight_errors")

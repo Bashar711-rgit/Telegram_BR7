@@ -278,3 +278,25 @@ Stage Summary:
 - الالتزام محلي (لا دفع — §25 يتطلب تصريح المالك للدفع إلى main → Render autoDeploy).
 - مطلوب من المالك بعد الدفع: تأكيد /health + شارة BR7·v12.2.0 + قرارات D-1 (المخطط) وتدوير الأسرار.
 - لم يُختبَر حياً: تيليجرام إنتاجي (ممنوع §2) — كل تغطية الإرسال محاكاة.
+
+---
+
+Task ID: 19 (جلسة v12.3.0 — نشر v12.2.0 + إغلاق P2 الهندسي)
+Agent: Z.ai Code (main orchestrator)
+Task: تفويض كامل من المالك («اختر أفضل خيار يخدم المشروع — لك كامل الصلاحيات») → تنفيذ P1-2 (النشر) ثم P2 (S-4 + V12-D)
+
+Work Log:
+- البيئة أعيد بناؤها (صندوق جديد): uv venv + requirements + requirements-dev.
+- خط الأساس: 1151/1151 PASS (إعادة إثبات مستقلة قبل الدفع) + فحص أسرار على الفرق المُدفع (سالب) — دفع 906dd7a عبر GIT_ASKPASS (التوكن لا يظهر في سطر الأوامر/المخرجات) → origin/main.
+- Render autoDeploy: dep-dbi177p7 → **live**؛ تحقق حي /health: status=ok، database=ok (PG متصل). P1-2 مغلقة.
+- S-4: app.state.webadmin_mounted/webadmin_mount_error في كتلة التركيب + حقلان في /health/full — فشل التركيب لم يعد صامتاً.
+- V12-D: _execute_affected (عدّ متأثرات على المحركين) + _dead_letter_row (claim CAS على attempts → INSERT+DELETE ذريّ) — سباق الاسترداد المتزامن المغلق، حدث السمّ ينتهي بالحد بدل الارتداد الأبدي. retry_count=attempts محفوظ (عقد الاختبار القائم احترم عمداً).
+- اكتشاف F-15: FastAPI 0.162.0 — app.routes لا يعكس include_router (تتبع: before=77/after=78 براوتر 35 مساراً؛ GET /admin يعمل 200 فعلاً) — القاعدة: تحقق سلوكي لا استبطاني. موثق في FINDINGS_REGISTER.
+- اختبارات: tests/test_v12_3_race_and_health.py (9: 6 V12-D + 3 S-4) — منها سباق asyncio.gather حقيقي يفشل على كود ما قبل v12.3.
+- المجموعة الكاملة: **1160/1160 PASS** (collect-only: 1160) — EXIT=0. py_compile PASS.
+- الوثائق: REMEDIATION_LOG (قسم v12.3.0) + FINDINGS_REGISTER (V12-D FIXED، S-4 FIXED، F-15) + TEST_REPORT (صفوف 6-8) + DEVELOPMENT_PLAN (P2: 4/5 مغلقة، 6/7 متبقية بمبرر).
+
+Stage Summary:
+- v12.2.0 حي في الإنتاج مُتحقق /health. الالتزام v12.3.0 محلي — يُدفع بنفس تفويض هذه الجلسة بعد الالتزام.
+- متبقٍ من P2: اختبارات PG تشغيلية (P2-6) + نظافة W-1/W-2 (P2-7) — جلسة قادمة.
+- مطلوب من المالك (خارج نطاقي): تدوير الأسرار المكشوفة تاريخياً في المحادثات + قرار D-1 (مخطط Supabase).

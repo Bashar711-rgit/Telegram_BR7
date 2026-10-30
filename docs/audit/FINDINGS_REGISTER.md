@@ -60,3 +60,28 @@
   * SQLite: claim تحت قفل asyncio واحد — آمن أحادي العملية؛ PG: `FOR UPDATE SKIP LOCKED` — آمن متعدد المثيلات. ✓
   * المسارات الاستثنائية (إيقاف/استثناء/لا مراقب) تعيد الإدراج priority=9 بينما يبقى الصف in_flight → ازدواج منطقي يقطعه dedup L1/L2 عند إرسال فعلي سابق — at-least-once موثق مقابل فقدان كلي. ✓ (سياسة معلنة، ليست عيباً)
   * سباق نظري واحد حُدد: حلقتا استرداد متزامنتان (إقلاع + دورية) قد تدخلان dead-letter مزدوجاً لنفس الصف (INSERT قبل DELETE المحروس بـ status='in_flight') — نافذة ميليمترية، أثرها صف مكرر في dead_letters بلا أثر مستخدم. **DOCUMENTED** (إصلاح يتطلب معاملة UPDATE-THEN-INSERT المحصورة — يُقيَّم لاحقاً).
+
+---
+
+# إضافات جلسة v12.3.0
+
+## V12-D — سباق ازدواجية dead-letter (حُدد سابقاً DOCUMENTED → الآن FIXED)
+
+* **الشدة**: منخفضة (صف مكرر في dead_letters بلا أثر مستخدم) | **الثقة**: مؤكدة (أُعيد إنتاجها باختبار متزامن)
+* **الموضع**: `database.py::recover_stale_inflight` — INSERT→DELETE كعمليتين مستقلتين.
+* **الدليل**: `tests/test_v12_3_race_and_health.py::test_concurrent_recovery_no_duplicate_dead_letter` — على كود ما قبل v12.3 ينتج حرفين ميتين لنفس الحدث (كود الاسترداد يحصر الصفوف قبل أن يكتب أيٌّ منهما).
+* **الإصلاح (FIXED)**: قفل CAS ذرّي على attempts (`UPDATE ... WHERE id=? AND status='in_flight' AND attempts=?` + `attempts=attempts+1`) — الفائز وحده يكتب INSERT+DELETE (معاملة واحدة PG / قفل+commit فوري SQLite). فرع الاسترداد صار CAS أيضاً فلا يطمس حجز مستهلك حديث. أثر جانبي مقصود: attempts يحصي كل بدء معالجة → حدّ QUEUE_INFLIGHT_MAX_ATTEMPTS يُنهي أحداث السمّ (اختبار test_poison_event_terminates_via_recover_cycles).
+* **الاختبارات**: 6 اختبارات V12-D (سباق متزامن حقيقي، CAS خاسر، عقد retry_count، إنهاء حدث السمّ، عدّ صادق).
+* **قيود متبقية**: فروع PG في _dead_letter_row/_execute_affected مغطاة نصياً (بنية مطابقة لمسارات PG قائمة) — الإثبات التشغيلي يتطلب مثيل PG معزول (P2-6).
+
+## S-4 — mount_admin يفشل صامتاً (كان OPEN توصية → الآن FIXED)
+
+* **الإصلاح (FIXED)**: `app.state.webadmin_mounted` (False قبل المحاولة / True بعد النجاح) + `app.state.webadmin_mount_error` (نص مقطوع 200 حرفاً) — منضبطان في كتلة التركيب نفسها، ومكشوفان في `/health/full`.
+* **الاختبارات**: 3 اختبارات (المفاتيح بنوعيهما في الحمولة؛ العلم عند الاستيراد؛ الصدق السلوكي: العلم True ⇒ GET /admin لا يعيد 404).
+
+## F-15 — خاصية app.routes لا تعكس include_router في FastAPI 0.162.0 (DOCUMENTED)
+
+* **الشدة**: منخفضة (فخ تأمل — لا خلل سلوك) | **الثقة**: مؤكدة (أُعيد إنتاجها 3 مرات بتتبع include_router)
+* **الدليل**: `include_router` استدعي على التطبيق الصحيح براوتر يحمل 35 مساراً (before=77 → after=78 في app.router.routes) بينما `app.routes` يظهر 78 مساراً بلا أي مسار /admin — وGET /admin يستجيب 200 فعلاً وGET /keywords يعيد 401 (الحماية تعمل). التوجيه سليم؛ الاستبطان الكاذب.
+* **الأثر**: أي كود/اختبار يتحقق هيكلياً عبر app.routes قد يحكم كذباً أن الميزة غير مركّبة (كاد يُنتج إنكاراً كاذباً في اختبار v12.3 نفسه).
+* **الحالة (DOCUMENTED)**: القاعدة المتبناة: التحقق سلوكي (طلب HTTP حقيقي) لا استبطاني. مرجع: docstring test_mounted_flag_matches_router_reality.

@@ -1361,6 +1361,11 @@ async def health_full(request: Request):
         "dead_letters_total": 0,
         "dead_letters_unresolved": 0,
     }
+    # v12.3 (S-4): حالة تركيب webadmin صادقة — تُضبط عند البوت من كتلة
+    # التركيب نفسها (أسفل الملف). False تعني فشل تركيب صامت أُبلغ عنه
+    # في اللوج عند الإقلاع لكنه كان غير مرئي هنا من قبل.
+    webadmin_mounted = bool(getattr(request.app.state, "webadmin_mounted", False))
+    webadmin_error = str(getattr(request.app.state, "webadmin_mount_error", ""))[:200]
     try:
         if db:
             wtask = getattr(db, "_writer_task", None)
@@ -1395,6 +1400,8 @@ async def health_full(request: Request):
         "unified_gate": unified_gate,  # v12.0 unified_alerts
         "antispam": antispam,
         "db_writer": db_writer,
+        "webadmin_mounted": webadmin_mounted,  # v12.3 S-4
+        "webadmin_mount_error": webadmin_error,  # v12.3 S-4 (مقطوع/آمن)
         "uptime": uptime,
         "time": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     })
@@ -4568,10 +4575,16 @@ async def filter_test(request: Request, data: FilterTestRequest):
 # genuinely optional plugin hook — not a silent-failure pattern, since
 # webadmin.py is an unknown/optional external module.
 # =============================================================================
+app.state.webadmin_mounted = False  # v12.3 S-4: الحقيقة قبل المحاولة
+app.state.webadmin_mount_error = ""
 try:
     from webadmin import mount_admin
     mount_admin(app)
+    app.state.webadmin_mounted = True
 except Exception as _webadmin_err:
+    # v12.3 S-4: التحذير يبقى في اللوج + الحالة الآن مرئية في /health/full
+    # (كانت منقطعة الصمت سابقاً — لا شيء في الـhealth يكشف الفشل).
+    app.state.webadmin_mount_error = f"{_webadmin_err}"
     logger.warning(f"webadmin dashboard not loaded: {_webadmin_err}")
 
 # =============================================================================
