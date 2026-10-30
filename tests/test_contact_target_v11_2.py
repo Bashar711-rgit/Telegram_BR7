@@ -323,7 +323,7 @@ class TestAlertBotSend:
         sent = bot.calls[0]["payload"]
         assert sent["parse_mode"] == "HTML"
         # لا رابط خام في النص الظاهر (داخل href فقط) — قالب v11.6 مع @username
-        assert sent["text"].startswith("المرسل: <a href=\"https://t.me/iesk1\">نواف محمد</a> — @iesk1\n")
+        assert sent["text"].startswith("المرسل: <a href=\"https://t.me/iesk1\">نواف محمد</a> — <a href=\"https://t.me/iesk1\">@iesk1</a>\n")
 
     @pytest.mark.asyncio
     async def test_send_user_id_button_without_username(self):
@@ -543,7 +543,8 @@ class TestSpecTenCases:
         built = build_alert_html(_data(sender_id=123456789, sender_username="@iesk1"))
         assert 'href="https://t.me/iesk1"' in built["text"]
         assert {"text": "مراسلة", "url": "https://t.me/iesk1"} in built["buttons"][0]
-        assert built["text"].startswith("المرسل: <a href=\"https://t.me/iesk1\">نواف محمد</a> — @iesk1\n")
+        # v12.1.0: الاسم و@username كلاهما رابط (صيغة الصورة المرجعية)
+        assert built["text"].startswith("المرسل: <a href=\"https://t.me/iesk1\">نواف محمد</a> — <a href=\"https://t.me/iesk1\">@iesk1</a>\n")
 
     def test_case2_no_username_uid_5601276336(self):
         """Test 2: username=None + user_id=5601276336 → clickable عبر user_id."""

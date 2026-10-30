@@ -533,6 +533,17 @@ class EnhancedTelegramBot:
                                 await self.db.add_to_queue(event_data, priority=9)
                             except Exception:
                                 pass
+                    # ══ v12.1.0 التزامن الصلب: الحماة (ack) ══
+                    # المعالجة اكتملت أو حُوّلت لـDLQ (المسؤولية انتقلت):
+                    # احذف الصف in_flight — بدون ack يُسترد لاحقاً كـ
+                    # _recovered (at-least-once). فشل الـack نفسه آمن:
+                    # الصف يبقى في الطابور ويُعاد فحصه دورياً.
+                    try:
+                        _qid = event_data.get("_queue_id")
+                        if _qid is not None:
+                            await self.db.ack_queue_event(_qid)
+                    except Exception as _ack_err:
+                        logger.debug(f"ack failed (fail-safe): {type(_ack_err).__name__}")
                     internal_queue.task_done()
                     # v9.12 (audit M-07 / M-05 related): clear the local
                     # reference after successful processing so the
@@ -1202,6 +1213,33 @@ class EnhancedTelegramBot:
             except Exception as e:
                 logger.error(f"Cleanup error: {e}")
 
+    async def _inflight_recovery_loop(self) -> None:
+        """══ v12.1.0 — حلقة الاسترداد الدورية (التزامن الصلب) ═══
+
+        كل QUEUE_RECOVER_INTERVAL_SECONDS (افتراضي 120s): فحص صفوف
+        in_flight العالقة (claimed_at أقدم من QUEUE_INFLIGHT_MAX_AGE_SECONDS
+        = 600s) — عاملٌ انهار بين السحب (claim) والحماة (ack) كان يُفقد
+        الحدث للأبد؛ الآن يُعاد للطابور بوسم _recovered ويعاد إرسال تنبيهه
+        (at-least-once) أو يُودع dead_letters بصدق بعد تجاوز المحاولات.
+        الإقلاع نفسه يستدعيها مرة أولى عبر run_startup_maintenance.
+        فشل-آمن: أي خلل → محاولة لاحقة (لا استثناءات خارج الحلقة).
+        """
+        try:
+            interval = max(30, int(getattr(CFG, "QUEUE_RECOVER_INTERVAL_SECONDS", 120) or 120))
+        except Exception:
+            interval = 120
+        # أول فحص مبكر بعد الإقلاع (يلتقط عالق التشغيل السابق فوراً)
+        await asyncio.sleep(min(interval, 15))
+        while self.is_running:
+            try:
+                from unified_alerts.maintenance import recover_inflight_events
+                await recover_inflight_events(self.db)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.debug(f"inflight recovery loop error (fail-safe): {type(e).__name__}: {e}")
+            await asyncio.sleep(interval)
+
     async def _dedup_cleanup_loop(self) -> None:
         """v9.12 (audit H-08): dedicated short-cadence loop for the
         alert_dedup table. Runs every DEDUP_CLEANUP_INTERVAL_SECONDS
@@ -1804,6 +1842,10 @@ class EnhancedTelegramBot:
         self._cleanup_task = self._track_task(self._cleanup_loop(), "cleanup")
         # v9.12 (audit H-08): dedicated short-cadence dedup cleanup task.
         self._dedup_cleanup_task = self._track_task(self._dedup_cleanup_loop(), "dedup_cleanup")
+        # v12.1.0 التزامن الصلب: استرداد دوري لأحداث in-flight العالقة
+        self._inflight_recovery_task = self._track_task(
+            self._inflight_recovery_loop(), "inflight_recovery"
+        )
         # v10.0 Precision: التقرير اليومي للإدارة
         if getattr(CFG, "DIGEST_ENABLED", True):
             self._digest_task = self._track_task(self._digest_loop(), "daily_digest")

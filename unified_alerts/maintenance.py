@@ -60,7 +60,7 @@ async def run_startup_maintenance(db: Any) -> Dict[str, Any]:
 
     يعيد ملخصاً صادقاً لما نُفذ (للسجل و /health).
     """
-    summary: Dict[str, Any] = {"purged_queue_rows": 0}
+    summary: Dict[str, Any] = {"purged_queue_rows": 0, "recovered_inflight": 0}
     try:
         purged = await purge_stale_queue_rows(db)
         summary["purged_queue_rows"] = purged
@@ -74,4 +74,59 @@ async def run_startup_maintenance(db: Any) -> Dict[str, Any]:
             )
     except Exception as e:
         logger.debug(f"startup maintenance skipped: {type(e).__name__}: {e}")
+    # ══ v12.1.0: استرداد in-flight من انهيار سابق — قبل أول pop ══
+    try:
+        recovered = await recover_inflight_events(db)
+        summary["recovered_inflight"] = recovered
+    except Exception as e:
+        logger.debug(f"inflight recovery (startup) skipped: {type(e).__name__}: {e}")
     return summary
+
+
+async def recover_inflight_events(db: Any, *, max_age_seconds: Optional[int] = None) -> int:
+    """══ v12.1.0 — قلب التزامن الصلب ═══
+
+    استرداد صفوف processing_queue العالقة في حالة in_flight — الحدث الذي
+    سُحب (claim) ثم انهارت العملية قبل ack كان يُفقد للأبد في v≤12.0.1
+    (pop=DELETE). الآن: reclaim → pending مع وسم _recovered=1 في
+    event_data ليعيد خط الأنابيب بناء التنبيه وإرساله (at-least-once) —
+    طبقات dedup اللاحقة تمنع الازدواج المرئي للمستخدم في الحالات الطبيعية.
+
+    * attempts >= QUEUE_INFLIGHT_MAX_ATTEMPTS → dead_letters بصدق
+      (لا دورة إعادة أبدية) + عداد queue_recovered_dead.
+    * تُستدعى عند الإقلاع ودورياً (كل QUEUE_RECOVER_INTERVAL_SECONDS).
+    * فشل-آمن: أي خلل DB → 0 بلا استثناءات.
+    """
+    if db is None:
+        return 0
+    stats = get_unified_stats()
+    try:
+        if max_age_seconds is None:
+            try:
+                from config import CFG
+
+                max_age_seconds = int(
+                    getattr(CFG, "QUEUE_INFLIGHT_MAX_AGE_SECONDS", 600) or 600
+                )
+            except Exception:
+                max_age_seconds = 600
+        result = await db.recover_stale_inflight(max_age_seconds=max_age_seconds)
+        recovered = int((result or {}).get("recovered", 0) or 0)
+        dead = int((result or {}).get("dead", 0) or 0)
+        if recovered:
+            stats.inc("queue_recovered", recovered)
+            logger.warning(
+                f"♻️ unified_alerts.inflight: recovered {recovered} in-flight "
+                f"event(s) (claimed > {max_age_seconds}s — previous crash/deploy window)"
+            )
+        if dead:
+            stats.inc("queue_recovered_dead", dead)
+            logger.error(
+                f"☠️ unified_alerts.inflight: {dead} in-flight event(s) exceeded "
+                f"max attempts → dead_letters (honest dead-end, no infinite loop)"
+            )
+        return recovered
+    except Exception as e:
+        stats.inc("inflight_errors")
+        logger.debug(f"recover_inflight_events failed (fail-safe): {type(e).__name__}: {e}")
+        return 0

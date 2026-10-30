@@ -116,6 +116,27 @@ def build_username_suffix(username: Any = None) -> str:
         return ""
     return f"{SENDER_DASH}@{u}"
 
+
+def build_username_suffix_linked(username: Any = None, url: Any = None) -> str:
+    """══ v12.1.0 — صيغة الصورة المرفقة من المستخدم ══
+
+    « — <a href="url">@username</a>» — الـ@username نفسه رابط HTML
+    (يظهر أزرق مثل اسم المرسل في اللقطة المرجعية: كلاهما أزرق).
+    تُستخدم في قالب Bot API (parse_mode=HTML) حصراً؛ مسار MTProto يضيف
+    الكيان بنفسه في build_alert_entity_pack.
+    بلا username صالح أو بلا url → سلسلة فارغة (المستدعي يرجع للنصي)."""
+    try:
+        u = str(username or "").strip().lstrip("@")
+        link = str(url or "").strip()
+    except Exception:
+        return ""
+    if not u or not _is_valid_username(u):
+        return ""
+    if not (link.startswith("https://") or link.startswith("http://")
+            or link.startswith("tg://")):
+        return ""
+    return f'{SENDER_DASH}<a href="{link}">@{u}</a>'
+
 # أنواع المرسل التي يُسمح لها بـ tg://user?id (لا القنوات ولا المحذوفون)
 _USER_ID_CAPABLE_TYPES = frozenset({"user", "bot", "assumed_user"})
 
@@ -488,6 +509,27 @@ def build_alert_entity_pack(
     except Exception as e:  # الكيانات ميزة — فشلها لا يكسر الإرسال
         logger.debug(f"contact_target entity pack failed: {type(e).__name__}: {e}")
         entities = []
+
+    # ══ v12.1.0 — كيان الرابط الثاني: «@username» في الذيل ══
+    # صيغة الصورة المرجعية: الاسم والـ@username كلاهما رابط (أزرق).
+    # الإزاحة: SENDER_LABEL + display + الفاصل « — » ثم @username.
+    # ميزة فقط — فشلها لا يكسر الإرسال ولا يقلل قابلية نقر الاسم.
+    try:
+        uname = getattr(target, "username", None) if target is not None else None
+        uname_url = (str(name_url_override).strip() if name_url_override else None) or (
+            target.selected_url if target is not None else None
+        )
+        _u = str(uname or "").strip().lstrip("@")
+        if _u and uname_url and _is_valid_username(_u) and MessageEntityTextUrl is not None:
+            uname_off = (
+                utf16_len(SENDER_LABEL) + utf16_len(display) + utf16_len(SENDER_DASH)
+            )
+            uname_len = utf16_len(f"@{_u}")
+            entities.append(
+                MessageEntityTextUrl(offset=uname_off, length=uname_len, url=uname_url)
+            )
+    except Exception as e:
+        logger.debug(f"contact_target username entity failed: {type(e).__name__}: {e}")
 
     suffix = ""
     if rule_tag:

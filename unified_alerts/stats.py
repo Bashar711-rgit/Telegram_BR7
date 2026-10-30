@@ -18,6 +18,8 @@ from __future__ import annotations
 import threading
 from typing import Any, Dict
 
+# ═══ v12.1.0 ═══
+
 _LOCK = threading.Lock()
 
 # العدادات الأساسية — مفاتيح ثابتة (تظهر دائماً في snapshot حتى بصفر)
@@ -38,6 +40,23 @@ _BASE: Dict[str, int] = {
     # الصيانة
     "queue_purged_startup": 0,
     "queue_purged_periodic": 0,
+    # ══ v12.1.0 التزامن الصلب (claim/ack/recover) ══
+    # أحداث استُرجعت من in-flight بعد انهيار (أعيدت للطابور ثم عولجت)
+    "queue_recovered": 0,
+    # صفوف in-flight تجاوزت محاولاتها → dead_letters (بصدق لا دورة أبدية)
+    "queue_recovered_dead": 0,
+    # تنبيهات أُعيد إرسالها فعلاً عبر مسار المسترد (كانت ستُفقد)
+    "recovered_resend": 0,
+    # أحداث مستردة وصلها إيصال تنبيه سابق (أُرسلت قبل الانهيار) — تخطٍّ صادق
+    "recovered_dupe_skip": 0,
+    # أخطاء ack/recover (فشل-آمن)
+    "inflight_errors": 0,
+    # ══ v12.1.0 سياسة الفلترة الموحدة ══
+    "filter_ok": 0,
+    "filter_too_short": 0,
+    "filter_too_long": 0,
+    "filter_invalid": 0,
+    "policy_errors": 0,
 }
 
 
@@ -77,7 +96,7 @@ def unified_snapshot() -> Dict[str, Any]:
     try:
         snap = _singleton.snapshot()
         snap["enabled"] = True
-        snap["version"] = "12.0.0"
+        snap["version"] = "12.1.0"
         return snap
     except Exception:
         out = dict(_BASE)

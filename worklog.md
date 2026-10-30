@@ -193,3 +193,51 @@ Work Log:
 Stage Summary:
 - v11.7.1 على الإنتاج بالكامل: main=0abd5ac، الخدمة live، الصحة خضراء، الشارة صادقة.
 - ملاحظة أمان للمالك: التوكنان شاركا في المحادثة — **يُنصح بتدويرهما** (GitHub: Settings → Developer settings → Fine-grained tokens؛ Render: Account Settings → API Keys) بعد قراءة هذا السجل.
+
+---
+Task ID: 18 (v12.1.0 — التزامن الصلب + محرك الفلترة الموحد + صيغة الصورة المرجعية)
+Agent: Z.ai Code (main orchestrator)
+Task: حل مشكلة التنبيهات نهائياً — لا فقدان، لا تكرار، لا تنبيه مشوّه، صيغة مطابقة للصورة المرفقة
+
+Work Log:
+- **تشخيص جذري (بأدلة)**:
+  * ثغرة فقد (1): pop_from_queue كانت SELECT ثم DELETE في نفس اللحظة — أي انهيار
+    (SIGKILL/OOM/نشر Render) بين السحب واكتمال المعالجة كان يُفقد الحدث للأبد.
+  * ثغرة فقد (2): قياسات الطول غير الموحدة — _validate_event تقيس المقصوص بينما
+    _store_message والفلتر يقيسان الخام: رسالة خامها 80 ومقصوصها 40 كانت تعبر
+    التحقق ثم تُقتل "no_content"/"too_long" → طلب صالح بلا تنبيه أبداً.
+  * صيغة البطاقة: اللقطة المرجعية من المستخدم تُظهر الاسم و@username كلاهما
+    رابطاً أزرق — الكود كان يربط الاسم فقط ويترك @username نصاً عادياً.
+- **التزامن الصلب (claim/ack/recover — at-least-once)**:
+  * processing_queue يكسب status/claimed_at/attempts (ترحيل إضافي idempotent
+    للـSQLite عبر _migrate_queue_inflight وPG عبر ADD COLUMN IF NOT EXISTS +
+    migrations/0003_queue_inflight.sql — طُبّق فعلياً على Supabase الحية).
+  * pop_from_queue أصبح claim بلا حذف + حقن _queue_id؛ ack_queue_event يحذف
+    بعد اكتمال المعالجة (main.py worker)؛ recover_stale_inflight يسترد العالق
+    (claimed_at > QUEUE_INFLIGHT_MAX_AGE_SECONDS=600s) بوسم _recovered=1 أو
+    يودعه dead_letters بصدق بعد QUEUE_INFLIGHT_MAX_ATTEMPTS=3 محاولات.
+  * حلقة استرداد دورية _inflight_recovery_loop (كل 120s) + استرداد إقلاعي عبر
+    run_startup_maintenance.
+  * مسار المسترد في _process_event_pipeline: رسالة مخزنة + إيصال تنبيه
+    (alert_exists على جدول alerts) → تخطٍّ صادق؛ بلا إيصال → إعادة إرسال
+    (فك حجز dedup المحاولة المنهارة أولاً في _send_alert) — at-least-once
+    موثق مقابل فقدان كلي، وطبقات dedup اللاحقة تحكم الحالات الطبيعية.
+- **محرك الفلترة الموحد**: unified_alerts/filter_policy.py — مصدر حقيقة واحد
+  (strip + صفر-العرض + 6..65 شاملاً الحدين، CFG حي) يُستخدم من _validate_event
+  و_store_message وfilter_engine.analyze — الثغرتان مغلقتان من جذورهما،
+  والفشل-آمن يحفظ السلوك السابق عند أي خلل.
+- **صيغة الصورة المرجعية (v12.1.0)**: build_username_suffix_linked في
+  contact_target — «المرسل: {الاسم رابط} — {@username رابط}» في قالب Bot API،
+  وكيان MessageEntityTextUrl ثانٍ في مسار MTProto (build_alert_entity_pack)
+  بنفس الإزاحة المحسوبة. الأزرار [عرض الرسالة][مراسلة] كما هي (مطابقة).
+- **العدادات الصادقة**: unified_stats تكسب filter_ok/too_short/too_long/invalid,
+  queue_recovered/recovered_dead, recovered_resend/recovered_dupe_skip,
+  inflight_errors, policy_errors — تظهر في /health/full (مفاتيح ثابتة).
+- **الإصدار**: BOT_VERSION 12.1.0.
+- **الاختبارات**: 27 اختباراً جديداً (tests/test_unified_v12_1.py) تغطي السياسة
+  الموحدة وclaim/ack/recover والإيصال وصيغة البطاقة وثغرة الطول؛ تحديث توقعات
+  القوالب الذهبية لصيغة الصيغة المرجعية الجديدة (GOLDEN S1/S4، acceptance_1،
+  case1، send_username_method، nav_resolver frozen-builder)؛ توحيد عقد الفلتر
+  مع المواصفة (نصوص < 6 خارج ظرف المحرك). الملفات الحرجة: 195 passed.
+- **قاعدة البيانات الفعلية (Supabase)**: فحص حي — 30 جدولاً، 321 تنبيهاً،
+  32,535 رسالة؛ ترحيل 0003 طُبّق فعلياً (status/claimed_at/attempts + فهارس).

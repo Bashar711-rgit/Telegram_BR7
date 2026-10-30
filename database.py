@@ -520,6 +520,7 @@ class EnhancedDatabase:
             await self._migrate_sender_account_hashes()  # v10.4
             await self._migrate_sender_access()  # v10.7
             await self._migrate_intel_entities()  # v11.1 normalized intel entities
+            await self._migrate_queue_inflight()  # v12.1.0 التزامن الصلب claim/ack/recover
             await self._create_indexes()
             self.is_connected = True
             await self.start_writer()
@@ -814,6 +815,9 @@ class EnhancedDatabase:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 event_data TEXT NOT NULL,
                 priority INTEGER DEFAULT 5,
+                status TEXT DEFAULT 'pending',
+                claimed_at REAL,
+                attempts INTEGER DEFAULT 0,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             );
             CREATE TABLE IF NOT EXISTS dead_letters (
@@ -1432,48 +1436,168 @@ class EnhancedDatabase:
             self._queue_mirror_dirty = True
             return -1
 
-    async def pop_from_queue(self) -> Optional[dict]:
+    # ══ v12.1.0 التزامن الصلب (claim/ack/recover) ══
+    # أعمدة processing_queue الجديدة — إضافة فقط بلا إعادة تسمية ولا حذف
+    # (نفس ضمانات _migrate_sender_intel: لا فقدان بيانات، idempotent).
+    _QUEUE_INFLIGHT_COLUMNS = [
+        ("status", "TEXT NOT NULL DEFAULT 'pending'"),
+        ("claimed_at", "DOUBLE PRECISION"),
+        ("attempts", "INTEGER DEFAULT 0"),
+    ]
+
+    async def _migrate_queue_inflight(self) -> None:
+        """v12.1.0: processing_queue يكسب status/claimed_at/attempts.
+
+        التزامن الصلب: pop لم يعد يحذف — يميّز الصف in_flight ويحذفه فقط
+        بعد اكتمال المعالجة (ack). الانهيار بين السحب والاكتمال كان يُفقد
+        الحدث للأبد (pop=DELETE سابقاً) — الآن استرداد دوري/إقلاعي يعيده.
+        PostgreSQL: ADD COLUMN IF NOT EXISTS؛ SQLite: pragma-check لكل عمود.
+        """
+        table = "processing_queue"
+        existing: set = set()
+        if self.db_type == "postgresql":
+            rows = await self._fetchall(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name = ?",
+                (table,),
+            )
+            existing = {r["column_name"] for r in rows}
+        else:
+            rows = await self._fetchall(f"PRAGMA table_info({table})", ())
+            existing = {r["name"] for r in rows}
+        added = 0
+        for name, decl in self._QUEUE_INFLIGHT_COLUMNS:
+            if name in existing:
+                continue
+            try:
+                if self.db_type == "postgresql":
+                    await self._execute(
+                        f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {name} {decl}"
+                    )
+                else:
+                    sqlite_decl = decl.replace("DOUBLE PRECISION", "REAL")
+                    await self._execute(f"ALTER TABLE {table} ADD COLUMN {name} {sqlite_decl}")
+                added += 1
+            except Exception as e:
+                logger.warning(
+                    f"queue-inflight migration: {table}.{name} skipped: "
+                    f"{type(e).__name__}: {str(e)[:120]}"
+                )
+        await self._commit()
+        if added:
+            logger.info(
+                f"Database migration v12.1.0: processing_queue inflight (+{added} columns)"
+            )
+
+    @staticmethod
+    def _claim_payload(event_id: Any, raw: Any) -> dict:
+        """يفك JSON ويحقن _queue_id للحماة اللاحقة (ack) — فشل-آمن."""
         try:
+            if isinstance(raw, (str, bytes)):
+                data = json_loads(raw)
+            elif isinstance(raw, dict):
+                data = dict(raw)
+            else:
+                data = {}
+        except Exception:
+            data = {}
+        try:
+            if isinstance(data, dict):
+                data.setdefault("_queue_id", int(event_id))
+        except Exception:
+            pass
+        return data if isinstance(data, dict) else {}
+
+    async def pop_from_queue(self) -> Optional[dict]:
+        """══ v12.1.0 — claim بلا حذف (التزامن الصلب) ═══
+
+        الاسم التاريخي محفوظ للتوافق (main.py producer) — الدلالة الجديدة:
+          1. اختيار أقدم صف pending (أو بلا حالة — صفوف ما قبل الترحيل).
+          2. تمييزه in_flight مع claimed_at=الآن وattempts=attempts+1.
+          3. حقن _queue_id في event_data ليعرف العامل ماذا يُسجّل (ack).
+
+        الحذف لم يعد هنا — نقل إلى ack_queue_event بعد اكتمال المعالجة.
+        أي انهيار (SIGKILL/OOM/نشر) بين السحب والاكتمال يترك الصف in_flight
+        ويُسترد تلقائياً عبر recover_stale_inflight بدل فقدانه للأبد.
+        """
+        try:
+            now_ts = time.time()
             if self.db_type == "sqlite":
-                # v9.12 (audit C-01 + M-01): pop no longer takes _hash_lock.
-                # The queue is serialised by _queue_lock (cap enforcement)
-                # and the underlying aiosqlite connection is single-threaded
-                # anyway. Removing the cross-purpose _hash_lock contention
-                # lets message dedup (is_duplicate) proceed in parallel with
-                # queue pops.
                 async with self._queue_lock:
                     cursor = await self._sqlite_conn.execute(
                         "SELECT id, event_data FROM processing_queue "
+                        "WHERE status IS NULL OR status != 'in_flight' "
                         "ORDER BY priority DESC, created_at ASC LIMIT 1"
                     )
                     row = await cursor.fetchone()
                     if not row:
                         return None
                     await self._sqlite_conn.execute(
-                        "DELETE FROM processing_queue WHERE id = ?", (row[0],)
+                        "UPDATE processing_queue SET status = 'in_flight', "
+                        "claimed_at = ?, attempts = attempts + 1 WHERE id = ?",
+                        (now_ts, row[0]),
                     )
                     await self._sqlite_conn.commit()
-                    self._queue_size_mirror = max(0, self._queue_size_mirror - 1)
-                return json_loads(row[1])
+                return self._claim_payload(row[0], row[1])
             else:
                 async with self._pool.acquire() as conn:
                     async with conn.transaction():
                         row = await conn.fetchrow(
                             "SELECT id, event_data FROM processing_queue "
+                            "WHERE (status IS NULL OR status <> 'in_flight') "
                             "ORDER BY priority DESC, created_at ASC "
                             "LIMIT 1 FOR UPDATE SKIP LOCKED"
                         )
                         if not row:
                             return None
                         await conn.execute(
-                            "DELETE FROM processing_queue WHERE id = $1", row["id"]
+                            "UPDATE processing_queue SET status = 'in_flight', "
+                            "claimed_at = $1, attempts = attempts + 1 WHERE id = $2",
+                            now_ts, row["id"],
                         )
-                        self._queue_size_mirror = max(0, self._queue_size_mirror - 1)
-                        return json_loads(row["event_data"])
+                return self._claim_payload(row["id"], row["event_data"])
         except Exception as e:
             logger.error(f"pop_from_queue failed: {e}")
             self._queue_mirror_dirty = True
             return None
+
+    async def ack_queue_event(self, event_id: Any) -> bool:
+        """══ v12.1.0 — الحماة (ack): حذف الصف بعد اكتمال معالجته ══
+
+        يُستدعى من main.py worker بعد عودة process_event_from_queue
+        (سواء اكتملت بنجاح أو حُوّلت لـDLQ — المسؤولية انتقلت إما للـDLQ
+        أو أُنجزت). أي مسار آخر يسجّل حماته بنفسه (إعادة إدراج = صف جديد).
+        فشل-آمن: خطأ DB → False + عدّاد، الحدث يبقى in_flight ويُسترد لاحقاً.
+        """
+        try:
+            eid = int(event_id)
+        except Exception:
+            return False
+        try:
+            if self.db_type == "sqlite":
+                async with self._queue_lock:
+                    cursor = await self._sqlite_conn.execute(
+                        "DELETE FROM processing_queue WHERE id = ?", (eid,)
+                    )
+                    deleted = cursor.rowcount or 0
+                    await self._sqlite_conn.commit()
+                    if deleted:
+                        self._queue_size_mirror = max(0, self._queue_size_mirror - 1)
+                return bool(deleted)
+            else:
+                async with self._pool.acquire() as conn:
+                    row = await conn.fetchrow(
+                        "DELETE FROM processing_queue WHERE id = $1 RETURNING id", eid
+                    )
+                if row:
+                    self._queue_size_mirror = max(0, self._queue_size_mirror - 1)
+                return bool(row)
+        except Exception as e:
+            from unified_alerts.stats import get_unified_stats as _gus
+            _gus().inc("inflight_errors")
+            logger.debug(f"ack_queue_event({event_id}) failed: {type(e).__name__}: {e}")
+            self._queue_mirror_dirty = True
+            return False
 
     async def queue_size(self) -> int:
         # v9.12 (audit C-01): prefer the in-memory mirror (O(1)) over a
@@ -1488,6 +1612,110 @@ class EnhancedDatabase:
             return int(row["cnt"]) if row else 0
         except Exception:
             return 0
+
+    async def recover_stale_inflight(self, max_age_seconds: int = 600) -> Dict[str, int]:
+        """══ v12.1.0 — قلب الاسترداد: reclaim العالق أو dead-letter بصدق ══
+
+        صفوف in_flight التي مضى على claimed_at أكثر من max_age_seconds =
+        عامل سحبها انهار قبل ack (SIGKILL/OOM/نشر) — الحدث كان يُفقد للأبد.
+        الآن:
+          * attempts >= QUEUE_INFLIGHT_MAX_ATTEMPTS (افتراضي 3):
+            INSERT dead_letters (بصدق — لا دورة إعادة أبدية) + حذف الصف.
+          * غير ذلك: status → pending + حقن _recovered=1 في event_data
+            ليعيد خط الأنابيب بناء التنبيه وإرساله عند إعادة السحب.
+        يعيد {"recovered": n, "dead": m} — فشل-آمن ({0,0} بلا استثناء).
+        """
+        stats_out = {"recovered": 0, "dead": 0}
+        try:
+            try:
+                max_attempts = max(1, int(
+                    getattr(CFG, "QUEUE_INFLIGHT_MAX_ATTEMPTS", 3) or 3
+                ))
+            except Exception:
+                max_attempts = 3
+            cutoff = time.time() - max(5, int(max_age_seconds))
+            rows = await self._fetchall(
+                "SELECT id, event_data, attempts FROM processing_queue "
+                "WHERE status = 'in_flight' AND claimed_at IS NOT NULL "
+                "AND claimed_at < ?",
+                (cutoff,),
+            )
+            if not rows:
+                return stats_out
+            for r in rows:
+                rid = r.get("id")
+                attempts = int(r.get("attempts") or 0)
+                raw = r.get("event_data")
+                try:
+                    if attempts >= max_attempts:
+                        # Dead-letter صادق — منع دورة إعادة أبدية
+                        err = (
+                            f"inflight_expired: no ack within {max_age_seconds}s "
+                            f"(attempts={attempts})"
+                        )
+                        await self._execute(
+                            "INSERT INTO dead_letters (event_data, error_text, retry_count) "
+                            "VALUES (?, ?, ?)",
+                            (raw if isinstance(raw, (str, bytes)) else json_dumps(raw or {}), err, attempts),
+                        )
+                        await self._execute(
+                            "DELETE FROM processing_queue WHERE id = ? AND status = 'in_flight'",
+                            (rid,),
+                        )
+                        stats_out["dead"] += 1
+                        self._queue_size_mirror = max(0, self._queue_size_mirror - 1)
+                    else:
+                        try:
+                            if isinstance(raw, (str, bytes)):
+                                data = json_loads(raw)
+                            elif isinstance(raw, dict):
+                                data = dict(raw)
+                            else:
+                                data = {}
+                        except Exception:
+                            data = {}
+                        if isinstance(data, dict):
+                            data["_recovered"] = 1
+                            payload = json_dumps(data)
+                        else:
+                            payload = raw if isinstance(raw, (str, bytes)) else "{}"
+                        await self._execute(
+                            "UPDATE processing_queue SET status = 'pending', "
+                            "claimed_at = NULL, event_data = ? "
+                            "WHERE id = ? AND status = 'in_flight'",
+                            (payload, rid),
+                        )
+                        stats_out["recovered"] += 1
+                except Exception as row_err:
+                    from unified_alerts.stats import get_unified_stats as _gus
+                    _gus().inc("inflight_errors")
+                    logger.debug(
+                        f"recover_stale_inflight row {rid} skipped: "
+                        f"{type(row_err).__name__}: {row_err}"
+                    )
+            await self._commit()
+        except Exception as e:
+            from unified_alerts.stats import get_unified_stats as _gus
+            _gus().inc("inflight_errors")
+            logger.debug(f"recover_stale_inflight failed (fail-safe): {type(e).__name__}: {e}")
+        return stats_out
+
+    async def alert_exists(self, msg_hash: str) -> bool:
+        """v12.1.0: هل وصل إيصال تنبيه لهذا msg_hash؟ (جدول alerts)
+
+        يستخدمه مسار الاسترداد: حدث مسترد رسالته مخزنة من المحاولة
+        المنهارة + لها إيصال = أُرسلت فعلاً → تخطٍّ صادق (لا ازدواج)؛
+        بلا إيصال = انهار بين الحجز والإرسال → أعد الإرسال (لا فقدان).
+        فشل-آمن: أي خلل → False (مسار إعادة الإرسال، dedup اللاحق يحكم).
+        """
+        try:
+            row = await self._fetchone(
+                "SELECT 1 AS one FROM alerts WHERE message_hash = ? LIMIT 1",
+                (str(msg_hash or ""),),
+            )
+            return row is not None
+        except Exception:
+            return False
 
     async def purge_queue(self) -> int:
         try:

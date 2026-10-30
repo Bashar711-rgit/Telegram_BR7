@@ -41,16 +41,22 @@ from unified_alerts.card import (
     CardReport,
     validate_and_repair_card,
 )
+from unified_alerts.filter_policy import (
+    FilterPolicy,
+    FilterVerdict,
+    normalize_for_measure,
+)
 from unified_alerts.stats import (
     get_unified_stats,
     unified_snapshot,
 )
 from unified_alerts.maintenance import (
     purge_stale_queue_rows,
+    recover_inflight_events,
     run_startup_maintenance,
 )
 
-__version__ = "12.0.0"
+__version__ = "12.1.0"
 
 __all__ = [
     "GateDecision",
@@ -58,9 +64,13 @@ __all__ = [
     "get_alert_gate",
     "CardReport",
     "validate_and_repair_card",
+    "FilterPolicy",
+    "FilterVerdict",
+    "normalize_for_measure",
     "get_unified_stats",
     "unified_snapshot",
     "purge_stale_queue_rows",
+    "recover_inflight_events",
     "run_startup_maintenance",
     "__version__",
 ]

@@ -105,6 +105,7 @@ from contact_target import (  # noqa: E402
     SENDER_LABEL,
     build_alert_entity_pack,
     build_username_suffix,
+    build_username_suffix_linked,
     metric_inc as _contact_metric,
     resolve_contact_target as _resolve_contact_target,
     utf16_len,
@@ -550,6 +551,17 @@ def build_alert_html(
         sender_html = InputSanitizer.escape_html(display)
         contact_method = "text_only"
     uname_suffix_html = build_username_suffix(target.username)
+    # ══ v12.1.0 — صيغة الصورة المرجعية من المستخدم ══
+    # «المرسل: {الاسم رابط} — {@username رابط}» — كلاهما أزرق (اللقطة
+    # المرجعية: N+ أزرق و @l8i18l أزرق). الرابط نفسه username_url المختار
+    # من ContactTarget — بلا رابط صالح يبقى الذيل النصي العادي (لا
+    # اختلاق روابط — عقد v11.6 §3.6 كما هو).
+    try:
+        _linked_suffix = build_username_suffix_linked(target.username, target.username_url)
+        if _linked_suffix:
+            uname_suffix_html = _linked_suffix
+    except Exception:
+        pass  # فشل-آمن: الذيل النصي العادي كما هو
 
     # ── سطر «🏷 قاعدة» (ميزة محرك القواعد) — عند وجوده فقط ──
     rule_tag = (analysis or {}).get("rule_tag") if isinstance(analysis, dict) else None

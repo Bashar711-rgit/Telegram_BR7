@@ -2334,7 +2334,37 @@ class EnhancedAccountMonitor:
                 pass
         if not await self._validate_event(data): return
         msg_hash, validated_text, is_new = await self._store_message(data)
-        if not is_new: await self._inc_stat("duplicates"); return
+        if not is_new:
+            # ══ v12.1.0 — مسار المسترد: القرار بالإيصال لا بالذاكرة ══
+            # حدث مسترد من in_flight (انهار العامل قبل إتمام الإرسال):
+            # الرسالة مخزنة من المحاولة المنهارة (is_new=False) — إن وصلها
+            # إيصال تنبيه فأُرسلت فعلاً → تخطٍّ صادق؛ بلا إيصال → أكمل
+            # التحليل والإرسال (كانت ستُفقد للأبد). الحدث العادي غير
+            # المسترد يبقى مكرراً كما كان.
+            if data.get("_recovered"):
+                try:
+                    _receipt = await self.db.alert_exists(msg_hash)
+                except Exception:
+                    _receipt = False
+                if _receipt:
+                    from unified_alerts.stats import get_unified_stats as _gus
+                    _gus().inc("recovered_dupe_skip")
+                    logger.info(
+                        f"♻️ recovered event has alert receipt — skip "
+                        f"[chat={data.get('chat_id')} msg={data.get('message_id')}] "
+                        f"(unified_alerts inflight)"
+                    )
+                    return
+                logger.warning(
+                    f"♻️ recovered event WITHOUT alert receipt — re-sending "
+                    f"[chat={data.get('chat_id')} msg={data.get('message_id')}] "
+                    f"(unified_alerts inflight: previous attempt crashed before send)"
+                )
+                if validated_text is None:
+                    validated_text = self._recover_captured_text(data)
+                await self._analyze_and_alert(data, msg_hash, validated_text)
+                return
+            await self._inc_stat("duplicates"); return
         # v9.8 fast-capture fallback: recover the text from the buffer if
         # the pipeline's own copy is empty (deleted-message edge cases).
         if validated_text is None:
@@ -2377,34 +2407,53 @@ class EnhancedAccountMonitor:
             await self._inc_stat("echo_skipped")
             return False
         if text:
-            # v12.0: توحيد دلالة الطول مع InputSanitizer.validate_message_text —
-            # العد على النص بعد strip (كان سابقاً على النص الخام، فمرّر نصاً
-            # مكوَّناً من فراغات/محارف صفرية العرض ثم انكسر لاحقاً عند
-            # validate_message_text → "تنبيه بنص فارغ"). الحدود شاملة:
-            # MIN_MESSAGE_LENGTH <= الطول <= MAX_MESSAGE_LENGTH (6..65).
-            _stripped = str(text).strip()
+            # ══ v12.1.0: السياسة الموحدة (FilterPolicy) — نفس القياس في كل
+            # الطبقات: strip + إزالة صفر-العرض + 6..65 شاملاً الحدين (CFG حي).
+            # كانت الفحوص سابقاً بثلاثة قياسات مختلفة (خام/مقصوص) فتُفقد
+            # رسائل صالحة بين الطبقات (خام 80/مقصوص 40 مثلاً).
             try:
-                _cfg_min_len = int(getattr(CFG, "MIN_MESSAGE_LENGTH", 6) or 6)
+                from unified_alerts.filter_policy import FilterPolicy as _FP
+                if not _FP.quick_ok(text):
+                    # v11.8.2 (F-22): عداد مخصص لرفض الطول بدل errors العام —
+                    # رفض الطول ترشيح طبيعي وليس خطأ تشغيلاً.
+                    await self._inc_stat("length_rejected"); return False
             except Exception:
-                _cfg_min_len = 6
-            try:
-                _cfg_max_len = int(getattr(CFG, "MAX_MESSAGE_LENGTH", 65) or 65)
-            except Exception:
-                _cfg_max_len = 65
-            if not (_cfg_min_len <= len(_stripped) <= _cfg_max_len):
-                # v11.8.2 (F-22): عداد مخصص لرفض الطول بدل errors العام —
-                # رفض الطول ترشيح طبيعي وليس خطأ تشغيلاً.
-                await self._inc_stat("length_rejected"); return False
+                # فشل-آمن: خلل السياسة → السلوك السابق (v11.5.2) حرفياً
+                _stripped = str(text).strip()
+                try:
+                    _cfg_min_len = int(getattr(CFG, "MIN_MESSAGE_LENGTH", 6) or 6)
+                except Exception:
+                    _cfg_min_len = 6
+                try:
+                    _cfg_max_len = int(getattr(CFG, "MAX_MESSAGE_LENGTH", 65) or 65)
+                except Exception:
+                    _cfg_max_len = 65
+                if not (_cfg_min_len <= len(_stripped) <= _cfg_max_len):
+                    await self._inc_stat("length_rejected"); return False
         return True
 
 
     async def _store_message(self, data: Dict[str, Any]) -> Tuple[str, Optional[str], bool]:
         text = data.get("text", ""); chat_id = data.get("chat_id", 0); message_id = data.get("message_id", 0)
         media_type = data.get("media_type", "media"); timestamp = data.get("timestamp", time.time())
-        validated_text = text if (text and CFG.MIN_MESSAGE_LENGTH <= len(text) <= CFG.MAX_MESSAGE_LENGTH) else None
+        # ══ v12.1.0 — إصلاح ثغرة فقد حقيقية ══
+        # كانت القياس هنا على النص الخام (بدون strip) بينما _validate_event
+        # تقيس المقصوص — رسالة خامها 80 ومقصوصها 40 كانت تعبر التحقق ثم
+        # تُقتل هنا (validated_text=None → "no_content") فلا تنبيه أبداً.
+        # الآن القياس الموحد FilterPolicy (strip + شامل الحدين 6..65) والنص
+        # المعتمد للتحليل/التنبيه هو المقصوص — نفس سياسة كل الطبقات.
+        try:
+            from unified_alerts.filter_policy import FilterPolicy as _FP
+            _v = _FP.check(text)
+            validated_text = _v.stripped_text if _v.ok else None
+        except Exception:
+            validated_text = None
         norm = (text or "").lower().strip(); msg_hash = fast_hash(f"{chat_id}_{message_id}_{norm}")
         async with self._processed_lock:
-            if msg_hash in self._processed_hashes: return msg_hash, validated_text, False
+            if msg_hash in self._processed_hashes:
+                # v12.1.0: حدث مسترد رسالته مسبوقة — القرار لاحقاً بالإيصال
+                # (alert_exists) لا بالذاكرة؛ المهمة تعود من _process_event_pipeline
+                return msg_hash, validated_text, False
             self._processed_hashes[msg_hash] = True
         rec = MessageRecord(message_hash=msg_hash, chat_id=chat_id, sender_id=data.get("sender_id", 0),
             message_text=validated_text or f"[{media_type}]", timestamp=timestamp)
@@ -2582,6 +2631,13 @@ class EnhancedAccountMonitor:
         try: await self.db.update_sender_reputation(sender_id, is_valid)
         except Exception as e: logger.warning(f"update_sender_reputation failed [{self.account['name']}]: {e}")
         if is_valid and await self.db.can_send_alert(sender_id):
+            # ══ v12.1.0: عداد صادق — هذا التنبيه كان سيُفقد لولا الاسترداد ══
+            if data.get("_recovered"):
+                try:
+                    from unified_alerts.stats import get_unified_stats as _gus
+                    _gus().inc("recovered_resend")
+                except Exception:
+                    pass
             await self._send_alert(data, keyword=analysis.get("keyword") or "طلب", text=validated_text or "",
                                    msg_hash=msg_hash, analysis=analysis)
             await self._inc_stat("alerts_sent")
@@ -3103,6 +3159,17 @@ class EnhancedAccountMonitor:
         # نفس المرسل بنفس النص عبر أي حساب من الحسابات الستة = تنبيه واحد فقط.
         # الحجز آتومي (ذاكرة + DB) — وعند فشل الإرسال يُفك لإعادة المحاولة.
         dedup_fp = content_fingerprint(sender_id, text)
+        # ══ v12.1.0: الحدث المسترد — فك حجز المحاولة المنهارة أولاً ══
+        # الانهيار وقع بعد الحجز وقبل الإرسال (بلا إيصال — البوابة أعلاه
+        # تحققت): الحجز القديم كان سيمنع إرسال التنبيه للأبد. الفك هنا
+        # آمن: لا إيصال = لم يصل التنبيه للمستخدم من هذه المحاولة.
+        # (نافذة ازدواج ميليمترية نظرياً: إرسال نجح + انهار قبل الإيصال —
+        # مقبولة بصدق مقابل فقدان التنبيه كلياً؛ at-least-once.)
+        if data.get("_recovered"):
+            try:
+                await get_deduplicator().release(dedup_fp)
+            except Exception:
+                pass
         if not await get_deduplicator().check_and_claim(dedup_fp):
             await self._inc_stat("duplicates")
             logger.info(

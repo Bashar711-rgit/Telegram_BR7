@@ -1645,16 +1645,30 @@ class EnhancedFilter:
         try:
             if not isinstance(text, str):
                 return self._result("ignore", 0.0, ["invalid_input"], original_text=original_text)
-            if len(text) > CFG.MAX_MESSAGE_LENGTH:
-                return self._result("ignore", 0.0, ["too_long"], original_text=original_text)
-
-            # v14.4: analyzer-local 3-char floor — the ops-level
-            # MIN_MESSAGE_LENGTH (10) silently killed short high-signal
-            # requests ("ابي حل", "فزعه"); anything that short and junky is
-            # handled by the ignore/spam tries below anyway.
-            validated = text.strip()
-            if len(validated) < self.FILTER_MIN_MESSAGE_CHARS:
-                return self._result("ignore", 0.0, ["too_short"], original_text=original_text)
+            # ══ v12.1.0: السياسة الموحدة — قياس واحد لكل الطبقات ══
+            # كانت الفحوص هنا على النص الخام (len(text) > MAX قبل strip)
+            # فتُرفض رسالة خامها 80 ومقصوصها 40 "too_long" بعد أن عبرت
+            # _validate_event المقيسة على المقصوص — فقد صامت لطلب صالح.
+            # الآن: FilterPolicy (strip + صفر-العرض + 6..65 شاملاً الحدين،
+            # CFG حي) — نفس القرار من أي طبقة. فشل-آمن: خلل السياسة →
+            # السلوك السابق حرفياً.
+            try:
+                from unified_alerts.filter_policy import FilterPolicy as _FP
+                _v = _FP.check(text)
+                if not _v.ok:
+                    return self._result(
+                        "ignore", 0.0, [_v.reason], original_text=original_text)
+                validated = _v.stripped_text
+            except Exception:
+                if len(text) > CFG.MAX_MESSAGE_LENGTH:
+                    return self._result("ignore", 0.0, ["too_long"], original_text=original_text)
+                # v14.4: analyzer-local 3-char floor — the ops-level
+                # MIN_MESSAGE_LENGTH (10) silently killed short high-signal
+                # requests ("ابي حل", "فزعه"); anything that short and junky is
+                # handled by the ignore/spam tries below anyway.
+                validated = text.strip()
+                if len(validated) < self.FILTER_MIN_MESSAGE_CHARS:
+                    return self._result("ignore", 0.0, ["too_short"], original_text=original_text)
 
             cleaned, original = self._clean(validated)
             cache_key = hashlib.blake2b(cleaned.encode(), digest_size=16).hexdigest()[:32]

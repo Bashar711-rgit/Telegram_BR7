@@ -411,6 +411,13 @@ class _ConfigData:
     # v12.0 unified_alerts: حذف صفوف processing_queue الأقدم من هذا العمر
     # عند الإقلاع ودورياً — الطابور مخزن تشغيلي عابر (ليس بيانات مستخدم).
     QUEUE_STALE_PURGE_SECONDS: int
+    # ══ v12.1.0 التزامن الصلب (claim/ack/recover) ══
+    # صف in_flight بلا ack أطول من هذا = العامل انهار → استرداد تلقائي
+    QUEUE_INFLIGHT_MAX_AGE_SECONDS: int
+    # أقصى محاولات لحدث واحد قبل dead_letters بصدق (لا دورة أبدية)
+    QUEUE_INFLIGHT_MAX_ATTEMPTS: int
+    # دورية فحص الاسترداد
+    QUEUE_RECOVER_INTERVAL_SECONDS: int
     # v11.5: الرد التعويضي F (مواصفة §11)
     REPLY_FIX_ENABLED: bool
     REPLY_FIX_HOURLY_PER_USER: int
@@ -767,6 +774,10 @@ class Config:
             MAX_EVENT_AGE_SECONDS=SecretManager.get_int("MAX_EVENT_AGE_SECONDS", 1800, required=False),
             ALERT_CARD_MAX_CHARS=SecretManager.get_int("ALERT_CARD_MAX_CHARS", 4000, required=False),
             QUEUE_STALE_PURGE_SECONDS=SecretManager.get_int("QUEUE_STALE_PURGE_SECONDS", 7200, required=False),
+            # v12.1.0 التزامن الصلب
+            QUEUE_INFLIGHT_MAX_AGE_SECONDS=SecretManager.get_int("QUEUE_INFLIGHT_MAX_AGE_SECONDS", 600, required=False),
+            QUEUE_INFLIGHT_MAX_ATTEMPTS=SecretManager.get_int("QUEUE_INFLIGHT_MAX_ATTEMPTS", 3, required=False),
+            QUEUE_RECOVER_INTERVAL_SECONDS=SecretManager.get_int("QUEUE_RECOVER_INTERVAL_SECONDS", 120, required=False),
             LANGUAGE_FILTER=SecretManager.get_bool("LANGUAGE_FILTER", True),
             MIN_ARABIC_CONFIDENCE=SecretManager.get_float("MIN_ARABIC_CONFIDENCE", 0.7, required=False),
             BLOOM_FILTER_SIZE=SecretManager.get_int("BLOOM_FILTER_SIZE", 50000, required=False),
@@ -1003,7 +1014,7 @@ class Config:
 # =============================================================================
 # Bot version — single source of truth (v10.2 Send Rotation)
 # =============================================================================
-BOT_VERSION: Final = "11.8.2"
+BOT_VERSION: Final = "12.1.0"
 BOT_CODENAME: Final = "Sender Intelligence"
 
 # =============================================================================

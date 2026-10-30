@@ -94,9 +94,9 @@ class TestBuildAlertHtml:
             group_link="https://t.me/sultanu1999",
         )
         assert built["contact_method"] == "username"
-        # القالب الحرفي: الاسم وحده رابط + « — @username» نص مستقل بجانبه
+        # v12.1.0 صيغة الصورة المرجعية: الاسم رابط + « — @username» رابط أيضاً
         assert built["text"].startswith(
-            'المرسل: <a href="https://t.me/Lara507">هناء العنزي</a> — @Lara507\n\n'
+            'المرسل: <a href="https://t.me/Lara507">هناء العنزي</a> — <a href="https://t.me/Lara507">@Lara507</a>\n\n'
         )
         assert "\n\nنص الرسالة:\n\n" in built["text"]
         # v11.6: بلا رموز 👤/💬 وبلا blockquote/اقتباس

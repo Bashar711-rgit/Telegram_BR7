@@ -167,6 +167,16 @@ async def test_keywords_contract_no_regression(f: EnhancedFilter):
         for item in kw["test_cases"].get(group, []):
             if len(item["text"]) > 65:
                 allowed_fail.add(item["text"])
+    # v12.1.0 توحيد السياسة: المواصفة الصريحة 6..65 شاملاً الحدين — الحالات
+    # الأقصر من 6 خارج ظرف الفلتر (خط الإنتاج الحي يرفضها في _validate_event
+    # قبل وصولها للمحرك منذ v11.5.2)؛ توقعاتها القديمة (review) وثّقت أرضية
+    # المحرك المباشرة القديمة (3) التي أُوحّدت الآن مع المواصفة.
+    from unified_alerts.filter_policy import FilterPolicy as _FP
+    _spec_min = _FP.limits()[0]
+    for group in ("positive", "negative", "borderline"):
+        for item in kw["test_cases"].get(group, []):
+            if len(item["text"]) < _spec_min:
+                allowed_fail.add(item["text"])
     f14_review_override = set()
     for item in kw["test_cases"].get("borderline", []):
         if "تقرير ثاني محتاج مساعدة" in item["text"]:

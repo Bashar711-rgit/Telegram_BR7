@@ -423,7 +423,8 @@ class TestFrozenBuilderIntegration:
         # القالب الموحد v11.6: الاسم ← (فارغ) ← «نص الرسالة:» ← النص كاملاً بلا إطار
         assert '\n\nنص الرسالة:\n\nنص التنبيه' in alert
         assert '<blockquote>' not in alert and '💬' not in alert and '👤' not in alert
-        assert "— @ahmed_99" in alert  # الـusername نص مستقل بجانب الاسم
+        # v12.1.0 صيغة الصورة المرجعية: الاسم و@username كلاهما رابط
+        assert '— <a href="https://t.me/ahmed_99">@ahmed_99</a>' in alert
         assert "رابط الرسالة" not in alert  # الروابط في الأزرار الآن
         # v11.6: نفس اللوحة لكل المسارات — [ عرض الرسالة ][ مراسلة ]
         assert buttons == [[

@@ -47,11 +47,18 @@ _EXPECTED_OVERRIDES = {
 def _kw_cases():
     with open(KW_FILE, encoding="utf-8") as f:
         kw = json.load(f)
+    # v12.1.0 توحيد السياسة 6..65 شاملاً الحدين: الحالات الأقصر من 6 خارج
+    # ظرف الفلتر (خط الإنتاج الحي يرفضها في _validate_event قبل المحرك)
+    # — تُستبعد من مفاضلة القرار وتوثق في اختبار العقد كحالات مسموحة.
+    from unified_alerts.filter_policy import FilterPolicy as _FP
+    _spec_min = _FP.limits()[0]
     cases = []
     for group in ("positive", "negative", "borderline"):
         for i, case in enumerate(kw.get("test_cases", {}).get(group, [])):
             cid = f"{group}-{i}"
             text = _SPEC_SAMPLE_OVERRIDES.get(cid, case["text"])
+            if len(text) < _spec_min:
+                continue
             expected = _EXPECTED_OVERRIDES.get(cid, case["expected"])
             cases.append((cid, text, expected))
     return cases
@@ -128,9 +135,14 @@ class TestShortMessages:
         r = await flt.analyze("ابي حل")
         assert r["decision"] != "ignore", r
 
-    async def test_bare_intent_bottoms_at_review(self, flt):
+    async def test_bare_intent_below_spec_floor_rejected(self, flt):
+        # v12.1.0 توحيد السياسة: المواصفة الصريحة 6..65 شاملاً الحدين —
+        # نصوص أقل من 6 تُرفض too_short (نفس قرار خط الإنتاج الحي:
+        # _validate_event كانت ترفضها قبل الفلتر منذ v11.5.2 — القياس
+        # الآن واحداً في كل الطبقات عبر FilterPolicy).
         r = await flt.analyze("محتاج")
-        assert r["decision"] == "review", r
+        assert r["decision"] == "ignore", r
+        assert "too_short" in (r.get("reasons") or []), r
 
     async def test_fazaa_request(self, flt):
         r = await flt.analyze("فزعه ابي احد يحل لي الواجب اليوم")

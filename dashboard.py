@@ -1343,6 +1343,12 @@ async def health_full(request: Request):
         unified_gate = _u_snap()
     except Exception:
         unified_gate = {"enabled": False, "version": "12.0.0"}
+    # v12.1.0: لقطة سياسة الفلترة الموحدة (الحدود الحية الشاملة)
+    try:
+        from unified_alerts.filter_policy import FilterPolicy as _fp
+        unified_gate["filter_policy"] = _fp.snapshot()
+    except Exception:
+        pass
     # v11.7.1 (المهمة الهندسية §2.5): حالة الكاتب/الطابور/DLQ — أقل قدر
     # لازم من المعلومات التشخيصية الآمنة: عدّادات وحالة مهمة فقط. لا نصوص
     # رسائل ولا معرّفات مستخدمين ولا أسرار. كل فشل يُبتلع بأمان (fields=0).

@@ -50,11 +50,11 @@ from alert_bot import build_alert_html  # noqa: E402
 import pytest  # noqa: E402
 
 
-# ── GOLDEN OUTPUT (v11.3 — القالب الموحد المطلوب حرفياً) ────────────────
+# ── GOLDEN OUTPUT (v12.1.0 — صيغة الصورة المرجعية: الاسم و@username كلاهما رابط) ──
 GOLDEN = {
     "S1_username_chat": {
         "alert": (
-            'المرسل: <a href="https://t.me/ahmed_99">أحمد محمد</a> — @ahmed_99'
+            'المرسل: <a href="https://t.me/ahmed_99">أحمد محمد</a> — <a href="https://t.me/ahmed_99">@ahmed_99</a>'
             '\n\nنص الرسالة:\n\n'
             'أبي مساعدة في واجب الاحصاء ضروري'
         ),
@@ -88,7 +88,7 @@ GOLDEN = {
     },
     "S4_unknown_title": {
         "alert": (
-            'المرسل: <a href="https://t.me/user_x">مستخدم</a> — @user_x'
+            'المرسل: <a href="https://t.me/user_x">مستخدم</a> — <a href="https://t.me/user_x">@user_x</a>'
             '\n\nنص الرسالة:\n\n'
             'أبي مساعدة في واجب الاحصاء ضروري'
         ),
