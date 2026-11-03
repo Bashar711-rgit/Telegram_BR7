@@ -103,11 +103,6 @@ echo -e "${BLUE}📌 Creating required directories...${NC}"
 mkdir -p downloads sessions templates 2>/dev/null || true
 echo -e "${GREEN}✅ Directories created${NC}"
 
-# ========== إعداد متغيرات إضافية للـ Dashboard ==========
-if [ "$DASHBOARD_ENABLED" = "true" ]; then
-    echo -e "${GREEN}✅ Dashboard enabled on port ${DASHBOARD_PORT:-8080}${NC}"
-fi
-
 # ========== عرض معلومات النظام ==========
 echo -e "${BLUE}=========================================="
 echo -e "  📊 System Information"

@@ -1,4 +1,6 @@
-# 🤖 Telegram Bot v13.0 – IntentEngine Edition (Render Cloud)
+# 🤖 Telegram Bot v14.0 – IntentEngine Edition (Render Cloud)
+
+> **v14.0 «No Dashboard»:** أُزيلت لوحة التحكم نهائياً بكل ملفاتها وقاعدة بياناتها (طلب المالك) — البوت ينفّذ ويراقب ويرسل التنبيهات، والإدارة كلها عبر أوامر تيليجرام.
 
 نظام متقدم لمراقبة مجموعات تيليجرام واصطياد طلبات المساعدة الطلابية، مهيأ للتشغيل **24/7 على Render المجاني** كـ Web Service.---
 
@@ -289,9 +291,8 @@ Permanent Ignore (Cross-Group Spam / Mass Poster)
 ├── database.py             # طبقة قاعدة البيانات (SQLite/PostgreSQL)
 ├── filter_engine.py        # محرك الفلترة IntentEngine
 ├── monitors.py             # مراقبو الحسابات (StringSession)
-├── dashboard.py            # لوحة التحكم + /health + /login
+├── unified_alerts/         # v12: البوابة الموحدة وبطاقة التنبيه
 ├── keywords.json           # قاعدة الكلمات المفتاحية
-├── templates/dashboard.html
 ├── generate_session.py     # توليد Session String محلياً (احتياطي)
 ├── render.yaml             # Blueprint (بدون أسرار)
 ├── requirements.txt
@@ -322,13 +323,9 @@ Permanent Ignore (Cross-Group Spam / Mass Poster)
 |---|---|
 | `TARGET_GROUP_ID` | معرف المجموعة المستهدفة للتنبيهات |
 | `ADMIN_CHAT_ID` | معرف شات الأدمن |
-| `DASHBOARD_ENABLED` | `true` |
-| `DASHBOARD_AUTH_TOKEN` | رمز قوي للوحة التحكم و`/login` |
 | `SECRET_KEY_OVERRIDE` | مفتاح Fernet |
-| `RENDER_API_KEY` | مفتاح Render API (لحفظ الجلسات تلقائياً من `/login`) |
-| `RENDER_SERVICE_ID` | معرف الخدمة `srv-...` |
 | `{PREFIX}_API_ID / _API_HASH / _PHONE / _SESSION_NAME` | بيانات كل حساب (MAIN, ACCOUNT_1..5) |
-| `{PREFIX}_SESSION_STRING` | تُملأ تلقائياً عبر `/login` أو يدوياً |
+| `{PREFIX}_SESSION_STRING` | جلسة كل حساب (تُولَّد بـ generate_session.py) |
 | `ALERT_BOT_TOKEN` | (v10.8 اختياري) توكن بوت التنبيهات `@alzariqi711r_bot` — أضف البوت إلى TARGET_GROUP_ID (يفضل أدمن). غيابه = إرسال من حسابات المستخدمين بدون أزرار |
 
 متغيرات IntentEngine والأداء لها قيم افتراضية جاهزة (انظر `render.yaml`).
@@ -350,16 +347,28 @@ python generate_session.py
 
 ## 📋 أوامر الأدمن (في شات الأدمن)
 
-`/help` · `/stats` · `/status` · `/accounts` · `/health` · `/filter_stats` · `/dashboard` · `/block <id>` · `/unblock <id>` · `/purge` · `/spam` · `/unspam <id>` · `/contact`
+`/help` · `/stats` · `/status` · `/accounts` · `/health` · `/filter_stats` · `/block <id>` · `/unblock <id>` · `/purge` · `/spam` · `/unspam <id>` · `/contact`
+
+> `/dashboard` يبقى مستقبَلاً ويُجيب: «لوحة التحكم أُزيلت من هذا البوت».
 
 ---
 
-## 🌐 لوحة التحكم
+## 🌐 نقاط الويب (خادم صحة قائم بذاته — لا لوحة)
 
-- `/` — لوحة التحكم الكاملة (تحتاج `DASHBOARD_AUTH_TOKEN`)
-- `/login` — تسجيل دخول الحسابات وتوليد الجلسات
-- `/health` — فحص الصحة (بدون مصادقة) لـ Render وUptimeRobot
+- `/health` — فحص الحياة (بدون مصادقة) لـ Render وUptimeRobot
+- `/health/full` — الحالة التشغيلية الكاملة (توكن اختياري `HEALTH_FULL_TOKEN`)
 
 ---
 
-📅 **الإصدار:** v13.0 – IntentEngine Edition + v9.11 (أزرار التواصل + مكافحة السبام + إصلاح BIGINT) – 2026-09
+📅 **الإصدار:** v14.0 «No Dashboard» – 2026-11
+
+---
+
+## 🧾 سجل v14.0 — فصل لوحة التحكم وحذفها بالكامل
+
+- **حُذفت الملفات:** `dashboard.py` (4595 سطر) · `dashboard_store.py` · `webadmin/` (9 ملفات) · `templates/dashboard.html` + `templates/admin.html` · 7 ملفات اختبار لوحة كاملة · `scripts/migrate_sqlite_to_pg.py` (كان يعتمد API اللوحة).
+- **حُذفت من النواة:** استيراد/تشغيل اللوحة من `main.py` + أمر `/dashboard` (يبقى برد إزالة) + قسم إدارة الحسابات الحيّ v9.34 (كان حصرياً للوحة) + `DASHBOARD_*` من `config.py` و`render.yaml` + جداول `dashboard_users` / `dashboard_accounts` / `filter_decisions` من `database.py` (بما فيها كتابة قرارات الفلترة من `monitors.py`) — خادم الصحة القائم بذاته (`/health` + `/health/full` على `$PORT`) صار الطبقة الويب الوحيدة.
+- **قاعدة البيانات:** `migrations/0004_remove_dashboard.sql` يسقط الجداول الثلاثة وينظف صفوف إعدادات اللوحة من `app_settings` (الجدول نفسه يبقى — نواة البوت تستخدمه). تُطبَّق مرة واحدة من Supabase SQL Editor.
+- **اعتماديات:** حُذف `fastapi` / `uvicorn` / `websockets` / `python-multipart` / `itsdangerous` / `qrcode` (كانت كلها للوحة) من `requirements.txt` و`requirements.lock`.
+- **اختبارات:** 955/955 PASS (الفرق عن 1160 = اختبارات اللوحة المحذوفة معها؛ تغطية تقليم intel أُعيد توجيهها إلى `sender_contacts`).
+- **أرشيف:** اللوحة كاملة محفوظة في فرع `pre-dashboard-removal` (مع tag) وخارج المستودع كحزمة مستقلة.

@@ -82,67 +82,6 @@ class TestDbReconnectSelfCancel:
                 pass
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# F2 (audit A-2) — /health كان يرجع 200 دائماً حتى وهو ميت
-# ═══════════════════════════════════════════════════════════════════════════
-class _FakeDb:
-    """بديل db للوحة — يجب أن يملك close() لأن lifespan ال teardown
-    يستدعيه عندما owns_db=True."""
-
-    def __init__(self, is_connected: bool, db_healthy: bool):
-        self.is_connected = is_connected
-        self.db_healthy = db_healthy
-        self.closed = False
-
-    async def close(self):
-        self.closed = True
-
-
-class TestHealthStatusCodes:
-    @pytest.fixture()
-    async def client(self):
-        from dashboard import app
-
-        async with app.router.lifespan_context(app):
-            transport = ASGITransport(app=app)
-            async with AsyncClient(transport=transport, base_url="http://test") as ac:
-                yield ac
-
-    @pytest.mark.asyncio
-    async def test_health_503_when_db_down(self, client):
-        """db منخرف فعلياً (is_connected=False) → HTTP 503 كي يعيد Render
-        تشغيل العملية بدل الزومبي الأبدي."""
-        from dashboard import app
-
-        app.state.db = _FakeDb(is_connected=False, db_healthy=False)
-        r = await client.get("/health")
-        assert r.status_code == 503
-        assert r.json()["database"] == "down"
-
-    @pytest.mark.asyncio
-    async def test_health_200_when_db_ok(self, client):
-        from dashboard import app
-
-        app.state.db = _FakeDb(is_connected=True, db_healthy=True)
-        r = await client.get("/health")
-        assert r.status_code == 200
-        assert r.json()["status"] == "ok"
-
-    @pytest.mark.asyncio
-    async def test_health_200_when_degraded_but_connected(self, client):
-        """اتصال حي مع db_healthy=False (فشل flush عابر) يبقى 200 عمداً —
-        إعادة تشغيل هنا كانت تفقد الدُفعة بلا داعٍ."""
-        from dashboard import app
-
-        app.state.db = _FakeDb(is_connected=True, db_healthy=False)
-        r = await client.get("/health")
-        assert r.status_code == 200
-        assert r.json()["status"] == "degraded"
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# F3 (audit A-4) — DLQ لم يكن يفهم FloodWait
-# ═══════════════════════════════════════════════════════════════════════════
 class TestDlqFloodAwareDelay:
     def _make_dlq(self):
         from monitors import DeadLetterQueue
@@ -304,10 +243,8 @@ class TestPostgresParity:
         assert out.endswith("ON CONFLICT DO NOTHING")
         assert "INSERT INTO blocked_senders" in out
 
-    def test_alter_decl_datetime_transformed(self):
-        """تصريحات ALTER للوحة الحسابات تحوّل DATETIME على PG."""
-        src = (Path(sys_path) / "database.py").read_text(encoding="utf-8")
-        assert 'decl = str(decl).replace("DATETIME", "TIMESTAMP")' in src
+    # v14.0: test_alter_decl_datetime_transformed أُزيل — كان يختبر تحويل
+    # DATETIME في هجرة dashboard_accounts المحذوفة مع اللوحة.
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -316,10 +253,13 @@ class TestPostgresParity:
 class TestIntelRetention:
     @pytest.mark.asyncio
     async def test_old_intel_rows_deleted(self, db):
-        """صفوف أقدم من النافذة تُحذف من filter_decisions؛ الحديثة تبقى
+        """صفوف أقدم من النافذة تُحذف من sender_contacts؛ الحديثة تبقى
         (يستخدم الـfixture المؤسسي من conftest).
 
-        الشكل يطابق الإنتاج: created_at تُكتب TEXT عبر CURRENT_TIMESTAMP —
+        v14.0: كان الجدول المُختبر filter_decisions (محذوف مع اللوحة) —
+        نفس مسار «ts» النصي يُختبر الآن عبر sender_contacts.updated_at.
+
+        الشكل يطابق الإنتاج: updated_at تُكتب TEXT عبر CURRENT_TIMESTAMP —
         وهذه نفسها مصيدة الأنواع التي عالجتها الدالة (REAL < TEXT في
         SQLite كان سيعطل التقليم صامتة)."""
         import time as _time
@@ -328,19 +268,19 @@ class TestIntelRetention:
         old_ts = now - 200 * 86400  # 200 يوماً
         old_str = _time.strftime("%Y-%m-%d %H:%M:%S", _time.gmtime(old_ts))
         new_str = _time.strftime("%Y-%m-%d %H:%M:%S", _time.gmtime(now))
-        for h, ts_str in ((f"ret_old_{old_ts}", old_str), (f"ret_new_{old_ts}", new_str)):
+        for sid, ts_str in ((-900001, old_str), (-900002, new_str)):
             await db._execute(
-                "INSERT INTO filter_decisions (msg_hash, chat_id, sender_id, "
-                "decision, created_at) VALUES (?,?,?,?,?)",
-                (h, 1, 0, "accept", ts_str),
+                "INSERT INTO sender_contacts (sender_id, username, updated_at) "
+                "VALUES (?,?,?)",
+                (sid, f"ret_{sid}", ts_str),
             )
         await db._commit()
         removed = await db._cleanup_intel_tables(90)
         assert removed >= 1
-        rows = await db._fetchall("SELECT msg_hash FROM filter_decisions", ())
-        hashes = {r["msg_hash"] for r in rows}
-        assert f"ret_old_{old_ts}" not in hashes, "الصف القديم (>90d) يجب أن يُحذف"
-        assert f"ret_new_{old_ts}" in hashes, "الصف الحديث يجب أن يبقى"
+        rows = await db._fetchall("SELECT sender_id FROM sender_contacts WHERE sender_id < 0", ())
+        ids = {r["sender_id"] for r in rows}
+        assert -900001 not in ids, "الصف القديم (>90d) يجب أن يُحذف"
+        assert -900002 in ids, "الصف الحديث يجب أن يبقى"
 
 
 # ═══════════════════════════════════════════════════════════════════════════

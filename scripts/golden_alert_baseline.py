@@ -13,11 +13,9 @@ PROJECT_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_DIR))
 os.environ.setdefault("TARGET_GROUP_ID", "-1001234567890")
 os.environ.setdefault("ADMIN_CHAT_ID", "654321")
-os.environ.setdefault("DASHBOARD_AUTH_TOKEN", "test-dashboard-token-0123456789")
 os.environ.setdefault("DB_TYPE", "sqlite")
 os.environ["DB_FILE"] = str(PROJECT_DIR / "tests" / "_golden.db")
 os.environ["LOG_FILE"] = str(PROJECT_DIR / "tests" / "_golden.log")
-os.environ["DASHBOARD_ENABLED"] = "false"
 
 from telethon import Button  # noqa: E402
 from config import CFG  # noqa: E402

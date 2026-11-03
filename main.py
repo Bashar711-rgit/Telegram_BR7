@@ -117,14 +117,6 @@ from alert_ui import AlertBotClient  # v11.0: عميل بوت حي — Callbacks
 from sender_resolver import get_sender_intel_snapshot, get_mention_intel_snapshot
 from contact_target import get_contact_metrics_snapshot
 
-# Import Dashboard
-try:
-    from dashboard import set_bot_reference, start_dashboard as run_dashboard
-    DASHBOARD_AVAILABLE = True
-except ImportError:
-    DASHBOARD_AVAILABLE = False
-    logger.warning("dashboard.py not found – Dashboard disabled")
-
 # psutil optional
 try:
     import psutil
@@ -393,7 +385,6 @@ class EnhancedTelegramBot:
         self._health_task: Optional[asyncio.Task] = None
         self._memory_task: Optional[asyncio.Task] = None
         self._health_server_task: Optional[asyncio.Task] = None
-        self._dashboard_task: Optional[asyncio.Task] = None
         self._keep_alive_task: Optional[asyncio.Task] = None
         self._main_client_watchdog_task: Optional[asyncio.Task] = None
 
@@ -596,121 +587,6 @@ class EnhancedTelegramBot:
             if m.account["name"].lower() == name_lower:
                 return m
         return None
-
-    # ─── v9.34: Runtime account management (dashboard → live monitors) ──────
-    # The dashboard shares this process and event loop, so it can create/
-    # remove monitors directly — an account added & logged-in from the panel
-    # becomes a live monitor WITHOUT waiting for a Render redeploy. Every
-    # method is keyed by account PREFIX (the panel's stable identifier) and
-    # is fully fail-safe: a runtime glitch never crashes the bot loop.
-    def get_monitor_by_prefix(self, prefix: str) -> Optional[EnhancedAccountMonitor]:
-        p = str(prefix or "").strip().upper()
-        for m in self.monitors:
-            try:
-                if (m.account or {}).get("prefix", "").upper() == p:
-                    return m
-            except Exception:
-                continue
-        return None
-
-    async def add_runtime_monitor(self, acc: Dict[str, Any]) -> Dict[str, Any]:
-        """v9.34: إنشاء مراقب حي لحساب من اللوحة (نفس مسار الإقلاع حرفياً:
-        EnhancedAccountMonitor + set_bot + connect).
-
-        v9.36 (حرج — السبب الجذري لـ«الحساب مفعّل لكن لا يراقب»): مراقب حي
-        فعلاً يُحترم (لا إعادة بناء بلا داعٍ)، أما المراقب القديم المعطوب أو
-        غير المتصل (النمط الفعلي: مُنشأ عند الإقلاع بلا جلسة لأن *_SESSION_STRING
-        لم تكن موجودة بعد) فسابقاً كان يُجمّد كل محاولات التوصيل اللاحقة
-        للأبد — تسجيل دخول ناجح يحفظ الجلسة في DB + Render ثم يستدعي هذا
-        التابع فيجد المراقب القديم فيعيد «already + خطأ No session القديم»
-        دون أي اتصال بالجلسة الجديدة. الإصلاح: المراقب المعطوب يُقطع اتصاله
-        ويُزال ويُبنى مراقب جديد بالجلسة الطازجة بنفس مسار الإقلاع — ويفشل
-        الاتصال الجديد لسبب حقيقي فيظهر الخطأ الحقيقي الجديد لا القديم."""
-        prefix = str((acc or {}).get("prefix") or "").strip().upper()
-        if not prefix:
-            return {"ok": False, "error": "prefix مفقود"}
-        existing = self.get_monitor_by_prefix(prefix)
-        if existing is not None:
-            alive = bool(
-                existing.is_connected
-                and existing.client is not None
-                and EnhancedAccountMonitor._is_client_alive(existing.client)
-            )
-            if alive:
-                return {"ok": True, "already": True}
-            stale_reason = str(existing._last_connect_error or "غير متصل")
-            try:
-                await existing.disconnect()
-            except Exception as e:
-                logger.warning(
-                    f"add_runtime_monitor: stale disconnect failed [{prefix}]: "
-                    f"{type(e).__name__}: {e}"
-                )
-            try:
-                self.monitors.remove(existing)
-            except ValueError:
-                pass
-            logger.info(
-                f"add_runtime_monitor: replacing stale monitor [{prefix}] "
-                f"(previous state: {stale_reason[:120]})"
-            )
-        try:
-            mon = EnhancedAccountMonitor(acc, self.db, self.filter, self.main_client)
-            mon.set_bot(self)
-            self.monitors.append(mon)
-            ok = await asyncio.wait_for(mon.connect(), timeout=120)
-            if ok:
-                logger.info(f"✅ Runtime monitor added: {prefix} ({acc.get('name')})")
-                if self.main_client is None:
-                    self.main_client = mon.client
-                    for other in self.monitors:
-                        other.main_client = self.main_client
-                    logger.info(f"👑 Main client promoted: {prefix}")
-                return {"ok": True}
-            err = (mon._last_connect_error or "فشل الاتصال")
-            return {"ok": False, "error": str(err)[:200]}
-        except asyncio.TimeoutError:
-            return {"ok": False, "error": "انتهت مهلة الاتصال (120 ثانية)"}
-        except Exception as e:
-            logger.error(f"add_runtime_monitor failed [{prefix}]: {type(e).__name__}: {e}")
-            return {"ok": False, "error": f"{type(e).__name__}: {str(e)[:150]}"}
-
-    async def remove_runtime_monitor(self, prefix: str, disconnect_client: bool = True) -> bool:
-        """v9.34: إزالة مراقب حي (قطع اتصال + حذف من القائمة) — False إن لم يوجد."""
-        mon = self.get_monitor_by_prefix(prefix)
-        if mon is None:
-            return False
-        if disconnect_client:
-            try:
-                await mon.disconnect()
-            except Exception as e:
-                logger.warning(f"remove_runtime_monitor disconnect failed [{prefix}]: {e}")
-        try:
-            self.monitors.remove(mon)
-        except ValueError:
-            pass
-        logger.info(f"🛑 Runtime monitor removed: {prefix}")
-        return True
-
-    async def reconnect_runtime_monitor(self, prefix: str) -> Dict[str, Any]:
-        """v9.34: إعادة اتصال مراقب حي — disconnect كامل ثم connect جديد."""
-        mon = self.get_monitor_by_prefix(prefix)
-        if mon is None:
-            return {"ok": False, "error": "لا يوجد مراقب حي لهذا الحساب"}
-        try:
-            await mon.disconnect()
-        except Exception as e:
-            logger.debug(f"reconnect pre-disconnect failed [{prefix}]: {e}")
-        try:
-            ok = await asyncio.wait_for(mon.connect(), timeout=120)
-            return {"ok": bool(ok), "error": None if ok else (mon._last_connect_error or "فشل الاتصال")}
-        except asyncio.TimeoutError:
-            mon.is_connected = False
-            return {"ok": False, "error": "انتهت مهلة الاتصال (120 ثانية)"}
-        except Exception as e:
-            logger.error(f"reconnect_runtime_monitor failed [{prefix}]: {type(e).__name__}: {e}")
-            return {"ok": False, "error": f"{type(e).__name__}: {str(e)[:150]}"}
-
 
     # ─── Admin / Copy handler registration (idempotent, re-runnable) ──────────
     # Both are now re-registerable so a main-client failover (M-10/M-11)
@@ -966,7 +842,7 @@ class EnhancedTelegramBot:
             f"{'on' if target_id else 'off'})"
         )
 
-    # ─── Health HTTP Server (fallback when Dashboard is disabled) ─────────────
+    # ─── Health HTTP Server (الطبقة الويب الوحيدة — /health + /health/full) ───
     async def _health_server(self):
         if not AIOHTTP_AVAILABLE:
             logger.warning("Aiohttp not installed. Health server disabled.")
@@ -975,7 +851,7 @@ class EnhancedTelegramBot:
         app = web.Application()
 
         async def health_handler(request):
-            # v11.8.2 (F-11): توحيد عقد /health مع dashboard.py حرفياً —
+            # v11.8.2 (F-11): عقد /health الأدنى (status/database/db_healthy/time) —
             # الحد الأدنى للـ liveness فقط (status/database/db_healthy/time)
             # بنفس دلالة 503. الـ snapshot التشغيلي الكامل كان يُفضي هنا
             # بلا مصادقة (نقلته L-08 عمداً إلى /health/full في اللوحة) —
@@ -1044,19 +920,6 @@ class EnhancedTelegramBot:
 
         await asyncio.Event().wait()
 
-    # ─── Dashboard Server (main web face on Render: binds $PORT) ──────────────
-    async def _start_dashboard(self):
-        if not DASHBOARD_AVAILABLE:
-            return
-        set_bot_reference(self)
-        port = int(os.getenv("PORT", CFG.DASHBOARD_PORT))
-        logger.info(f"🚀 Starting Dashboard + Health endpoint on port {port}")
-        try:
-            await run_dashboard(host="0.0.0.0", port=port)
-        except Exception as e:
-            logger.error(f"Failed to start Dashboard on port {port}: {e}")
-
-    # ─── Keep-Alive Self-Ping (M-07: no localhost fallback) ────────────────────
     async def _keep_alive_loop(self) -> None:
         """
         Pings /health from an EXTERNAL address every KEEP_ALIVE_INTERVAL_SECONDS
@@ -1312,33 +1175,9 @@ class EnhancedTelegramBot:
         try:
             lines: List[str] = ["📊 <b>التقرير اليومي — ملخص الأداء (24 ساعة)</b>", ""]
 
-            # 1) قرارات الفلترة — المصدر الأهم
-            try:
-                fd = await self.db.filter_decision_stats(hours=24)
-                if fd and fd.get("total", 0) > 0:
-                    lines += [
-                        "🎯 <b>قرارات الفلترة:</b>",
-                        f"• رسائل مقيّمة: {fd.get('total', 0):,}",
-                        f"• ✅ قبول: {fd.get('accepted', 0):,} | 🔍 مراجعة: {fd.get('review', 0):,} | ❌ تجاهل: {fd.get('ignored', 0):,}",
-                        f"• متوسط الثقة: {int(round(float(fd.get('avg_confidence', 0.0)) * 100))}%",
-                    ]
-                    subjects = fd.get("subjects") or []
-                    if subjects:
-                        top3 = "، ".join(
-                            f"{s.get('name', '?')} ({s.get('count', 0)})" for s in subjects[:3]
-                        )
-                        lines.append(f"• المواد الأكثر: {top3}")
-                    fb_pos = fd.get("feedback_positive", 0)
-                    fb_neg = fd.get("feedback_negative", 0)
-                    if fb_pos or fb_neg:
-                        lines.append(f"• التغذية الراجعة: 👍 {fb_pos} | 👎 {fb_neg}")
-                    lines.append("")
-                else:
-                    lines += ["🎯 قرارات الفلترة: لا بيانات خلال 24 ساعة", ""]
-            except Exception as e:
-                logger.debug(f"Digest: filter stats skipped: {e}")
-
-            # 2) الإجماليات العامة + الحواجز
+            # 1) الإجماليات العامة + الحواجز
+            # (v14.0: قسم «قرارات الفلترة» أُزيل مع جدول filter_decisions —
+            #  كان يخدم معمل الفلترة في لوحة التحكم المحذوفة)
             try:
                 stats = await self.db.get_stats()
                 lines += [
@@ -1496,7 +1335,7 @@ class EnhancedTelegramBot:
 
         @self.main_client.on(tl_events.NewMessage(
             chats=CFG.ADMIN_CHAT_ID, incoming=True,
-            pattern=r"^/(stats|status|help|block|unblock|purge|accounts|health|filter_stats|dashboard|spam|unspam|contact)(.*)$",
+            pattern=r"^/(stats|status|help|block|unblock|purge|accounts|health|filter_stats|spam|unspam|contact)(.*)$",
         ))
         async def _admin_handler(event: Any) -> None:
             try:
@@ -1513,7 +1352,7 @@ class EnhancedTelegramBot:
         cmd = cmd.lstrip("/").lower()
 
         if cmd == "help":
-            await event.reply("<b>أوامر البوت:</b>\n/stats – إحصائيات\n/status – حالة الحسابات\n/accounts – التفاصيل\n/health – الصحة\n/dashboard – لوحة التحكم\n/block &lt;id&gt; – حظر\n/unblock &lt;id&gt; – رفع حظر\n/purge – تفريغ الطابور\n/spam – قوائم مكافحة السبام\n/unspam &lt;id&gt; – إزالة من تجاهل السبام\n/contact – الرسائل الجاهزة", parse_mode="html")
+            await event.reply("<b>أوامر البوت:</b>\n/stats – إحصائيات\n/status – حالة الحسابات\n/accounts – التفاصيل\n/health – الصحة\n/block &lt;id&gt; – حظر\n/unblock &lt;id&gt; – رفع حظر\n/purge – تفريغ الطابور\n/spam – قوائم مكافحة السبام\n/unspam &lt;id&gt; – إزالة من تجاهل السبام\n/contact – الرسائل الجاهزة", parse_mode="html")
         elif cmd == "stats":
             db_stats = await self.db.get_stats()
             rl = self.rate_limiter.status()
@@ -1580,24 +1419,9 @@ class EnhancedTelegramBot:
                 lines.append(f"• {k}: {v}")
             await event.reply("\n".join(lines), parse_mode="html")
         elif cmd == "dashboard":
-            if CFG.DASHBOARD_ENABLED and DASHBOARD_AVAILABLE:
-                url = os.getenv("RENDER_EXTERNAL_URL") or f"http://localhost:{CFG.DASHBOARD_PORT}"
-                # v9.12 (audit H-09): the auth token is no longer echoed
-                # into the Telegram chat. The chat history, synced devices
-                # and chat backups would otherwise retain the token forever
-                # — anyone with read access to the admin's Telegram account
-                # would gain full dashboard control. The admin should
-                # retrieve the token from Render's environment variables
-                # panel (or wherever they stored it) instead.
-                await event.reply(
-                    f"<b>🌐 رابط لوحة التحكم</b>\n"
-                    f"الرابط: <code>{url}</code>\n"
-                    f"🔑 استخدم التوكن الموجود في إعدادات البيئة على Render "
-                    f"(DASHBOARD_AUTH_TOKEN) — لا يُرسل هنا لحماية الأمان.",
-                    parse_mode="html",
-                )
-            else:
-                await event.reply("❌ لوحة التحكم غير مفعلة")
+            # v14.0: لوحة التحكم أُزيلت نهائياً من المشروع (طلب المالك) —
+            # الرد يبقى لتجنّب «الأمر الصامت» مع مستخدمي الأمر القديم.
+            await event.reply("ℹ️ لوحة التحكم أُزيلت من هذا البوت — الإدارة تتم عبر أوامر تيليجرام فقط.")
         elif cmd == "block":
             uid = args.strip()
             if uid.isdigit():
@@ -1697,45 +1521,26 @@ class EnhancedTelegramBot:
         # (قبل تشغيل أي مراقب — حتى تُتجاهل رسائل المصنفين كمزعجين منذ اللحظة الأولى).
         await setup_antispam(self.db)
 
-        # Start the web layer FIRST so Render's health check passes immediately
-        # and the Dashboard stays reachable even before/without any account
-        # connection (sessions can then be added via the /login page).
-        if CFG.DASHBOARD_ENABLED and DASHBOARD_AVAILABLE:
-            self._dashboard_task = self._track_task(self._start_dashboard(), "dashboard")
-            logger.info("Dashboard task started (serves /health on $PORT)")
-        else:
-            self._health_server_task = self._track_task(self._health_server(), "health_server")
-            logger.info("Dashboard disabled - standalone health server on $PORT")
+        # v14.0: الطبقة الويب = خادم الصحة القائم بذاته (يخدم /health و /health/full
+        # على $PORT). لوحة التحكم أُزيلت نهائياً من المشروع (طلب المالك).
+        self._health_server_task = self._track_task(self._health_server(), "health_server")
+        logger.info("Health server task started (serves /health on $PORT)")
 
         self._keep_alive_task = self._track_task(self._keep_alive_loop(), "keep_alive")
 
         accounts = sorted(ACCOUNTS, key=lambda a: a.get("priority", 0), reverse=True)
         if not accounts:
             logger.warning(
-                "No accounts configured - running in dashboard-only mode. "
+                "No accounts configured - monitoring disabled. "
                 "Set MAIN_API_ID / MAIN_API_HASH / MAIN_PHONE / MAIN_SESSION_STRING "
-                "env vars (or use the /login page), then restart the service."
+                "env vars, then restart the service."
             )
 
         logger.info(f"Connecting {len(accounts)} account(s) sequentially...")
         connected = 0
 
-        # v9.34: احترام تعطيل الحسابات من لوحة التحكم — قاعدة البيانات مصدر
-        # الحقيقة (enabled=0 = لا مراقبة لهذا الحساب في هذا الإقلاع). فشل
-        # القراءة = لا تخطي (السلوك التاريخي حرفياً).
-        disabled_prefixes: Set[str] = set()
-        try:
-            for row in await self.db.list_dashboard_accounts():
-                if not row.get("enabled", True):
-                    disabled_prefixes.add((row.get("prefix") or "").upper())
-        except Exception as e:
-            logger.debug(f"disabled-accounts lookup skipped: {e}")
-
         for idx, acc in enumerate(accounts, 1):
             acc_prefix = (acc.get("prefix") or "").upper()
-            if acc_prefix in disabled_prefixes:
-                logger.info(f"⏭️ Skipping disabled account: {acc['name']} ({acc_prefix}) — enabled=false in DB")
-                continue
             logger.info(f"\n[{idx}/{len(accounts)}] Connecting: {acc['name']} | {acc['phone']}")
             mon = EnhancedAccountMonitor(acc, self.db, self.filter, self.main_client)
             mon.set_bot(self)
@@ -1772,8 +1577,8 @@ class EnhancedTelegramBot:
 
         if connected == 0:
             logger.warning(
-                "No accounts connected - running in dashboard-only mode. "
-                "Fix the *_SESSION_STRING env vars (or use the /login page), then restart."
+                "No accounts connected - monitoring disabled. "
+                "Fix the *_SESSION_STRING env vars, then restart."
             )
 
         self.memory_monitor.start()
@@ -2036,7 +1841,6 @@ class EnhancedTelegramBot:
                 for m in self.monitors
             )
             kw_count = sum(len(v) for v in KEYWORDS.values())
-            dashboard_status = "🟢 مفعل" if CFG.DASHBOARD_ENABLED else "🔴 غير مفعل"
             db_health_status = "✅ سليمة" if self.db.db_healthy else "⚠️ غير مستقرة"
 
             await self.main_client.send_message(
@@ -2046,8 +1850,7 @@ class EnhancedTelegramBot:
                 f"👥 الحسابات: {connected_count}/{len(self.monitors)}\n"
                 f"🗂 الطابور: {qsize} رسالة معلقة\n"
                 f"🗄 قاعدة البيانات: {db_health_status}\n"
-                f"🔑 الكلمات المفتاحية: {kw_count:,}\n"
-                f"🌐 Dashboard: {dashboard_status}\n\n"
+                f"🔑 الكلمات المفتاحية: {kw_count:,}\n\n"
                 f"<b>الحسابات:</b>\n{acct_lines}\n\n"
                 f"💡 اكتب /help للأوامر المتاحة",
                 parse_mode="html",

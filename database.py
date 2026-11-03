@@ -102,7 +102,7 @@ v9.0 (this pass) — full audit fix, database.py ONLY:
               (purge_queue() + cleanup_dead_letters()) and logs CRITICAL.
 
 All existing public methods and their signatures are preserved exactly,
-so monitors.py / main.py / dashboard.py call sites require zero changes.
+so monitors.py / main.py call sites require zero changes.
 """
 
 from __future__ import annotations
@@ -246,7 +246,6 @@ CRITICAL_EXPORT_TABLES: Dict[str, Tuple[str, ...]] = {
     "rules": ("name", "conditions", "action", "action_value", "priority", "hits",
               "enabled", "created_by"),
     "allowed_entities": ("entity_type", "entity_id", "note"),
-    "keywords_json": (),  # mirror handled via dashboard_store, not a table
 }
 
 
@@ -473,10 +472,6 @@ class EnhancedDatabase:
         self._backup_task: Optional[asyncio.Task] = None
         # Note: _cleanup_task intentionally absent — cleanup is owned by main.py
 
-        # Dashboard query cache
-        self._query_cache: TTLCache = TTLCache(maxsize=100, ttl=30)
-        self._cache_lock = asyncio.Lock()
-
         # v9.20 P1: كاش نطاق المصادر — (expiry, set) أو None. مجموعة فارغة
         # تعني "جدول فارغ = مراقبة كل شيء" (لا تخلط مع كاش فارغ منتهٍ).
         self._sources_cache: Optional[Tuple[float, set]] = None
@@ -516,7 +511,6 @@ class EnhancedDatabase:
             await self._create_tables()
             await self._migrate_bigint_ids()
             await self._migrate_sender_intel()
-            await self._migrate_dashboard_account_status()  # v9.34
             await self._migrate_sender_account_hashes()  # v10.4
             await self._migrate_sender_access()  # v10.7
             await self._migrate_intel_entities()  # v11.1 normalized intel entities
@@ -993,71 +987,6 @@ class EnhancedDatabase:
                 source TEXT DEFAULT 'botpanel',
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             );
-            -- v9.29 P4 RBAC: مستخدمو اللوحة بأدوار وصلاحيات دقيقة. التوكن
-            -- الرئيسي يبقى مفتاح Super Admin الأعلى، وهذا الجدول يضيف حسابات
-            -- بشرية بأدوار (Master Prompt 9.1) مع Soft Delete (10.2) وتدقيق
-            -- كامل. كلمة المرور scrypt-hashed — لا يُعاد النص أبداً.
-            CREATE TABLE IF NOT EXISTS dashboard_users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                username TEXT NOT NULL UNIQUE,
-                password_hash TEXT NOT NULL,
-                role TEXT NOT NULL DEFAULT 'viewer',
-                enabled INTEGER NOT NULL DEFAULT 1,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                last_login_at DATETIME,
-                deleted_at DATETIME
-            );
-            CREATE INDEX IF NOT EXISTS idx_dashboard_users_username
-                ON dashboard_users (username);
-            -- v9.33: سجل الحسابات التي أُضيفت من اللوحة — قاعدة البيانات هي
-            -- مصدر الحقيقة للوحة (Master Prompt 4). الحساب المضاف يُخزَّن هنا
-            -- فوراً فيظهر في إدارة الجلسات دون انتظار إعادة تشغيل، ويُزامَن
-            -- مع متغيرات بيئة Render (المخزن الدائم في الإنتاج) في نفس
-            -- الطلب. session_string يُخزَّن فقط بعد تسجيل دخول ناجح.
-            CREATE TABLE IF NOT EXISTS dashboard_accounts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                prefix TEXT NOT NULL UNIQUE,
-                name TEXT NOT NULL DEFAULT '',
-                api_id INTEGER NOT NULL,
-                api_hash TEXT NOT NULL,
-                phone TEXT NOT NULL,
-                session_name TEXT NOT NULL DEFAULT '',
-                priority INTEGER NOT NULL DEFAULT 10,
-                session_string TEXT,
-                is_main INTEGER NOT NULL DEFAULT 0,
-                enabled INTEGER NOT NULL DEFAULT 1,
-                origin TEXT NOT NULL DEFAULT 'panel',
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                updated_at DATETIME
-            );
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_dashboard_accounts_prefix
-                ON dashboard_accounts (prefix);
-            CREATE TABLE IF NOT EXISTS filter_decisions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                msg_hash TEXT,
-                chat_id INTEGER NOT NULL,
-                sender_id INTEGER NOT NULL,
-                sender_name TEXT DEFAULT '',
-                account_name TEXT DEFAULT '',
-                text TEXT DEFAULT '',
-                decision TEXT NOT NULL DEFAULT 'ignore',
-                confidence REAL DEFAULT 0.0,
-                score REAL DEFAULT 0.0,
-                keyword TEXT DEFAULT '',
-                intent_verb TEXT DEFAULT '',
-                academic_object TEXT DEFAULT '',
-                subject TEXT DEFAULT '',
-                type_tag TEXT DEFAULT '',
-                urgent INTEGER DEFAULT 0,
-                reasons TEXT DEFAULT '',
-                feedback INTEGER NOT NULL DEFAULT 0,
-                feedback_note TEXT DEFAULT '',
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            );
-            CREATE INDEX IF NOT EXISTS idx_filter_decisions_created
-                ON filter_decisions (created_at DESC);
-            CREATE INDEX IF NOT EXISTS idx_filter_decisions_decision
-                ON filter_decisions (decision);
             CREATE TABLE IF NOT EXISTS app_settings (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL,
@@ -1279,61 +1208,6 @@ class EnhancedDatabase:
         await self._commit()
         if added:
             logger.info(f"Database migration v9.3: sender_contacts enriched (+{added} columns)")
-
-    # v9.34: أعمدة تتبع حالة الحساب في اللوحة — إضافة فقط بلا إعادة تسمية
-    # ولا حذف (نفس ضمانات _migrate_sender_intel: لا فقدان بيانات، idempotent،
-    # رخيصة عند كل إقلاع). status: connected/disconnected/error/pending/unknown.
-    _DASHBOARD_ACCOUNT_STATUS_COLUMNS = [
-        ("status", "TEXT"),
-        ("last_error", "TEXT"),
-        ("last_connected_at", "DATETIME"),
-        ("last_activity_at", "DATETIME"),
-    ]
-
-    async def _migrate_dashboard_account_status(self) -> None:
-        """v9.34: enrich dashboard_accounts with live status tracking columns.
-
-        Same backward-compatible-by-construction guarantees as
-        _migrate_sender_intel: columns are ADDED, never renamed/dropped;
-        existing queries are unaffected; idempotent on every boot.
-        PostgreSQL uses ADD COLUMN IF NOT EXISTS; SQLite is pragma-checked
-        per column (no IF NOT EXISTS support there).
-        """
-        table = "dashboard_accounts"
-        existing: set = set()
-        if self.db_type == "postgresql":
-            rows = await self._fetchall(
-                "SELECT column_name FROM information_schema.columns "
-                "WHERE table_name = ?",
-                (table,),
-            )
-            existing = {r["column_name"] for r in rows}
-        else:
-            rows = await self._fetchall(f"PRAGMA table_info({table})", ())
-            existing = {r["name"] for r in rows}
-
-        added = 0
-        for name, decl in self._DASHBOARD_ACCOUNT_STATUS_COLUMNS:
-            if name in existing:
-                continue
-            # v11.7 (audit D-1): DATETIME ليس نوعاً في PostgreSQL — نفس
-            # القاعدة العامة في _create_tables تُطبق على تصريحات ALTER.
-            if self.db_type == "postgresql":
-                decl = str(decl).replace("DATETIME", "TIMESTAMP")
-            try:
-                if self.db_type == "postgresql":
-                    await self._execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {name} {decl}")
-                else:
-                    await self._execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
-                added += 1
-            except Exception as e:
-                logger.warning(
-                    f"dashboard-account migration: {table}.{name} skipped: "
-                    f"{type(e).__name__}: {str(e)[:120]}"
-                )
-        await self._commit()
-        if added:
-            logger.info(f"Database migration v9.34: dashboard_accounts enriched (+{added} columns)")
 
     async def _create_indexes(self) -> None:
         indexes = [
@@ -3811,17 +3685,17 @@ class EnhancedDatabase:
         """v11.7 (audit D-3): تقليم جداول التحليلات غير المحصورة.
 
         المحصورة سابقاً: messages/alerts/spam_watch/audit/notifications/
-        dead_letters/alert_dedup. المتبقي بلا أي حد كان:
-          group_messages، message_analysis، filter_decisions  → تُحذف بالتاريخ
-              (الأحدث منها يغذي نشاط المستخدم وتقارير اللوحة — 90 يوماً
-              أوسع من أي نافذة عرض موجودة).
+        dead_letters/alert_dedup. المتبقي بلا أي حد:
+          group_messages، message_analysis      → تُحذف بالتاريخ
+              (الأحدث منها يغذي نشاط المستخدم — 90 يوماً أوسع من أي
+              نافذة عرض موجودة).
           sender_contacts                      → تُحذف بالتاريخ (updated_at).
-        البقية (users/group_memberships/user_activity/sender_stats/
-        dashboard_accounts) ملفات هوية تراكمية بحجم صف واحد لكل كيان —
+        البقية (users/group_memberships/user_activity/sender_stats)
+        ملفات هوية تراكمية بحجم صف واحد لكل كيان —
         لا تُحذف بالتاريخ (حذفها يهوي الهوية نفسها لا السجل).
 
-        ⚠️ وعي الأنواع (مثبت): filter_decisions.created_at و
-        sender_contacts.updated_at تُكتب TEXT عبر CURRENT_TIMESTAMP
+        ⚠️ وعي الأنواع (مثبت): sender_contacts.updated_at تُكتب TEXT
+        عبر CURRENT_TIMESTAMP
         (إدراجها لا يمرر القيمة)، بينما group_messages.message_date و
         message_analysis.created_at أرقام epoch حقيقية. مقارنة REAL <
         TEXT في SQLite تجعل النص أكبر دائماً فلا يُحذف شيء صامتة —
@@ -3839,7 +3713,6 @@ class EnhancedDatabase:
             # (table, column, value_kind) — epoch: رقم؛ ts: نص CURRENT_TIMESTAMP
             ("group_messages", "message_date", "epoch"),
             ("message_analysis", "created_at", "epoch"),
-            ("filter_decisions", "created_at", "ts"),
             ("sender_contacts", "updated_at", "ts"),
         ]
         for table, col, kind in plan:
@@ -4189,569 +4062,7 @@ class EnhancedDatabase:
             logger.debug(f"cleanup_old_audit_logs skipped: {e}")
             return 0
 
-    # ------------------------------------------------------------------
-    # v9.29 P4 RBAC: مستخدمو اللوحة (dashboard_users).
-    # ------------------------------------------------------------------
 
-    # v9.29: أدوار اللوحة — Master Prompt 9.1 حرفياً (الصلاحيات الدقيقة
-    # تُعرَّف في dashboard.py ROLE_PERMISSIONS ويعاد تسطيحها هنا للعرض).
-    DASHBOARD_ROLES: Tuple[str, ...] = (
-        "super_admin", "admin", "supervisor", "operator", "viewer",
-    )
-
-    @staticmethod
-    def hash_dashboard_password(password: str) -> str:
-        """v9.29: scrypt hashing بصيغة scrypt$n$r$p$salt$hash (stdlib فقط).
-
-        معاملات ثابتة وموثقة (n=2^14, r=8, p=1) — التحقق يستخدم نفس
-        المعاملات من رأس السلسلة فالترقية مستقبلية دون كسر القديم.
-        """
-        salt = os.urandom(16)
-        digest = hashlib.scrypt(
-            password.encode("utf-8"), salt=salt, n=2 ** 14, r=8, p=1, dklen=32
-        )
-        return f"scrypt$16384$8$1${salt.hex()}${digest.hex()}"
-
-    @staticmethod
-    def verify_dashboard_password(password: str, stored: str) -> bool:
-        """v9.29: تحقق timing-safe من كلمة المرور مقابل السلسلة المخزنة.
-
-        أي خلل في الصيغة (سلسلة قديمة/تالفة) يعيد False بدل رفع استثناء.
-        """
-        try:
-            parts = (stored or "").split("$")
-            if len(parts) != 6 or parts[0] != "scrypt":
-                return False
-            n, r, p = int(parts[1]), int(parts[2]), int(parts[3])
-            salt = bytes.fromhex(parts[4])
-            expected = bytes.fromhex(parts[5])
-            digest = hashlib.scrypt(
-                password.encode("utf-8"), salt=salt, n=n, r=r, p=p,
-                dklen=len(expected),
-            )
-            return hmac.compare_digest(digest, expected)
-        except Exception:
-            return False
-
-    @staticmethod
-    def _dashboard_user_row(row: Any) -> Dict[str, Any]:
-        """v9.29: تسطيح صف مستخدم لواجهات اللوحة — بلا hash أبداً."""
-        d = dict(row)
-        d.pop("password_hash", None)
-        for key in ("enabled",):
-            if key in d:
-                d[key] = bool(d[key])
-        return d
-
-    async def create_dashboard_user(self, username: str, password: str,
-                                    role: str = "viewer") -> Optional[Dict[str, Any]]:
-        """v9.29: إنشاء مستخدم لوحة — None عند تكرار الاسم (فشل-آمن).
-
-        التحقق من صيغة الاسم/قوة كلمة المرور/صلاحية الدور مسؤولية الطبقة
-        العليا (dashboard.py) — هنا تُخزَّن فقط بعد التحقق.
-        """
-        if role not in self.DASHBOARD_ROLES:
-            return None
-        try:
-            ph = self.hash_dashboard_password(password)
-            await self._execute(
-                "INSERT INTO dashboard_users (username, password_hash, role, enabled)"
-                " VALUES (?, ?, ?, 1)",
-                (str(username).strip(), ph, role),
-            )
-            await self._commit()
-        except Exception as e:
-            logger.debug(f"create_dashboard_user failed: {e}")
-            return None
-        return await self.get_dashboard_user_by_name(str(username).strip())
-
-    async def list_dashboard_users(self, include_deleted: bool = False,
-                                   limit: int = 200) -> List[Dict[str, Any]]:
-        """v9.29: قائمة المستخدمين (Soft Delete مخفي افتراضياً)."""
-        try:
-            sql = "" if include_deleted else " AND deleted_at IS NULL"
-            rows = await self._fetchall(
-                "SELECT * FROM dashboard_users WHERE 1=1" + sql +
-                " ORDER BY username LIMIT ?",
-                (max(1, min(int(limit), 500)),),
-            )
-            return [self._dashboard_user_row(r) for r in rows]
-        except Exception as e:
-            logger.debug(f"list_dashboard_users skipped: {e}")
-            return []
-
-    async def get_dashboard_user(self, user_id: int) -> Optional[Dict[str, Any]]:
-        """v9.29: جلب مستخدم بالمعرّف (يشمل المحذوف — للتحقق قبل الحذف)."""
-        try:
-            row = await self._fetchone(
-                "SELECT * FROM dashboard_users WHERE id = ?", (int(user_id),)
-            )
-            return self._dashboard_user_row(row) if row else None
-        except Exception:
-            return None
-
-    async def get_dashboard_user_by_name(self, username: str,
-                                         include_deleted: bool = False,
-                                         include_hash: bool = False) -> Optional[Dict[str, Any]]:
-        """v9.29: جلب مستخدم بالاسم — مسار المصادقة يطلب include_hash=True.
-
-        include_deleted=False يخفي المحذوف (لا دخول بعد الحذف الناعم)،
-        وinclude_hash=True يبقي password_hash للمصادقة فقط — الواجهات
-        تستهلك الافتراضي (بلا hash أبداً).
-        """
-        try:
-            sql = "SELECT * FROM dashboard_users WHERE username = ?"
-            if not include_deleted:
-                sql += " AND deleted_at IS NULL"
-            row = await self._fetchone(sql, (str(username).strip(),))
-            if row is None:
-                return None
-            if include_hash:
-                d = dict(row)
-                d["enabled"] = bool(d.get("enabled"))
-                return d
-            return self._dashboard_user_row(row)
-        except Exception:
-            return None
-
-    async def set_dashboard_user_enabled(self, user_id: int, enabled: bool) -> bool:
-        """v9.29: تفعيل/تعطيل مستخدم (تعطيل = منع دخول فوري بلا حذف)."""
-        try:
-            cur = await self._execute(
-                "UPDATE dashboard_users SET enabled = ? WHERE id = ? AND deleted_at IS NULL",
-                (1 if enabled else 0, int(user_id)),
-            )
-            await self._commit()
-            return bool(cur.rowcount)
-        except Exception as e:
-            logger.debug(f"set_dashboard_user_enabled skipped: {e}")
-            return False
-
-    # ─────────────── v10.0: سجل قرارات الفلترة (filter_decisions) ───────────────
-
-    async def save_filter_decision(self, rec: Dict[str, Any]) -> bool:
-        """v10.0: حفظ قرار فلترة واحد (رسالة وصلت لمرحلة الكلمات المفتاحية).
-
-        يُكتب مباشرة (بلا دفعة) لأنه مطلوب فوراً في «معمل الفلترة»، وكمية
-        الصفوف محدودة طبيعياً (رسائل ذات كلمات مفتاحية فقط). فشل-آمن دائماً:
-        أي خطأ لا يرفع استثناءً — مراقبة الرسائل أهم من السجل.
-        """
-        try:
-            await self._execute(
-                """
-                INSERT INTO filter_decisions
-                    (msg_hash, chat_id, sender_id, sender_name, account_name,
-                     text, decision, confidence, score, keyword, intent_verb,
-                     academic_object, subject, type_tag, urgent, reasons)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    str(rec.get("msg_hash") or ""),
-                    int(rec.get("chat_id") or 0),
-                    int(rec.get("sender_id") or 0),
-                    str(rec.get("sender_name") or "")[:120],
-                    str(rec.get("account_name") or "")[:60],
-                    str(rec.get("text") or "")[:600],
-                    str(rec.get("decision") or "ignore")[:20],
-                    float(rec.get("confidence") or 0.0),
-                    float(rec.get("score") or 0.0),
-                    str(rec.get("keyword") or "")[:80],
-                    str(rec.get("intent_verb") or "")[:80],
-                    str(rec.get("academic_object") or "")[:80],
-                    str(rec.get("subject") or "")[:60],
-                    str(rec.get("type_tag") or "")[:60],
-                    1 if rec.get("urgent") else 0,
-                    str(rec.get("reasons") or "")[:400],
-                ),
-            )
-            await self._commit()
-            return True
-        except Exception as e:
-            logger.debug(f"save_filter_decision skipped: {e}")
-            return False
-
-    async def get_filter_decisions(self, limit: int = 60,
-                                   decision: Optional[str] = None) -> List[Dict[str, Any]]:
-        """v10.0: أحدث قرارات الفلترة — فشل-آمن (قائمة فارغة)."""
-        try:
-            lim = max(1, min(int(limit), 300))
-            if decision:
-                rows = await self._fetchall(
-                    "SELECT * FROM filter_decisions WHERE decision = ? "
-                    "ORDER BY id DESC LIMIT ?",
-                    (str(decision)[:20], lim),
-                )
-            else:
-                rows = await self._fetchall(
-                    "SELECT * FROM filter_decisions ORDER BY id DESC LIMIT ?",
-                    (lim,),
-                )
-            out = []
-            for r in rows:
-                d = dict(r)
-                d["urgent"] = bool(d.get("urgent"))
-                out.append(d)
-            return out
-        except Exception as e:
-            logger.debug(f"get_filter_decisions skipped: {e}")
-            return []
-
-    async def set_filter_decision_feedback(self, decision_id: int, correct: bool,
-                                           note: str = "") -> Optional[Dict[str, Any]]:
-        """v10.0: تغذية راجعة بشرية على قرار — تعيد الصف المحدَّث أو None."""
-        try:
-            cur = await self._execute(
-                "UPDATE filter_decisions SET feedback = ?, feedback_note = ? WHERE id = ?",
-                (1 if correct else -1, str(note or "")[:200], int(decision_id)),
-            )
-            await self._commit()
-            if not getattr(cur, "rowcount", 0):
-                return None
-            return await self._fetchone(
-                "SELECT * FROM filter_decisions WHERE id = ?", (int(decision_id),)
-            )
-        except Exception as e:
-            logger.debug(f"set_filter_decision_feedback skipped: {e}")
-            return None
-
-    async def filter_decision_stats(self, hours: int = 24) -> Dict[str, Any]:
-        """v10.0: إحصاءات القرارات (عدد/متوسط ثقة/حسب المادة/أعلى كلمات).
-
-        فشل-آمن: أي خطأ يعيد هيكلاً فارغاً.
-        """
-        empty = {"total": 0, "accepted": 0, "review": 0, "ignored": 0,
-                 "feedback_positive": 0, "feedback_negative": 0,
-                 "avg_confidence": 0.0, "subjects": [], "top_keywords": []}
-        try:
-            cutoff = time.time() - max(1, int(hours)) * 3600
-            # قابلية نقل: مقارنة نصية بصيغة CURRENT_TIMESTAMP تعمل في SQLite
-            # وPostgreSQL معاً (v10.0) بدل datetime('unixepoch') الخاص بـ SQLite.
-            cutoff_str = datetime.utcfromtimestamp(cutoff).strftime("%Y-%m-%d %H:%M:%S")
-            row = await self._fetchone(
-                """
-                SELECT COUNT(*) AS total,
-                       SUM(CASE WHEN decision='accept' THEN 1 ELSE 0 END) AS accepted,
-                       SUM(CASE WHEN decision='review' THEN 1 ELSE 0 END) AS review,
-                       SUM(CASE WHEN decision='ignore' THEN 1 ELSE 0 END) AS ignored,
-                       SUM(CASE WHEN feedback=1 THEN 1 ELSE 0 END) AS fb_pos,
-                       SUM(CASE WHEN feedback=-1 THEN 1 ELSE 0 END) AS fb_neg,
-                       AVG(confidence) AS avg_conf
-                FROM filter_decisions
-                WHERE created_at >= ?
-                """,
-                (cutoff_str,),
-            )
-            if not row:
-                return empty
-            subjects = await self._fetchall(
-                """
-                SELECT subject AS name, COUNT(*) AS count FROM filter_decisions
-                WHERE created_at >= ?
-                      AND subject IS NOT NULL AND subject != ''
-                GROUP BY subject ORDER BY count DESC LIMIT 8
-                """,
-                (cutoff_str,),
-            )
-            keywords = await self._fetchall(
-                """
-                SELECT keyword AS name, COUNT(*) AS count FROM filter_decisions
-                WHERE created_at >= ?
-                      AND keyword IS NOT NULL AND keyword != ''
-                GROUP BY keyword ORDER BY count DESC LIMIT 10
-                """,
-                (cutoff_str,),
-            )
-            return {
-                "total": int(row.get("total") or 0),
-                "accepted": int(row.get("accepted") or 0),
-                "review": int(row.get("review") or 0),
-                "ignored": int(row.get("ignored") or 0),
-                "feedback_positive": int(row.get("fb_pos") or 0),
-                "feedback_negative": int(row.get("fb_neg") or 0),
-                "avg_confidence": round(float(row.get("avg_conf") or 0.0), 3),
-                "subjects": [dict(s) for s in subjects],
-                "top_keywords": [dict(k) for k in keywords],
-            }
-        except Exception as e:
-            logger.debug(f"filter_decision_stats skipped: {e}")
-            return empty
-
-    # ─────────────── v9.33: سجل الحسابات من اللوحة (dashboard_accounts) ───────────────
-
-    async def list_dashboard_accounts(self, limit: int = 100) -> List[Dict[str, Any]]:
-        """v9.33: قائمة حسابات اللوحة بترتيب الإنشاء — فشل-آمن (قائمة فارغة)."""
-        try:
-            rows = await self._fetchall(
-                "SELECT * FROM dashboard_accounts ORDER BY id ASC LIMIT ?",
-                (max(1, int(limit)),),
-            )
-            out = []
-            for r in rows:
-                d = dict(r)
-                d["is_main"] = bool(d.get("is_main"))
-                d["enabled"] = bool(d.get("enabled"))
-                out.append(d)
-            return out
-        except Exception as e:
-            logger.debug(f"list_dashboard_accounts failed: {e}")
-            return []
-
-    async def get_dashboard_account(self, prefix: str) -> Optional[Dict[str, Any]]:
-        """v9.33: جلب حساب بالبادئة (MAIN / ACCOUNT_N) — None عند الغياب."""
-        try:
-            row = await self._fetchone(
-                "SELECT * FROM dashboard_accounts WHERE prefix = ?", (str(prefix).strip(),)
-            )
-            if row is None:
-                return None
-            d = dict(row)
-            d["is_main"] = bool(d.get("is_main"))
-            d["enabled"] = bool(d.get("enabled"))
-            return d
-        except Exception:
-            return None
-
-    async def upsert_dashboard_account(
-        self, prefix: str, name: str, api_id: int, api_hash: str, phone: str,
-        session_name: str = "", priority: int = 10, session_string: Optional[str] = None,
-        is_main: bool = False, origin: str = "panel",
-    ) -> Optional[Dict[str, Any]]:
-        """v9.33: إضافة/تحديث حساب بالبادئة (مصدر حقيقة اللوحة).
-
-        ON CONFLICT(prefix): تُحدَّث حقول الإعداد دائماً، وsession_string
-        لا يُمسّ إلا إذا جاءت قيمة جديدة (None = احتفظ بالموجود) — فلا
-        يمحو استدعاء إعدادي جلسة مسجلة سابقاً بالخطأ.
-        """
-        try:
-            await self._execute(
-                """
-                INSERT INTO dashboard_accounts
-                    (prefix, name, api_id, api_hash, phone, session_name,
-                     priority, session_string, is_main, origin, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-                ON CONFLICT(prefix) DO UPDATE SET
-                    name = excluded.name,
-                    api_id = excluded.api_id,
-                    api_hash = excluded.api_hash,
-                    phone = excluded.phone,
-                    session_name = excluded.session_name,
-                    priority = excluded.priority,
-                    is_main = excluded.is_main,
-                    origin = excluded.origin,
-                    updated_at = CURRENT_TIMESTAMP
-                """,
-                (str(prefix).strip(), str(name or "").strip(), int(api_id),
-                 str(api_hash or "").strip(), str(phone or "").strip(),
-                 str(session_name or "").strip(), int(priority),
-                 session_string, 1 if is_main else 0, str(origin or "panel")),
-            )
-            if session_string is not None:
-                await self._execute(
-                    "UPDATE dashboard_accounts SET session_string = ? WHERE prefix = ?",
-                    (str(session_string), str(prefix).strip()),
-                )
-            await self._commit()
-        except Exception as e:
-            logger.error(f"upsert_dashboard_account failed [{prefix}]: {e}")
-            return None
-        return await self.get_dashboard_account(str(prefix).strip())
-
-    async def set_dashboard_account_session(self, prefix: str, session_string: str) -> bool:
-        """v9.33: حفظ Session String بعد تسجيل دخول ناجح (بلا إعادة كتابة الإعدادات)."""
-        try:
-            cur = await self._execute(
-                "UPDATE dashboard_accounts SET session_string = ?, updated_at = CURRENT_TIMESTAMP "
-                "WHERE prefix = ?",
-                (str(session_string), str(prefix).strip()),
-            )
-            await self._commit()
-            return bool(cur.rowcount)
-        except Exception as e:
-            logger.debug(f"set_dashboard_account_session skipped: {e}")
-            return False
-
-    # ─────────────── v9.34: إدارة حسابات اللوحة الكاملة (CRUD + حالة حية) ───────────────
-
-    async def update_dashboard_account(
-        self, prefix: str,
-        name: Optional[str] = None, api_id: Optional[int] = None,
-        api_hash: Optional[str] = None, phone: Optional[str] = None,
-        session_name: Optional[str] = None, priority: Optional[int] = None,
-    ) -> bool:
-        """v9.34: تعديل بيانات حساب — فقط الحقول الممرّرة (None = لا يمسّ).
-        الـprefix نفسه لا يُغيَّر أبداً (هو المفتاح في البيئة والمراقبات)."""
-        sets: List[str] = []
-        vals: List[Any] = []
-        if name is not None:
-            sets.append("name = ?"); vals.append(str(name).strip())
-        if api_id is not None:
-            sets.append("api_id = ?"); vals.append(int(api_id))
-        if api_hash is not None:
-            sets.append("api_hash = ?"); vals.append(str(api_hash).strip())
-        if phone is not None:
-            sets.append("phone = ?"); vals.append(str(phone).strip())
-        if session_name is not None:
-            sets.append("session_name = ?"); vals.append(str(session_name).strip())
-        if priority is not None:
-            sets.append("priority = ?"); vals.append(int(priority))
-        if not sets:
-            return True  # لا شيء للتحديث — يُعدّ نجاحاً لا فشلاً
-        sets.append("updated_at = CURRENT_TIMESTAMP")
-        vals.append(str(prefix).strip())
-        try:
-            cur = await self._execute(
-                f"UPDATE dashboard_accounts SET {', '.join(sets)} WHERE prefix = ?",
-                tuple(vals),
-            )
-            await self._commit()
-            return bool(cur.rowcount)
-        except Exception as e:
-            logger.error(f"update_dashboard_account failed [{prefix}]: {e}")
-            return False
-
-    async def delete_dashboard_account(self, prefix: str) -> bool:
-        """v9.34: حذف حساب من قاعدة البيانات نهائياً (bool: هل حُذف فعلاً)."""
-        try:
-            cur = await self._execute(
-                "DELETE FROM dashboard_accounts WHERE prefix = ?",
-                (str(prefix).strip(),),
-            )
-            await self._commit()
-            return bool(cur.rowcount)
-        except Exception as e:
-            logger.error(f"delete_dashboard_account failed [{prefix}]: {e}")
-            return False
-
-    async def set_dashboard_account_enabled(self, prefix: str, enabled: bool) -> bool:
-        """v9.34: تفعيل/تعطيل حساب (DB مصدر الحقيقة — المراقبة تتبعه)."""
-        try:
-            cur = await self._execute(
-                "UPDATE dashboard_accounts SET enabled = ?, updated_at = CURRENT_TIMESTAMP "
-                "WHERE prefix = ?",
-                (1 if enabled else 0, str(prefix).strip()),
-            )
-            await self._commit()
-            return bool(cur.rowcount)
-        except Exception as e:
-            logger.error(f"set_dashboard_account_enabled failed [{prefix}]: {e}")
-            return False
-
-    async def set_dashboard_account_status(
-        self, prefix: str, status: str, last_error: Optional[str] = None,
-    ) -> bool:
-        """v9.34: تحديث حالة الاتصال الحية في قاعدة البيانات (فشل-آمن —
-        التتبع لا يُسقط عملية حية أبداً). status: connected/disconnected/
-        error/pending."""
-        if status not in ("connected", "disconnected", "error", "pending"):
-            return False
-        try:
-            cur = await self._execute(
-                "UPDATE dashboard_accounts SET status = ?, last_error = ?, "
-                "updated_at = CURRENT_TIMESTAMP WHERE prefix = ?",
-                (status, (str(last_error)[:300] if last_error else None), str(prefix).strip()),
-            )
-            await self._commit()
-            return bool(cur.rowcount)
-        except Exception as e:
-            logger.debug(f"set_dashboard_account_status skipped: {e}")
-            return False
-
-    async def mark_dashboard_account_connected(self, prefix: str) -> bool:
-        """v9.34: نجاح اتصال — status=connected + وقت آخر اتصال + مسح آخر خطأ."""
-        try:
-            cur = await self._execute(
-                "UPDATE dashboard_accounts SET status = 'connected', last_error = NULL, "
-                "last_connected_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP "
-                "WHERE prefix = ?",
-                (str(prefix).strip(),),
-            )
-            await self._commit()
-            return bool(cur.rowcount)
-        except Exception as e:
-            logger.debug(f"mark_dashboard_account_connected skipped: {e}")
-            return False
-
-    async def mark_dashboard_account_activity(self, prefix: str) -> bool:
-        """v9.34: ختم آخر نشاط (fire-and-forget من مسار الرسائل — لا يُبطئ أبداً)."""
-        try:
-            await self._execute(
-                "UPDATE dashboard_accounts SET last_activity_at = CURRENT_TIMESTAMP "
-                "WHERE prefix = ?",
-                (str(prefix).strip(),),
-            )
-            await self._commit()
-            return True
-        except Exception as e:
-            logger.debug(f"mark_dashboard_account_activity skipped: {e}")
-            return False
-
-
-    async def set_dashboard_user_role(self, user_id: int, role: str) -> bool:
-        """v9.29: تغيير دور مستخدم (دور غير معروف = رفض صامت)."""
-        if role not in self.DASHBOARD_ROLES:
-            return False
-        try:
-            cur = await self._execute(
-                "UPDATE dashboard_users SET role = ? WHERE id = ? AND deleted_at IS NULL",
-                (role, int(user_id)),
-            )
-            await self._commit()
-            return bool(cur.rowcount)
-        except Exception as e:
-            logger.debug(f"set_dashboard_user_role skipped: {e}")
-            return False
-
-    async def set_dashboard_user_password(self, user_id: int, password: str) -> bool:
-        """v9.29: إعادة تعيين كلمة مرور — scrypt جديد بعامل ملح جديد."""
-        try:
-            ph = self.hash_dashboard_password(password)
-            cur = await self._execute(
-                "UPDATE dashboard_users SET password_hash = ? WHERE id = ? AND deleted_at IS NULL",
-                (ph, int(user_id)),
-            )
-            await self._commit()
-            return bool(cur.rowcount)
-        except Exception as e:
-            logger.debug(f"set_dashboard_user_password skipped: {e}")
-            return False
-
-    async def touch_dashboard_user_login(self, user_id: int) -> bool:
-        """v9.29: تحديث last_login_at عند دخول ناجح (فشل-آمن)."""
-        try:
-            await self._execute(
-                "UPDATE dashboard_users SET last_login_at = CURRENT_TIMESTAMP"
-                " WHERE id = ?",
-                (int(user_id),),
-            )
-            await self._commit()
-            return True
-        except Exception:
-            return False
-
-    async def soft_delete_dashboard_user(self, user_id: int) -> bool:
-        """v9.29: حذف ناعم (Master Prompt 10.2) — الصف يبقى للتدقيق مع
-        deleted_at + enabled=0 فلا يعود صالحاً للدخول إطلاقاً."""
-        try:
-            cur = await self._execute(
-                "UPDATE dashboard_users SET deleted_at = CURRENT_TIMESTAMP,"
-                " enabled = 0 WHERE id = ? AND deleted_at IS NULL",
-                (int(user_id),),
-            )
-            await self._commit()
-            return bool(cur.rowcount)
-        except Exception as e:
-            logger.debug(f"soft_delete_dashboard_user skipped: {e}")
-            return False
-
-    async def count_dashboard_users(self, include_deleted: bool = False) -> int:
-        """v9.29: عدّاد المستخدمين (لوحات الإحصاء)."""
-        try:
-            sql = "" if include_deleted else " WHERE deleted_at IS NULL"
-            row = await self._fetchone(
-                "SELECT COUNT(*) AS n FROM dashboard_users" + sql
-            )
-            return int(row["n"]) if row else 0
-        except Exception:
             return 0
 
     # ─── v9.20 P1: مصادر المراقبة (Sources) ──────────────────
@@ -5212,8 +4523,8 @@ class EnhancedDatabase:
         """
         payload: Dict[str, Any] = {"version": 1, "exported_at": time.time(), "tables": {}}
         for table, columns in CRITICAL_EXPORT_TABLES.items():
-            if table == "keywords_json" or not columns:
-                continue  # keywords mirror يُدار عبر dashboard_store
+            if not columns:
+                continue
             try:
                 cols = ", ".join(columns)
                 rows = await self._fetchall(f"SELECT {cols} FROM {table}")
@@ -5240,7 +4551,7 @@ class EnhancedDatabase:
         cleared: set = set()
         try:
             for table, columns in CRITICAL_EXPORT_TABLES.items():
-                if table == "keywords_json" or not columns:
+                if not columns:
                     continue
                 rows = tables.get(table)
                 if not isinstance(rows, list) or not rows:
@@ -5963,3 +5274,4 @@ class EnhancedDatabase:
         elif self.db_type == "postgresql" and self._pool:
             await self._pool.close()
         logger.info("Database v9.0 closed")
+

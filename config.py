@@ -165,7 +165,7 @@ def setup_logging(
         # — it dumps local variables (including session strings, API hashes,
         # tokens, sender phone numbers, message text) into every traceback
         # written to bot.log, and the webadmin logs reader exposes that
-        # file to anyone with dashboard access. We now default to
+        # file to anyone with access to the machine. We now default to
         # diagnose=False in production (RENDER=true or ENVIRONMENT=prod)
         # and only enable it when LOG_DIAGNOSE=true is set explicitly.
         # Local dev keeps diagnose=True for actually useful tracebacks.
@@ -374,11 +374,7 @@ class _ConfigData:
     HEALTH_MIN_MONITORS_RATIO: float
     SESSION_BACKUP_INTERVAL: int
 
-    # ── Dashboard Settings ──
-    DASHBOARD_ENABLED: bool
-    DASHBOARD_PORT: int
-    DASHBOARD_AUTH_TOKEN: str
-    # v9.28-1: سياسات الاحتفاظ — قابلة للضبط حياً من اللوحة (مجموعة retention)
+    # ── v9.28-1: سياسات الاحتفاظ ──
     # القيم الافتراضية = السلوك التاريخي حرفياً (رسائل 7 / تدقيق 90 / إشعارات 30)
     RETENTION_MESSAGES_DAYS: int
     RETENTION_AUDIT_DAYS: int
@@ -613,14 +609,6 @@ class Config:
         if cls._instance is not None:
             return cls._instance
 
-        # تحذير أمني لـ DASHBOARD_AUTH_TOKEN
-        dash_token = SecretManager.get("DASHBOARD_AUTH_TOKEN", "change-me", required=False)
-        if dash_token == "change-me":
-            logger.warning(
-                "⚠️ DASHBOARD_AUTH_TOKEN is still 'change-me'! "
-                "Please change it immediately for security."
-            )
-
         setup_logging(
             log_file=SecretManager.get("LOG_FILE", "bot.log", required=False),
             level=SecretManager.get("LOG_LEVEL", "INFO", required=False),
@@ -640,8 +628,8 @@ class Config:
         if tg_raw is None or admin_raw is None:
             logger.critical(
                 "TARGET_GROUP_ID/ADMIN_CHAT_ID missing at boot — running in "
-                "dashboard-only mode (no monitoring/alerts). If this is a "
-                "normal deploy, verify the Render environment variables."
+                "idle mode (no monitoring/alerts, health server only). If this "
+                "is a normal deploy, verify the Render environment variables."
             )
             tg = int(tg_raw) if tg_raw is not None else 0
             admin = int(admin_raw) if admin_raw is not None else 0
@@ -808,10 +796,6 @@ class Config:
             HEALTH_CHECK_INTERVAL=SecretManager.get_int("HEALTH_CHECK_INTERVAL", 60, required=False),
             HEALTH_MIN_MONITORS_RATIO=SecretManager.get_float("HEALTH_MIN_MONITORS_RATIO", 0.5, required=False),
             SESSION_BACKUP_INTERVAL=SecretManager.get_int("SESSION_BACKUP_INTERVAL", 3600, required=False),
-            # ========== Dashboard ==========
-            DASHBOARD_ENABLED=SecretManager.get_bool("DASHBOARD_ENABLED", False),
-            DASHBOARD_PORT=SecretManager.get_int("DASHBOARD_PORT", 8080, required=False),
-            DASHBOARD_AUTH_TOKEN=dash_token,
             # v9.28-1: سياسات الاحتفاظ (7/90/30 = السلوك التاريخي حرفياً)
             RETENTION_MESSAGES_DAYS=SecretManager.get_int("RETENTION_MESSAGES_DAYS", 7, required=False),
             RETENTION_AUDIT_DAYS=SecretManager.get_int("RETENTION_AUDIT_DAYS", 90, required=False),
@@ -1000,9 +984,8 @@ class Config:
 
         cls._instance = cfg
         logger.info(
-            f"Config v13.1 built: DB={db_type} | "
+            f"Config v14.0 built: DB={db_type} | "
             f"PROCESSING_WORKERS={workers} | "
-            f"DASHBOARD={'ON' if cfg.DASHBOARD_ENABLED else 'OFF'} | "
             f"FUZZY={'ON' if cfg.FUZZY_MATCHING_ENABLED else 'OFF'} | "
             f"NEGATION={'ON' if cfg.NEGATION_ENABLED else 'OFF'} | "
             f"AD_DETECTION={'ON' if cfg.AD_DETECTION_ENABLED else 'OFF'}"
@@ -1019,8 +1002,8 @@ class Config:
 # =============================================================================
 # Bot version — single source of truth (v10.2 Send Rotation)
 # =============================================================================
-BOT_VERSION: Final = "13.0.0"
-BOT_CODENAME: Final = "Sender Intelligence"
+BOT_VERSION: Final = "14.0.0"
+BOT_CODENAME: Final = "No Dashboard"
 
 # =============================================================================
 # Pre-built config instance
@@ -1385,8 +1368,7 @@ def get_memory_info() -> Dict[str, Any]:
     return {"rss_mb": 0, "vms_mb": 0, "percent": 0.0}
 
 logger.info(
-    f"config.py v13.1 loaded | Accounts: {len(ACCOUNTS)} | Workers: {CFG.PROCESSING_WORKERS} | "
+    f"config.py v14.0 loaded | Accounts: {len(ACCOUNTS)} | Workers: {CFG.PROCESSING_WORKERS} | "
     f"DB_URL: {'YES' if os.getenv('DATABASE_URL') else 'NO'} | "
-    f"DASHBOARD: {'ON' if CFG.DASHBOARD_ENABLED else 'OFF'} | "
     f"INTENT_ENGINE: v13.1 (template-boost fix applied)"
 )

@@ -18,13 +18,11 @@ sys.path.insert(0, str(PROJECT_DIR))
 # Deterministic, safe test environment — must be set BEFORE config import.
 os.environ.setdefault("TARGET_GROUP_ID", "-1001234567890")
 os.environ.setdefault("ADMIN_CHAT_ID", "654321")
-os.environ.setdefault("DASHBOARD_AUTH_TOKEN", "test-dashboard-token-0123456789")
 os.environ.setdefault("DB_TYPE", "sqlite")
 # Do NOT let a sandbox-wide DATABASE_URL flip the DB engine mid-suite.
 os.environ.pop("DATABASE_URL", None)
 os.environ["DB_FILE"] = str(PROJECT_DIR / "tests" / "_test_bot.db")
 os.environ["LOG_FILE"] = str(PROJECT_DIR / "tests" / "_test_bot.log")
-os.environ["DASHBOARD_ENABLED"] = "false"
 
 # v11.5.1: host secrets must never leak into the test environment.
 # config.py loads <project>/accounts.env via dotenv at import time; a host
@@ -53,24 +51,6 @@ def _reset_v11_7_1_singleton_state():
 
 
 from database import EnhancedDatabase  # noqa: E402
-
-
-async def drain_dashboard_tasks(app=None):
-    """Wait for fire-and-forget audit/notification tasks to finish.
-
-    Audit writes are fire-and-forget by design (v9.18); tests that read
-    /api/audit right after a mutating call must drain the tracked tasks
-    first — otherwise the read races the write.
-    """
-    import asyncio
-    import dashboard as _dash
-    for _ in range(50):
-        pending = [t for t in getattr(_dash, "_background_dashboard_tasks", set())
-                   if not t.done()]
-        if not pending:
-            break
-        await asyncio.sleep(0.02)
-        await asyncio.gather(*pending, return_exceptions=True)
 
 
 @pytest.fixture()

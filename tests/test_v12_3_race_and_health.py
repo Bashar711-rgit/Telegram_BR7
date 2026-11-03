@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""اختبارات v12.3.0 — V12-D (سباق ازدواجية dead-letter) + S-4 (شفافية webadmin).
+"""اختبارات v12.3.0 — V12-D (سباق ازدواجية dead-letter).
 
 التغطية:
   A. V12-D — القفل الذرّي (CAS على attempts):
@@ -9,7 +9,6 @@
      4. مسار سعيد: True + حرف ميت واحد + الصف خرج + عقد retry_count=attempts.
      5. حدث السمّ ينتهي عبر دورات استرداد (لا ارتداد أبدي pending↔in_flight).
      6. _execute_affected يعدّ الصفوف المتأثرة بصدق (أساس CAS).
-  B. S-4 — /health/full يكشف حالة تركيب webadmin صادقاً (لا انقطاع صامت).
 
 القيود الموثقة: فروع PostgreSQL في _dead_letter_row/_execute_affected تُختبر
 نصياً بالبنية نفسها (SQLite فقط هنا) — لا يُدعى أنها إثبات تشغيلي لـPG.
@@ -20,10 +19,7 @@ import json
 import time
 
 import pytest
-from httpx import ASGITransport, AsyncClient
-
 from database import EnhancedDatabase
-from tests.test_dashboard import AUTH  # نفس توكن اللوحة المعتمد
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -181,59 +177,3 @@ class TestDeadLetterRace:
             (rid, 2),
         )
         assert n2 == 0
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# B. S-4 — شفافية تركيب webadmin في /health/full
-# ═══════════════════════════════════════════════════════════════════════
-
-@pytest.fixture()
-async def client():
-    from dashboard import app
-    async with app.router.lifespan_context(app):
-        transport = ASGITransport(app=app)
-        async with AsyncClient(transport=transport, base_url="http://test") as ac:
-            yield ac
-
-
-class TestWebadminMountVisibility:
-    @pytest.mark.asyncio
-    async def test_health_full_exposes_webadmin_mount_state(self, client):
-        """/health/full يحمل webadmin_mounted (bool) + webadmin_mount_error
-        (نص مقطوع آمن) — فشل التركيب لم يعد صامتاً في التشخيص."""
-        r = await client.get("/health/full", headers=AUTH)
-        assert r.status_code == 200
-        body = r.json()
-        assert "webadmin_mounted" in body
-        assert isinstance(body["webadmin_mounted"], bool)
-        assert "webadmin_mount_error" in body
-        assert isinstance(body["webadmin_mount_error"], str)
-        assert len(body["webadmin_mount_error"]) <= 200
-
-    @pytest.mark.asyncio
-    async def test_webadmin_state_flag_set_at_import(self, client):
-        """app.state يحمل العلمين بعد الاستيراد بغضّ النظر عن نتيجة التركيب."""
-        from dashboard import app
-        assert hasattr(app.state, "webadmin_mounted")
-        assert isinstance(app.state.webadmin_mounted, bool)
-        assert hasattr(app.state, "webadmin_mount_error")
-
-    @pytest.mark.asyncio
-    async def test_mounted_flag_matches_router_reality(self, client):
-        """الصدق السلوكي: إن كان العلم True فلا بد لمسار /admin أن يستجيب
-        فعلياً (لا ادعاء بلا بنية).
-
-        ملاحظة تدقيقية v12.3: في FastAPI 0.162.0 خاصية app.routes لم تعد
-        تعكس مسارات include_router (سلوك تأمل جديد — app.routes أظهر 78
-        مساراً بلا أي مسار /admin بينما GET /admin يستجيب 200 فعلاً).
-        لذلك التحقق هنا سلوكي (طلب HTTP حقيقي) لا استبطاني."""
-        from dashboard import app
-        if app.state.webadmin_mounted:
-            r = await client.get("/admin")
-            assert r.status_code != 404, (
-                "webadmin_mounted=True بينما /admin يعيد 404 — ادعاء كاذب"
-            )
-        else:
-            # علم False صادق أيضاً: /admin إما 404 أو محمي بحارس لا يمرره
-            r = await client.get("/admin")
-            assert r.status_code in (401, 404) or r.status_code < 500

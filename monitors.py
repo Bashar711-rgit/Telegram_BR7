@@ -2618,32 +2618,6 @@ class EnhancedAccountMonitor:
             or (rule_result is not None and rule_result.get("action") == "allow")
         )
         # =========================================================================
-        # ── v10.0: سجل قرارات الفلترة — كل رسالة وصلت لمرحلة الكلمات ──
-        # (accept/review/ignore-بكلمة) تُسجَّل مع تصنيفها لتظهر في «معمل
-        # الفلترة» مع تغذية راجعة بشرية تُغذّي الأوزان التكيفية. فشل-آمن.
-        if validated_text and analysis.get("keyword") is not None:
-            try:
-                _sender_name = f"{data.get('sender_first_name') or ''} {data.get('sender_last_name') or ''}".strip()
-                await self.db.save_filter_decision({
-                    "msg_hash": msg_hash,
-                    "chat_id": chat_id_rule,
-                    "sender_id": sender_id,
-                    "sender_name": _sender_name,
-                    "account_name": data.get("account_name", self.account.get("name", "")),
-                    "text": validated_text,
-                    "decision": decision,
-                    "confidence": float(analysis.get("confidence") or 0.0),
-                    "score": float(analysis.get("score") or 0.0) if isinstance(analysis.get("score"), (int, float)) else 0.0,
-                    "keyword": str(analysis.get("keyword") or ""),
-                    "intent_verb": str(analysis.get("intent_verb") or ""),
-                    "academic_object": str(analysis.get("academic_object") or ""),
-                    "subject": str(analysis.get("subject") or ""),
-                    "type_tag": str(analysis.get("type_tag") or ""),
-                    "urgent": bool(analysis.get("urgent")),
-                    "reasons": "; ".join(str(r) for r in (analysis.get("reasons") or [])[:8]),
-                })
-            except Exception as _fd_err:
-                logger.debug(f"filter decision log skipped [{self.account['name']}]: {_fd_err}")
         # ══ v11.1: message_analysis — تحليل الرسالة ككيان منفصل ══
         # تُسجَّل كل رسالة وصلت لمرحلة الكلمات (accept/ignore) بمؤشرات
         # المحرك الفعلية فقط — ما لا ينتجه المحرك يُخزَّن NULL بصدق.

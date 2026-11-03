@@ -316,3 +316,19 @@ Work Log:
 - البطاقة v13: BOT_NAME_LINE="B_Bot" مضمّن في SENDER_LABEL (كل إزاحات الكيانات المشتقة تصح تلقائياً في alert_bot/alert_ui/entity_pack) + ترتيب الأزرار [مراسلة][عرض الرسالة] حرفياً + echo guard يتعرف على التوقيع الجديد والقديم.
 - اختبارات: tests/test_v13_dedup_and_card.py (~40 اختباراً: T1-T10 + عقد البطاقة §14) + تحديث الاختبارات المثبتة للقالب القديم (golden regression إلى العقد v13).
 - المجموعة الكاملة: **1225 PASS** (EXIT=0، صفر فشل) — شاملة 1160 القاعدة + الجديدة.
+
+---
+Task ID: v14.0-no-dashboard
+Agent: Z.ai (main orchestrator)
+Task: فصل لوحة التحكم وحذف ملفاتها بالكامل وقاعدة بياناتها (طلب المالك الصريح) — v14.0 «No Dashboard»
+
+Work Log:
+- حماية قبل الحذف: فرع `pre-dashboard-removal` + tag `v13.0.0-pre-dashboard-removal` + حزمة أرشيف مستقلة خارج المستودع (BR7_dashboard_separated_v13.0.0.tar.gz).
+- حذف الملفات (git rm): dashboard.py (4595 سطر) · dashboard_store.py (592) · webadmin/ (9 ملفات، 2205 سطر) · templates/dashboard.html + admin.html (308KB) · 7 ملفات اختبار لوحة (test_dashboard/test_dashboard_store/test_webadmin/test_filter_lab/test_account_management/test_accounts_db/test_otp_delivery/test_qr_sms_login/test_rbac/test_rbac_expansion/test_runtime_monitor_replacement) · scripts/migrate_sqlite_to_pg.py (كان يستدعي API اللوحة).
+- main.py: إزالة الاستيراد المشروط + _start_dashboard + _dashboard_task + قسم v9.34 لإدارة الحسابات الحية (كان حصرياً للوحة) + فروع /dashboard (يبقى الأمر برد «أُزيلت») + بحث الحسابات المعطلة من dashboard_accounts + سطور حالة اللوحة؛ خادم الصحة القائم بذاته (/health + /health/full على $PORT) صار الطبقة الويب الوحيدة دائماً. 2096→1922 سطراً.
+- config.py: حذف DASHBOARD_ENABLED/DASHBOARD_PORT/DASHBOARD_AUTH_TOKEN (حقول + قراءة + تحذير التوكن + سطري سجل)؛ BOT_VERSION=14.0.0، BOT_CODENAME="No Dashboard".
+- database.py: حذف إنشاء الجداول الثلاثة (dashboard_users/dashboard_accounts/filter_decisions — app_settings بقيت لنواة البوت) + هجرة v9.34 + DASHBOARD_ROLES + كل دوال CRUD (users/accounts/filter-decisions) + صف keywords_json من CRITICAL_EXPORT_TABLES؛ 5965→5284 سطراً.
+- monitors.py: حذف كتابة save_filter_decision من المسار الساخن (كانت تغذي معمل الفلترة في اللوحة حصراً) — كتابة أقل على قاعدة البيانات المجانية.
+- النشر: render.yaml (DASHBOARD_AUTH_TOKEN/ENABLED/PORT/CORS + RENDER_API_KEY/RENDER_SERVICE_ID + سطر التوافق) · requirements.txt/lock (fastapi/uvicorn/websockets/python-multipart/itsdangerous/qrcode) · start.sh (كتلة dashboard) · conftest (توكن اللوحة + drain helper).
+- قاعدة البيانات: migrations/0004_remove_dashboard.sql — DROP للجداول الثلاثة + تنظيف صفوف إعدادات اللوحة من app_settings (idempotent، يُطبق من Supabase SQL Editor — لا وصول مباشر للإنتاج من الصندوق).
+- اختبارات: إعادة بناء .venv من requirements.lock (ضاع مع إعادة تدوير الصندوق)؛ تجريد أجزاء اللوحة من 7 ملفات اختبار مختلطة؛ اختبار تقليم intel أُعيد توجيهه من filter_decisions إلى sender_contacts (نفس مسار ts النصي)؛ النتيجة **955/955 PASS** (الفرق عن 1225 = اختبارات اللوحة المحذوفة معها).
