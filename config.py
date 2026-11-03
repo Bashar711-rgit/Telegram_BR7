@@ -894,8 +894,9 @@ class Config:
             CAPTURE_BUFFER_SIZE=SecretManager.get_int("CAPTURE_BUFFER_SIZE", 1000, required=False),
             CAPTURE_TTL_SECONDS=SecretManager.get_int("CAPTURE_TTL_SECONDS", 30, required=False),
             # v9.10 dedup: يمنع تكرار التنبيهات (نفس المرسل بنفس النص، عبر أي
-            # حساب من الحسابات الستة أو إعادة إرسال). كلتا القيمتين قابلتان
-            # للتعديل الحي من لوحة التحكم (DEDUP_ENABLED / DEDUP_WINDOW_SECONDS).
+            # حساب من الحسابات الستة أو إعادة إرسال). تُقرأ من env عند الإقلاع
+            # (DEDUP_ENABLED / DEDUP_WINDOW_SECONDS) — المصدر الرسمي بعد حذف
+            # اللوحة (v14.0) هو البيئة حصراً، والقراءة حية من CFG عند كل claim.
             DEDUP_ENABLED=SecretManager.get_bool("DEDUP_ENABLED", True),
             DEDUP_WINDOW_SECONDS=SecretManager.get_int("DEDUP_WINDOW_SECONDS", 86400, required=False),
             DEDUP_RECOVERY_STEAL_MIN_AGE_SECONDS=SecretManager.get_int(
@@ -981,6 +982,16 @@ class Config:
             TEXT_CACHE_SIZE=SecretManager.get_int("TEXT_CACHE_SIZE", 5000, required=False),
             TEXT_CACHE_TTL=SecretManager.get_int("TEXT_CACHE_TTL", 300, required=False),
         )
+
+        # v14.1 (تدقيق 2-a): fail-fast — REVIEW يجب أن يكون أدنى من ACCEPT
+        # حصراً، وإلا يفحص المحرك accept أولاً فيختفي مسار review بصمت.
+        if not (0 < cfg.CONFIDENCE_REVIEW_THRESHOLD < cfg.CONFIDENCE_ACCEPT_THRESHOLD <= 1.0):
+            raise ValueError(
+                "CONFIDENCE_REVIEW_THRESHOLD must be > 0 and "
+                "< CONFIDENCE_ACCEPT_THRESHOLD <= 1.0 "
+                f"(got review={cfg.CONFIDENCE_REVIEW_THRESHOLD}, "
+                f"accept={cfg.CONFIDENCE_ACCEPT_THRESHOLD})"
+            )
 
         cls._instance = cfg
         logger.info(

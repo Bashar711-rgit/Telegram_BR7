@@ -91,6 +91,10 @@ from security import (
 from metrics import BoundedMetrics
 from adaptive import AdaptiveWeights
 
+# v14.1 (تدقيق 2-a): إصدار المحرك — مصدر واحد للتيليمتري (message_analysis)
+# بدل "intent-engine-v13" المكتوبة يدوياً التي كانت تُخزّن إصدارات خاطئة.
+FILTER_ENGINE_VERSION: Final[str] = "14.5.0"
+
 try:
     from rapidfuzz import fuzz, process as rf_process
     RAPIDFUZZ_AVAILABLE = True
@@ -585,9 +589,12 @@ class EnhancedFilter:
 
         # Read fuzzy settings from keywords.json/CFG BEFORE loading keywords.
         # This prevents AttributeError in _load_keyword_sets.
+        # v14.1 (تدقيق 2-a): المفتاح الصحيح CFG.FUZZY_MATCHING_ENABLED (المعرّف
+        # فعلاً في config.py:951) — كان يُقرأ FUZZY_FALLBACK_ENABLED غير
+        # المعرّف، فيطبع "FUZZY=OFF" في اللوج ويبقى المحرك يعمل fuzzy.
         fuzzy_data = self._raw_keywords.get("fuzzy_matching", {})
         self._fuzzy_enabled = (
-            _cfg("FUZZY_FALLBACK_ENABLED", fuzzy_data.get("enabled", True))
+            _cfg("FUZZY_MATCHING_ENABLED", fuzzy_data.get("enabled", True))
             and RAPIDFUZZ_AVAILABLE
         )
         self._fuzzy_score_cutoff = _cfg("FUZZY_SCORE_CUTOFF", 85.0)
@@ -1178,9 +1185,11 @@ class EnhancedFilter:
         from config import load_keywords
         fresh = load_keywords(path)
         # Re-read fuzzy settings if they changed in the new file
+        # v14.1: نفس تصحيح المفتاح أعلاه + إبطال كاش النصوص (قرارات قديمة
+        # مخبأة تبقى صالحة حتى 5 دقائق لو لم يُمسّ الكاش بعد إعادة التحميل).
         fuzzy_data = fresh.get("fuzzy_matching", {})
         self._fuzzy_enabled = (
-            _cfg("FUZZY_FALLBACK_ENABLED", fuzzy_data.get("enabled", True))
+            _cfg("FUZZY_MATCHING_ENABLED", fuzzy_data.get("enabled", True))
             and RAPIDFUZZ_AVAILABLE
         )
         self._fuzzy_score_cutoff = _cfg("FUZZY_SCORE_CUTOFF", 85.0)
@@ -1189,6 +1198,12 @@ class EnhancedFilter:
         self._fuzzy_only_for = fuzzy_data.get("only_for", [])
 
         self._load_keyword_sets(fresh)
+        # v14.1 (تدقيق 2-a): إبطال كاش القرارات بعد إعادة بناء الtries —
+        # مسح TTLCache ذري تحت GIL؛ الدالة متزامنة ونادرة (إدارية).
+        try:
+            self._text_cache.clear()
+        except Exception:
+            pass
         # Re-seed adaptive weights on reload.
         if hasattr(self, "_adaptive_intent"):
             self._adaptive_intent = self._reseed_adaptive(self._adaptive_intent, self._intent_weights)
@@ -1352,6 +1367,10 @@ class EnhancedFilter:
         return min(score, 1.0)
 
     def _detect_advertisement(self, text: str) -> Tuple[float, List[str]]:
+        # v14.1 (تدقيق 2-a): بوابة CFG.AD_DETECTION_ENABLED — المفتاح كان معرّفاً
+        # ولا يقرأه المحرك. الافتراضي True = السلوك السابق حرفياً.
+        if not getattr(CFG, "AD_DETECTION_ENABLED", True):
+            return (0.0, [])
         ad_score = 0.0
         reasons = []
 
@@ -1465,7 +1484,13 @@ class EnhancedFilter:
           signal (0.2), not a kill.
         * negation_exceptions back the negation off only when they occur
           near the negator.
+
+        v14.1 (تدقيق 2-a): بوابة CFG.NEGATION_ENABLED — المفتاح كان معرّفاً
+        في config ولا يقرأه المحرك (يُطبع OFF باللوج ويستمر الكشف). الافتراضي
+        True = السلوك السابق حرفياً.
         """
+        if not getattr(CFG, "NEGATION_ENABLED", True):
+            return (False, 0.0, [])
         exception_positions: List[int] = []
         for word, _w, pos in self._search_all_valid(self._resolution_trie, text):
             exception_positions.append(pos)
@@ -2386,6 +2411,10 @@ class EnhancedFilter:
             weight = await self._adaptive_academic.record_feedback(term, was_correct)
         else:
             raise ValueError(f"Unknown term_kind: {term_kind!r} (expected 'intent' or 'academic')")
+        # v14.1 (تدقيق 2-a): التصحيح يُبطل كاش القرارات — كان النص المحلل
+        # قبل التصحيح يعيد قراره القديم من _text_cache حتى 5 دقائق (TTL).
+        async with self._cache_lock:
+            self._text_cache.clear()
         async with self._stats_lock:
             self._stats["feedback_events"] += 1
         return weight
@@ -2397,13 +2426,17 @@ class EnhancedFilter:
         emoji no longer hard-blocks (it feeds _detect_advertisement instead),
         and institution terms block only alongside real commercial signals
         (a student writing "مكتب خدمات الجامعه" is not an advertiser).
+
+        v14.1: فرعا الإعلانات هنا يخضعان لنفس بوابة AD_DETECTION_ENABLED
+        (اتساق دلالي: الإيقاف يعطّل كشف الإعلانات كله، لا التقييم فقط).
         """
-        if self._search_first_valid(self._ad_hard_trie, text):
-            result.reason = "advertisement"
-            return True
-        if ad_score >= 0.3 and self._search_first_valid(self._education_trie, text):
-            result.reason = "education_provider"
-            return True
+        if getattr(CFG, "AD_DETECTION_ENABLED", True):
+            if self._search_first_valid(self._ad_hard_trie, text):
+                result.reason = "advertisement"
+                return True
+            if ad_score >= 0.3 and self._search_first_valid(self._education_trie, text):
+                result.reason = "education_provider"
+                return True
         return False
 
     def _convert_result(self, result: FilterResult, is_arabic: bool, arabic_ratio: float,

@@ -1,5 +1,30 @@
 
 ---
+Task ID: v14.1.0 (audit-fixes: filter + alert systems)
+Agent: Z.ai Code (main orchestrator)
+Task: فحص معمّق مزدوج (نظام الفلترة + نظام التنبيهات) بعد حذف اللوحة + إصلاح كل العيوب المؤكدة
+
+Work Log:
+- خط الأساس: 955/955 على v14.0.2. فحصان متوازيان (استكشاف معمّق) غطيا filter_engine/classifier/clauses/antispam/adaptive/negative_memory و monitors/alert_bot/dedup/unified_alerts/reply_fix/contact_target/database بدليل file:line لكل ملاحظة.
+- [2-a/HIGH] التقرير اليومي كان يموت دائماً: main.py:1211 كان يقرأ CFG.BOT_VERSION و الحقل غير موجود على الـdataclass المجمد (ثابت وحدة) → AttributeError مبتلَع → لا digest أبداً + يُعلَّم اليوم مرسَلاً. أُصلح بثوابت BOT_VERSION/BOT_CODENAME المستوردة.
+- [2-a/MEDIUM] مفاتيح القتل كانت وهمية: المحرك قرأ FUZZY_FALLBACK_ENABLED غير المعرّف (يبقى fuzzy يعمل رغم طباعة FUZZY=OFF)، ولم يكن يقرأ NEGATION_ENABLED/AD_DETECTION_ENABLED إطلاقاً. وُصلت البوابات الثلاث (_fuzzy_enabled + بوابات _detect_negation/_detect_advertisement/_is_blocked). الافتراضي True = السلوك السابق حرفياً.
+- [2-a/MEDIUM-latent] record_feedback/reload_keywords كانا لا يبطلان _text_cache (قرارات قديمة حتى 5 دقائق بعد تصحيح/إعادة تحميل). أُضيف إبطال الكاش في كليهما.
+- [2-a/MEDIUM] تيليمتري message_analysis كانت تخزن إصدارات كاذبة منذ v11 ("11.1.0" + "intent-engine-v13" اليدوية). أُضيف FILTER_ENGINE_VERSION ثابتاً للمحرك واستُخدم مع BOT_VERSION. + app_version للـTelethon 13.0→14.0.
+- [2-a/LOW] استرداد fast-capture صار يقيس بالسياسة الموحدة FilterPolicy (كان يقيس strip فقط — نص خامه 66 بمحرف صفر-عرض واحد كان يُرفض رغم تجويز البوابة الموحدة).
+- [2-a/LOW] config: تحقق fail-fast جديد — CONFIDENCE_REVIEW_THRESHOLD يجب أن يكون أدنى من CONFIDENCE_ACCEPT_THRESHOLD حصراً (وإلا يختفي مسار review بصمت).
+- [2-b/MEDIUM] سباق TOCTOU في الرد التعويضي: allowed() → sleep(2-5s) → record كان يسمح بردّين «👤» لنفس المرسل خلال الساعة عبر مهمتين متزامنتين. أصبح الحجز ذرياً قبل أي await، وللمسلّم كاملاً حجز واحد (كان لكل درجة — يقفل المرسل ساعة بلا ردّ).
+- [2-b/MEDIUM] عداد alerts_sent الصادق: _send_alert يعيد True فقط عند تسليم فعلي (AlertBot/verified/admin-DM/fallback/أساسي — 5 نقاط) والمتصل يزداد عند True فقط (كان يُحتسب حتى في المكرر/المحدود/المشابه-الممنوع). + موسّع RC-2: فشل تسجيل ما بعد الإرسال في مسار AlertBot/verified لا يفعّل الـfallback (كان خطر بطاقة مكررة مرئية).
+- [2-b/MEDIUM] فرع PostgreSQL في claim_alert_fingerprint: كان SELECT FOR UPDATE + INSERT بلا ON CONFLICT — سباق إدخال مزدوج عند تعدد النسخ → unique_violation → فشل-مفتوح → تنبيهان. أصبح INSERT … ON CONFLICT DO NOTHING RETURNING (نفس دلالات SQLite حرفياً). ضمن عملية واحدة لم يتأثر شيء (L1 الذري يسبق DB).
+- [v14.0-tail] إكمال تنظيف اللوحة: جداول RBAC الخمسة أُزيلت من مخطط br7 (br7_schema_v1.sql) + ترحيل idempotent جديد migrations/0005_remove_dashboard_br7.sql (CASCADE لقيود FK فقط، لا يلمس public ولا br7.filter_decisions) + apply_br7_schema.py حُدّثت عدّاداته. حُذفت 9 دوال بيانات لوحة ميتة من database.py (get_hourly_stats/get_dashboard_summary/…) + اختبارها، وتنظيف آخر إشارات "dashboard/اللوحة" في docstrings (metrics/sender_resolver/unified_alerts/dedup/gate/filter_policy/config).
+- تأكيدات "سليم ومؤكد" من التدقيق (بلا تغيير): فلتر الطول 6..65 متسق عبر كل البوابات، ترتيب الـprefilter صحيح، fast capture بلا معالجة مزدوجة (ثلاث طبقات)، dedup عبر الحسابات ينذر مرة واحدة بالضبط، طوابق T/N/B/V بلا تكرار بينها، cooldown يُحدَّث عند التسليم الفعلي فقط، عزل reply_fix لحساب المالك سليم، بوابة unified_alerts بلا تجاوز، وترحيل 0004 على public آمن تماماً (لا قارئ حي للمفاتيح المحذوفة — القرّاء الوحيدون لـapp_settings هم negmem:* التي لا يمسها).
+
+Stage Summary:
+- 973/973 PASS (955 − 1 اختبار لوحة محذوف + 19 اختبار تدقيق جديد: بوابات القتل، إبطال الكاش، سباق حصة الرد التعويضي، حجز السلّم الواحد، ومصادر source-level للبقية).
+- الأداء والسلوك الافتراضي غير متغيرين — كل الإصلاحات إما إصلاح عطل صامت أو توصيل مفاتيح كان المالك يظنها تعمل. السلوك يتغير فقط عند ضبط مفاتيح القتل صراحة في env.
+- على المالك: تشغيل migrations/0004 (public) و 0005 (br7) على Supabase SQL Editor — كلاهما idempotent.
+- أعطال منخفضة الخطورة وثّقت دون تغيير (سلوك مقصود/تأثير محدود): أرضيات antispam max(2,..) + سقف _Activity.trim 1800s، أرضية المحرك الاحتياطية FILTER_MIN_MESSAGE_CHARS=3 (تصميم v14.4 الموثق، بلا أثر في المسار الحي)، إصلاح تعليق ترجيح "ال" 0.7 (سلوكي — يحتاج موافقة منفصلة).
+
+---
 Task ID: v14.0.2 (no-dashboard polish + push)
 Agent: Z.ai Code (main orchestrator)
 Task: تنظيف آخر بقايا مراجع اللوحة في التعليقات + الدفع الفعلي إلى GitHub بتوكن المالك

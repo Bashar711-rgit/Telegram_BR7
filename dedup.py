@@ -43,9 +43,10 @@ dedup.py — Cross-Account Alert Deduplication v1.0 (v9.10)
 فشل-آمن:
   * أي خطأ في DB → نثق بـ L1 فقط ونعيد True (التنبيه الأول يمر، والذاكرة
     تمنع تكرار الحسابات خلال العملية) — لا يُفقد تنبيه بسبب مشكلة حفظ.
-  * DEDUP_ENABLED=false (أو من اللوحة) → تعطيل كامل فوري.
-  * النافذة الزمنية DEDUP_WINDOW_SECONDS قابلة للتعديل حياً من اللوحة
-    (تُقرأ من CFG عند كل claim — تطبيق فوري بدون إعادة تشغيل).
+  * DEDUP_ENABLED=false → تعطيل كامل فوري (يُقرأ من env/CFG — المصدر
+    الرسمي بعد حذف اللوحة v14.0).
+  * النافذة الزمنية DEDUP_WINDOW_SECONDS تُقرأ من CFG عند كل claim —
+    تغيير البيئة وإعادة التشغيل تطبّقها (بلا قارئ حي من قاعدة البيانات).
 """
 
 from __future__ import annotations
@@ -326,7 +327,7 @@ def init_deduplicator(db: Any) -> AlertDeduplicator:
 
 
 def get_deduplicator() -> AlertDeduplicator:
-    """يعيد الـ singleton (أو نسخة بدون DB في dashboard-only mode / الاختبارات)."""
+    """يعيد الـ singleton (أو نسخة بدون DB في وضع health-only / الاختبارات)."""
     global _dedup
     if _dedup is None:
         _dedup = AlertDeduplicator(db=None)
@@ -334,7 +335,7 @@ def get_deduplicator() -> AlertDeduplicator:
 
 
 def get_dedup_snapshot() -> Dict[str, Any]:
-    """Read-only snapshot لـ /health و dashboard — لا يرمي استثناءات أبداً."""
+    """Read-only snapshot لـ /health — لا يرمي استثناءات أبداً."""
     try:
         return get_deduplicator().snapshot()
     except Exception:

@@ -5,7 +5,7 @@ metrics.py — Bounded latency metrics with anomaly detection.
 Tracks a rolling window of latency samples (milliseconds) for
 EnhancedFilter.analyze() and exposes:
 
-  - percentile snapshots (p50/p95/p99) for telemetry/dashboards
+  - percentile snapshots (p50/p95/p99) for telemetry consumers
     (`get_telemetry()` in filter_engine.py reads these).
   - lightweight z-score based anomaly detection on each new sample, so a
     single unusually slow analyze() call can be logged and surfaced without

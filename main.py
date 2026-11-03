@@ -102,6 +102,8 @@ from config import (
     get_contact_templates,
     contact_template_labels,
     InputSanitizer,
+    BOT_VERSION,      # v14.1: ثوابت وحدة المستوى (CFG frozen بلا هذه الحقول)
+    BOT_CODENAME,
 )
 from database import EnhancedDatabase
 from dedup import get_dedup_snapshot, init_deduplicator
@@ -1208,7 +1210,7 @@ class EnhancedTelegramBot:
             except Exception:
                 pass
 
-            lines += ["", f"🤖 BR7 v{CFG.BOT_VERSION} {getattr(CFG, 'BOT_CODENAME', '')} — تقرير آلي يومي"]
+            lines += ["", f"🤖 BR7 v{BOT_VERSION} {BOT_CODENAME} — تقرير آلي يومي"]
             text = "\n".join(lines)
             await self.main_client.send_message(CFG.ADMIN_CHAT_ID, text, parse_mode="html")
             logger.info("Daily digest sent to admin")

@@ -98,7 +98,7 @@ def get_unified_stats() -> UnifiedAlertStats:
 
 
 def unified_snapshot() -> Dict[str, Any]:
-    """لقطة قراءة-فقط لـ /health/full و dashboard — لا ترمي استثناءات."""
+    """لقطة قراءة-فقط لـ /health/full — لا ترمي استثناءات."""
     try:
         snap = _singleton.snapshot()
         snap["enabled"] = True

@@ -51,7 +51,8 @@ v9.8 (this fix) — Fast Capture: protection against deletion bots:
   * Gated by CFG.FAST_CAPTURE_ENABLED (env FAST_CAPTURE_ENABLED, default
     false; production rollout sets true in Render env — documented kill
     switch). Buffer sizing via CAPTURE_BUFFER_SIZE / CAPTURE_TTL_SECONDS.
-  * /health (dashboard + fallback server) exposes a fast_capture snapshot
+  * /health (طبقة الويب الوحيدة بعد v14.0 «No Dashboard») exposes a
+    fast_capture snapshot
     (enabled/size/saved/deleted_captured/deleted_recovered/...).
 
 v9.9 (this pass) — Sender Intelligence / Sender Contact Resolver:
@@ -238,7 +239,8 @@ from telethon.tl.types import (
     User as TgUser,
     MessageEntityMentionName,
 )
-from config import CFG, InputSanitizer, fast_hash
+from config import CFG, InputSanitizer, fast_hash, BOT_VERSION  # v14.1: + إصدار البوت
+from filter_engine import FILTER_ENGINE_VERSION  # v14.1: مصدر واحد لإصدار المحرك
 from task_util import spawn_bg  # v11.8.1 (F-17): مرجع محفوظ لمهام background
 from database import EnhancedDatabase, MessageRecord, AlertRecord, DeadLetterRecord
 from filter_engine import EnhancedFilter
@@ -765,10 +767,10 @@ alert_latency = AlertLatencyTracker()
 
 
 def get_capture_snapshot() -> Dict[str, Any]:
-    """Read-only snapshot for /health and dashboard diagnostics.
+    """Read-only snapshot for /health diagnostics.
 
     Standard counter keys are ALWAYS present (zero-filled) so the health
-    contract is stable for dashboards/alerting."""
+    contract is stable for alerting/telemetry consumers."""
     try:
         base = {
             "saved": 0, "expired": 0, "evicted": 0,
@@ -1290,7 +1292,7 @@ class EnhancedAccountMonitor:
         return dict(
             api_id=self.account["api_id"],
             api_hash=self.account["api_hash"],
-            device_model="Render Cloud", system_version="Linux", app_version="13.0",
+            device_model="Render Cloud", system_version="Linux", app_version="14.0",
             timeout=CFG.CONNECTION_TIMEOUT, connection_retries=5, retry_delay=5,
             auto_reconnect=False,
             # v10.4: parallel update dispatch (Telethon default) stays OFF the
@@ -1435,21 +1437,21 @@ class EnhancedAccountMonitor:
                     else:
                         logger.error(
                             f"No session for {account['name']} - set its *_SESSION_STRING env var "
-                            f"or login via the dashboard /login page"
+                            f"in Render (generate a StringSession locally via telethon)"
                         )
-                        self._last_connect_error = "No session - login via /login"
-                        self._stats["last_error"] = "No session - login via /login"
+                        self._last_connect_error = "No session - set *_SESSION_STRING env var"
+                        self._stats["last_error"] = "No session - set *_SESSION_STRING env var"
                         return False
                     await client.connect()
                     if not await client.is_user_authorized():
                         logger.error(
                             f"Session for {account['name']} is expired/revoked - "
-                            f"re-login via the dashboard /login page"
+                            f"generate a fresh StringSession and update its *_SESSION_STRING env var in Render"
                         )
                         try: await client.disconnect()
                         except Exception: pass
-                        self._last_connect_error = "Session expired - re-login via /login"
-                        self._stats["last_error"] = "Session expired - re-login via /login"
+                        self._last_connect_error = "Session expired - update *_SESSION_STRING env var"
+                        self._stats["last_error"] = "Session expired - update *_SESSION_STRING env var"
                         return False
                     me = await client.get_me()
                     # v11.5.2: سجّل هويتنا — رسائل هذا الحساب لا تُراقب (صدى التنبيهات)
@@ -2159,14 +2161,32 @@ class EnhancedAccountMonitor:
         entry = _capture.lookup(data.get("chat_id"), data.get("message_id"))
         if not entry:
             return None
-        cap_text = (entry.get("text") or "").strip()
-        if cap_text and CFG.MIN_MESSAGE_LENGTH <= len(cap_text) <= CFG.MAX_MESSAGE_LENGTH:
-            logger.info(
-                f"fast_capture fallback | chat={data.get('chat_id')} | "
-                f"msg={data.get('message_id')} — text recovered from capture buffer"
-            )
-            _capture.inc("fallback_used")
-            return cap_text
+        # v14.1 (تدقيق 2-a): القياس بالسياسة الموحدة (strip + إزالة صفر-العرض
+        # + حدود 6..65 شاملة من CFG) — كان يقيس النص المقصوص فقط، فنص خامه
+        # 66 بمحرف صفر-عرض واحد كان يُرفض هنا رغم أن البوابة الموحدة تجيزه.
+        cap_text = entry.get("text") or ""
+        if not cap_text:
+            return None
+        try:
+            from unified_alerts.filter_policy import FilterPolicy
+            _fpv = FilterPolicy.check(cap_text)
+            if _fpv.ok:
+                logger.info(
+                    f"fast_capture fallback | chat={data.get('chat_id')} | "
+                    f"msg={data.get('message_id')} — text recovered from capture buffer"
+                )
+                _capture.inc("fallback_used")
+                return _fpv.stripped_text
+        except Exception:
+            # فشل-آمن: نفس السلوك السابق على النص المقصوص
+            cap_text = cap_text.strip()
+            if CFG.MIN_MESSAGE_LENGTH <= len(cap_text) <= CFG.MAX_MESSAGE_LENGTH:
+                logger.info(
+                    f"fast_capture fallback | chat={data.get('chat_id')} | "
+                    f"msg={data.get('message_id')} — text recovered from capture buffer"
+                )
+                _capture.inc("fallback_used")
+                return cap_text
         return None
 
 
@@ -2644,8 +2664,8 @@ class EnhancedAccountMonitor:
                                                or str(analysis.get("reason") or "") or None)),
                     "detection_reason": str(_kw_v11) if _kw_v11 is not None else None,
                     "processing_time_ms": round((time.perf_counter() - start_time) * 1000, 3),
-                    "engine_version": str(getattr(CFG, "BOT_VERSION", "11.1.0")),
-                    "filter_version": "intent-engine-v13",
+                    "engine_version": str(BOT_VERSION),
+                    "filter_version": f"intent-engine-v{FILTER_ENGINE_VERSION}",
                 })
             except Exception as _ma_err:
                 logger.debug(f"message_analysis log skipped [{self.account['name']}]: {type(_ma_err).__name__}")
@@ -2659,10 +2679,14 @@ class EnhancedAccountMonitor:
                     _gus().inc("recovered_resend")
                 except Exception:
                     pass
-            await self._send_alert(data, keyword=analysis.get("keyword") or "طلب", text=validated_text or "",
+            # v14.1 (تدقيق 2-b): عداد صادق — _send_alert يعيد True فقط عند
+            # تسليم فعلي (Bot API/fallback/admin-DM). كان يُحتسب حتى في
+            # المكرر/المحدود/المشابه-الممنوع فيتضخم alerts_sent وlast_alert_time.
+            _delivered = await self._send_alert(data, keyword=analysis.get("keyword") or "طلب", text=validated_text or "",
                                    msg_hash=msg_hash, analysis=analysis)
-            await self._inc_stat("alerts_sent")
-            async with self._stats_lock: self._stats["last_alert_time"] = time.time()
+            if _delivered:
+                await self._inc_stat("alerts_sent")
+                async with self._stats_lock: self._stats["last_alert_time"] = time.time()
         try:
             # v9.9: persist the FULL sender snapshot (identity + metadata)
             # into sender_contacts. Identity fields follow the COALESCE
@@ -3150,6 +3174,11 @@ class EnhancedAccountMonitor:
         repeated send failure correctly advances toward max_retries instead
         of resetting (mirrors the same fix applied to
         process_event_from_queue).
+
+        v14.1 (تدقيق 2-b): يعيد bool — True فقط عند تسليم فعلي للتنبيه
+        (Bot API / fallback / admin-DM)؛ None (falsy) في كل مسارات الإسقاط
+        (dedup/rate-limit/similarity/البوابة/لا عميل). المتصل الرئيسي يحتسب
+        alerts_sent فقط عند True (عداد صادق).
         """
         if not self._bot_ref: return
         # ══ v12.0 unified_alerts: بوابة العمر عند الإرسال (طبقة ثانية) ══
@@ -3649,12 +3678,24 @@ class EnhancedAccountMonitor:
                     _bmsg_v11 = chat_info.get("msg_link")
                     _bmsg_v11 = _bmsg_v11 if _bmsg_v11 and _bmsg_v11 != "#" else None
                     _busr_v11 = sender_target.selected_url or None  # v11.2: هدف الاسم/الزر نفسه
-                    await self._record_sent_alert(
-                        None, data, msg_hash, account_name, keyword, alert_text,
-                        chat_id, sender_id, display_name, contact_method=_method,
-                        button_message_url=_bmsg_v11, button_user_url=_busr_v11,
-                    )
-                    return
+                    # v13 RC-2 (موسّع v14.1): فشل التسجيل بعد نجاح الإرسال لا
+                    # يُفعّل الـfallback أبداً — كان ينتج بطاقة مكررة مرئية.
+                    try:
+                        await self._record_sent_alert(
+                            None, data, msg_hash, account_name, keyword, alert_text,
+                            chat_id, sender_id, display_name, contact_method=_method,
+                            button_message_url=_bmsg_v11, button_user_url=_busr_v11,
+                        )
+                    except Exception as _bot_rec_err:
+                        from unified_alerts.stats import get_unified_stats as _gus_r
+                        try: _gus_r().inc("record_after_send_failed")
+                        except Exception: pass
+                        logger.error(
+                            f"Alert WAS delivered via AlertBot but post-send recording failed "
+                            f"[{account_name}] msg_hash={msg_hash}: "
+                            f"{type(_bot_rec_err).__name__}: {str(_bot_rec_err)[:150]} — NOT resending (v13 RC-2)"
+                        )
+                    return True
                 try:  # v11.1: فشل محاولة الإرسال يُسجل بصدق (status=failed)
                     await self.db.mark_alert_dispatched(
                         msg_hash, status="failed", error=str(_reason or "")[:300])
@@ -3690,12 +3731,22 @@ class EnhancedAccountMonitor:
                                 msg_hash, status="delivered", error="verified_after_unknown")
                         except Exception:
                             pass
-                        await self._record_sent_alert(
-                            None, data, msg_hash, account_name, keyword, alert_text,
-                            chat_id, sender_id, display_name,
-                            contact_method="bot_verified",
-                        )
-                        return
+                        try:
+                            await self._record_sent_alert(
+                                None, data, msg_hash, account_name, keyword, alert_text,
+                                chat_id, sender_id, display_name,
+                                contact_method="bot_verified",
+                            )
+                        except Exception as _ver_rec_err:
+                            from unified_alerts.stats import get_unified_stats as _gus_r
+                            try: _gus_r().inc("record_after_send_failed")
+                            except Exception: pass
+                            logger.error(
+                                f"Alert VERIFIED-delivered but post-send recording failed "
+                                f"[{account_name}] msg_hash={msg_hash}: "
+                                f"{type(_ver_rec_err).__name__}: {str(_ver_rec_err)[:150]} — NOT resending (v13 RC-2)"
+                            )
+                        return True
                     logger.info(
                         f"AlertBot {_unk_reason.split(':')[0]} and NOT found in target "
                         f"[{account_name}] — confirmed failure → user-account fallback"
@@ -3986,7 +4037,7 @@ class EnhancedAccountMonitor:
                             "(all target-channel candidates failed)"
                         )
                         await self._inc_stat("send_errors")
-                        return
+                        return True  # v14.1: تسليم فعلي — عدّه صادقاً
                     except Exception as ae:
                         logger.error(f"Admin DM fallback failed [{account_name}]: {ae}")
                 # v9.12 (audit M-05): unified DLQ push path — same helper
@@ -4016,7 +4067,7 @@ class EnhancedAccountMonitor:
                     f"[{account_name}] msg_hash={msg_hash}: "
                     f"{type(_fb_rec_err).__name__}: {str(_fb_rec_err)[:150]} — NOT resending (v13 RC-2)"
                 )
-            return
+            return True  # v14.1: fallback سلّم فعلياً
         # الإرسال الأساسي نجح فعلياً — التسجيل الآن بمعزل تام عن الإرسال:
         # أي استثناء DB هنا يُسجل بصدق ولا يفعّل أي fallback (كان ينتج
         # بطاقة ثانية مكررة — RC-2).
@@ -4034,6 +4085,7 @@ class EnhancedAccountMonitor:
                 f"[{account_name}] msg_hash={msg_hash}: "
                 f"{type(_rec_err).__name__}: {str(_rec_err)[:150]} — NOT resending (v13 RC-2)"
             )
+        return True  # v14.1: المسار الأساسي سلّم فعلياً
 
     def _schedule_reply_fix(
         self,

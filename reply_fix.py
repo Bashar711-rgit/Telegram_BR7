@@ -298,6 +298,13 @@ class ReplyFixer:
             metric_inc("reply_fix_skipped")
             return "SKIP:no_client"
 
+        # v14.1 (تدقيق 2-b): احجز الحصة ذرياً قبل أي await — كان الترتيب
+        # allowed() → sleep(2-5s) → _record_attempt، فتمر مهمتان متزامنتان
+        # لنفس المرسل بallowed() قبل أحدهما يحجز (TOCTOU) وترسلان ردّين
+        # «👤» خلال الساعة رغم حد hourly_per_user=1. الحجز هنا قبل النوم
+        # يغلق السباق، ويُسجّل مرة واحدة (كان السلّم يستهلك حصة لكل درجة).
+        self._record_attempt(uid)
+
         # 3) فاصل عشوائي 2–5 ث (مواصفة §11) — خارج المسار الحرج أصلاً
         try:
             await asyncio.sleep(random.uniform(self.jitter_min, self.jitter_max))
@@ -328,7 +335,6 @@ class ReplyFixer:
                     )
                     continue
                 try:
-                    self._record_attempt(uid)
                     if reply_to_msg_id:
                         sent = await client.send_message(
                             chat_id, _REPLY_TEXT,
@@ -396,9 +402,8 @@ class ReplyFixer:
             metric_inc("reply_fix_failure")
             return f"FAIL:entity_build:{type(e).__name__}"
 
-        # 5) الإرسال كرد على التنبيه
+        # 5) الإرسال كرد على التنبيه (الحجز تم أعلاه — v14.1)
         try:
-            self._record_attempt(uid)
             if reply_to_msg_id:
                 sent = await client.send_message(
                     chat_id, _REPLY_TEXT,

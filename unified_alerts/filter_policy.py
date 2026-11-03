@@ -18,7 +18,8 @@ unified_alerts/filter_policy.py — سياسة الفلترة الموحدة (v1
   * القياس على النص بعد strip وإزالة محارف صفر-العرض.
   * MIN_MESSAGE_LENGTH <= الطول <= MAX_MESSAGE_LENGTH — **شاملاً الحدين**
     (6..65 افتراضياً): 6 يمر، 65 يمر، 5 يُرفض، 66 يُرفض.
-  * القراءة حية من CFG عند كل استدعاء — تعديل اللوحة يسري فوراً.
+  * القراءة حية من CFG عند كل استدعاء — تغيير البيئة وإعادة التشغيل يطبّقه
+    (المصدر الرسمي بعد حذف اللوحة v14.0).
   * هامش الحد: قرارات على الحد بالضبط مستقرة (لا انقلاب بين استدعاءين
     بسبب microtic اختلاف قياس — نفس روح _BOUNDARY_GRACE في gate.py).
 
@@ -144,7 +145,7 @@ class FilterPolicy:
 
     @staticmethod
     def snapshot() -> dict:
-        """لقطة الإعدادات لـ /health/full واللوحة."""
+        """لقطة الإعدادات لـ /health/full."""
         mn, mx = FilterPolicy.limits()
         return {
             "min_message_length": mn,

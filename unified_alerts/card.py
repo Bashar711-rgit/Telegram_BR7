@@ -126,8 +126,8 @@ def _truncate_safe_html(text: str, max_units: int) -> str:
     if last_lt > last_gt:
         # وسم مفتوح (غير مكتمل) في النهاية — نقص قبله
         head = head[:last_lt]
-    # أغلق آخر <a ...> غير مغلق إن وجد
-    tail = text[cut_py:]
+    # أغلق آخر <a ...> غير مغلق إن وجد (v14.1: حُذف المتغير الميت `tail`
+    # — كان يُحسب ولا يُقرأ؛ نافذة الكلوسينج تقارن head فقط)
     opens_in_head = len(_ANCHOR_OPEN.findall(head))
     closes_in_head = head.lower().count("</a>")
     if opens_in_head > closes_in_head:

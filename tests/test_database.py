@@ -67,27 +67,8 @@ class TestQueue:
         assert first["p"] == "high"
 
 
-@pytest.mark.asyncio
-class TestHourlyStats:
-    async def test_query_runs_without_sql_error(self, db):
-        """Audit H-6 regression: hourly stats previously referenced
-        non-existent messages.decision/confidence columns."""
-        now = time.time()
-        await db.try_insert_message(MessageRecord(
-            message_hash=fast_hash("h1"), chat_id=1, sender_id=1,
-            message_text="hello", timestamp=now))
-        await db.add_alert(AlertRecord(
-            message_hash=fast_hash("h1"), chat_id=1, sender_id=1,
-            account_name="Main", keyword="طلب", alert_text="x",
-            timestamp=now, decision="accept", confidence=0.9))
-        await db._flush()  # alerts live in a batch buffer until flushed
-        hourly = await db.get_hourly_stats(24)
-        assert isinstance(hourly, list) and len(hourly) >= 1
-        row = hourly[-1]
-        assert row["messages_count"] >= 1
-        assert row["alerts_count"] >= 1
-        assert row["accepted_count"] >= 1
-        assert 0 < row["avg_confidence"] <= 1.0
+# v14.1: حُذف TestHourlyStats مع get_hourly_stats (كود لوحة التحكم الميت
+# — اللوحة أُزيلت كلياً في v14.0 «No Dashboard»).
 
 
 @pytest.mark.asyncio

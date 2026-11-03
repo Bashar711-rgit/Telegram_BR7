@@ -3152,23 +3152,32 @@ class EnhancedDatabase:
                 await self._commit()
                 return False
             else:
-                # PostgreSQL: SELECT … FOR UPDATE inside one transaction —
-                # same semantics as the SQLite branch, atomically serialized
-                # against concurrent workers/instances.
+                # PostgreSQL: المطالبة بـ INSERT … ON CONFLICT DO NOTHING
+                # RETURNING — آتومية عبر العمليات/النسخ (SELECT … FOR UPDATE
+                # لا يقفل صفاً غير موجود، فكان سباق INSERT مزدوج يفشل مفتوحاً
+                # عبر unique_violation → فشل DB → فشل-مفتوح → تنبيهان).
+                # v14.1 (تدقيق 2-b): نفس دلالات فرع SQLite حرفياً.
                 async with self._pool.acquire() as conn:
                     async with conn.transaction():
+                        inserted = await conn.fetchval(
+                            "INSERT INTO alert_dedup "
+                            "(fingerprint, sender_id, first_seen, last_seen, hits) "
+                            "VALUES ($1, NULL, $2, $2, 1) "
+                            "ON CONFLICT (fingerprint) DO NOTHING "
+                            "RETURNING fingerprint",
+                            fingerprint, first_seen,
+                        )
+                        if inserted is not None:
+                            # نحن من أدخل الصف — أول مطالبة داخل النافذة
+                            return True
+                        # الصف موجود (مطالبة غيرنا) — منطق النافذة تحت قفل الصف
                         row = await conn.fetchrow(
                             "SELECT last_seen FROM alert_dedup "
                             "WHERE fingerprint = $1 FOR UPDATE",
                             fingerprint,
                         )
                         if row is None:
-                            await conn.execute(
-                                "INSERT INTO alert_dedup "
-                                "(fingerprint, sender_id, first_seen, last_seen, hits) "
-                                "VALUES ($1, NULL, $2, $2, 1)",
-                                fingerprint, first_seen,
-                            )
+                            # سباق مع تنظيف متزامن — عاملها كأول مطالبة
                             return True
                         last_seen = float(row["last_seen"] or 0.0)
                         if first_seen - last_seen > max(1, window_hint):
@@ -3932,9 +3941,11 @@ class EnhancedDatabase:
                            source: str = "botpanel") -> bool:
         """v9.18 P0: تسجيل عملية في سجل التدقيق — فشل-آمن تماماً.
 
-        يُستدعى fire-and-forget من اللوحتين (BotPanel/webadmin) فلا يُسمح له
-        أبداً برفع استثناء أو تعطيل المسار الأصلي. لا أسرار ولا كلمات مرور
-        تُكتب هنا — والمتصل مسؤول عن إخفاء الهواتف (القناع في dashboard.py).
+        fire-and-forget بحيث لا يُسمح له أبداً برفع استثناء أو تعطيل المسار
+        الأصلي. لا أسرار ولا كلمات مرور تُكتب هنا — والمتصل مسؤول عن إخفاء
+        الهواتف (القناع داخل هذه الوحدة). source يقبل القيمة التاريخية
+        "botpanel" للتوافق مع الصفوف القديمة؛ بعد v14.0 «No Dashboard» لا
+        يوجد كاتب جديد إلا الاختبارات والأدوات اليدوية.
         """
         try:
             await self._execute(
@@ -5080,179 +5091,11 @@ class EnhancedDatabase:
         row = await self._fetchone(sql, tuple(params))
         return int(row["cnt"]) if row else 0
 
-    async def get_hourly_stats(self, hours: int = 24) -> List[Dict[str, Any]]:
-        """
-        Hourly aggregates for the last N hours.
-
-        v9.1 fix (audit H-6): the previous single query referenced
-        ``decision`` / ``confidence`` columns on the *messages* table — those
-        columns only exist on *alerts* — so the query raised
-        "no such column" on every call and the admin dashboard's hourly chart
-        was permanently empty. Message counts now come from ``messages`` and
-        decision/confidence aggregates from ``alerts``; the two result sets
-        are merged per hour in Python (works identically on SQLite and PG).
-        """
-        cutoff = time.time() - (hours * 3600)
-        messages_sql = """
-            SELECT strftime('%Y-%m-%d %H:00:00', datetime(timestamp, 'unixepoch')) as hour,
-                   COUNT(*) as messages_count
-            FROM messages
-            WHERE timestamp >= ?
-            GROUP BY hour
-        """ if self.db_type == "sqlite" else """
-            SELECT to_char(to_timestamp(timestamp), 'YYYY-MM-DD HH24:00:00') as hour,
-                   COUNT(*) as messages_count
-            FROM messages
-            WHERE timestamp >= $1
-            GROUP BY hour
-        """
-        alerts_sql = """
-            SELECT strftime('%Y-%m-%d %H:00:00', datetime(timestamp, 'unixepoch')) as hour,
-                   COUNT(*) as alerts_count,
-                   SUM(CASE WHEN decision = 'accept' THEN 1 ELSE 0 END) as accepted_count,
-                   AVG(CASE WHEN confidence > 0 THEN confidence END) as avg_confidence
-            FROM alerts
-            WHERE timestamp >= ?
-            GROUP BY hour
-        """ if self.db_type == "sqlite" else """
-            SELECT to_char(to_timestamp(timestamp), 'YYYY-MM-DD HH24:00:00') as hour,
-                   COUNT(*) as alerts_count,
-                   SUM(CASE WHEN decision = 'accept' THEN 1 ELSE 0 END) as accepted_count,
-                   AVG(CASE WHEN confidence > 0 THEN confidence END) as avg_confidence
-            FROM alerts
-            WHERE timestamp >= $1
-            GROUP BY hour
-        """
-        try:
-            msg_rows = await self._fetchall(messages_sql, (cutoff,))
-            alert_rows = await self._fetchall(alerts_sql, (cutoff,))
-        except Exception as e:
-            logger.error(f"get_hourly_stats error: {e}")
-            return []
-
-        merged: "Dict[str, Dict[str, Any]]" = {}
-        for r in msg_rows:
-            merged[str(r["hour"])] = {
-                "hour": str(r["hour"]),
-                "messages_count": int(r["messages_count"] or 0),
-                "alerts_count": 0,
-                "accepted_count": 0,
-                "avg_confidence": 0.0,
-            }
-        for r in alert_rows:
-            hour = str(r["hour"])
-            entry = merged.setdefault(
-                hour,
-                {"hour": hour, "messages_count": 0, "alerts_count": 0, "accepted_count": 0, "avg_confidence": 0.0},
-            )
-            entry["alerts_count"] = int(r["alerts_count"] or 0)
-            entry["accepted_count"] = int(r["accepted_count"] or 0)
-            entry["avg_confidence"] = round(float(r["avg_confidence"] or 0.0), 3)
-
-        return sorted(merged.values(), key=lambda x: x["hour"])
-
-    async def get_top_keywords(self, limit: int = 20) -> List[Dict[str, Any]]:
-        sql = """
-            SELECT keyword, COUNT(*) as count
-            FROM alerts
-            WHERE keyword IS NOT NULL AND keyword != ''
-            GROUP BY keyword
-            ORDER BY count DESC
-            LIMIT ?
-        """
-        return await self._fetchall(sql, (limit,))
-
-    async def get_top_senders(self, limit: int = 20) -> List[Dict[str, Any]]:
-        sql = """
-            SELECT m.sender_id,
-                   COUNT(*) as total_messages,
-                   SUM(CASE WHEN m.keyword_found IS NOT NULL THEN 1 ELSE 0 END) as alerts_count,
-                   c.username, c.first_name, c.last_name,
-                   s.reputation_score
-            FROM messages m
-            LEFT JOIN sender_contacts c ON m.sender_id = c.sender_id
-            LEFT JOIN sender_stats s ON m.sender_id = s.sender_id
-            GROUP BY m.sender_id
-            ORDER BY total_messages DESC
-            LIMIT ?
-        """
-        return await self._fetchall(sql, (limit,))
-
-    async def get_dashboard_summary(self) -> Dict[str, Any]:
-        cache_key = "dashboard_summary"
-        async with self._cache_lock:
-            if cache_key in self._query_cache:
-                return dict(self._query_cache[cache_key])
-
-        summary: Dict[str, Any] = {
-            "total_messages": 0,
-            "total_alerts": 0,
-            "unique_senders": 0,
-            "unique_chats": 0,
-            "avg_reputation": 0.0,
-            "blocked_senders": 0,
-            "accepted_count": 0,
-            "reviewed_count": 0,
-            "ignored_count": 0,
-            "avg_confidence": 0.0,
-            "queue_evictions": self.stats.get("queue_evictions", 0),
-            "db_healthy": self._db_healthy,
-        }
-        try:
-            row = await self._fetchone("SELECT COUNT(*) as cnt FROM messages")
-            summary["total_messages"] = int(row["cnt"]) if row else 0
-            row = await self._fetchone("SELECT COUNT(*) as cnt FROM alerts")
-            summary["total_alerts"] = int(row["cnt"]) if row else 0
-            row = await self._fetchone("SELECT COUNT(DISTINCT sender_id) as cnt FROM messages")
-            summary["unique_senders"] = int(row["cnt"]) if row else 0
-            row = await self._fetchone("SELECT COUNT(DISTINCT chat_id) as cnt FROM messages")
-            summary["unique_chats"] = int(row["cnt"]) if row else 0
-            row = await self._fetchone(
-                "SELECT AVG(reputation_score) as avg FROM sender_stats WHERE total_messages > 0"
-            )
-            summary["avg_reputation"] = float(row["avg"]) if row and row["avg"] else 0.0
-            row = await self._fetchone("SELECT COUNT(*) as cnt FROM blocked_senders")
-            summary["blocked_senders"] = int(row["cnt"]) if row else 0
-            row = await self._fetchone("SELECT COUNT(*) as cnt FROM alerts WHERE decision = 'accept'")
-            summary["accepted_count"] = int(row["cnt"]) if row else 0
-            row = await self._fetchone("SELECT COUNT(*) as cnt FROM alerts WHERE decision = 'review'")
-            summary["reviewed_count"] = int(row["cnt"]) if row else 0
-            row = await self._fetchone("SELECT COUNT(*) as cnt FROM alerts WHERE decision = 'ignore'")
-            summary["ignored_count"] = int(row["cnt"]) if row else 0
-            row = await self._fetchone("SELECT AVG(confidence) as avg FROM alerts WHERE confidence > 0")
-            summary["avg_confidence"] = float(row["avg"]) if row and row["avg"] else 0.0
-
-            async with self._cache_lock:
-                self._query_cache[cache_key] = summary
-        except Exception as e:
-            logger.error(f"Dashboard summary error: {e}")
-        return summary
-
-    async def get_recent_alerts_for_dashboard(self, limit: int = 10) -> List[Dict[str, Any]]:
-        sql = """
-            SELECT a.*, s.username, s.first_name, s.last_name
-            FROM alerts a
-            LEFT JOIN sender_contacts s ON a.sender_id = s.sender_id
-            ORDER BY a.timestamp DESC
-            LIMIT ?
-        """
-        return await self._fetchall(sql, (limit,))
-
-    async def get_recent_messages_for_dashboard(self, limit: int = 10) -> List[Dict[str, Any]]:
-        sql = """
-            SELECT m.*, s.username, s.first_name, s.last_name
-            FROM messages m
-            LEFT JOIN sender_contacts s ON m.sender_id = s.sender_id
-            ORDER BY m.timestamp DESC
-            LIMIT ?
-        """
-        return await self._fetchall(sql, (limit,))
-
-    async def fetch_recent_alerts(self, limit: int = 50) -> List[Dict[str, Any]]:
-        return await self.get_recent_alerts_for_dashboard(limit)
-
-    async def fetch_top_senders(self, limit: int = 20) -> List[Dict[str, Any]]:
-        return await self.get_top_senders(limit)
+    # v14.1: أُزيلت دوال بيانات لوحة التحكم الميتة (get_hourly_stats /
+    # get_top_keywords / get_top_senders / get_dashboard_summary /
+    # get_recent_alerts_for_dashboard / get_recent_messages_for_dashboard /
+    # fetch_recent_alerts / fetch_top_senders) — كان مستهلكها الوحيد
+    # لوحة التحكم المحذوفة في v14.0 «No Dashboard»، وصفر متصلين في الكود.
 
     # ─── Close ────────────────────────────────────────────────────────────────
     async def close(self) -> None:

@@ -1146,7 +1146,7 @@ logger.info(
 
 
 def get_sender_intel_snapshot() -> Dict[str, Any]:
-    """Read-only snapshot for /health and dashboard diagnostics.
+    """Read-only snapshot for /health diagnostics.
     Standard keys ALWAYS present (zero-filled) — stable health contract."""
     try:
         return sender_intel.snapshot()

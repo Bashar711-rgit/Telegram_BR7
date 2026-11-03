@@ -41,7 +41,7 @@ REPO = Path(__file__).resolve().parent.parent
 MIGRATIONS = REPO / "migrations"
 DDL_FILE = MIGRATIONS / "br7_schema_v1.sql"
 VERSION = "0001_br7_initial"
-DESCRIPTION = "Unified br7 DDL v1.0.0"
+DESCRIPTION = "Unified br7 DDL v1.1.0 (v14.1: dashboard tables removed)"
 
 STAGING_PRELUDE = """
 DO $roles$
@@ -58,9 +58,9 @@ $roles$;
 
 # (name, sql, checker)
 CHECKS = [
-    ("br7 table count == 44",
+    ("br7 table count == 39",
      "SELECT count(*) FROM information_schema.tables WHERE table_schema='br7'",
-     lambda v: v == 44),
+     lambda v: v == 39),
     ("RLS-disabled tables == 0",
      "SELECT count(*) FROM pg_tables WHERE schemaname='br7' AND rowsecurity=false",
      lambda v: v == 0),
@@ -83,10 +83,9 @@ CHECKS = [
      lambda v: v >= 55),
     ("system_settings seeds == 5",
      "SELECT count(*) FROM br7.system_settings", lambda v: v == 5),
-    ("dashboard_roles seeds == 3",
-     "SELECT count(*) FROM br7.dashboard_roles", lambda v: v == 3),
-    ("dashboard_permissions seeds == 7",
-     "SELECT count(*) FROM br7.dashboard_permissions", lambda v: v == 7),
+    ("dashboard_* tables absent == 0",
+     "SELECT count(*) FROM information_schema.tables WHERE table_schema='br7' "
+     "AND table_name LIKE 'dashboard_%'", lambda v: v == 0),
     ("gap-filler tables == 5",
      "SELECT count(*) FROM information_schema.tables WHERE table_schema='br7' "
      "AND table_name IN ('deleted_messages','app_stats','legacy_account_map',"
@@ -97,14 +96,14 @@ CHECKS = [
      "WHERE status IN ('valid','configured') "
      "AND encrypted_session IS NULL AND secret_reference IS NULL",
      lambda v: v == 0),
-    ("updated_at triggers == 19",
+    ("updated_at triggers == 18",
      "SELECT count(*) FROM information_schema.triggers "
      "WHERE trigger_schema='br7' AND trigger_name LIKE '%_updated_at'",
-     lambda v: v == 19),
-    ("audit triggers == 3 (distinct names)",
+     lambda v: v == 18),
+    ("audit triggers == 2 (distinct names)",
      "SELECT count(DISTINCT trigger_name) FROM information_schema.triggers "
      "WHERE trigger_schema='br7' AND trigger_name LIKE 'trg_br7_audit_%'",
-     lambda v: v == 3),
+     lambda v: v == 2),
     ("service_role schema USAGE == 1",
      "SELECT count(*) FROM pg_namespace n "
      "WHERE n.nspname='br7' AND has_schema_privilege('service_role', n.oid, 'USAGE')",
@@ -260,7 +259,7 @@ async def functional_smoke(conn: asyncpg.Connection) -> bool:
         rec("RLS enabled with zero policies (deny-by-default)",
             await conn.fetchval(
                 "SELECT count(*) FROM pg_tables WHERE schemaname='br7' "
-                "AND rowsecurity=true") == 44)
+                "AND rowsecurity=true") == 39)
 
         # 7. enforce_retention dry run returns jsonb
         ret = await conn.fetchval("SELECT br7.enforce_retention(true)")
