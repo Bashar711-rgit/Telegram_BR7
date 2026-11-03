@@ -1,5 +1,21 @@
 
 ---
+Task ID: v14.1.1 (audit-tail: last dead dashboard code + stale comments)
+Agent: Z.ai Code (main orchestrator)
+Task: تنظيف ذيول تدقيق الفلترة والتنبيهات — آخر دوال اللوحة الميتة + آخر التعليقات الخادعة
+
+Work Log:
+- حُذفت 3 دوال ميتة إضافية من database.py (−123 سطراً): get_messages_with_filters / get_alerts_with_filters / count_alerts_with_filters — كانت واجهة /api/alerts باللوحة، صفر متصلين في الكود (تحقق grep شامل + سوتِ الاختبارات).
+- تعليقات «اللوحة» الخادمة الأخيرة صُحّحت إلى «env في Render هو المصدر الرسمي بعد v14.0»: monitors.py:95 (DEDUP_* حي)، dedup.py:294 (snapshot)، unified_alerts/__init__.py:23+29، unified_alerts/gate.py:64+147. (سطر monitors.py:183 «اللوحة» = لوحة أزرار تيليجرام لا لوحة التحكم — تُرك كما هو عمداً).
+- README.md: إشارات dashboard_store التاريخية في سجل الإصدارات (v9.x) تُركت كسجل تاريخي عمداً — لا تنطبق على الكود الحالي.
+- ملاحظة تشغيلية موثقة من التدقيق: ترحيل 0004 آمن تماماً على الكود (صفر قرّاء للمفاتيح المحذوفة)، لكن أي تعديلات كلمات مفتاحية أُجريت من اللوحة سابقاً ولم تُنسخ إلى keywords.json ستضيع عند تشغيله — تأكد من مطابقة keywords.json قبل التنفيذ.
+- الاختبارات: 973/973 PASS (نفس عدّة v14.1.0 — الإزالات بلا متصلين لا تغيّر العدّة).
+
+Stage Summary:
+- الكود: صفر مراجع وظيفية للوحة التحكم (استيراد/مسار/إعداد). المتبقي نص تاريخي في سجلات الإصدارات فقط.
+- على المالك: تشغيل 0004 (public) + 0005 (br7) في Supabase SQL Editor بعد التأكد من مطابقة keywords.json وenv في Render.
+
+---
 Task ID: v14.1.0 (audit-fixes: filter + alert systems)
 Agent: Z.ai Code (main orchestrator)
 Task: فحص معمّق مزدوج (نظام الفلترة + نظام التنبيهات) بعد حذف اللوحة + إصلاح كل العيوب المؤكدة

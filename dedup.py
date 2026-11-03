@@ -291,7 +291,7 @@ class AlertDeduplicator:
         return dict(self._stats)
 
     def snapshot(self) -> Dict[str, Any]:
-        """لقطة للقراءة فقط لـ /health واللوحة (مفاتيح ثابتة دائماً)."""
+        """لقطة للقراءة فقط لـ /health (مفاتيح ثابتة دائماً)."""
         try:
             base = {
                 "claimed": 0, "blocked": 0, "released": 0,

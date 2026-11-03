@@ -61,7 +61,7 @@ class UnifiedAlertGate:
             return  # الحدث قديم — مُسقط بصدق ومُحصى
     """
 
-    # ── إعدادات حيّة (تُقرأ من CFG عند كل استدعاء — اللوحة تغيّرها فوراً) ──
+    # ── إعدادات حيّة (تُقرأ من CFG عند كل استدعاء — المصدر الرسمي بعد حذف اللوحة v14.0: env في Render) ──
     @staticmethod
     def _age_limit_seconds() -> int:
         try:
@@ -144,7 +144,7 @@ class UnifiedAlertGate:
             return GateDecision(allowed=True, reason="gate_error")
 
     def snapshot(self) -> Dict[str, Any]:
-        """لقطة إعدادات البوابة للقراءة في /health واللوحة."""
+        """لقطة إعدادات البوابة للقراءة في /health/full."""
         try:
             return {
                 "max_event_age_seconds": self._age_limit_seconds(),
