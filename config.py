@@ -164,8 +164,8 @@ def setup_logging(
         # v9.12 (audit M-11): diagnose=True was a major secret-leak vector
         # — it dumps local variables (including session strings, API hashes,
         # tokens, sender phone numbers, message text) into every traceback
-        # written to bot.log, and the webadmin logs reader exposes that
-        # file to anyone with access to the machine. We now default to
+        # written to bot.log, and that file is readable by anyone with
+        # access to the machine. We now default to
         # diagnose=False in production (RENDER=true or ENVIRONMENT=prod)
         # and only enable it when LOG_DIAGNOSE=true is set explicitly.
         # Local dev keeps diagnose=True for actually useful tracebacks.

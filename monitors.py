@@ -1968,8 +1968,8 @@ class EnhancedAccountMonitor:
                     continue
                 # v9.12 (audit M-15): the captured message text is no
                 # longer echoed into INFO logs — it's user private content
-                # that should not end up in bot.log (which is readable via
-                # the webadmin logs reader). We log only the metadata
+                # that should not end up in bot.log (which is readable by
+                # anyone with access to the machine). We log only the metadata
                 # (chat/msg ids, sender label, queued/alerted flags) plus a
                 # short length hint. The full text remains in the
                 # FastCaptureBuffer for the recovery pipeline to use.
