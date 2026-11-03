@@ -54,7 +54,7 @@ def buf():
 @pytest.fixture()
 def enable_capture():
     """Temporarily flip CFG.FAST_CAPTURE_ENABLED (frozen dataclass →
-    object.__setattr__, same live-apply pattern as dashboard_store)."""
+    object.__setattr__, live-apply pattern)."""
     old = CFG.FAST_CAPTURE_ENABLED
     object.__setattr__(CFG, "FAST_CAPTURE_ENABLED", True)
     _capture.clear()

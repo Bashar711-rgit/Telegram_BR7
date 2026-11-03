@@ -282,13 +282,13 @@ async def safe_findall_async(pattern: _PatternLike, text: str) -> List[Any]:
 #
 # المشكلة (مواصفة §11: "Trust forwarding headers only when they come from
 # explicitly configured trusted proxies"):
-#   dashboard._AuthGuard.client_ip كانت تأخذ أول قيمة X-Forwarded-For حرفياً —
+#   طبقة ويب سابقة (حُذفت في v14.0 «No Dashboard») كانت تأخذ أول قيمة
+#   X-Forwarded-For حرفياً —
 #   والقيمة الأولى يتحكم بها العميل نفسه عندما لا يستبدل البروكسي الترويسة:
 #     * ترويش القفل: المهاجم يبدّل XFF في كل طلب → لا يبلغ عتبة القفل أبداً.
 #     * سَمّ المفتاح: فشلات مزوّرة باسم IP الضحية → قفل إداري (DoS).
-#   webadmin._LoginGuard أُصلحت سابقاً (v9.12 audit M-12) بنمط TRUSTED_PROXIES
-#   — والنمط الصحيح يُوحَّد هنا لكل الطبقات (بلا تبعيات تطبيقية حتى يبقى
-#   استيراده من dashboard.py وwebadmin معاً آمناً معماریاً).
+#   أُصلحت سابقاً (v9.12 audit M-12) بنمط TRUSTED_PROXIES — والنمط الصحيح
+#   يُوحَّد هنا لكل طبقات الحماية الحالية (health endpoints) بلا تبعيات تطبيقية.
 #
 # الخوارزمية (المعيار العملي للبروكسيات العكسية):
 #   1. إن لم يكن الاتصال المباشر من بروكسي موثوق → XFF يتحكم به العميل →
@@ -310,7 +310,7 @@ _proxy_cache: tuple = (0.0, ())  # (ts, tuple[_BaseNetwork, ...])
 # الافتراضي: قفزات بروكسي معيارية (loopback + نطاق داخلي 10/8)
 _DEFAULT_TRUSTED_PROXIES = "127.0.0.0/8,10.0.0.0/8,::1/128"
 
-_XFF_KEY_MAX_LEN = 64  # سقف طول المفتاح (نفس سلوك dashboard السابق)
+_XFF_KEY_MAX_LEN = 64  # سقف طول المفتاح (معيار موحّد لطبقة الحماية)
 
 
 def parse_trusted_proxies(raw: str) -> tuple:
