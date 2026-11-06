@@ -18,6 +18,21 @@ correction can swing a term's weight wildly — that's the "bounded feedback"
 in the module's purpose. Weights are also hard-clamped to
 [_MIN_WEIGHT, _MAX_WEIGHT] so a term can never be fully zeroed out (and
 permanently blocked) or fully saturate to certainty from feedback alone.
+
+v14.5.1:
+  * CRITICAL FIX — public `weights` and `alpha` properties added. The
+    previous version exposed only `_weights` / `_alpha` (underscore-prefixed),
+    while filter_engine._reseed_adaptive() reads `existing.weights` and
+    `getattr(existing, "alpha", 0.05)` — i.e. WITHOUT the underscore. As a
+    result `hasattr(existing, "weights")` was always False and every
+    learned weight was silently discarded on every reload_keywords(), and
+    the configured ADAPTIVE_ALPHA was always reset to 0.05. Adding these
+    two properties makes the merge actually work with zero changes needed
+    in filter_engine.py.
+  * `alpha` is now clamped to [0.001, 1.0] at construction. A zero alpha
+    from a config typo would silently freeze learning; a >1.0 value makes
+    the EMA oscillate around the target on every update. Clamping at
+    construction time is defensive and cannot be undone by later calls.
 """
 
 from __future__ import annotations
@@ -30,10 +45,7 @@ class AdaptiveWeights:
     """EMA-smoothed, bounded per-term confidence weights.
 
     Behaves like a `Dict[str, float]` for reads (`get()`), plus an async
-    `record_feedback()` for updates. `_weights` and `_alpha` are exposed as
-    plain attributes (not name-mangled/private) deliberately: filter_engine.py's
-    `_reseed_adaptive()` reads them directly when merging learned weights
-    into a freshly reloaded keyword set on `reload_keywords()`.
+    `record_feedback()` for updates.
     """
 
     _MIN_WEIGHT = 0.1
@@ -44,9 +56,41 @@ class AdaptiveWeights:
 
     def __init__(self, weights: Dict[str, float], alpha: float = 0.05) -> None:
         self._weights: Dict[str, float] = dict(weights)
-        self._alpha = alpha
+        # v14.5.1: clamp alpha at construction. Anything <= 0 silently
+        # freezes learning; anything > 1 makes the EMA oscillate. A
+        # mistyped ADAPTIVE_ALPHA in Render env should not be able to
+        # quietly degrade the model — it should be corrected in place.
+        try:
+            a = float(alpha)
+        except (TypeError, ValueError):
+            a = 0.05
+        self._alpha = max(0.001, min(1.0, a))
         self._lock = asyncio.Lock()
         self.feedback_count: int = 0
+
+    # ── v14.5.1: public read accessors ─────────────────────────────────
+    @property
+    def weights(self) -> Dict[str, float]:
+        """The live weights dict.
+
+        filter_engine._reseed_adaptive() reads this via `existing.weights`
+        when merging learned values into a freshly reloaded keyword set.
+        Returns the SAME dict (not a copy) so reload can iterate without
+        allocating — the caller only reads, and record_feedback() is the
+        only writer (protected by _lock).
+        """
+        return self._weights
+
+    @property
+    def alpha(self) -> float:
+        """The current (validated) EMA learning rate.
+
+        filter_engine._reseed_adaptive() reads this via
+        `getattr(existing, "alpha", 0.05)` — returning the actual alpha
+        (which may have been set from ADAPTIVE_ALPHA) prevents a silent
+        reset to 0.05 on every reload_keywords().
+        """
+        return self._alpha
 
     def get(self, term: str, default: float = _DEFAULT_WEIGHT) -> float:
         """Synchronous read — matches dict.get() semantics used throughout
