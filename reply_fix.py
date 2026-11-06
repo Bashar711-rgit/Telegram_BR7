@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-reply_fix.py — الرد التعويضي F (v11.5 — مواصفة المستخدم §11)
+reply_fix.py — الرد التعويضي F (v14.5.1 — مواصفة المستخدم §11)
 
 الغرض:
   عند إرسال تنبيه عبر AlertBot لمرسل **بلا username**، يرد حساب المراقبة
@@ -15,13 +15,30 @@ reply_fix.py — الرد التعويضي F (v11.5 — مواصفة المست�
   * حد يومي كلي قابل للضبط (REPLY_FIX_DAILY_CAP).
   * فاصل عشوائي 2–5 ثوانٍ (JITTER_MIN/JITTER_MAX) قبل الإرسال — في مهمة
     خلفية مستقلة، لا يحجب خط المعالجة.
-  * الوجهة قناة بث (broadcast) → تعطيل تلقائي مع تسجيل السبب.
+  * Face destination broadcast → ChatWriteForbiddenError → تعطيل تلقائي
+    دائم لباقي الجلسة (يُسجَّل السبب في اللوج) — تكرار المحاولة على
+    قناة بث حظر مستمر هدر حصص لا معنى له.
   * ChatWriteForbidden / SlowModeWait / FloodWait → تجاوز آمن بلا إعادة
     محاولة فورية (FloodWait يُسجل مدته).
   * التحقق الإلزامي: كيانات الرسالة المرسلة يجب أن تحوي
     MessageEntityMentionName — غيابه = FAILED (لا ادعاء نجاح).
   * لا يُنفَّذ F إلا لمرسل من نوع user/bot ولديه access_hash لحساب
     المراقبة المعني (المحذوف/القناة/المجهول → SKIP مسجَّل).
+
+v14.5.1 — correction pass:
+  * disable_for_broadcast() is now actually invoked. The docstring always
+    claimed "قناة بث → تعطيل تلقائي", but nothing ever set
+    _broadcast_disabled, so every reply_fix attempt against a broadcast
+    target burned a daily quota even after ChatWriteForbiddenError made
+    it clear no reply can ever succeed. Now: on the first
+    ChatWriteForbiddenError, the F subsystem disables itself globally
+    (single TARGET_GROUP_ID scenario) and returns SKIP. SlowModeWaitError
+    stays transient (does NOT disable — slow mode ends by itself).
+  * __version__ = "14.5.1" (was "11.5.0"; the file had been patched many
+    times without ever bumping the header version).
+  * Removed unused imports: InputPeerUser and SendMessageRequest — the
+    file always used the high-level client.send_message API. Importing
+    them was pure noise (and a tiny import-time cost on a hot path).
 
 القيود الموثقة (حدود النظام لا ادعاءات):
   * v11.8.2 (F-18): خريطة التقييد بالساعة والعدّاد اليومي كانا بذاكرة
@@ -62,21 +79,19 @@ except Exception:  # pragma: no cover
     _TELETHON_ERRORS = False
 
 try:
-    from telethon.tl.functions.messages import SendMessageRequest
+    # v14.5.1: InputPeerUser / SendMessageRequest حُذفا — غير مستخدمين.
     from telethon.tl.types import (
-        InputPeerUser,
         InputMessageEntityMentionName,
         InputUser,
         MessageEntityMentionName,
     )
     _TELETHON_TYPES = True
 except Exception:  # pragma: no cover
-    SendMessageRequest = None  # type: ignore[assignment]
-    InputPeerUser = InputMessageEntityMentionName = None  # type: ignore[assignment]
+    InputMessageEntityMentionName = None  # type: ignore[assignment]
     InputUser = MessageEntityMentionName = None  # type: ignore[assignment]
     _TELETHON_TYPES = False
 
-__version__ = "11.5.0"
+__version__ = "14.5.1"
 
 # نص الرد: إشارة شخص واحدة (المواصفة §11 — بديل الاسم القابل للنقر)
 _REPLY_TEXT = "👤"
@@ -122,6 +137,8 @@ class ReplyFixer:
         self._hour_history: Dict[int, Deque[float]] = {}
         self._day_key: int = time.gmtime().tm_yday
         self._day_count: int = 0
+        # v14.5.1: يُفعَّل عند أول ChatWriteForbiddenError (قناة بث/حظر
+        # كتابة دائم) — يُوقف المحاولات اللاحقة بلا حرق حصص.
         self._broadcast_disabled: bool = False
 
     # ─────────────────────────── الحدود ───────────────────────────
@@ -244,7 +261,12 @@ class ReplyFixer:
                 pass
 
     def disable_for_broadcast(self, reason: str = "") -> None:
-        """تعطيل تلقائي: وجهة التنبيه قناة بث لا تقبل الردود المناسبة."""
+        """تعطيل تلقائي دائم: وجهة التنبيه قناة بث لا تقبل الردود المناسبة.
+
+        v14.5.1: يُستدعى الآن فعلياً من run() عند أول
+        ChatWriteForbiddenError — يُخفض تكلفة المحاولات المتكررة على
+        قناة معروفة عدم القبول (كل محاولة تحرق حصة يومية).
+        """
         self._broadcast_disabled = True
         logger.warning(f"[ALERT] reply_fix=SKIP reason=broadcast_target ({reason[:80]})")
         metric_inc("reply_fix_skipped")
@@ -351,9 +373,15 @@ class ReplyFixer:
                 except Exception as e:
                     ename = type(e).__name__
                     last_err = ename
-                    if _TELETHON_ERRORS and isinstance(e, (ChatWriteForbiddenError, SlowModeWaitError)):
+                    # v14.5.1: ChatWriteForbidden = دائم (قناة بث أو حظر
+                    # كتابة) → عطّل F كلياً. SlowModeWait = عابر (ينتهي) →
+                    # تخطّي فقط بلا تعطيل.
+                    if _TELETHON_ERRORS and isinstance(e, ChatWriteForbiddenError):
+                        self.disable_for_broadcast(f"write_forbidden:{ename}")
+                        return f"SKIP:write_forbidden:{ename}"
+                    if _TELETHON_ERRORS and isinstance(e, SlowModeWaitError):
                         metric_inc("reply_fix_skipped")
-                        return f"SKIP:write_forbidden_or_slowmode:{ename}"
+                        return f"SKIP:slowmode:{ename}"
                     if _TELETHON_ERRORS and isinstance(e, FloodWaitError):
                         metric_inc("reply_fix_skipped")
                         return f"SKIP:floodwait_{int(getattr(e, 'seconds', 0) or 0)}"
@@ -419,10 +447,13 @@ class ReplyFixer:
             raise
         except Exception as e:
             ename = type(e).__name__
-            if _TELETHON_ERRORS and isinstance(e, (ChatWriteForbiddenError, SlowModeWaitError)):
-                # تجاوز آمن — بلا إعادة محاولة فورية (مواصفة §11)
+            # v14.5.1: نفس منطق التمييز — Forbidden = دائم، Slowmode = عابر.
+            if _TELETHON_ERRORS and isinstance(e, ChatWriteForbiddenError):
+                self.disable_for_broadcast(f"write_forbidden:{ename}")
+                return f"SKIP:write_forbidden:{ename}"
+            if _TELETHON_ERRORS and isinstance(e, SlowModeWaitError):
                 metric_inc("reply_fix_skipped")
-                return f"SKIP:write_forbidden_or_slowmode:{ename}"
+                return f"SKIP:slowmode:{ename}"
             if _TELETHON_ERRORS and isinstance(e, FloodWaitError):
                 metric_inc("reply_fix_skipped")
                 return f"SKIP:floodwait_{int(getattr(e, 'seconds', 0) or 0)}"
