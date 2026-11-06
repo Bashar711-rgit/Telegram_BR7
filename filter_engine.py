@@ -1,67 +1,58 @@
 #!/usr/bin/env python3
 """
-filter_engine.py — v14.5.0
+filter_engine.py — v14.5.1
+
+v14.5.1 — correction pass (fixes for regressions found in v14.5.0):
+* Analyzer stats: every early-exit path now increments `rejected` +
+  (`ignored` or `review`) — previously only `processed` grew for the vast
+  majority of group messages, breaking telemetry.
+* Success path: `language` / `lang_conf` / `match_score` are now populated
+  (were always "unknown" / 0.0 / 0.0 for ACCEPTED messages).
+* Exact-match cache hit returns `copy.deepcopy(cached)` — the previous
+  `dict(cached)` was a shallow copy sharing mutable `reasons` /
+  `key_phrases` / `score_details` with the cache.
+* `_fuzzy_intent_fallback`: symmetric length window (`+/-delta`).
+* `Prefilter.check`: `arabic_ratio` numerator restricted to `isalpha()`
+  Arabic letters (was including Arabic-Indic digits, could exceed 1.0).
+* `_normalize_term` now applies the same 4+→3 repeat collapse and the
+  Arabic-Indic digit translation used in `_clean`.
+* `_search_first_valid` stops at the first valid match (lazy).
+* `reload_keywords` is guarded by a `threading.Event`: in-flight analyses
+  wait for the reload to finish before reading trie/weight state.
 
 v14.5.0 — performance + normalization pass (بدون أي تغيير في دلالات القرار):
-* EARLY EXIT («Fail Fast»): الرسائل بلا كلمة مفتاحية (لا intent ولا
-  indirect ولا implicit) تخرج فوراً بعد فحص weak-ignore — فحوص
-  urgency/boost/help/context/negation/ads لم تعد تُنفَّذ عليها (كانت أكبر
-  هدر زمني في المسار الراكد: معظم رسائل المجموعات ليست طلبات).
-* WeightedTrie skip: مواضع البداية التي يسبقها run حروف عربية أطول من
-  أقصى clitic (3) تُتخطى في search_all/search_first — كانت ستُرفض حتماً
-  بواسطة valid_word_boundary، فالنتائج متطابقة 100% والمسح أسرع بكثير.
-* _clean يضيف: تقليص تكرار الحروف العربية (4+ → 3) و توحيد الأرقام
-  العربية-الهندية ٠-٩ → 0-9 (تقليل False Negatives للمدّ والأخطاء
-  الشائعة؛ كلمات الـ ignore "ههه/هههه" تبقى آمنة — لا تقليص أقل من 3).
-* _spam_score: نمط التكرار كان يُجمَّع (re.compile) عند كل استدعاء —
-  أصبح ثابتاً صنفياً (نفس النمط والنتيجة).
+* EARLY EXIT («Fail Fast»): الرسائل بلا كلمة مفتاحية تخرج فوراً.
+* WeightedTrie skip: تخطي مواضع البداية المستحيلة.
+* _clean يضيف: تقليص تكرار الحروف العربية (4+ → 3) وتوحيد الأرقام.
+* _spam_score: نمط التكرار ثابت صنفي.
 
 v14.4.0 — accuracy overhaul (precision + recall):
-* Word-boundary validation for ALL precision tries (request/indirect/urgency/
-  implicit/context/boost/ignore/spam/ad/education/negation). Arabic clitic
-  prefixes (و ف ب ل ك ال وال بال ...) are still accepted, so "الاستاذ" and
-  "وابي" match while "كتابي"→"ابي" and "محل"→"حل" no longer do.
-* Negation rebuilt on full-token regex: the affirmation "لا" / negator "مش"
-  can no longer match INSIDE "علاج" / "للمشكلة" / "المادة" (was silently
-  dropping huge volumes of legitimate requests). Clause boundaries are now
-  checked BETWEEN the negator and the intent (not before the negator),
-  post_clause negators only negate when the request precedes them, and
-  negation_exceptions are scoped to ±6 tokens of the negator.
-* Fuzzy fallback is token-level (fuzz.ratio per token, length-windowed) —
-  the old whole-text partial_ratio re-introduced substring false positives
-  and reported a wrong intent position.
-* Best-match selection: request/context tries return the HIGHEST-WEIGHT
-  valid match (tier-aware), not merely the first positional one.
-* Implicit availability questions ("مين يساعد", "عندي واجب") now produce a
-  keyword and are scored on the weighted pipeline alone; expert-only context
-  ("احتاج دكتور") is capped at review; template boost is gated on academic
-  specificity and skipped entirely for ad-like texts.
-* Length modifier relaxes for messages carrying a specific academic object;
-  bare intents bottom out at "review" (never ignored, never auto-accepted).
-* Prefilter counts the Arabic ratio over LETTERS (digits/latin no longer
-  dilute it) and the emoji cap exempts neutral emojis.
-* Help expressions (مساعده/فزعه/توضيح...) feed the grammar + academic
-  components so "محتاج مساعده" is no longer dropped.
+* Word-boundary validation for ALL precision tries.
+* Negation rebuilt on full-token regex.
+* Fuzzy fallback is token-level.
+* Best-match selection by HIGHEST-WEIGHT.
+* Implicit availability questions scored on the weighted pipeline alone.
 
 Retained all previous fixes (v14.3.2):
   * result.valid always synchronized with the final decision.
-  * Syntax errors corrected; field naming unified (key_phrases).
   * Original text preserved (original_text field).
   * Keywords normalized on load.
-  * Clause-level negation (resolution phrases do not suppress new requests).
+  * Clause-level negation.
   * Fuzzy settings read from keywords.json/CFG.
   * Thread-safe and stable.
 
 Compatibility: FilterResult, TrieNode, WeightedTrie, OptimizedBloomFilter,
-ShardedLRUCache, Prefilter, EnhancedFilter, ModerationService.
+ShardedLRUCache (removed), Prefilter, EnhancedFilter, ModerationService.
 """
 
 from __future__ import annotations
 
 import asyncio
+import copy                     # v14.5.1 — deep copy cache hits
 import hashlib
 import math
 import re
+import threading              # v14.5.1 — reload barrier
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Final, List, Optional, Set, Tuple
@@ -91,9 +82,7 @@ from security import (
 from metrics import BoundedMetrics
 from adaptive import AdaptiveWeights
 
-# v14.1 (تدقيق 2-a): إصدار المحرك — مصدر واحد للتيليمتري (message_analysis)
-# بدل "intent-engine-v13" المكتوبة يدوياً التي كانت تُخزّن إصدارات خاطئة.
-FILTER_ENGINE_VERSION: Final[str] = "14.5.0"
+FILTER_ENGINE_VERSION: Final[str] = "14.5.1"
 
 try:
     from rapidfuzz import fuzz, process as rf_process
@@ -104,12 +93,6 @@ except ImportError:
 
 try:
     from langdetect import detect, DetectorFactory
-    # v9.12 (audit L-03): langdetect uses a non-deterministic random seed
-    # by default, so the same text could be classified differently on
-    # consecutive calls. For our use case (Arabic ratio gating) the
-    # non-determinism is a real correctness risk — a borderline text
-    # could pass prefilter on one call and fail on the next. Pin the
-    # seed so the same text always yields the same language verdict.
     DetectorFactory.seed = 0
     LANGDETECT_AVAILABLE = True
 except ImportError:
@@ -121,11 +104,6 @@ try:
 except ImportError:
     PYARABIC_AVAILABLE = False
 
-# v12.2.0 (audit F-14): مسار احتياطي لإزالة التشكيل/التطويل عند غياب
-# pyarabic — نفس فئات المحارف التي تغطيها araby.strip_tashkeel +
-# araby.strip_tatweel (حركات قصيرة 064B-065F، سكون صغير 0670، تطويل 0640).
-# مطابق دلالياً للحالات العملية؛ يمنع انهيار المطابقة بصمت في أي بيئة
-# لم تُثبّت فيها التبعية (ثبت بفشل خط الأساس في بيئة نظيفة).
 _FALLBACK_TASHKEEL_RE = re.compile(r"[\u064B-\u065F\u0670\u0640]")
 
 
@@ -136,10 +114,6 @@ def _cfg(name: str, default: Any) -> Any:
     return getattr(CFG, name, default)
 
 
-# v14.4: Arabic clitic prefixes that may legitimately precede a keyword
-# inside the same word ("الاستاذ", "وابي", "للواجب"). Any other letter run
-# before a candidate match invalidates it ("كتابي" must NOT match "ابي",
-# "محل" must NOT match "حل").
 _PREFIX_CLITICS: Final[frozenset] = frozenset({
     "و", "ف", "ب", "ل", "ك",
     "ال", "وال", "بال", "فال", "كال", "لل", "ولل",
@@ -149,19 +123,8 @@ _SENTINEL_CHARS: Final[frozenset] = frozenset(
     " \t\r\n.,!?؟،؛:;()[]{}\"'“”«»…-_/\\|=+*&^%$#@~`<>%0123456789"
 )
 
-# v14.5: أقصى طول لحرف رابط عربي (clitic) في valid_word_boundary — يستخدم
-# لتخطي مواضع منتصف الكلمة في مسح الـ tries بدون تغيير النتائج إطلاقاً:
-# أي موقع بداية يسبقه run حروف عربية أطول من هذا العدد سيُرفض حتماً بواسطة
-# valid_word_boundary، فلا داعي لفحصه من الأساس (تسريع كبير للمسح).
-_MAX_CLITIC_LEN: Final[int] = 3  # "وال" أطول صيغة في _PREFIX_CLITICS
+_MAX_CLITIC_LEN: Final[int] = 3
 
-# v14.5: تطبيع خفيف إضافي داخل _clean (الهدف: تقليل FN بدون المساس بالدقة):
-#  * تقليص تكرار الحروف (4+ → 3): "هههههه"→"ههه" (يبقى مطابقاً لكلمة
-#    الـ ignore "ههه")، "مررررررا"→"مرررا" — الأخطاء الشائعة للمدّ
-#    لم تعد تُفلت الكلمات التي تحوي حرفاً ممدوداً بكثرة.
-#  * توحيد الأرقام العربية-الهندية ٠-٩ → 0-9 (رسائل مختلطة عربي/أرقام).
-#  ملاحظة أمان: تم اختيار 4+→3 وليس 2+→1 عمداً — كلمات الـ ignore
-#  "ههه" و"هههه" في keywords.json يجب أن تظل قابلة للمطابقة.
 _AR_REPEAT_4PLUS: Final = re.compile(r"([\u0621-\u064A])\1{3,}")
 _AR_DIGIT_MAP: Final = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
 
@@ -171,14 +134,7 @@ def _is_arabic_letter(ch: str) -> bool:
 
 
 def valid_word_boundary(text: str, start: int) -> bool:
-    """True when ``text[start:]`` begins a word (or follows Arabic clitics).
-
-    The run of Arabic letters immediately before ``start`` must be empty
-    (word start) or exactly one of the known clitic prefixes. Suffix
-    continuation after the match is always allowed ("واجبي" matches
-    "واجب"). Non-Arabic characters (digits, latin, punctuation) act as
-    boundaries.
-    """
+    """True when ``text[start:]`` begins a word (or follows Arabic clitics)."""
     j = start
     while j > 0 and _is_arabic_letter(text[j - 1]):
         j -= 1
@@ -188,36 +144,24 @@ def valid_word_boundary(text: str, start: int) -> bool:
 
 
 def _run_of_arabic_before(text: str, start: int) -> int:
-    """v14.5: طول الـ run الحروف العربية مباشرة قبل ``start``.
-
-    يستخدمه WeightedTrie لتخطي مواضع البداية المستحيلة بسرعة: أي run
-    أطول من أقصى clitic (3) يعني أن valid_word_boundary سيرفض الموقع
-    حتماً، فالفحص هنا = هدر زمني بحت.
-    """
+    """v14.5: طول الـ run الحروف العربية مباشرة قبل ``start``."""
     j = start
     count = 0
     while j > 0 and _is_arabic_letter(text[j - 1]):
         j -= 1
         count += 1
         if count > _MAX_CLITIC_LEN:
-            return count  # early exit — سيرفض valid_word_boundary حتماً
+            return count
     return count
 
 
 _NEG_DELIMS = r"[\s.,!?؟،؛:;()\-/\"'«»…]"
 
-# v11.7 (audit F-6): حدود النفي عبر الترقيم فقط — بلا مسافات! المسافة
-# فاصل كلمات طبيعي («ما ابي حل») وليست حد جملة؛ إدراجها كان سيكسر كل
-# النفي المباشر. هذه الفئة للفحص بين النافي والطلب حصراً.
 _NEG_PUNCT_BOUNDARY_RE = re.compile(r"[.,!?؟،؛:;()\-/\"'«»…]")
 
 
 def _boundary_regex(negs: List[str]) -> Optional[re.Pattern]:
-    """Compile a full-token alternation for negator phrases.
-
-    Both sides of every match must be word edges, so "مش" can never match
-    inside "مشكلة" and "لا" can never match inside "علاج".
-    """
+    """Compile a full-token alternation for negator phrases."""
     negs = sorted({n for n in negs if n}, key=len, reverse=True)
     if not negs:
         return None
@@ -233,12 +177,7 @@ def _boundary_regex(negs: List[str]) -> Optional[re.Pattern]:
 
 
 def _expand_al_variants(terms: Set[str]) -> Set[str]:
-    """v14.4: Arabic attaches "ال" to EACH word of a phrase — "تحليل
-    احصايي" never literally appears inside "التحليل الاحصايي". Generate
-    the definite-article variants for multi-word keywords so the tries can
-    match definite noun phrases. Single words are already handled by the
-    clitic boundary check. Combinatorics are capped at 2^3 expansions per
-    phrase (phrases here are 2-4 words)."""
+    """v14.4: Arabic attaches "ال" to EACH word of a phrase."""
     out: Set[str] = set(terms)
     for term in terms:
         words = term.split(" ")
@@ -288,12 +227,10 @@ class FilterResult:
     negation_detected: bool = False
     advert_score: float = 0.0
 
-    # additive fields (v14.2+)
     key_phrases: List[str] = field(default_factory=list)
     fuzzy_matched: bool = False
     anomaly: bool = False
 
-    # new in v14.3
     original_text: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
@@ -330,18 +267,7 @@ class FilterResult:
 
 
 class Prefilter:
-    """Prefilter with lowered default min_words to allow short high-signal requests.
-
-    v14.4: the Arabic ratio is computed over LETTERS only (digits/latin/
-    punctuation no longer dilute it — "حل homework 2" is a valid Arabic
-    request), and the emoji cap can exempt neutral emojis (students are
-    expressive; ad-style emoji spam is not).
-
-    v9.12 (audit C-02): `check()` is now a coroutine so it can use the
-    non-blocking `safe_findall_async` / `safe_search_async` helpers. All
-    callers already awaited it (or called it from another coroutine that
-    we now mark `await`); no behaviour change otherwise.
-    """
+    """Prefilter with lowered default min_words to allow short high-signal requests."""
 
     @staticmethod
     async def check(
@@ -369,8 +295,6 @@ class Prefilter:
             return False, f"too_few_words_{word_count}", metadata
 
         exempt = emoji_exempt or set()
-        # v9.12 (C-02): non-blocking async regex — was the #1 event-loop
-        # freezer in the prefilter hot path.
         emojis_raw = await safe_findall_async(EMOJI_PATTERN, text)
         emojis = [e for e in emojis_raw if e not in exempt]
         emoji_count = len(emojis)
@@ -379,7 +303,11 @@ class Prefilter:
         if emoji_count > max_emojis:
             return False, f"too_many_emojis_{emoji_count}", metadata
 
-        arabic_chars = sum(1 for c in text if '\u0600' <= c <= '\u06FF')
+        # v14.5.1: عدّ الحروف العربية isalpha فقط — كان يشمل الأرقام
+        # العربية-الهندية فيتجاوز النسبة 1.0 عند خلط حروف وأرقام.
+        arabic_chars = sum(
+            1 for c in text if c.isalpha() and '\u0600' <= c <= '\u06FF'
+        )
         letter_chars = sum(1 for c in text if c.isalpha())
         arabic_ratio = (arabic_chars / letter_chars) if letter_chars else 0.0
         metadata["arabic_ratio"] = arabic_ratio
@@ -387,7 +315,6 @@ class Prefilter:
         if arabic_ratio < 0.1:
             return False, "low_arabic_ratio", metadata
 
-        # Run the two URL/phone checks concurrently — both are non-blocking.
         has_url_match, has_phone_match = await asyncio.gather(
             safe_search_async(URL_PATTERN, text),
             safe_search_async(PHONE_PATTERN, text),
@@ -455,12 +382,6 @@ class OptimizedBloomFilter:
             self._added_count = 0
 
 
-# v9.12 (audit L-10): ShardedLRUCache was removed — it was constructed in
-# EnhancedFilter.__init__ as `self._cache = ShardedLRUCache(...)` but never
-# read or written by any code path (only `_text_cache` is used). The dead
-# class definition and the dead `self._cache` attribute are both gone.
-
-
 class TrieNode:
     __slots__ = ("children", "is_end", "word", "weight")
 
@@ -499,10 +420,6 @@ class WeightedTrie:
         limit = min(len(text), 1000)
         max_depth = min(self._max_word_len + 1, 60)
         for start in range(limit):
-            # v14.5 perf: skip مواضع منتصف الكلمة الطويلة — أي موقع يسبقه
-            # run حروف عربية أطول من أقصى clitic (3) سيُرفض بواسطة
-            # valid_word_boundary في كل مسارات الاستدعاء، فلا فائدة من
-            # فحصه. النتائج متطابقة 100% مع مسار أسرع بكثير.
             if _run_of_arabic_before(text, start) > _MAX_CLITIC_LEN:
                 continue
             node = self._root
@@ -520,7 +437,6 @@ class WeightedTrie:
         limit = min(len(text), 1000)
         max_depth = min(self._max_word_len + 1, 60)
         for start in range(limit):
-            # v14.5 perf: نفس تخطي مواضع منتصف الكلمة في search_first.
             if _run_of_arabic_before(text, start) > _MAX_CLITIC_LEN:
                 continue
             node = self._root
@@ -541,16 +457,10 @@ class EnhancedFilter:
     )
     NEGATION_SCOPE_TOKENS: Final[int] = 6
 
-    # v11.8.1 (F-13): post_clause negators whose verb is a WANT-verb —
-    # a request right after them is their negated OBJECT («ما ابي حل»),
-    # not a new request. Aspectual withdrawals («ما عاد», "ما بقى»)
-    # canonically refer to an EARLIER request and keep the soft path.
     _POST_CLAUSE_WANT_NEGATORS: Final[Tuple[str, ...]] = (
         "ما ابي", "ما ابغى", "ما اريد", "ما احتاج",
         "ما عاد ابي", "ما عاد اريد",
     )
-    # v14.4: the analyzer's own floor — the ops-level CFG.MIN_MESSAGE_LENGTH
-    # (10 chars) silently killed short high-signal requests ("ابي حل").
     FILTER_MIN_MESSAGE_CHARS: Final[int] = 3
 
     _PATTERNS: Dict[str, re.Pattern] = {
@@ -587,11 +497,6 @@ class EnhancedFilter:
         self._last_stats_reset = time.time()
         self._raw_keywords: Dict[str, Any] = KEYWORDS
 
-        # Read fuzzy settings from keywords.json/CFG BEFORE loading keywords.
-        # This prevents AttributeError in _load_keyword_sets.
-        # v14.1 (تدقيق 2-a): المفتاح الصحيح CFG.FUZZY_MATCHING_ENABLED (المعرّف
-        # فعلاً في config.py:951) — كان يُقرأ FUZZY_FALLBACK_ENABLED غير
-        # المعرّف، فيطبع "FUZZY=OFF" في اللوج ويبقى المحرك يعمل fuzzy.
         fuzzy_data = self._raw_keywords.get("fuzzy_matching", {})
         self._fuzzy_enabled = (
             _cfg("FUZZY_MATCHING_ENABLED", fuzzy_data.get("enabled", True))
@@ -602,26 +507,22 @@ class EnhancedFilter:
         self._fuzzy_min_token_length = _cfg("FUZZY_MIN_TOKEN_LENGTH", fuzzy_data.get("minimum_token_length", 5))
         self._fuzzy_only_for = fuzzy_data.get("only_for", [])
 
-        # Now load keywords and build tries.
         self._load_keyword_sets()
         self._build_tries()
 
         self._bloom = OptimizedBloomFilter(CFG.BLOOM_FILTER_SIZE, CFG.BLOOM_FILTER_FP)
-        # v9.12 (audit L-10): removed dead `self._cache = ShardedLRUCache(...)`
-        # — was constructed but never read or written. Only `_text_cache`
-        # below is used by the analysis path.
         self._text_cache = TTLCache(maxsize=CFG.TEXT_CACHE_SIZE, ttl=CFG.TEXT_CACHE_TTL)
         self._cache_lock = asyncio.Lock()
+        # v14.5.1: barrier لتماسك الحالة بين reload_keywords (إداري نادر)
+        # والتحليلات الجارية على threads.
+        self._reload_event = threading.Event()
+        self._reload_event.set()
 
         self._regex_guard = SafeRegexExecutor(
             timeout_s=_cfg("REGEX_TIMEOUT_S", 0.25),
             max_workers=_cfg("REGEX_GUARD_WORKERS", 4),
         )
-        # v9.12 (audit C-03): dedicated bounded executor for the CPU-bound
-        # filter pipeline. Capped at FILTER_EXECUTOR_WORKERS so under load
-        # we don't fan out unbounded threads; the ModerationService
-        # Semaphore already throttles concurrent analyze() calls.
-        from concurrent.futures import ThreadPoolExecutor  # local import keeps top-level clean
+        from concurrent.futures import ThreadPoolExecutor
         self._filter_executor = ThreadPoolExecutor(
             max_workers=max(1, _cfg("FILTER_EXECUTOR_WORKERS", 4)),
             thread_name_prefix="filter-core",
@@ -635,7 +536,7 @@ class EnhancedFilter:
         self._adaptive_academic = AdaptiveWeights(self._academic_weights, alpha=_cfg("ADAPTIVE_ALPHA", 0.05))
 
         logger.info(
-            "Filter v14.4.0 ready | intent_verbs={} | academic_objects={} | negation={} | boost_patterns={} | "
+            "Filter v14.5.1 ready | intent_verbs={} | academic_objects={} | negation={} | boost_patterns={} | "
             "distance_scoring={} | fuzzy_fallback={}",
             len(self._intent_verbs_all),
             len(self._academic_objects_all),
@@ -645,17 +546,16 @@ class EnhancedFilter:
             "ON" if self._fuzzy_enabled else "OFF",
         )
 
-    # ------------------------------------------------------------------
-    # Helper: normalize a keyword term (same as input normalization)
-    # ------------------------------------------------------------------
     def _normalize_term(self, term: str) -> str:
+        """v14.5.1: تطبيع مطابق لـ _clean — كان الاختلاف يُيتّم أي keyword
+        يحوي 4+ تكرار حرف عربي أو رقماً عربياً-هندياً بعد v14.5."""
         term = term.lower()
         term = self._normalize_arabic(term)
+        if _AR_REPEAT_4PLUS.search(term):
+            term = _AR_REPEAT_4PLUS.sub(r"\1\1\1", term)
+        term = term.translate(_AR_DIGIT_MAP)
         return term
 
-    # ------------------------------------------------------------------
-    # Keyword loading (updated to normalize all terms)
-    # ------------------------------------------------------------------
     def _generate_template_patterns(self, kw: Dict[str, Any]) -> Set[str]:
         generated: Set[str] = set()
         templates_data = kw.get("templates", {})
@@ -683,7 +583,6 @@ class EnhancedFilter:
         if not isinstance(availability, list):
             availability = []
 
-        # Normalize all word banks
         need = [self._normalize_term(t) for t in need]
         person = [self._normalize_term(t) for t in person]
         action = [self._normalize_term(t) for t in action]
@@ -855,10 +754,6 @@ class EnhancedFilter:
         self._ad_blockers: Set[str] = set(kw.get("ad_blockers", []))
         self._ad_blockers = {b.lower() for b in self._ad_blockers if isinstance(b, str)}
 
-        # v14.4: hard-only ad trie for the _is_blocked short-circuit — hard
-        # signals + strong/individual providers + commercial link domains.
-        # Medium signals (خصم/عرض خاص...) stay score-only: a single medium
-        # word must never insta-kill a legitimate message.
         _hard_terms: Set[str] = set()
         _hs = self._ad_signals.get("hard_signals", [])
         if isinstance(_hs, list):
@@ -872,12 +767,6 @@ class EnhancedFilter:
         _hard_terms.update(self._ad_blockers)
         self._ad_hard_trie = WeightedTrie(_hard_terms)
 
-        # Ignore signals — v14.4 two-tier:
-        #   strong (social/politics/health/entertainment) → early hard ignore.
-        #   weak (greetings/thanks/affirmations/wellbeing/reactions) → ignore
-        #   only when the message carries NO request keyword ("السلام عليكم
-        #   عندي مشروع تخرج" must not die because of the greeting, and
-        #   "ما عرفت احل" must not die because of the affirmation "عرفت").
         _ignore_weak_keys = {"greetings", "thanks", "affirmations", "wellbeing", "reactions"}
         ignore_data = kw.get("ignore_signals", {})
         self._ignore_all: Set[str] = set()
@@ -903,11 +792,6 @@ class EnhancedFilter:
             if isinstance(action_verbs_data.get(key), list):
                 self._action_verbs.update(_norm_set(action_verbs_data.get(key, [])))
 
-        # v11.8 (F-06): help-VERB anchor trie — grammar-only help verbs
-        # (يساعدني/ساعدوني/...) used to be skipped entirely by the v14.5
-        # early-exit when no intent/implicit keyword existed. This conservative
-        # sub-list (verb forms only, NOT generic nouns like مساعدة/دعم)
-        # anchors the intent so real help cries enter the full scoring path.
         _help_anchor_terms: Set[str] = _norm_set(
             {"يساعدني", "تساعدني", "يسعفني", "فزعوا لي", "فزعوا"}
         )
@@ -948,11 +832,6 @@ class EnhancedFilter:
                     nk = self._normalize_term(k)
                     nv = self._normalize_term(v)
                     self._dialect_map[nk] = nv
-        # NOTE: _build_dialect_pattern() is invoked at the END of this method
-        # (after the final keyword sets exist) so it can exclude mapping
-        # sources that are prefixes of known keywords — e.g. the phrase-level
-        # mapping "مين يعرف"→"من يعرف" must NOT apply inside the recognized
-        # keyword "مين يعرف احد" (that mismatch caused real false negatives).
 
         # University context
         self._university_context: Set[str] = set()
@@ -961,16 +840,11 @@ class EnhancedFilter:
             if isinstance(value, list):
                 self._university_context.update(_norm_set(value))
 
-        # v14.4: concrete departments / academic levels (تمريض، شبكات، هندسه،
-        # ماجستير...) are strong academic signals — promote them to object-tier
-        # weights so best-match selection prefers them over generic context.
         for strong_key in ("academic_departments", "academic_levels"):
             for term in _norm_list(university_data.get(strong_key, [])):
                 self._academic_weights.setdefault(term, 1.0)
                 self._academic_objects_all.add(term)
 
-        # v14.4: expert/role words are ambiguous on their own ("احتاج دكتور")
-        # — messages whose ONLY context is one of these are capped at review.
         self._expert_words: Set[str] = {"خبير", "متخصص", "مختص", "فاهم", "شاطر", "محترف"}
         roles = university_data.get("university_roles", [])
         if isinstance(roles, list):
@@ -992,7 +866,7 @@ class EnhancedFilter:
                 except Exception:
                     pass
 
-        # Scoring weights (documentation only)
+        # Scoring weights
         self._scoring_weights: Dict[str, float] = {}
         weights_data = kw.get("scoring_weights", {})
         positive_modules = weights_data.get("positive_modules", {})
@@ -1006,8 +880,6 @@ class EnhancedFilter:
         if isinstance(boundaries, list):
             self._clause_boundaries.update(_norm_set(boundaries))
 
-        # v14.4: full-token boundary regexes — negators must be standalone
-        # words ("مش" must not match inside "مشكلة", "لا" not inside "علاج").
         pre_verb_terms = []
         if isinstance(pre_verb, dict):
             pre_verb_terms = [t for t in pre_verb.get("terms", []) if isinstance(t, str)]
@@ -1022,7 +894,6 @@ class EnhancedFilter:
         self.urgency_words: Set[str] = self._urgency_all
         self.ignore_words: Set[str] = self._ignore_all
 
-        # v14.4: definite-article phrase variants ("تحليل الاحصايي")
         self.request_words = _expand_al_variants(self.request_words)
         self.context_words = _expand_al_variants(self.context_words)
         self.indirect_words = _expand_al_variants(self.indirect_words)
@@ -1062,7 +933,6 @@ class EnhancedFilter:
         self.ad_blockers.update(old_blockers)
         self.spam_patterns.update(old_spam)
 
-        # Ensure all sets are clean
         self.request_words = set(self.request_words)
         self.context_words = set(self.context_words)
         self.indirect_words = set(self.indirect_words)
@@ -1095,9 +965,8 @@ class EnhancedFilter:
         self._subject_markers_trie = WeightedTrie(self._subject_markers)
         self._action_verbs_trie = WeightedTrie(self._action_verbs)
 
-        # Fuzzy candidate terms: combine from categories specified in fuzzy_matching.only_for
+        # Fuzzy candidate terms
         fuzzy_terms_set = set()
-        # Use safe getattr to avoid AttributeError if called before __init__ sets _fuzzy_only_for
         only_for = getattr(self, "_fuzzy_only_for", []) or ["intent_verbs"]
         if "intent_verbs" in only_for:
             fuzzy_terms_set.update(self._intent_verbs_all)
@@ -1107,9 +976,6 @@ class EnhancedFilter:
             fuzzy_terms_set.update(self._boost_patterns)
         self._all_fuzzy_terms: List[str] = list(fuzzy_terms_set)
 
-        # v14.4: token-level fuzzy buckets (single-word terms grouped by
-        # length) — replaces the whole-text partial_ratio scan which matched
-        # short terms INSIDE unrelated words ("كتابي"→"ابي").
         self._fuzzy_terms_by_len: Dict[int, List[str]] = {}
         for term in self._all_fuzzy_terms:
             if term and " " not in term:
@@ -1117,8 +983,6 @@ class EnhancedFilter:
 
         self._raw_keywords = kw
 
-        # v14.4: now that the final sets exist, build the dialect pattern
-        # with keyword-aware source exclusion.
         self._dialect_pattern = None
         self._build_dialect_pattern()
 
@@ -1134,8 +998,10 @@ class EnhancedFilter:
         ]
 
     def _search_first_valid(self, trie: WeightedTrie, text: str) -> Optional[Tuple[str, float, int]]:
-        for word, weight, pos in self._search_all_valid(trie, text):
-            return (word, weight, pos)
+        # v14.5.1: توقّف عند أول مطابقة صالحة بدل تجميع كل النتائج.
+        for word, weight, pos in trie.search_all(text):
+            if valid_word_boundary(text, pos):
+                return (word, weight, pos)
         return None
 
     @staticmethod
@@ -1160,8 +1026,6 @@ class EnhancedFilter:
     def _search_best_context(
         self, text: str, intent_pos: Optional[int]
     ) -> Tuple[Optional[Tuple[str, float, int]], List[Tuple[str, float, int]]]:
-        """Pick the strongest academic-object match; ties break by proximity
-        to the intent verb (falls back to earliest)."""
         candidates = []
         seen: Set[str] = set()
         for word, _w, pos in self._context_trie.search_all(text):
@@ -1178,48 +1042,46 @@ class EnhancedFilter:
         return best, candidates
 
     def _build_tries(self) -> None:
-        # Tries are built inside _load_keyword_sets; kept for API compatibility.
         pass
 
     def reload_keywords(self, path: str = "keywords.json") -> None:
         from config import load_keywords
-        fresh = load_keywords(path)
-        # Re-read fuzzy settings if they changed in the new file
-        # v14.1: نفس تصحيح المفتاح أعلاه + إبطال كاش النصوص (قرارات قديمة
-        # مخبأة تبقى صالحة حتى 5 دقائق لو لم يُمسّ الكاش بعد إعادة التحميل).
-        fuzzy_data = fresh.get("fuzzy_matching", {})
-        self._fuzzy_enabled = (
-            _cfg("FUZZY_MATCHING_ENABLED", fuzzy_data.get("enabled", True))
-            and RAPIDFUZZ_AVAILABLE
-        )
-        self._fuzzy_score_cutoff = _cfg("FUZZY_SCORE_CUTOFF", 85.0)
-        self._fuzzy_max_edit_distance = _cfg("FUZZY_MAX_EDIT_DISTANCE", fuzzy_data.get("max_edit_distance", 1))
-        self._fuzzy_min_token_length = _cfg("FUZZY_MIN_TOKEN_LENGTH", fuzzy_data.get("minimum_token_length", 5))
-        self._fuzzy_only_for = fuzzy_data.get("only_for", [])
-
-        self._load_keyword_sets(fresh)
-        # v14.1 (تدقيق 2-a): إبطال كاش القرارات بعد إعادة بناء الtries —
-        # مسح TTLCache ذري تحت GIL؛ الدالة متزامنة ونادرة (إدارية).
+        # v14.5.1: أغلق الحاجز قبل بناء الحالة — التحليلات الجارية تنتظر
+        # انتهاء إعادة التحميل قبل قراءة tries/weights.
+        self._reload_event.clear()
         try:
-            self._text_cache.clear()
-        except Exception:
-            pass
-        # Re-seed adaptive weights on reload.
-        if hasattr(self, "_adaptive_intent"):
-            self._adaptive_intent = self._reseed_adaptive(self._adaptive_intent, self._intent_weights)
-            self._adaptive_academic = self._reseed_adaptive(self._adaptive_academic, self._academic_weights)
-        self._stats["keyword_reloads"] = self._stats.get("keyword_reloads", 0) + 1
-        logger.info(
-            "Filter keyword sets reloaded from {} | templates={} entries | boost_patterns_total={}",
-            path,
-            len(fresh.get("templates", {})),
-            len(self._boost_patterns),
-        )
+            fresh = load_keywords(path)
+            fuzzy_data = fresh.get("fuzzy_matching", {})
+            self._fuzzy_enabled = (
+                _cfg("FUZZY_MATCHING_ENABLED", fuzzy_data.get("enabled", True))
+                and RAPIDFUZZ_AVAILABLE
+            )
+            self._fuzzy_score_cutoff = _cfg("FUZZY_SCORE_CUTOFF", 85.0)
+            self._fuzzy_max_edit_distance = _cfg("FUZZY_MAX_EDIT_DISTANCE", fuzzy_data.get("max_edit_distance", 1))
+            self._fuzzy_min_token_length = _cfg("FUZZY_MIN_TOKEN_LENGTH", fuzzy_data.get("minimum_token_length", 5))
+            self._fuzzy_only_for = fuzzy_data.get("only_for", [])
+
+            self._load_keyword_sets(fresh)
+            try:
+                self._text_cache.clear()
+            except Exception:
+                pass
+            if hasattr(self, "_adaptive_intent"):
+                self._adaptive_intent = self._reseed_adaptive(self._adaptive_intent, self._intent_weights)
+                self._adaptive_academic = self._reseed_adaptive(self._adaptive_academic, self._academic_weights)
+            self._stats["keyword_reloads"] = self._stats.get("keyword_reloads", 0) + 1
+            logger.info(
+                "Filter keyword sets reloaded from {} | templates={} entries | boost_patterns_total={}",
+                path, len(fresh.get("templates", {})), len(self._boost_patterns),
+            )
+        finally:
+            # v14.5.1: افتح الحاجز دائماً — حتى لو فشل التحميل —
+            # تحليل عالق للأبد أسوأ بكثير من حالة جزئية.
+            self._reload_event.set()
 
     @staticmethod
     def _reseed_adaptive(existing: AdaptiveWeights, static_defaults: Dict[str, float]) -> AdaptiveWeights:
         merged = dict(static_defaults)
-        # Preserve learned weights for terms that still exist
         if hasattr(existing, "weights"):
             for term, learned in existing.weights.items():
                 if term in merged:
@@ -1229,20 +1091,10 @@ class EnhancedFilter:
 
     _build_keyword_sets = reload_keywords
 
-    # ------------------------------------------------------------------
-    # Normalization
-    # ------------------------------------------------------------------
     def _build_dialect_pattern(self) -> None:
         if not self._dialect_map:
             self._dialect_pattern = None
             return
-        # v14.4: exclude mapping sources that are prefixes of known keywords —
-        # phrase-level mapping inside a recognized keyword destroyed the match
-        # ("مين يعرف"→"من يعرف" broke the keyword "مين يعرف احد").
-        # v11.7 (audit F-5): الحصر توسّع من «بادئة» إلى «أي موضع داخل» كلمة
-        # مفتاحية معروفة: "مره→جدا" كانت تفسد "الماده مره صعبه" (مره في
-        # المنتصف)، و"تورطت→تايه" كانت تقتل كلمة التائية "تورطت" المعلنة
-        # نفسها — كلها إعادة إنتاج حية (كلمات مفتاحية معلنة لا تُطابق أبداً).
         known = (
             getattr(self, "request_words", set())
             | getattr(self, "context_words", set())
@@ -1276,12 +1128,6 @@ class EnhancedFilter:
             except Exception as exc:
                 logger.debug("pyarabic normalization failed: {}", exc)
         else:
-            # v12.2.0 (audit F-14): غياب pyarabic كان يُسقط إزالة التشكيل
-            # والتطويل بصمت — رسالة مشكولة («اِحْتَـاجُ حَـلّ») لا تطابق
-            # الكلمة المفتاحية («احتاج حل») → تنبيه صالح يُفقد (FN).
-            # أُثبت بفشل 12 اختباراً في بيئة نظيفة بلا pyarabic. المسار
-            # الاحتياطي regex يغطي نفس المحارف تماماً (حركات 064B-065F +
-            # سكون 0670 + تطويل 0640) — نفس دلالة araby بدون تبعية.
             text = _FALLBACK_TASHKEEL_RE.sub("", text)
         return text
 
@@ -1299,14 +1145,7 @@ class EnhancedFilter:
             return capped
 
     def _clean(self, text: str) -> Tuple[str, str]:
-        """Returns (cleaned_for_matching, original_preserved).
-
-        v14.5: بعد التطبيع الأساسي يضاف (تقليل False Negatives):
-          * تقليص تكرار الحروف العربية (4+ → 3) — رسائل المدّ ("مرررررا"،
-            "ههههههه") تعود قابلة للمطابقة، وكلمات الـ ignore "ههه" و
-            "هههه" في keywords.json تبقى آمنة تماماً (لا تقليص أقل من 3).
-          * توحيد الأرقام العربية-الهندية (٠-٩ → 0-9) للرسائل المختلطة.
-        """
+        """Returns (cleaned_for_matching, original_preserved)."""
         original = text
         cleaned = WS_PATTERN.sub(" ", text).strip()
         cleaned = cleaned.lower()
@@ -1318,8 +1157,6 @@ class EnhancedFilter:
         return cleaned, original
 
     def _is_arabic(self, text: str) -> Tuple[bool, float]:
-        """v14.4: ratio computed over LETTERS only — digits/latin in mixed
-        student messages ("حل assignment 2") no longer dilute it."""
         if not text:
             return False, 0.0
         arabic_count = sum(1 for c in text if c in self.ARABIC_CHARS)
@@ -1340,14 +1177,9 @@ class EnhancedFilter:
     _REPEAT_CHARS_PATTERN: Final = re.compile(r"(.)\1{4,}")
 
     async def _spam_score(self, text: str) -> float:
-        """v9.12 (C-02): converted to a coroutine so the 4 regex calls
-        inside the hot path no longer freeze the event loop. All four
-        patterns are dispatched concurrently via asyncio.gather so the
-        wall-clock cost is roughly max(...) instead of sum(...)."""
         score = 0.0
         if not text:
             return score
-        # Dispatch the four ReDoS-guarded checks in parallel.
         phone_m, urls, emojis, repeat_m = await asyncio.gather(
             safe_search_async(PHONE_PATTERN, text),
             safe_findall_async(URL_PATTERN, text),
@@ -1360,15 +1192,11 @@ class EnhancedFilter:
         score += min(0.4, url_count * 0.2)
         emoji_count = len(emojis)
         score += min(0.2, emoji_count * 0.04)
-        # v14.5 perf: النمط كان يُترجم (re.compile) عند كل استدعاء — الآن
-        # ثابت صنفي مُجمّع مرة واحدة (نفس النمط، نفس النتيجة).
         if repeat_m:
             score += 0.15
         return min(score, 1.0)
 
     def _detect_advertisement(self, text: str) -> Tuple[float, List[str]]:
-        # v14.1 (تدقيق 2-a): بوابة CFG.AD_DETECTION_ENABLED — المفتاح كان معرّفاً
-        # ولا يقرأه المحرك. الافتراضي True = السلوك السابق حرفياً.
         if not getattr(CFG, "AD_DETECTION_ENABLED", True):
             return (0.0, [])
         ad_score = 0.0
@@ -1429,14 +1257,6 @@ class EnhancedFilter:
                     ad_score += 0.15
                     reasons.append(f"institution_term: {term}")
 
-        # v11.8 (F-01): commercial-prefix rule — a first-person-plural
-        # provider verb (نقدم/نوفر/نسوي/…) combined with explicit COMMERCIAL
-        # context (price/discount/CTA/institution/payment signals) is the
-        # «نقدم حل واجبات… اسعار مميزه» ad shape that literal substring
-        # matching missed (the 0.956 accept FP). Word-bounded verb check +
-        # a genuine-collective guard (نحتاج/مع بعض/…) keeps student groups
-        # («نحتاج نسوي بحث تخرج») safe. Placed AFTER every context loop so
-        # the reason list is complete when evaluated.
         if weak_count > 0 and strong_count == 0 and individual_count == 0:
             commercial_context = any(
                 r.startswith(("medium_ad_signal", "cta_signal", "payment_signal",
@@ -1472,23 +1292,6 @@ class EnhancedFilter:
         return min(ad_score, 1.0), reasons
 
     def _detect_negation(self, text: str, intent_pos: Optional[int]) -> Tuple[bool, float, List[str]]:
-        """
-        v14.4: boundary-aware, clause-scoped negation.
-
-        * Negators are matched as FULL tokens (regex) — "لا" can no longer
-          fire inside "علاج"/"السلام" and "مش" not inside "للمشكلة".
-        * pre_verb negators only suppress an intent within the same clause
-          (no clause boundary BETWEEN them) and within NEGATION_SCOPE_TOKENS.
-        * post_clause negators ("ما عاد", "ما ابي"...) only suppress a
-          request that came BEFORE them; a new request after them is a soft
-          signal (0.2), not a kill.
-        * negation_exceptions back the negation off only when they occur
-          near the negator.
-
-        v14.1 (تدقيق 2-a): بوابة CFG.NEGATION_ENABLED — المفتاح كان معرّفاً
-        في config ولا يقرأه المحرك (يُطبع OFF باللوج ويستمر الكشف). الافتراضي
-        True = السلوك السابق حرفياً.
-        """
         if not getattr(CFG, "NEGATION_ENABLED", True):
             return (False, 0.0, [])
         exception_positions: List[int] = []
@@ -1505,30 +1308,22 @@ class EnhancedFilter:
                     return True
             return False
 
-        # 1) Resolution phrases ("تم الحل", "خلصت"...)
+        # 1) Resolution phrases
         resolution_match = self._search_first_valid(self._resolution_trie, text)
         if resolution_match:
             res_phrase, _, res_pos = resolution_match
             if intent_pos is not None and intent_pos > res_pos:
-                # New request after resolution: not a pure resolution
                 logger.debug("Resolution phrase '{}' found but intent appears later; not fully negated", res_phrase)
                 return True, 0.2, [f"resolution_phrase_with_new_request: {res_phrase}"]
             return True, 1.0, [f"resolution_phrase: {res_phrase}"]
 
-        # 2) post_clause negators ("ما عاد", "ما بقى", "ما ابي"...)
+        # 2) post_clause negators
         if self._post_clause_pattern is not None:
             for m in self._post_clause_pattern.finditer(text):
                 neg_pos = m.start()
                 if _exception_near(neg_pos):
                     continue
                 if intent_pos is not None and intent_pos > neg_pos:
-                    # v11.8.1 (F-13): «ما ابي حل» — with WANT-verbs the
-                    # intent right after the negator is the negated OBJECT
-                    # itself, not a fresh request. Same clause + short
-                    # distance ⇒ strong negation (0.8). A clause boundary
-                    # (or a far intent) keeps the v14.4 "new request wins"
-                    # soft path so «ما عاد ابي مساعدتك، بس ابي حل واجبي»
-                    # still reaches clause_rescore for the second clause.
                     between = text[neg_pos:intent_pos]
                     _same_clause = not any(
                         b in between for b in self._clause_boundaries
@@ -1542,13 +1337,6 @@ class EnhancedFilter:
                         and self._token_distance(text, neg_pos, intent_pos)
                         <= self.NEGATION_SCOPE_TOKENS
                     ):
-                        # v11.8.1 (F-13 follow-up): do NOT strong-kill when a
-                        # LATER clause carries a fresh request —
-                        # «ما عاد ابي مساعدتك، بس ابي حل واجبي»: the
-                        # withdrawal covers the object clause only; the
-                        # post-boundary clause is a genuine request and
-                        # keeps the v14.4 soft path (clause_rescore may
-                        # then upgrade it).
                         _tail = text[intent_pos:]
                         _later_intent = False
                         for b in self._clause_boundaries:
@@ -1562,26 +1350,17 @@ class EnhancedFilter:
                             return True, 0.8, [
                                 f"post_clause_negates_object: {m.group()}"
                             ]
-                    # request AFTER the withdrawal phrase → new request wins
                     return True, 0.2, [f"post_clause_with_new_request: {m.group()}"]
                 return True, 0.8, [f"post_clause_negator: {m.group()}"]
 
-        # 3) pre_verb negators ("ما", "مو", "لا"...)
+        # 3) pre_verb negators
         if self._pre_verb_pattern is not None:
             for m in self._pre_verb_pattern.finditer(text):
                 neg_pos = m.start()
                 if _exception_near(neg_pos):
                     continue
                 if intent_pos is not None:
-                    # a clause boundary between the negator and the intent
-                    # starts a new clause — the negation does not cross it
                     between = text[neg_pos:intent_pos]
-                    # v11.7 (audit F-6): علامات الترقيم حدود جُمل أيضاً —
-                    # «لا، ابي حل واجب»: النفي هنا استئنافي (discourse-لا)
-                    # والفاصلة تفصله عن الطلب، لكن الفحص القديم كان يعتبر
-                    # حدود "لكن/بس/الا" فقط فيُكبت طلباً حقيقياً (إعادة
-                    # إنتاج حية). _NEG_DELIMS هو نفسه حصر الحدود المعجمي
-                    # فتبقى الدلالة متسقة داخل الوحدة.
                     if any(b in between for b in self._clause_boundaries):
                         continue
                     if _NEG_PUNCT_BOUNDARY_RE.search(between):
@@ -1589,10 +1368,6 @@ class EnhancedFilter:
                     dist = self._token_distance(text, neg_pos, intent_pos)
                     if dist > self.NEGATION_SCOPE_TOKENS:
                         continue
-                    # v14.4: "ما طلعت متسقة ... وياليت احد يشرح" — the
-                    # negator denies an EARLIER verb, not the request. Only
-                    # a negator immediately attached to the intent (or with
-                    # no intent at all) suppresses it strongly.
                     neg_score = 0.8 if dist <= 1 else 0.25
                     return True, neg_score, [f"pre_verb_negator: {m.group()}"]
                 return True, 0.8, [f"pre_verb_negator: {m.group()}"]
@@ -1643,15 +1418,6 @@ class EnhancedFilter:
         return 0.9
 
     def _fuzzy_intent_fallback(self, cleaned: str) -> Optional[Tuple[str, float, int]]:
-        """v14.4: token-level fuzzy match against single-word intent terms.
-
-        The previous whole-text ``partial_ratio`` scan matched short terms
-        INSIDE unrelated longer words ("كتابي" fuzzy-matched "ابي" at 100)
-        and reported the position of the first TOKEN instead of the matched
-        term — corrupting both negation scoping and distance scoring.
-        Now every token is compared with ``fuzz.ratio`` against terms of a
-        similar length window only.
-        """
         if not self._fuzzy_enabled or not cleaned.strip():
             return None
         if not getattr(self, "_fuzzy_terms_by_len", {}):
@@ -1667,8 +1433,12 @@ class EnhancedFilter:
             if len(token) < self._fuzzy_min_token_length:
                 continue
             candidates: List[str] = list(self._fuzzy_terms_by_len.get(len(token), []))
+            # v14.5.1: نافذة متناظرة — كان +/- delta يجمع الكلمات الأطول فقط
+            # فيضيّع حالات «الطالب كتب أطول من الكلمة المفتاحية» (FN).
             for delta in range(1, max_dist + 1):
                 candidates.extend(self._fuzzy_terms_by_len.get(len(token) + delta, []))
+                if len(token) - delta >= self._fuzzy_min_token_length:
+                    candidates.extend(self._fuzzy_terms_by_len.get(len(token) - delta, []))
             for term in candidates:
                 scored = rf_process.extractOne(
                     token, [term], scorer=fuzz.ratio, score_cutoff=self._fuzzy_score_cutoff
@@ -1685,13 +1455,6 @@ class EnhancedFilter:
         try:
             if not isinstance(text, str):
                 return self._result("ignore", 0.0, ["invalid_input"], original_text=original_text)
-            # ══ v12.1.0: السياسة الموحدة — قياس واحد لكل الطبقات ══
-            # كانت الفحوص هنا على النص الخام (len(text) > MAX قبل strip)
-            # فتُرفض رسالة خامها 80 ومقصوصها 40 "too_long" بعد أن عبرت
-            # _validate_event المقيسة على المقصوص — فقد صامت لطلب صالح.
-            # الآن: FilterPolicy (strip + صفر-العرض + 6..65 شاملاً الحدين،
-            # CFG حي) — نفس القرار من أي طبقة. فشل-آمن: خلل السياسة →
-            # السلوك السابق حرفياً.
             try:
                 from unified_alerts.filter_policy import FilterPolicy as _FP
                 _v = _FP.check(text)
@@ -1702,10 +1465,6 @@ class EnhancedFilter:
             except Exception:
                 if len(text) > CFG.MAX_MESSAGE_LENGTH:
                     return self._result("ignore", 0.0, ["too_long"], original_text=original_text)
-                # v14.4: analyzer-local 3-char floor — the ops-level
-                # MIN_MESSAGE_LENGTH (10) silently killed short high-signal
-                # requests ("ابي حل", "فزعه"); anything that short and junky is
-                # handled by the ignore/spam tries below anyway.
                 validated = text.strip()
                 if len(validated) < self.FILTER_MIN_MESSAGE_CHARS:
                     return self._result("ignore", 0.0, ["too_short"], original_text=original_text)
@@ -1723,33 +1482,19 @@ class EnhancedFilter:
                         self._stats["prefilter_rejected"] += 1
                     return self._result("ignore", 0.0, [reason], original_text=original_text)
 
-            # ── v14.4 fix (audit H-1): cache BEFORE bloom, and the bloom can
-            # no longer turn a repeated text into an "ignore/duplicate"
-            # decision. The old order was:
-            #     bloom.contains(key) → return ignore("duplicate")
-            #     cache lookup (unreachable for repeats)
-            # Because every analyzed text was bloom-added, the SECOND time
-            # anyone posted the same normalized text (extremely common for
-            # short student requests posted by different users) the filter
-            # silently dropped it as "duplicate" instead of returning its
-            # (cached) analysis — a large false-negative surface. Now the
-            # exact-match cache is consulted first and RETURNS the previous
-            # analysis on a hit; the bloom is kept only as a statistical
-            # "this text was seen before" hint and never short-circuits the
-            # decision.
             async with self._cache_lock:
                 cached_result = self._text_cache.get(cache_key)
             if cached_result is not None:
                 async with self._stats_lock:
                     self._stats["cache_hits"] += 1
-                result = dict(cached_result)
+                # v14.5.1: deepcopy — dict(...) نسخة سطحية تُشارك reasons
+                # وkey_phrases وscore_details مع الكاش (تعديل مستهلك خارجي
+                # كان سيُسمّم كل ردود لاحقة لنفس النص).
+                result = copy.deepcopy(cached_result)
                 result["analysis_time_ms"] = round((time.perf_counter() - start) * 1000, 2)
                 return result
 
             if await self._bloom.contains(cache_key):
-                # Bloom hit + cache miss = stale cache entry (TTL expired) or
-                # a false positive. Either way, fall through to a fresh full
-                # analysis — never to an automatic "duplicate" ignore.
                 async with self._stats_lock:
                     self._stats["bloom_hits"] += 1
 
@@ -1768,16 +1513,6 @@ class EnhancedFilter:
                     self._stats["spam"] += 1
                 return self._result("ignore", 0.0, ["spam_detected"], original_text=original_text)
 
-            # ── v9.12 (audit C-03): the entire CPU-bound core (trie scans,
-            # fuzzy fallback, negation, advertisement detection, scoring)
-            # now runs off the event loop via run_in_executor. The event
-            # loop is free to interleave Telegram captures, queue pops and
-            # alert sends while a single message is being analyzed. The
-            # default ThreadPoolExecutor is bounded by asyncio, so under
-            # load the semaphore in ModerationService naturally throttles
-            # concurrent analyses. The sync helper returns the final
-            # result_dict plus a small stats-bucket we apply under the
-            # asyncio lock back on the loop.
             loop = asyncio.get_running_loop()
             core_result = await loop.run_in_executor(
                 self._filter_executor,
@@ -1789,7 +1524,6 @@ class EnhancedFilter:
                 arabic_ratio,
                 start,
             )
-            # core_result is a tuple: (result_dict, stats_to_inc, elapsed_ms_or_None, anomaly_value_or_None)
             result_dict, stats_to_inc, elapsed_ms, anomaly_value = core_result
 
             if anomaly_value is not None:
@@ -1817,7 +1551,6 @@ class EnhancedFilter:
                     self._stats["min_time_ms"] = min(self._stats["min_time_ms"], elapsed_ms)
 
             if elapsed_ms is not None:
-                # Only cache the full-analysis result, not early-exit dicts.
                 async with self._cache_lock:
                     self._text_cache[cache_key] = result_dict
 
@@ -1827,11 +1560,19 @@ class EnhancedFilter:
             logger.exception("Filter.analyze error")
             return self._result("ignore", 0.0, [f"internal_error: {str(e)[:50]}"], original_text=original_text)
 
-    # ── v9.12 (audit C-03): the CPU-bound core ──────────────────────────
-    # Runs inside run_in_executor — no awaits, no asyncio.Lock acquisition.
-    # Returns a tuple (result_dict, stats_to_inc, elapsed_ms_or_None,
-    # anomaly_value_or_None). When elapsed_ms is None the caller treats
-    # the result as an early-exit and skips anomaly/cache handling.
+    def _mark_rejected(
+        self, stats_inc: Dict[str, int], decision: str = "ignore"
+    ) -> Dict[str, int]:
+        """v14.5.1: كل مسار خروج مبكر يجب أن يعدّ rejected/ignored
+        (أو review). قبل التصحيح كان processed ينمو لكل رسالة لكن
+        rejected/ignored لا تنمو لأي رسالة سلكت Early Exit."""
+        stats_inc["rejected"] = stats_inc.get("rejected", 0) + 1
+        if decision == "review":
+            stats_inc["review"] = stats_inc.get("review", 0) + 1
+        else:
+            stats_inc["ignored"] = stats_inc.get("ignored", 0) + 1
+        return stats_inc
+
     def _analyze_core_sync(
         self,
         cleaned: str,
@@ -1841,40 +1582,43 @@ class EnhancedFilter:
         arabic_ratio: float,
         start: float,
     ) -> Tuple[Dict[str, Any], Dict[str, int], Optional[float], Optional[float]]:
-        # v14.4: boundary-valid short-circuits — the affirmation "لا"
-        # must not match inside "علاج/الاكسل/الاختبار" and kill real
-        # requests via the ignore/spam tries.
+
+        # v14.5.1: انتظار انتهاء أي reload جارٍ (نادر) قبل قراءة
+        # tries/weights — نمنع "torn read" على التحليل الواحد.
+        self._reload_event.wait(timeout=5.0)
+
         if self._search_first_valid(self._spam_trie, cleaned):
             return (
-                self._result("ignore", 0.0, ["spam_pattern"], original_text=original_text),
-                {"spam": 1},
-                None,
-                None,
+                self._convert_result(
+                    self._result("ignore", 0.0, ["spam_pattern"], original_text=original_text),
+                    is_arabic, arabic_ratio, 0.0, start,
+                ),
+                self._mark_rejected({"spam": 1}),
+                None, None,
             )
 
-        # v14.4: boundary-valid + STRONG-ONLY early ignore — weak social
-        # signals (greetings/thanks/affirmations) are evaluated later and
-        # never suppress messages that carry a request keyword.
         if self._search_first_valid(self._ignore_strong_trie, cleaned):
             return (
-                self._result("ignore", 0.0, ["ignore_pattern"], original_text=original_text),
-                {},
-                None,
-                None,
+                self._convert_result(
+                    self._result("ignore", 0.0, ["ignore_pattern"], original_text=original_text),
+                    is_arabic, arabic_ratio, 0.0, start,
+                ),
+                self._mark_rejected({}),
+                None, None,
             )
 
         if self._search_first_valid(self._ad_blocker_trie, cleaned):
             return (
-                self._result("ignore", 0.0, ["ad_blocker"], original_text=original_text),
-                {},
-                None,
-                None,
+                self._convert_result(
+                    self._result("ignore", 0.0, ["ad_blocker"], original_text=original_text),
+                    is_arabic, arabic_ratio, 0.0, start,
+                ),
+                self._mark_rejected({}),
+                None, None,
             )
 
-        # v14.4: boundary-aware, best-weight matching everywhere.
         intent_match = self._search_best(
-            self._request_trie,
-            cleaned,
+            self._request_trie, cleaned,
             lambda t: self._adaptive_intent.get(t, self._intent_weights.get(t, 0.7)),
         )
         fuzzy_used = False
@@ -1897,47 +1641,28 @@ class EnhancedFilter:
         )
 
         is_implicit = implicit_match is not None
-
-        # v14.4: implicit availability/problem requests anchor the intent
-        # when no explicit intent verb exists ("مين يساعد", "عندي واجب") —
-        # anchored BEFORE negation/distance so their scope is correct.
         if is_implicit and not intent_word:
             intent_weight = 0.7
             intent_pos = implicit_match[2]
 
-        # ── v14.5 EARLY EXIT («Fail Fast / Early Exit») ─────────────
-        # لا نية صريحة ولا طلب غير مباشر ولا ضمني ⇒ الرسالة بلا كلمة
-        # مفتاحية قطعاً. فحوص urgency/boost/help/context/negation/ads
-        # لا تغيّر قرار هذا المسار إطلاقاً (النتيجة "no_keyword" أو
-        # "ignore_pattern" في كل الأحوال) — تُتخطى كلها فوراً بدلاً
-        # من تنفيذها على رسائل خارج النطاق (أكبر مكسب أداء للمسار
-        # الراكد: معظم رسائل المجموعات ليست طلبات).
+        # ── Early exit ───────────────────────────────────────────────
         keyword = intent_word or (
             indirect_match[0] if indirect_match else None
         ) or (
             implicit_match[0] if implicit_match else None
         )
-        help_anchored = False  # v11.8 (F-06)
+        help_anchored = False
         if not keyword:
             result = FilterResult()
             result.original_text = original
-            # v14.4: weak ignore signals (greetings/thanks/...) apply only
-            # when the message carries no request keyword at all.
             if self._search_first_valid(self._ignore_trie, cleaned):
                 result.valid = False
                 result.reason = "ignore_pattern"
                 return (
                     self._convert_result(result, is_arabic, arabic_ratio, 0.0, start),
-                    stats_inc,
-                    None,
-                    None,
+                    self._mark_rejected(stats_inc),
+                    None, None,
                 )
-            # v11.8 (F-06): help-verb anchor fallback — «احد يساعدني» /
-            # «ساعدوني» carry no intent/implicit keyword but ARE requests.
-            # Anchor the intent at the help-verb position (conservative
-            # weight 0.65) so the full scoring path runs. Generic help
-            # nouns (مساعدة/دعم) deliberately do NOT anchor — they stay
-            # no_keyword to avoid review-queue noise (documented limitation).
             help_anchor = self._search_first_valid(self._help_anchor_trie, cleaned)
             if help_anchor is not None:
                 keyword = help_anchor[0]
@@ -1950,11 +1675,11 @@ class EnhancedFilter:
                 result.reason = "no_keyword"
                 return (
                     self._convert_result(result, is_arabic, arabic_ratio, 0.0, start),
-                    stats_inc,
-                    None,
-                    None,
+                    self._mark_rejected(stats_inc),
+                    None, None,
                 )
-        # ── كلمة مفتاحية موجودة — المتابعة بالمسار الكامل كما هو ──
+
+        # ── مسار كامل ────────────────────────────────────────────────
         urgency_match = self._search_first_valid(self._urgency_trie, cleaned)
         boost_match = self._search_first_valid(self._boost_trie, cleaned)
         help_match = self._search_first_valid(self._help_trie, cleaned)
@@ -1962,8 +1687,6 @@ class EnhancedFilter:
         urgency_marker = urgency_match[0] if urgency_match else None
         urgent = urgency_match is not None
 
-        # v14.4: strongest academic object (tier weight, then proximity
-        # to the intent anchor) instead of "first positional match".
         academic_match, context_matches = self._search_best_context(cleaned, intent_pos)
         academic_word = academic_match[0] if academic_match else None
         academic_pos = academic_match[2] if academic_match else None
@@ -1972,24 +1695,23 @@ class EnhancedFilter:
         is_negated, neg_score, neg_reasons = self._detect_negation(cleaned, intent_pos)
         if is_negated and neg_score > 0.7:
             return (
-                self._result(
-                    "ignore",
-                    1.0 - neg_score,
-                    neg_reasons,
-                    original_text=original_text,
+                self._convert_result(
+                    self._result("ignore", 1.0 - neg_score, neg_reasons, original_text=original_text),
+                    is_arabic, arabic_ratio, 0.0, start,
                 ),
-                stats_inc,
-                None,
-                None,
+                self._mark_rejected(stats_inc),
+                None, None,
             )
 
         ad_score, ad_reasons = self._detect_advertisement(cleaned)
         if ad_score > 0.6:
             return (
-                self._result("ignore", 1.0 - ad_score, ad_reasons, original_text=original_text),
-                stats_inc,
-                None,
-                None,
+                self._convert_result(
+                    self._result("ignore", 1.0 - ad_score, ad_reasons, original_text=original_text),
+                    is_arabic, arabic_ratio, ad_score, start,
+                ),
+                self._mark_rejected(stats_inc),
+                None, None,
             )
 
         result = FilterResult()
@@ -1998,9 +1720,8 @@ class EnhancedFilter:
         if self._is_blocked(cleaned, result, ad_score):
             return (
                 self._convert_result(result, is_arabic, arabic_ratio, ad_score, start),
-                stats_inc,
-                None,
-                None,
+                self._mark_rejected(stats_inc),
+                None, None,
             )
 
         score = CFG.SCORE_DIRECT_MATCH if intent_word else 0
@@ -2032,7 +1753,6 @@ class EnhancedFilter:
         result.context_confidence = 0.90 if context_matches else (0.85 if urgent else 0.75)
 
         legacy_confidence = score / 100.0
-
         weighted_confidence: Optional[float] = None
         distance_score = 0.0
         grammar_score = 0.0
@@ -2043,20 +1763,16 @@ class EnhancedFilter:
                 or help_match
             )
             grammar_score = 1.0 if grammar_match else 0.0
-
             if intent_pos is not None and academic_pos is not None:
                 distance_score = self._calculate_distance_score(intent_pos, academic_pos, len(cleaned))
             elif intent_word:
                 distance_score = 0.5
-
             context_component = min(len(context_matches) / 3.0, 1.0)
             urgency_component = 1.0 if urgent else 0.0
-
             weight_sum = (
                 CFG.SCORE_WEIGHT_INTENT + CFG.SCORE_WEIGHT_ACADEMIC + CFG.SCORE_WEIGHT_GRAMMAR
                 + CFG.SCORE_WEIGHT_DISTANCE + CFG.SCORE_WEIGHT_URGENCY + CFG.SCORE_WEIGHT_CONTEXT
             ) or 1.0
-
             weighted_confidence = (
                 intent_weight * CFG.SCORE_WEIGHT_INTENT
                 + academic_weight * CFG.SCORE_WEIGHT_ACADEMIC
@@ -2067,9 +1783,6 @@ class EnhancedFilter:
             ) / weight_sum
             weighted_confidence = max(0.0, min(1.0, weighted_confidence))
 
-        # v14.4: implicit-only requests are scored on the weighted
-        # pipeline alone — the legacy additive score is intent-centric
-        # and systematically under-rates them.
         if weighted_confidence is not None and not intent_word and is_implicit:
             result.confidence = weighted_confidence
         else:
@@ -2110,8 +1823,6 @@ class EnhancedFilter:
 
         token_count = len(cleaned.split())
         length_modifier = self._get_length_modifier(token_count)
-        # v14.4: a specific academic object carries its own context —
-        # relax the short-message discount proportionally.
         if academic_word:
             relief = max(0.0, min(1.0, (academic_weight - 0.5) / 0.5))
             length_modifier = length_modifier + (1.0 - length_modifier) * relief
@@ -2119,17 +1830,8 @@ class EnhancedFilter:
 
         if is_negated:
             result.confidence *= (1 - neg_score * 0.7)
-        # v11.8 (F-01): penalty coefficient 0.9 → 1.1 — the old value cut
-        # only 18% per 0.2 of ad evidence, letting request-shaped ads land
-        # at 0.956. Combined with commercial_prefix (+0.4) and the boost
-        # gate below, that shape now hard-ignores.
         result.confidence *= (1 - ad_score * 1.1)
 
-        # v14.4: template boost is gated — ad-like texts get nothing, and
-        # patterns over generic/expert context only give a weak bump.
-        # v11.8 (F-01): the gate is now EVIDENCE-based — any provider /
-        # commercial-prefix signal (or ad_score ≥ 0.2) disables the boost
-        # entirely; «ابي احد» must not rescue a commercial offer.
         boost = 0.0
         _ad_evidence = ad_score >= 0.2 or any(
             r.startswith(("commercial_prefix", "provider_detected",
@@ -2166,14 +1868,6 @@ class EnhancedFilter:
         else:
             result.decision = "ignore"
 
-        # ── v14.4 calibration caps ────────────────────────────────────
-        # 1) bare intents ("ابي", "محتاج", "مين يساعد") bottom out at
-        #    review: never silently ignored, never auto-accepted.
-        #    v11.8 (F-04): the floor now also covers 3-token short intents
-        #    («تكفون أحد يساعدني» = 0.383 ignore FN) and 4-token messages
-        #    anchored by the implicit/help fallback (no explicit intent
-        #    verb) — «من يعرف شخص يساعدني». Explicit-intent 4-token texts
-        #    («ودي اسافر هالصيف») stay below the cap by design.
         if (
             result.decision != "accept"
             and not academic_word
@@ -2185,8 +1879,6 @@ class EnhancedFilter:
         ):
             result.confidence = max(result.confidence, _cfg("CONFIDENCE_REVIEW_THRESHOLD", 0.40) + 0.05)
             result.decision = "review"
-        # 2) expert-only context ("احتاج دكتور") stays review until a
-        #    specific academic object disambiguates it.
         if (
             result.decision == "accept"
             and academic_word in getattr(self, "_expert_words", set())
@@ -2194,8 +1886,6 @@ class EnhancedFilter:
         ):
             result.decision = "review"
             result.reasons.append("capped: expert_only_context")
-        # 3) resolution + new request in one message → at most review
-        #    (documented engine limitation in keywords.json test_cases).
         if result.decision == "accept" and any(
             r.startswith(("resolution_phrase_with_new_request", "post_clause_with_new_request"))
             for r in result.reasons
@@ -2203,11 +1893,6 @@ class EnhancedFilter:
             result.decision = "review"
             result.reasons.append("capped: resolution_with_new_request")
 
-        # ── v10.0 Precision: تقييم البنود المستقلة (clause re-scoring) ──
-        # عندما لا يصل القرار للقبول، نقيّم كل بند من بنود الرسالة قسماً
-        # مستقلاً — بند الطلب الحقيقي («بس عندي تقرير محتاج مساعدة») لم يعد
-        # يتلوث ببند الاسترسال («لقيت حل الواجب»). الترقية مشروطة:
-        # نية صريحة + ثقة وزنية ≥ عتبة القبول + ليس بنداً عارياً (≤2 كلمة).
         if CFG.CLAUSE_RESCORE_ENABLED and result.decision != "accept":
             _up = self._clause_rescore(cleaned)
             if _up is not None:
@@ -2217,12 +1902,6 @@ class EnhancedFilter:
                     result.decision = "accept"
                     result.reasons.extend(up_reasons)
                     result.score_details["clause_rescore"] = round(up_conf, 4)
-                    # v11.8.1 (F-14): the rescore may raise confidence but
-                    # never the DECISION past a deliberate calibration cap.
-                    # The resolution+new-request ceiling (cap 3) fired
-                    # before the rescore ran — enforce it again so
-                    # «لقيت حل الواجب ... عندي تقرير محتاج مساعدة» cannot
-                    # land at accept 0.891 through the back door.
                     if any(
                         r.startswith((
                             "resolution_phrase_with_new_request",
@@ -2235,23 +1914,21 @@ class EnhancedFilter:
                             "capped: rescore_respects_resolution_ceiling"
                         )
 
-        # ===== الإصلاح الحاسم: مزامنة valid مع القرار النهائي =====
         result.valid = (result.decision == "accept")
-        # =====================================================
+
+        # v14.5.1: ضبط الحقول التي كانت تفقد قيمتها في المسار الناجح.
+        result.language = "ar" if is_arabic else "unknown"
+        result.lang_conf = arabic_ratio
+        result.match_score = result.confidence
 
         elapsed_ms = round((time.perf_counter() - start) * 1000, 2)
         result.analysis_time_ms = elapsed_ms
 
-        # Apply post-result stats counters that the async caller will merge.
         if result.valid:
             stats_inc["valid"] = stats_inc.get("valid", 0) + 1
             stats_inc["accepted"] = stats_inc.get("accepted", 0) + 1
         else:
-            stats_inc["rejected"] = stats_inc.get("rejected", 0) + 1
-            if result.decision == "review":
-                stats_inc["review"] = stats_inc.get("review", 0) + 1
-            else:
-                stats_inc["ignored"] = stats_inc.get("ignored", 0) + 1
+            self._mark_rejected(stats_inc, result.decision)
 
         result_dict = result.to_dict()
         result_dict["valid"] = result.valid
@@ -2261,21 +1938,8 @@ class EnhancedFilter:
     def _clause_rescore(
         self, cleaned: str
     ) -> Optional[Tuple[float, List[str]]]:
-        """يقيّم بنود الرسالة قسماً مستقلاً ويعيد أفضل ثقة بند مؤهلة للترقية.
-
-        شروط الترقية لكل بند (محافظة):
-          * ليس بند تحية/شكر/سبام (أشجار ignore/spam).
-          * يحمل نية صريحة (طلب مباشر أو fuzzy) وليس ضمنياً فقط.
-          * ليس نافياً محلياً («ما قدرت احله») وليس إعلانياً (> 0.5).
-          * ليس بنداً عارياً: يلزم (كلمات ≥ 3) أو (كلمتان + كائن أكاديمي).
-          * ليس سياق خبير غامضاً (نفس قاعدة calibration في المسار الرئيسي).
-          * الثقة الوزنية ≥ عتبة القبول.
-
-        Returns:
-            None أو (confidence, reasons) — فشل-آمن: أي استثناء ⇒ None.
-        """
         try:
-            from clauses import split_clauses  # استيراد كسول (بلا دورة)
+            from clauses import split_clauses
 
             parts = split_clauses(cleaned)
             if len(parts) <= 1:
@@ -2289,7 +1953,6 @@ class EnhancedFilter:
                 try:
                     if not clause or len(clause) < 4:
                         continue
-                    # بنود التحية/الشكر/السبام لا تُرقّى أبداً
                     if (
                         self._search_first_valid(self._ignore_strong_trie, clause)
                         or self._search_first_valid(self._spam_trie, clause)
@@ -2307,24 +1970,20 @@ class EnhancedFilter:
                     if c_match is None:
                         c_match = self._fuzzy_intent_fallback(clause)
                     if c_match is None:
-                        continue  # بلا نية صريحة — لا ترقية من بند ضمني
+                        continue
 
                     c_intent_word = c_match[0]
                     c_intent_pos = c_match[2]
-                    # الوزن الفعلي من المطابقة (نفس منهجية المسار الرئيسي —
-                    # قد يكون 1.5 لكلمات عالية الثقة وليس 0.7 الافتراضي)
                     c_intent_weight = (
                         self._adaptive_intent.get(c_intent_word, c_match[1])
                         if not c_match[1] or c_match[1] <= 1.0
                         else c_match[1]
                     )
 
-                    # نفي محلي — بند النفي لا يرقّى ولا يلوّن غيره
                     c_neg, c_neg_score, _ = self._detect_negation(clause, c_intent_pos)
                     if c_neg and c_neg_score > 0.5:
                         continue
 
-                    # إعلانات محلية
                     c_ad, _ = self._detect_advertisement(clause)
                     if c_ad > 0.5:
                         continue
@@ -2336,7 +1995,6 @@ class EnhancedFilter:
                         if c_acad_word else 0.0
                     )
 
-                    # سياق خبير غامض — نفس قاعدة المسار الرئيسي
                     if (
                         c_acad_word in getattr(self, "_expert_words", set())
                         and not (self._academic_weights.get(c_acad_word, 0.0) >= 0.75)
@@ -2383,7 +2041,6 @@ class EnhancedFilter:
                     conf *= 1.0 - c_ad * 0.9
                     conf = max(0.0, min(1.0, conf))
 
-                    # حارس البند العاري: كلمات ≤ 2 بلا كائن أكاديمي لا يرقّى
                     if c_tokens <= 2 and not c_acad_word:
                         continue
 
@@ -2411,8 +2068,6 @@ class EnhancedFilter:
             weight = await self._adaptive_academic.record_feedback(term, was_correct)
         else:
             raise ValueError(f"Unknown term_kind: {term_kind!r} (expected 'intent' or 'academic')")
-        # v14.1 (تدقيق 2-a): التصحيح يُبطل كاش القرارات — كان النص المحلل
-        # قبل التصحيح يعيد قراره القديم من _text_cache حتى 5 دقائق (TTL).
         async with self._cache_lock:
             self._text_cache.clear()
         async with self._stats_lock:
@@ -2420,16 +2075,6 @@ class EnhancedFilter:
         return weight
 
     def _is_blocked(self, text: str, result: FilterResult, ad_score: float = 0.0) -> bool:
-        """v14.4: only HARD commercial signals short-circuit to ignore.
-
-        Medium signals (خصم/عرض خاص) are score-only now, a single ad-style
-        emoji no longer hard-blocks (it feeds _detect_advertisement instead),
-        and institution terms block only alongside real commercial signals
-        (a student writing "مكتب خدمات الجامعه" is not an advertiser).
-
-        v14.1: فرعا الإعلانات هنا يخضعان لنفس بوابة AD_DETECTION_ENABLED
-        (اتساق دلالي: الإيقاف يعطّل كشف الإعلانات كله، لا التقييم فقط).
-        """
         if getattr(CFG, "AD_DETECTION_ENABLED", True):
             if self._search_first_valid(self._ad_hard_trie, text):
                 result.reason = "advertisement"
@@ -2495,19 +2140,18 @@ class EnhancedFilter:
         await self._bloom.clear()
         async with self._cache_lock:
             self._text_cache.clear()
-        logger.info("Filter v14.3.2 caches cleared")
+        logger.info("Filter v14.5.1 caches cleared")
 
     def shutdown(self) -> None:
         self._regex_guard.shutdown()
-        # v9.12 (audit C-03): release the filter CPU executor too.
         try:
             self._filter_executor.shutdown(wait=False, cancel_futures=True)
-        except Exception:  # noqa: BLE001 — shutdown is best-effort
+        except Exception:  # noqa: BLE001
             pass
 
 
 class ModerationService:
-    """Unified façade over EnhancedFilter (same as v14.3, no changes needed)."""
+    """Unified façade over EnhancedFilter (same as v14.5.0)."""
 
     def __init__(self, filter_: Optional[EnhancedFilter] = None,
                  timeout_s: float = 2.0, max_concurrency: int = 32) -> None:
