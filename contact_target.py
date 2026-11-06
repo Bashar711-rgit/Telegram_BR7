@@ -34,6 +34,9 @@ v14.5.1 — correction pass:
     (14 → 15 UTF-16 units).
   * __version__ now "14.5.1" (was "1.1.0" — three versions coexisted:
     docstring v11.2, module __version__ 1.1.0, project 14.5.1).
+  * USER REQUEST: Hidden "B_Bot" from the card header. SENDER_LABEL
+    starts directly with "المرسل: " to clean up the visual appearance
+    of the alert card.
 
 الطرق الثلاث المحفوظة داخليًا (spec #4–#6):
     1. username        → https://t.me/{username}          (الأفضل — يعمل للجميع)
@@ -103,8 +106,6 @@ _TG_URL = "https://t.me/"
 
 # ── نصوص القالب (المصدر الوحيد — alert_bot وalert_ui يستوردها) ─────────────
 # شكل التنبيه النهائي الفعال (v14.5.1 — يطابق SENDER_LABEL أدناه حرفياً):
-#     B_Bot
-#     (سطر فارغ)
 #     المرسل: [اسم المرسل قابل للنقر] — @username
 #     (سطر فارغ)
 #     نص الرسالة:
@@ -112,20 +113,17 @@ _TG_URL = "https://t.me/"
 #     [النص الأصلي كاملاً — أسطره ورموزه وروابطه كما وردت]
 #     ثم لوحة أزرار فعلية (Inline Keyboard): [ مراسلة ] [ عرض الرسالة ]
 # ملاحظات العقد:
-#   * سطر اسم البوت (BOT_NAME_LINE) يظهر في أعلى كل بطاقة بصورة ثابتة
-#     (مواصفة v13 §9 — «أولًا: اسم البوت») — يفصله سطر فارغ عن سطر المرسل.
-#     تغيير BOT_NAME_LINE يتطلب إعادة نشر (ليس من CFG — قرار تشغيلي).
+#   * تم إخفاء سطر اسم البوت (BOT_NAME_LINE) من العرض بناءً على طلب
+#     المستخدم لتنظيف شكل البطاقة.
 #   * «— @username» تُعرض فقط عند توفر username صالح — لا يُختلق أبداً.
 #   * اسم المرسل وحده هو الرابط (كيان/وسم anchor) — ليس السطر كله ولا
 #     نص الرسالة، و«@username» نص مستقل بجانب الاسم.
 #   * SENDER_LABEL يحدد إزاحة كيان الاسم (UTF-16) في كل المستهلكين
 #     (alert_bot فحص الاسم + alert_ui الإصلاح الذاتي) — تغييره هنا
-#     ينتشر تلقائياً. تضمين سطر اسم البوت داخل SENDER_LABEL يجعل كل
-#     الإزاحات المشتقة من utf16_len(SENDER_LABEL) صحيحة تلقائياً.
-BOT_NAME_LINE = "B_Bot"
-# v14.5.1: سطران (\n\n) بعد BOT_NAME_LINE — يطابق التعليق أعلاه
-# (كان \n واحداً في v11.2 رغم أن التعليق يوضّح سطراً فارغاً).
-SENDER_LABEL = f"{BOT_NAME_LINE}\n\nالمرسل: "
+#     ينتشر تلقائياً.
+BOT_NAME_LINE = "B_Bot" # مطلوب في monitors.py لفحص البطاقات
+# v14.5.1: حُذف اسم البوت والأسطر الفارغة من العرض — البطاقة تبدأ بالمرسل مباشرة.
+SENDER_LABEL = "المرسل: "
 
 # تسمية قسم نص الرسالة (سطر مستقل يسبق النص الأصلي مباشرة بعد سطر فارغ)
 MSG_TEXT_LABEL = "نص الرسالة:"
@@ -170,21 +168,9 @@ def build_username_suffix_linked(username: Any = None, url: Any = None) -> str:
 # أنواع المرسل التي يُسمح لها بـ tg://user?id (لا القنوات ولا المحذوفون)
 _USER_ID_CAPABLE_TYPES = frozenset({"user", "bot", "assumed_user"})
 
-# مطابقة للسلوك التاريخي: sender_type غير مصنف (""/unknown/none) مع sender_id يُعامل
-# كمستخدم مفترض (كما كان يبني alert_bot/monitors روابط tg://user?id قبل v11.2).
-# الحالة الحرجة: sender=None في _event_to_dict (فشل تحميل الكيان) تترك
-# sender_type="none" بينما sender_id موجودة — إسقاط tg://user?id هنا كان
-# سيعيد الشكوى الأصلية (اسم المرسل غير قابل للنقر) لأكثر حالة فشل شيوعاً.
-# لا هوية إطلاقاً (sender_id=0) فقط تعني none فعلياً.
-
 
 def _is_truthy(value: Any) -> bool:
-    """v14.5.1: تطبيع أشكال 'الصواب' إلى True.
-
-    يقبل: True, 1, "1", "true", "yes", "on" — كلها شائعة عبر طبقات
-    serialization (SQLite BOOLEAN→INTEGER، JSON، CSV exports).
-    يرفض: False, 0, "0", "false", "no", "off", None, "".
-    """
+    """v14.5.1: تطبيع أشكال 'الصواب' إلى True."""
     if value is True:
         return True
     if value is False or value is None:
@@ -210,13 +196,11 @@ _METRIC_KEYS = (
     "clickable_sender_failure",
     "contact_button_success",
     "contact_button_failure",
-    # ── v11.5 (مواصفة §16): عدادات السلالم والرد التعويضي ──
     "name_N1", "name_N2", "name_N3", "name_N4", "name_N5",
     "tier_T1", "tier_T2", "tier_T3", "tier_T4", "tier_T5",
     "contact_B1", "contact_B2", "contact_B3", "contact_B4", "contact_B5",
     "view_V1", "view_V2", "view_V3", "view_V4",
     "reply_fix_success", "reply_fix_failure", "reply_fix_skipped",
-    # ── v11.6: إسقاط أزرار مسار حسابات المستخدمين (قيد تيليجرام الموثق) ──
     "user_buttons_dropped",
 )
 
@@ -259,11 +243,7 @@ def build_display_name(
     user_id: Any = 0,
     display: Any = None,
 ) -> str:
-    """اسم المرسل المعروض — بلا user_id كاسم ظاهر (يظهر في الـdebug فقط).
-
-    ملاحظة: user_id مقبول للتوافق الخلفي لكنه غير مستخدم — v12.3 W-2
-    حذف الحساب الميت الذي كان يُنتج «مستخدم (1234)».
-    """
+    """اسم المرسل المعروض — بلا user_id كاسم ظاهر (يظهر في الـdebug فقط)."""
     if display and str(display).strip():
         return str(display).strip()
     full = f"{first_name or ''} {last_name or ''}".strip()
@@ -271,7 +251,7 @@ def build_display_name(
         return full
     uname = _clean_username(username)
     if uname:
-        return uname  # بلا @ — الاسم نفسه قابل للنقر
+        return uname
     return "مرسل غير محدد"
 
 
@@ -280,22 +260,6 @@ def build_display_name(
 # =============================================================================
 @dataclass(slots=True)
 class ContactTarget:
-    """
-    كل طرق الوصول الممكنة للمرسل + الهدف المختار.
-
-        user_id            الهوية الأساسية (ليست username)
-        username           الاسم العام إن وجد (بلا @)
-        display_name       الاسم الظاهر في التنبيه (قابل للنقر)
-        sender_type        user|bot|channel|assumed_user|deleted|none
-        username_url       https://t.me/{username}
-        user_id_url        tg://user?id={user_id}
-        openmessage_url    tg://openmessage?user_id={user_id}  (داخلي تجريبي)
-        selected_url       أفضل هدف متاح — يستخدمه الاسم والزر معًا (spec #16)
-        target_type        username|user_id|openmessage|none
-        resolution_status  resolved|partial|failed
-        reasons            أسباب داخلية للوج فقط — لا تظهر في التنبيهات
-    """
-
     user_id: int = 0
     username: Optional[str] = None
     usernames: Optional[List[str]] = None
@@ -311,11 +275,9 @@ class ContactTarget:
 
     @property
     def reachable(self) -> bool:
-        """هدف واحد على الأقل متاح — الاسم والزر يستخدمان نفس الهدف."""
         return bool(self.selected_url)
 
     def to_log_dict(self) -> Dict[str, Any]:
-        """لوج آمن — بلا أرقام هواتف ولا أي بيانات حساسة (spec #22)."""
         return {
             "user_id": self.user_id or None,
             "username": self.username,
@@ -351,13 +313,6 @@ def resolve_contact_target(
 ) -> ContactTarget:
     """
     يبني ContactTarget من بيانات المرسل الملتقطة — **بلا أي I/O**.
-
-    الخريطة (تُحفظ كل الطرق ثم يُختار الأفضل):
-        username صالح  → username_url   (الأفضل عالميًا)
-        user_id > 0    → user_id_url    (fallback أساسي — spec #5)
-        user_id > 0    → openmessage_url (يُحتفظ به داخليًا فقط — spec #6)
-
-    لا يرفع استثناءً أبدًا؛ البيانات الفارغة تعني target_type="none".
     """
     started = time.perf_counter()
     reasons: List[str] = []
@@ -366,11 +321,9 @@ def resolve_contact_target(
     except Exception:
         sid = 0
     if sid < 0:
-        # sender_id سالب = كيان محادثة وليس مستخدمًا — لا tg://user له
         reasons.append("negative_sender_id")
         sid = 0
 
-    # ── username: الأساسي ثم كل usernames النشطة (حسابات premium) ──
     uname = _clean_username(username) or None
     all_unames: Optional[List[str]] = None
     if not uname and usernames:
@@ -397,16 +350,9 @@ def resolve_contact_target(
         except Exception:
             pass
 
-    # ── نوع المرسل (spec #18) ──
-    # ""/unknown/none مع sender_id → assumed_user: الكيان غائب لكن الهوية
-    # الأساسية (user_id) موجودة — لا يجوز إسقاط وسيلة الوصول إليها (spec #5).
-    # المرسل Channel/Deleted يُبنى من كيان فعلي (ليس غياب كيان) فيبقى كما هو.
     st = str(sender_type or "").strip().lower()
     if st in ("", "unknown", "none"):
         st = "assumed_user" if sid else "none"
-    # v14.5.1: _is_truthy يقبل True/1/"1"/"true"/"yes"/"on" — التطبيع موحّد
-    # لـ is_bot وis_deleted. النسخة السابقة كانت تفحص is_bot نصياً فقط
-    # فيضيع `is_bot = 1` (SQLite/JSON) ويبقى sender_type="user" عن خطأ.
     if _is_truthy(is_deleted):
         st = "deleted"
     elif st in ("user", "assumed_user") and _is_truthy(is_bot):
@@ -414,17 +360,14 @@ def resolve_contact_target(
     if st == "channel":
         reasons.append("channel_sender_no_user_id")
 
-    # ── الطرق الثلاث ──
     username_url = f"{_TG_URL}{uname}" if uname else None
     user_id_url = (
         f"tg://user?id={sid}"
         if (sid and st in _USER_ID_CAPABLE_TYPES)
         else None
     )
-    # openmessage: احتياطي داخلي تجريبي فقط — لا يُختار أبدًا (spec #6)
     openmessage_url = f"tg://openmessage?user_id={sid}" if sid else None
 
-    # ── الاختيار: username ثم user_id ثم لا شيء ──
     if username_url:
         selected_url, target_type = username_url, "username"
     elif user_id_url:
@@ -465,7 +408,7 @@ def resolve_contact_target(
         resolution_status=status,
         reasons=reasons,
     )
-    try:  # لوج تشخيصي محصور — debug كي لا يزاحم لوج [SENDER] الحدثي
+    try:
         logger.debug(
             f"contact_target resolved in {(time.perf_counter() - started) * 1000:.2f}ms | "
             + " ".join(f"{k}={v}" for k, v in target.to_log_dict().items())
@@ -476,15 +419,9 @@ def resolve_contact_target(
 
 
 # =============================================================================
-# Validation chain (spec #20) — قبل الإرسال
+# Validation chain (spec #20)
 # =============================================================================
 def validate_contact_target(target: Optional[ContactTarget]) -> Tuple[bool, str]:
-    """
-    سلسلة التحقق قبل بناء الاسم/الزر:
-        target موجود؟ → نوع مرسل صالح؟ → اسم معروض متاح؟ → هدف واحد على الأقل؟
-        → الهدف من صيغة معروفة؟ → الكيان القابل للنقر قابل للبناء؟
-    لا تفشل التنبيه — تفشل الهدف فقط (المستدعي يكمل بلا كيان).
-    """
     if target is None:
         return False, "no_target"
     if target.sender_type in ("channel", "deleted", "none") and not target.username_url:
@@ -504,7 +441,7 @@ def validate_contact_target(target: Optional[ContactTarget]) -> Tuple[bool, str]
 
 
 # =============================================================================
-# Clickable-name entities (spec #14) — النص الظاهر ≠ الرابط
+# Clickable-name entities (spec #14)
 # =============================================================================
 def build_alert_entity_pack(
     display_name: str,
@@ -515,25 +452,6 @@ def build_alert_entity_pack(
     plain_budget: int = 3800,
     name_url_override: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """
-    يبني (plain_text, formatting_entities) للقالب v11.6 — نفس الشكل المرئي
-    حرفياً للنسخة HTML (parse_mode="html") لكن عبر كيانات جاهزة.
-
-    لماذا كيانات جاهزة؟ Telethon 1.45 `client.send_message(parse_mode=...)`
-    يمرر النص عبر _parse_message_text التي **تحذف** أي MessageEntityTextUrl
-    ينتهي بـ tg://user?id= إذا لم يستطع عميل الإرسال حلّ المستخدم من كاش
-    جلسته (_replace_with_mention → del entities[i]) — عميل البوت الحي
-    (جلسة جديدة) لا يملك كاش المرسلين فما يقريبًا كل أسماء tg://user تُحذف
-    صامتة ويصبح الاسم نصًا عاديًا (السبب الجذري للشكوى).
-    تمرير formatting_entities= **يتفادى ذلك المسار كلياً** (مرجع:
-    telethon/client/messages.py — parse ينفذ فقط عندما formatting_entities
-    is None) فتصل الكيانات حرفياً كما بُنيت.
-
-    الكيانات (v11.6 — بلا blockquote حصراً حسب المواصفة):
-        MessageEntityTextUrl → الاسم فقط (الرابط الداخلي selected_url،
-        أو name_url_override — حزمة الإصلاح الذاتي v11.3: رابط الرسالة
-        المصدر عند إسقاط الخادم لكيان tg://user).
-    """
     display = str(display_name or "").strip() or "مستخدم"
     raw = str(message_text or "")
     if len(raw) > max(64, int(plain_budget)):
@@ -556,14 +474,10 @@ def build_alert_entity_pack(
             entities.append(
                 MessageEntityTextUrl(offset=name_off, length=name_len, url=name_url)
             )
-    except Exception as e:  # الكيانات ميزة — فشلها لا يكسر الإرسال
+    except Exception as e:
         logger.debug(f"contact_target entity pack failed: {type(e).__name__}: {e}")
         entities = []
 
-    # ══ v12.1.0 — كيان الرابط الثاني: «@username» في الذيل ══
-    # صيغة الصورة المرجعية: الاسم والـ@username كلاهما رابط (أزرق).
-    # الإزاحة: SENDER_LABEL + display + الفاصل « — » ثم @username.
-    # ميزة فقط — فشلها لا يكسر الإرسال ولا يقلل قابلية نقر الاسم.
     try:
         uname = getattr(target, "username", None) if target is not None else None
         uname_url = (str(name_url_override).strip() if name_url_override else None) or (
@@ -600,7 +514,7 @@ def build_alert_entity_pack(
 
 
 # =============================================================================
-# [SENDER] logging (spec #22) — سطر واحد محصور بلا بيانات حساسة
+# [SENDER] logging (spec #22)
 # =============================================================================
 def log_sender_resolution(
     target: Optional[ContactTarget],
@@ -612,7 +526,6 @@ def log_sender_resolution(
     clickable: Optional[bool] = None,
     contact_button: Optional[bool] = None,
 ) -> None:
-    """سطر [SENDER] موحد — يظهر في اللوج فقط ولا يدخل نص التنبيه أبدًا."""
     try:
         t = target or ContactTarget()
         fields = [
