@@ -1,6 +1,18 @@
 #!/usr/bin/env python3
 """
-alert_ui.py – v11.0 Alert UI Client — عميل بوت تنبيهات حي (Telethon Bot Client).
+alert_ui.py – v14.5.1 Alert UI Client — عميل بوت تنبيهات حي (Telethon Bot Client).
+
+v14.5.1 — correction pass:
+  * _name_entity_present now also recognizes MessageEntityTextMention
+    (in addition to MessageEntityTextUrl). The previous check only knew
+    TextUrl, so a sender the bot DOES know (whose tg://user?id anchor
+    succeeds as a TextMention — Telethon's normal representation for
+    that case) was judged as a FAILED anchor and destroyed by
+    _heal_name_entity: the name link was rewritten from the sender's
+    profile to the source message. This is the same bug that alert_bot.py
+    v11.7.1 fixed on the Bot API path — alert_ui.py had not been aligned
+    with it. Users with public/mutual usernames saw one extra hop
+    (name → message → sender) for no reason.
 
 الهدف (طلب المستخدم: «أزرار حقيقية وليست وهمية — أزرار عملية»):
   * AlertBot (alert_bot.py) يرسل الأزرار عبر Bot API HTTP — أزرار حقيقية
@@ -363,14 +375,29 @@ class AlertBotClient:
     # ── v11.3: فحص كيان الاسم + إصلاح ذاتي (رابط الرسالة المصدر) ──
     @staticmethod
     def _name_entity_present(sent_msg: Any) -> bool:
-        """هل وصل كيان text_link لاسم المرسل داخل الرسالة المرسلة فعلاً؟
+        """هل وصل كيان رابط لاسم المرسل داخل الرسالة المرسلة فعلاً؟
+
+        v14.5.1: نتعرّف على MessageEntityTextUrl وMessageEntityTextMention
+        معاً. إغفال TextMention سابقاً كان يُشغّل heal زائفاً على مرسل
+        معروف للبوت (Telethon يُعيد TextMention لـ tg://user?id حين
+        يعرف البوت المستخدم) فيُنزل رابط الاسم من "محادثة المرسل" إلى
+        "عرض الرسالة" — نفس الإصلاح الذي طُبِّق في alert_bot.py v11.7.1
+        على مسار Bot API.
+
         فشل القراءة لا يُعاقب عليه (True) — الفحص ميزة لا حكم."""
         try:
             ents = getattr(sent_msg, "entities", None) or []
             off = utf16_len(SENDER_LABEL)
             for e in ents:
-                if type(e).__name__ == "MessageEntityTextUrl":
-                    if int(getattr(e, "offset", -1)) == off and int(getattr(e, "length", 0)) > 0:
+                # v14.5.1: كلا نوعي الكيان يُعتبران نجاحاً
+                if type(e).__name__ in (
+                    "MessageEntityTextUrl",
+                    "MessageEntityTextMention",
+                ):
+                    if (
+                        int(getattr(e, "offset", -1)) == off
+                        and int(getattr(e, "length", 0)) > 0
+                    ):
                         return True
         except Exception:
             return True
