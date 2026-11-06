@@ -156,6 +156,11 @@ from telethon.tl.types import (
     Channel as TgChannel,
     User as TgUser,
     MessageEntityMentionName,
+    # ══ إضافات الرادار الخارق (Raw Handler) ══
+    UpdateNewMessage,
+    UpdateNewChannelMessage,
+    Message,
+    # ═════════════════════════════════════════
 )
 from config import CFG, InputSanitizer, fast_hash, BOT_VERSION
 from filter_engine import FILTER_ENGINE_VERSION
@@ -1156,18 +1161,72 @@ class EnhancedAccountMonitor:
             except Exception as e: logger.debug(f"remove deleted-handler (pre-register) failed [{self.account['name']}]: {e}")
             self._deleted_handler_func = None
 
+        # ═══════════════════════════════════════════════════════════════
+        # 🚀 1. الرادار الخارق (Raw Handler): يلتقط الرسالة في أجزاء من الألف من الثانية
+        # ═══════════════════════════════════════════════════════════════
+        @self.client.on(events.Raw(types=[UpdateNewMessage, UpdateNewChannelMessage]))
+        async def _raw_new_message_handler(update):
+            if not _capture.enabled:
+                return
+            try:
+                msg = update.message
+                if not isinstance(msg, Message):
+                    return
+
+                if getattr(msg, 'out', False):
+                    return
+
+                text = getattr(msg, 'message', '')
+                if not text:
+                    return
+
+                peer = msg.peer_id
+                chat_id = 0
+                if hasattr(peer, 'channel_id'):
+                    chat_id = int(f"-100{peer.channel_id}")
+                elif hasattr(peer, 'chat_id'):
+                    chat_id = -peer.chat_id
+                else:
+                    chat_id = peer.user_id
+
+                sender_id = 0
+                if hasattr(msg, 'from_id') and msg.from_id:
+                    if hasattr(msg.from_id, 'user_id'): sender_id = msg.from_id.user_id
+                    elif hasattr(msg.from_id, 'channel_id'): sender_id = msg.from_id.channel_id
+
+                _capture.save(
+                    chat_id=chat_id,
+                    msg_id=msg.id,
+                    text=text.strip(),
+                    sender_id=sender_id,
+                    sender_name="",
+                    account=self.account["name"],
+                    sender_meta=None
+                )
+            except Exception as e:
+                logger.debug(f"raw_capture_error [{self.account['name']}]: {e}")
+
+        # ═══════════════════════════════════════════════════════════════
+        # 🛡️ 2. المعالج العادي (NewMessage): لإثراء البيانات وإرسال التنبيهات
+        # ═══════════════════════════════════════════════════════════════
         @self.client.on(events.NewMessage())
         async def _handler(event: events.NewMessage.Event):
             start_time = time.perf_counter()
             try:
                 if event.out: return
                 if event.chat_id == CFG.ADMIN_CHAT_ID: return
+
+                # ⚠️ [تعديل هام جداً] نقلنا الحفظ إلى هنا (قبل فحص البوتات)
+                # لكي نلتقط "الرسالة المؤكدة" حتى لو كانت مرسلة من بوت آخر
+                if _capture.enabled:
+                    self._fast_capture(event)
+
+                # الآن نتجاهل رسائل البوتات من الدخول لخط الأنابيب العادي
                 if event.sender and getattr(event.sender, "bot", False): return
+
                 msg_date = event.message.date
                 if msg_date and self.started_at > 0:
                     if msg_date.timestamp() < self.started_at - 5: return
-                if _capture.enabled:
-                    self._fast_capture(event)
                 early_key = (event.chat_id, event.message.id)
                 if early_key in _early_delivery_dedup:
                     await self._inc_stat("duplicates")
