@@ -1,20 +1,32 @@
 #!/usr/bin/env python3
 """
-unified_alerts/maintenance.py — الصيانة الذاتية (v12.0.0)
+unified_alerts/maintenance.py — الصيانة الذاتية (v14.5.1)
 
-  1. purge_stale_queue_rows — حذف صفوف processing_queue الأقدم من
-     QUEUE_STALE_PURGE_SECONDS (افتراضي 7200s = ساعتان). الطابور مخزن
-     تشغيلي عابر (ليس بيانات مستخدم) — الصفوف القديمة فيه:
-       * لن تصلح تنبيهاتها أبداً (بوابة العمر ستُسقطها عند pop)
-       * تشغل سعة MESSAGE_QUEUE_SIZE وتدفع evictions تضيّر أحداثاً جديدة
-     → التنظيف عند الإقلاع ودورياً يعيد الطابور لحجمه الفعال.
+1. purge_stale_queue_rows — حذف صفوف processing_queue الأقدم من
+   QUEUE_STALE_PURGE_SECONDS (افتراضي 7200s = ساعتان). الطابور مخزن
+   تشغيلي عابر (ليس بيانات مستخدم) — الصفوف القديمة فيه:
+   - لن تصلح تنبيهاتها أبداً (بوابة العمر ستُسقطها عند pop)
+   - تشغل سعة MESSAGE_QUEUE_SIZE وتدفع evictions تضيّر أحداثاً جديدة
+   → التنظيف عند الإقلاع ودورياً يعيد الطابور لحجمه الفعال.
 
-  2. run_startup_maintenance — نقطة واحدة تُستدعى من main.py بعد تهيئة DB:
-     تنظيف الطابور + تقرير صادق بعدّاد unified_stats.
+2. run_startup_maintenance — نقطة واحدة تُستدعى من main.py بعد تهيئة DB:
+   تنظيف الطابور + استرداد in-flight + تقرير صادق بعدّاد unified_stats.
 
-  الأمان:
-     * حذف بالعمر حصراً (created_at < cutoff) — لا يمس الصفوف الحية.
-     * أي فشل DB → يسجّل ويعيد 0 (لا استثناءات للإقلاع).
+الأمان:
+* حذف بالعمر حصراً (created_at < cutoff) — لا يمس الصفوف الحية.
+* أي فشل DB → يسجّل ويعيد 0 (لا استثناءات للإقلاع).
+
+v14.5.1 — إصلاح counter سالب:
+  النسخة السابقة كان run_startup_maintenance يفعل:
+      purged = await purge_stale_queue_rows(db)   # +N على queue_purged_periodic
+      stats.inc("queue_purged_startup", purged)
+      stats.inc("queue_purged_periodic", -purged) # طرح!
+  هذا يخلق نافذة قراءة ملتبسة: أي /health/full بين السطرين يرى
+  queue_purged_periodic = +N ثم يعود إلى 0 — أو worse، لو أعاد المُشغّل
+  استدعاء run_startup_maintenance في نفس العملية يرى -N.
+  الإصلاح: purge_stale_queue_rows يقبل counter kwarg. الإقلاع يمرر
+  counter="queue_purged_startup" مباشرة — بلا طرح، بلا نافذة ملتبسة.
+  التواقيع القديمة تبقى تعمل (counter الافتراضي = queue_purged_periodic).
 """
 
 from __future__ import annotations
@@ -26,8 +38,18 @@ from loguru import logger
 from unified_alerts.stats import get_unified_stats
 
 
-async def purge_stale_queue_rows(db: Any, *, max_age_seconds: Optional[int] = None) -> int:
-    """حذف صفوف processing_queue الأقدم من max_age_seconds — يعيد العدد."""
+async def purge_stale_queue_rows(
+    db: Any,
+    *,
+    max_age_seconds: Optional[int] = None,
+    counter: str = "queue_purged_periodic",
+) -> int:
+    """حذف صفوف processing_queue الأقدم من max_age_seconds — يعيد العدد.
+
+    v14.5.1: `counter` يتيح للاستدعاء الإقلاعي أن يُسجّل على
+    queue_purged_startup مباشرة (بدل الطرح المزدوج الذي كان يُنتج قيماً
+    سالبة عابرة في /health/full).
+    """
     if db is None:
         return 0
     stats = get_unified_stats()
@@ -44,10 +66,10 @@ async def purge_stale_queue_rows(db: Any, *, max_age_seconds: Optional[int] = No
         deleted = await db.purge_stale_queue_rows(max_age_seconds=max_age_seconds)
         deleted = int(deleted or 0)
         if deleted:
-            stats.inc("queue_purged_periodic", deleted)
+            stats.inc(counter, deleted)
             logger.info(
                 f"unified_alerts.maintenance: purged {deleted} stale queue rows "
-                f"(older than {max_age_seconds}s)"
+                f"(older than {max_age_seconds}s, counter={counter})"
             )
         return deleted
     except Exception as e:
@@ -59,16 +81,15 @@ async def run_startup_maintenance(db: Any) -> Dict[str, Any]:
     """صيانة الإقلاع — تُستدعى مرة واحدة من main.py بعد تهيئة DB.
 
     يعيد ملخصاً صادقاً لما نُفذ (للسجل و /health).
+
+    v14.5.1: الـpurge يُسجَّل مباشرةً على queue_purged_startup —
+    بلا طرح من queue_purged_periodic (كان يُنتج نافذة قيمة سالبة).
     """
     summary: Dict[str, Any] = {"purged_queue_rows": 0, "recovered_inflight": 0}
     try:
-        purged = await purge_stale_queue_rows(db)
+        purged = await purge_stale_queue_rows(db, counter="queue_purged_startup")
         summary["purged_queue_rows"] = purged
         if purged:
-            stats = get_unified_stats()
-            # عدّاد الإقلاع يوثق العملية منفصلة عن الدوري
-            stats.inc("queue_purged_startup", purged)
-            stats.inc("queue_purged_periodic", -purged)  # لا ازدواج في الدوري
             logger.info(
                 f"✅ unified_alerts startup maintenance: queue purged {purged} stale rows"
             )
