@@ -1221,8 +1221,8 @@ class EnhancedAccountMonitor:
                 if _capture.enabled:
                     self._fast_capture(event)
 
-                # الآن نتجاهل رسائل البوتات من الدخول لخط الأنابيب العادي
-                if event.sender and getattr(event.sender, "bot", False): return
+                # ══ [تعديل] تم تعطيل تجاهل البوتات لمراقبة رسائلها ══
+                # if event.sender and getattr(event.sender, "bot", False): return
 
                 msg_date = event.message.date
                 if msg_date and self.started_at > 0:
@@ -2443,7 +2443,7 @@ class EnhancedAccountMonitor:
                 _receipt_pre = False
             if _receipt_pre:
                 from unified_alerts.stats import get_unified_stats as _gus
-                _gus().inc("recovered_dupe_skip_send")
+                _gus.inc("recovered_dupe_skip_send")
                 await self._inc_stat("duplicates")
                 logger.info(
                     f"♻️ recovered event has alert receipt — skip BEFORE claim release "
@@ -2807,7 +2807,7 @@ class EnhancedAccountMonitor:
                         )
                     except Exception as _bot_rec_err:
                         from unified_alerts.stats import get_unified_stats as _gus_r
-                        try: _gus_r().inc("record_after_send_failed")
+                        try: _gus_r.inc("record_after_send_failed")
                         except Exception: pass
                         logger.error(
                             f"Alert WAS delivered via AlertBot but post-send recording failed "
@@ -2849,7 +2849,7 @@ class EnhancedAccountMonitor:
                             )
                         except Exception as _ver_rec_err:
                             from unified_alerts.stats import get_unified_stats as _gus_r
-                            try: _gus_r().inc("record_after_send_failed")
+                            try: _gus_r.inc("record_after_send_failed")
                             except Exception: pass
                             logger.error(
                                 f"Alert VERIFIED-delivered but post-send recording failed "
@@ -3088,7 +3088,7 @@ class EnhancedAccountMonitor:
                 )
             except Exception as _fb_rec_err:
                 from unified_alerts.stats import get_unified_stats as _gus_r
-                try: _gus_r().inc("record_after_send_failed")
+                try: _gus_r.inc("record_after_send_failed")
                 except Exception: pass
                 logger.error(
                     f"Alert WAS delivered via fallback but post-send recording failed "
@@ -3103,7 +3103,7 @@ class EnhancedAccountMonitor:
             )
         except Exception as _rec_err:
             from unified_alerts.stats import get_unified_stats as _gus_r
-            try: _gus_r().inc("record_after_send_failed")
+            try: _gus_r.inc("record_after_send_failed")
             except Exception: pass
             logger.error(
                 f"Alert WAS delivered but post-send recording failed "
