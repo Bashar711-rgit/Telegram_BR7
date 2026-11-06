@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-nav_resolver.py — Alert Navigation Resolver v10.6.0
+nav_resolver.py — Alert Navigation Resolver v14.5.1
 ====================================================
 
 Centralized multi-strategy resolution for the three clickable alert actions:
@@ -8,6 +8,24 @@ Centralized multi-strategy resolution for the three clickable alert actions:
   1. اسم المرسل  → يفتح محادثة/بروفايل المرسل مباشرة
   2. اسم المجموعة → يفتح المجموعة/القناة المصدر
   3. عرض الرسالة  → يفتح الرسالة الأصلية داخل مصدرها
+
+v14.5.1 — correction pass:
+  * _export_lock was a single GLOBAL asyncio.Lock. The docstring claimed
+    "Single-flight: concurrent alerts for the same chat share one call"
+    but the implementation serialized ALL chats — a 5-second API call for
+    chat A blocked every other chat's fresh fetch. Replaced with per-chat
+    locks (bounded map, unlocked-only eviction — same pattern as the
+    existing _discovery_locks). Under load this is now truly per-chat
+    single-flight; positive/negative-cached chats never touch the lock
+    (fast path is unchanged and still runs before the lock).
+  * _USERNAME_RE now enforces the correct 5-32 length ({4,31} instead
+    of {3,31}). Telegram rejects usernames shorter than 5 chars; the
+    old regex accepted 4-char shapes and could (rarely) build dead
+    t.me/abcd links from a mocked/historical data source.
+  * __version__ = "14.5.1" (was "1.1.0"; docstring said v10.6.0 — three
+    numbers coexisted).
+  * Docstring block above _USERNAME_RE now states the minimum (5) and
+    the maximum (32) explicitly.
 
 ARCHITECTURE (priority ladders — first wins, every failure advances):
 
@@ -101,13 +119,13 @@ except Exception:  # pragma: no cover — extremely old Telethon fallback
 from config import CFG
 from task_util import spawn_bg  # v11.8.1 (F-17): مرجع محفوظ لمهام background
 
-__version__ = "1.1.0"
+__version__ = "14.5.1"
 
-# v11.8.2 (F-27): المصدر القانوني الوحيد لنمط اسم المستخدم — {3,31}
-# (الحد الأقصى الموثق لتيليجرام 32 حرفاً). كان {3,63} هنا و{3,31} في
-# message_context و{3,63} في sender_resolver — الوحدة الثلاث الآن موحدة
-# على نفس النمط (تشديد أمان فقط: لا يوجد مستخدم تيليجرام حقيقي أطول من 32).
-_USERNAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{3,31}$")
+# v14.5.1: نمط اسم مستخدم تيليجرام — 5-32 حرفاً (الحد الأدنى 5، الحد الأقصى
+# 32). كان {3,31} (يقبل 4-32) في v11.8.2 — Telegram يرفض أقل من 5، فقد
+# يُبنى رابط ميت t.me/abcd إذا مرّ حدث/سجل تاريخي باسم قصير.
+# {4,31} = 1 حرف بادئة + 4 إلى 31 حرفاً إضافياً = 5-32 إجمالاً.
+_USERNAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{4,31}$")
 
 
 # =============================================================================
@@ -124,7 +142,10 @@ def clean_username(value: Any) -> Optional[str]:
 
 
 def is_valid_username(value: Any) -> bool:
-    """True only for shapes Telegram accepts as public usernames."""
+    """True only for shapes Telegram accepts as public usernames.
+
+    v14.5.1: 5-32 chars, letter-initial (matches _USERNAME_RE).
+    """
     clean = clean_username(value)
     return bool(clean) and bool(_USERNAME_RE.match(clean))
 
@@ -259,13 +280,15 @@ class NavigationResolver:
       * one failed strategy advances to the next — never aborts the chain
       * the only network call (exportMessageLink) is single-flight per chat,
         TTL-cached, negative-cached, and honors FloodWaitError without
-        hammering Telegram
+        hammering Telegram (per-chat locks, v14.5.1)
     """
 
     EXPORT_TTL_SECONDS = 3600      # exported links are stable — 1h cache
     EXPORT_NEG_TTL_SECONDS = 300   # failed export → 5min cool-down per chat
     DISCOVERY_NEG_TTL_SECONDS = 300  # failed/absent username → 5min per sender
     DISCOVERY_LOCK_MAX = 4096      # bounded single-flight lock map
+    # v14.5.1: سقف خريطة أقفال التصدير — يقارب عدد chats المتزامنة عملياً
+    EXPORT_LOCK_MAX = 1024
 
     def __init__(self):
         self._export_cache: "TTLCache[int, Dict[str, str]]" = TTLCache(
@@ -274,7 +297,9 @@ class NavigationResolver:
         self._export_negative: "TTLCache[int, bool]" = TTLCache(
             maxsize=2000, ttl=self.EXPORT_NEG_TTL_SECONDS
         )
-        self._export_lock = asyncio.Lock()
+        # v14.5.1: single-flight per chat — بديل عن asyncio.Lock العالمي
+        # الذي كان يُسلسل كل chats أثناء شبكة API بطيئة (حتى 5s لكل chat).
+        self._export_locks: "Dict[int, asyncio.Lock]" = {}
         self._discovery_negative: "TTLCache[int, bool]" = TTLCache(
             maxsize=5000, ttl=self.DISCOVERY_NEG_TTL_SECONDS
         )
@@ -617,8 +642,29 @@ class NavigationResolver:
             report.message_strategy = "none_available"
 
     # ─────────────────────────────────────────────────────────────────────
-    # C4/M3 — channels.exportMessageLink (last resort, cached, single-flight)
+    # C4/M3 — channels.exportMessageLink (last resort, cached, per-chat lock)
     # ─────────────────────────────────────────────────────────────────────
+    async def _get_export_lock(self, chat_id: int) -> asyncio.Lock:
+        """v14.5.1: قفل single-flight لكل chat (بدل asyncio.Lock عالمي).
+
+        التعليق القديم كان يقول «concurrent alerts for the same chat share
+        one call» لكن التنفيذ كان قفلاً واحداً لكل النظام — chat بطيء
+        (حتى 5s) كان يحجب كل chats الأخرى عن جلب export جديد. الآن كل
+        chat له قفله الخاص، وخريطة الأقفال محدودة بـ EXPORT_LOCK_MAX مع
+        إخلاء «الأقفال الحرة» فقط (نفس نمط _discovery_locks).
+        """
+        if len(self._export_locks) > self.EXPORT_LOCK_MAX:
+            try:
+                victim = next(
+                    (k for k, lk in self._export_locks.items() if not lk.locked()),
+                    None,
+                )
+                if victim is not None:
+                    self._export_locks.pop(victim, None)
+            except Exception:
+                pass
+        return self._export_locks.setdefault(int(chat_id), asyncio.Lock())
+
     async def _try_export_upgrade(
         self,
         monitor: Any,
@@ -657,12 +703,20 @@ class NavigationResolver:
         if client is None:
             return False
 
-        # Single-flight: concurrent alerts for the same chat share one call.
-        async with self._export_lock:
+        # v14.5.1: single-flight per chat — chat A's slow export no longer
+        # blocks chat B from starting its own (previously global lock).
+        lock = await self._get_export_lock(chat_id)
+        async with lock:
+            # double-check after acquiring our per-chat lock — another
+            # coroutine for THIS SAME chat may have populated the cache
+            # while we were waiting
             cached = self._export_cache.get(chat_id)
             if cached is not None:
                 self._inc("chat_export_hit")
                 return self._apply_exported(chat_info, cached, message_id, report, source="cache")
+            if self._export_negative.get(chat_id):
+                report.notes.append("export:negcached")
+                return False
             self._inc("chat_export_call")
             try:
                 peer = entity
@@ -874,7 +928,9 @@ class NavigationResolver:
                 **self._metrics,
                 "export_cache_size": len(self._export_cache),
                 "export_negative_size": len(self._export_negative),
+                "export_locks_size": len(self._export_locks),
                 "discovery_negative_size": len(self._discovery_negative),
+                "discovery_locks_size": len(self._discovery_locks),
             }
         except Exception:
             return {}
