@@ -610,8 +610,10 @@ def build_alert_html(
     # blockquote/اقتباس/إطار — النص الأصلي كما ورد (الأسطر واللغة والرموز
     # والروابط)، مهرباً HTML فقط كي لا تُفسد وسوم المستخدم الشكل. الحاجز
     # الوحيد: حد تيليجرام 4096 للرسالة كلها (قص مع "…" وتحذير لوج).
-    header = f"{SENDER_LABEL}{sender_html}{uname_suffix_html}"
-    msg_label = f"\n\n{MSG_TEXT_LABEL}\n\n"
+    # ══ [تعديل مطلوب] إضافة <b> للعناوين وإزالة السطر الفارغ قبل النص ══
+    header = f"<b>{SENDER_LABEL}</b>{sender_html}{uname_suffix_html}"
+    msg_label = f"\n\n<b>{MSG_TEXT_LABEL}</b>\n"
+    
     overhead = len(header) + len(msg_label) + len(rule_part) + 16
     budget = max(TELEGRAM_MAX_TEXT_LEN - overhead, 256)
     safe_text = InputSanitizer.escape_html(str(data.get("text") or ""))
