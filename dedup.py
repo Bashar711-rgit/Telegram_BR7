@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-dedup.py — Cross-Account Alert Deduplication v1.0 (v9.10)
+dedup.py — Cross-Account Alert Deduplication v14.5.1
 
 المشكلة التي يحلها هذا الملف:
   * نفس الرسالة تصل عبر الحسابات الستة (6 مراقبين) → يجب تنبيه واحد فقط.
@@ -9,13 +9,37 @@ dedup.py — Cross-Account Alert Deduplication v1.0 (v9.10)
   * التكرار قد يحدث عبر عمليات مراقبة مختلفة وعبر إعادة تشغيل العملية
     → الحماية يجب أن تكون في الذاكرة (سريعة) وفي قاعدة البيانات (دائمة).
 
+v14.5.1 — correction pass:
+  * steal_if_stale() now releases the memory claim ONLY after the DB
+    confirms the steal succeeded. The previous unconditional early release
+    broke the L1 fast path for subsequent same-fingerprint events in the
+    same process: once a recovered event tried to steal a FRESH claim held
+    by a live worker (DB said no), the memory entry was gone but the DB
+    row remained, so every later check paid a full DB round-trip instead
+    of the intended O(1) memory hit. Same fingerprint, same correctness,
+    just slower — but the whole point of L1 was to keep this fast path
+    warm for the full DEDUP_WINDOW. Fixed by moving _mem_release inside
+    `if stolen:`.
+  * content_fingerprint() now defensively coerces chat_id via try/except
+    (same shape as the sender_id guard right above it). Sender_id was
+    already protected; chat_id was not — a public-API caller passing
+    "@username" or an entity object raised ValueError out of a function
+    documented to be pure. Zero change for the current callers (chat_id
+    is always int), one line closes the public surface.
+  * __version__ = "14.5.1" added (was absent; docstring header showed
+    v1.0 (v9.10) while the rest of the project had long been on 14.x).
+  * _mem type annotation simplified: `Dict[str, float]` (OrderedDict is
+    still used at runtime for LRU semantics — Python 3.9+ does not need
+    the string-quoted generic; keeping the quoted form would be correct
+    but noisy).
+
 التصميم — طبقتان:
 
   L1 (ذاكرة):  مجموعة أحادية الترابط في الـ event loop — العمليات
                المتزامنة (claim متزامن من workers متعددة) آمنة لأن
                check-then-act تتم بشكل متزامن صرف (بدون أي await بين
                الفحص والحجز)، وهو نفس أسلوب FastCaptureBuffer.
-               LRU بسقف ثابت (DEDUP_MEM_MAX) مع كنس lazy للنافذة.
+               LRU بسقف ثابت (_mem_max=8192) مع كنس lazy للنافذة.
 
   L2 (قاعدة البيانات): جدول alert_dedup (fingerprint PRIMARY KEY) مع
                INSERT OR IGNORE — العملية آتومية عبر كل الـ workers
@@ -59,6 +83,8 @@ from typing import Any, Dict, Optional
 from loguru import logger
 
 from config import CFG, fast_hash
+
+__version__ = "14.5.1"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Fingerprint normalization (dedup-only — أقوى من تطبيع الفلتر ومقصوص عليه)
@@ -104,6 +130,8 @@ def content_fingerprint(
         (اختبار 9: اختلاف المرفقات يمنع الدمج الخاطئ).
       * المرسل بلا معرف (0/None): مجال anon لكل محادثة — مرسلان مجهولان
         مختلفان لا تُدمج بصمتهما، ونفس حدث المجموعة يبقى مكرراً واحداً.
+    v14.5.1: chat_id يقبل أي شكل بأمان (int coercion داخل try/except) —
+    كان int("@user") يرفع ValueError من دالة موثقة كـpure.
     """
     norm = normalize_for_fingerprint(text or "")
     try:
@@ -113,7 +141,12 @@ def content_fingerprint(
     if sid:
         domain = f"v1:{sid}"
     else:
-        domain = f"v1:anon:{int(chat_id or 0) if chat_id else 0}"
+        # v14.5.1: حماية chat_id — نفس نمط sender_id أعلاه
+        try:
+            cid = int(chat_id or 0)
+        except (TypeError, ValueError):
+            cid = 0
+        domain = f"v1:anon:{cid}"
     media = str(media_kind or "").strip().lower()
     return fast_hash(f"{domain}:{media}:{norm}")
 
@@ -138,8 +171,10 @@ class AlertDeduplicator:
     def __init__(self, db: Any = None, mem_max: int = 8192):
         self.db = db
         self._mem_max = max(256, int(mem_max))
-        # fp -> first_seen (LRU مع كنس lazy حسب النافذة)
-        self._mem: "OrderedDict[str, float]" = OrderedDict()
+        # fp -> first_seen (LRU مع كنس lazy حسب النافذة).
+        # v14.5.1: annotation مبسّط Dict — runtime يبقى OrderedDict
+        # (LRU يحتاجه فعلياً عبر move_to_end/popitem).
+        self._mem: Dict[str, float] = OrderedDict()  # type: ignore[assignment]
         self._stats: Dict[str, int] = {
             "claimed": 0,       # حجز ناجح (رسالة غير مكررة)
             "blocked": 0,       # رفض (مكرر)
@@ -177,9 +212,10 @@ class AlertDeduplicator:
 
     def _mem_claim(self, fp: str, now: float) -> None:
         self._mem[fp] = now
-        self._mem.move_to_end(fp)
+        self._mem.move_to_end(fp)  # type: ignore[attr-defined]
         while len(self._mem) > self._mem_max:
-            self._mem.popitem(last=False)
+            # OrderedDict.popitem(last=False) — LRU eviction من المقدمة
+            self._mem.popitem(last=False)  # type: ignore[attr-defined]
 
     def _mem_release(self, fp: str) -> None:
         self._mem.pop(fp, None)
@@ -251,11 +287,15 @@ class AlertDeduplicator:
         الحارس الزمني (الافتراضي 120s) أقصر بمراحل من عمر الاسترداد نفسه
         (QUEUE_INFLIGHT_MAX_AGE_SECONDS=600s) — الحجز الميت من محاولة
         منهارة يكون عتيقاً فعلاً عند وصول المسترد، والحجز الطازج لعامل
-        حي لا يُلمس أبداً."""
-        # الذاكرة أولاً — فك محلي ثم حذف شرطي ذري في DB هو الحكم الوحيد
-        self._mem_release(fingerprint)
+        حي لا يُلمس أبداً.
+
+        v14.5.1: فك الذاكرة يحدث فقط بعد تأكيد نجاح الاستيلاء من DB.
+        الفك المبكر كان يهبط بـL1 fast path بعد أول رفض استيلاء (الذاكرة
+        فارغة، DB row باقٍ) — التصحيح يعيد تصميم L1 كما وُصف.
+        """
         if self.db is None:
-            # بلا DB (وضع الاختبار) — الثقة بالذاكرة فقط: استيلاء مقبول
+            # بلا DB (وضع الاختبار) — الثقة بالذاكرة فقط
+            self._mem_release(fingerprint)
             self._stats["stolen"] += 1
             return True
         try:
@@ -269,6 +309,9 @@ class AlertDeduplicator:
             self._stats["steal_denied"] += 1
             return False
         if stolen:
+            # v14.5.1: فك الذاكرة **بعد** تأكيد نجاح DB — كان الفك
+            # المبكر يُبطل L1 fast path للأحداث اللاحقة بنفس البصمة.
+            self._mem_release(fingerprint)
             self._stats["stolen"] += 1
         else:
             self._stats["steal_denied"] += 1
