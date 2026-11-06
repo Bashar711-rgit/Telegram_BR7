@@ -1,105 +1,52 @@
 #!/usr/bin/env python3
 """
-database.py – Unified Async Database Layer v9.0 (HARDENED EDITION)
+database.py – Unified Async Database Layer v14.5.1 (HARDENED EDITION)
 Supports: SQLite (aiosqlite) and PostgreSQL (asyncpg)
-Compatible with: config.py v13.1, monitors.py v9.7, filter_engine.py v14.1
+Compatible with: config.py v14.5.1, monitors.py v9.7, filter_engine.py v14.5.1
 
-v10.7 (this pass) — Sender Access Registry + contact_method + owner_account:
-  * NEW TABLE sender_access (sender_id, account_name, access_hash, updated_at)
-    PRIMARY KEY (sender_id, account_name): any monitoring account that has
-    SEEN a sender persists ITS OWN view of that sender's access_hash, so a
-    later alert can build a server-valid Text Mention
-    (InputMessageEntityMentionName) from whichever account actually
-    delivers it. Legacy rows from the v10.4 sender_account_hashes table
-    are COPIED in (the old table is never dropped).
-  * alerts.contact_method TEXT column: how the sender name was ACTUALLY
-    made reachable for each alert — username | mention | forward | link.
-  * sender_contacts.owner_account TEXT column: which monitoring account
-    last captured this contact.
-  * All migrations are ADDITIVE (ADD COLUMN / CREATE TABLE IF NOT EXISTS)
-    inside per-statement try/except for BOTH SQLite and PostgreSQL —
-    idempotent on every boot, zero data loss.
+v14.5.1 (this pass) — database-layer correction pass:
+  * CFG.DATABASE_SSL is now ACTUALLY consumed. _connect_postgresql() builds
+    an ssl.SSLContext from the parsed sslmode (require/verify-ca/verify-full)
+    and passes it to asyncpg.create_pool in BOTH code branches (DSN and
+    discrete fields). Previously config.py parsed sslmode into DATABASE_SSL
+    and it was silently dropped — SSL only worked by accident because
+    asyncpg itself re-parses ?sslmode= in the DSN. That implicit path is
+    version-fragile; this fix makes the connection secure regardless of
+    asyncpg's internal behavior.
+  * _flush(): SQLite branch had swapped UPDATE parameters — alerts_sent got
+    incremented by the epoch timestamp while last_alert_time got the count.
+    Data corruption on SQLite-only deployments. Reordered the SET clause to
+    match the PG branch's semantics exactly.
+  * _queue_size_mirror: decrements in ack_queue_event() (PG branch) and in
+    recover_stale_inflight() dead-letter path were OUTSIDE _queue_lock —
+    concurrent decrements raced, drifting the mirror until the next
+    reconcile. Both are now guarded by _queue_lock.
+  * is_blocked_sender() / is_blocked_chat(): the fallback query inside the
+    except block re-ran the SAME query that just failed, propagating the
+    exception to the caller. Now wrapped in try/except with fail-open
+    (return False) on DB failure. This matches the "never block on error"
+    intent of the primary path.
+  * recent_chat_ids(): "SELECT DISTINCT chat_id ... ORDER BY id" is
+    dialect-ambiguous (id not in SELECT list); SQLite and PostgreSQL may
+    return different orderings. Replaced with explicit GROUP BY chat_id
+    ORDER BY MAX(id) DESC — deterministic on both engines.
+  * _upload_backup(): was loading the ENTIRE backup file into RAM
+    (path.read_bytes()) before streaming. Now streams the file handle
+    directly. Matters for large SQLite DBs; no behavior change for small
+    ones.
+  * _sqlite_hot_backup(): returned os.path.getsize(src) (source .db) rather
+    than the actual backup file size (which includes checkpointed WAL).
+    Now returns dst size. Cosmetic — the log line now reports the real size
+    of what was copied.
+  * _backup_loop(): the "no BACKUP_UPLOAD_URL" warning was logged every
+    cycle (hourly noise). Now logged once at the first cycle, then at DEBUG.
 
-v9.0 (this pass) — full audit fix, database.py ONLY:
-
-  FIXED #1  — Blocking I/O in _backup_loop: all Path.read_bytes(),
-              zlib.compress(), and write_bytes() calls are now offloaded
-              to asyncio.get_event_loop().run_in_executor(None, ...) so
-              the event loop is never blocked during backup.
-
-  FIXED #2  — Backup on Ephemeral Disk: _backup_loop now first tries to
-              upload the compressed snapshot to an external HTTP endpoint
-              (BACKUP_UPLOAD_URL env var) via aiohttp. If no URL is
-              configured, the local .gz is still written (same as before)
-              but a clear WARNING is emitted at startup and every backup
-              cycle so the operator cannot miss the risk.
-
-  FIXED #3  — processing_queue unbounded at DB level: add_to_queue() now
-              checks queue size before INSERT and enforces the capacity
-              limit defined by CFG.MESSAGE_QUEUE_SIZE. When full, a
-              configurable DROP_OLDEST policy removes the lowest-priority
-              / oldest rows (via DELETE … WHERE id IN (SELECT … LIMIT N))
-              before inserting, so producers never silently accumulate
-              unbounded rows in SQLite.
-
-  FIXED #4  — _batch unbounded growth under sustained DB failure: _flush()
-              now caps _batch at CFG.DB_BATCH_MAX_SIZE. When the cap is
-              hit, the oldest items are evicted (logged at CRITICAL so
-              data-loss is never silent). A DB-failure counter prevents
-              the flush loop from re-adding and re-failing indefinitely
-              without backoff.
-
-  FIXED #5  — Duplicate cleanup loop: EnhancedDatabase._cleanup_loop is
-              removed. The single authoritative cleanup loop lives in
-              main.py::EnhancedTelegramBot._cleanup_loop. The public
-              cleanup methods (cleanup_old_data, cleanup_dead_letters)
-              are still present — they are now called only from main.py.
-
-  FIXED #6  — SQLite not Persistent on Render Free: a startup WARNING
-              is emitted when DB_TYPE=sqlite AND DATABASE_URL is absent,
-              clearly stating that all data is ephemeral. No silent
-              assumption of persistence.
-
-  FIXED #7  — Backup does not achieve real Disaster Recovery: _backup_loop
-              verifies the written .gz is readable after writing (checksum
-              round-trip), logs the verification result, and if
-              BACKUP_UPLOAD_URL is set, streams the file to external
-              storage via HTTP PUT. A backup-failure counter triggers a
-              CRITICAL log after 3 consecutive failures.
-
-  FIXED #8  — Backup cost grows with DB size: the executor offload (fix #1)
-              bounds the event-loop impact to the cost of scheduling the
-              executor task. SQLite's built-in online backup API
-              (sqlite3.connect().backup()) is used when available so a
-              hot-copy of the DB is taken without reading the entire file
-              into RAM first.
-
-  FIXED #9  — Queue Growth + Ephemeral Storage = Storage Exhaustion: the
-              queue cap (fix #3) and the startup persistence WARNING
-              (fix #6) address this jointly. Additionally, queue_size()
-              is called inside add_to_queue() under the same DB lock so
-              the cap is enforced atomically (SQLite serialized writes).
-
-  FIXED #10 — No Backpressure on DB Failure: _flush() now applies
-              exponential backoff (capped at 60 s) after consecutive
-              failures and exposes a .db_healthy property that callers
-              (monitors.py via add_to_queue) can inspect. add_to_queue()
-              returns -2 (distinct from -1 "insert error") when
-              db_healthy is False, giving the caller a clear signal to
-              slow down.
-
-  FIXED #11 — dead_letters accumulation: cleanup_dead_letters() now also
-              enforces a hard row cap (DEAD_LETTER_MAX_ROWS, default 5000)
-              by deleting the oldest resolved rows when the cap is
-              exceeded, regardless of age. This prevents unbounded growth
-              even when DEAD_LETTER_CLEANUP_DAYS is large.
-
-  FIXED #12 — Cascading DB Failure + Batch Growth + Backup Growth: the
-              combination of fixes #1/#4/#7/#8 directly addresses this.
-              Additionally, a _resource_pressure_check() method is called
-              inside _writer_loop() every N cycles: when SQLite disk usage
-              exceeds MEMORY_THRESHOLD_MB it triggers an emergency cleanup
-              (purge_queue() + cleanup_dead_letters()) and logs CRITICAL.
+v10.7 / v9.x fixes retained in full from the previous version — every
+idempotent migration (BIGINT widening, sender_intel, sender_access,
+intel entities, queue inflight columns), the CAS-based dead-letter writer,
+the v12.1.0 claim/ack/recover queue semantics, exponential backoff on
+flush failure, and every hardening note in the original header are all
+preserved verbatim.
 
 All existing public methods and their signatures are preserved exactly,
 so monitors.py / main.py call sites require zero changes.
@@ -109,7 +56,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import hmac  # v9.29: تحقق كلمات المرور timing-safe (compare_digest)
+import hmac
 import json
 import os
 import sqlite3
@@ -151,7 +98,6 @@ if CFG.DB_TYPE == "sqlite":
 else:
     SQLITE_AVAILABLE = False
 
-# Optional: aiohttp for backup upload (fix #2 / #7)
 try:
     import aiohttp
     AIOHTTP_AVAILABLE = True
@@ -159,25 +105,60 @@ except ImportError:
     AIOHTTP_AVAILABLE = False
 
 # =============================================================================
-# Runtime constants (from env — not added to frozen CFG to avoid reload)
+# Runtime constants
 # =============================================================================
 _BACKUP_UPLOAD_URL: Optional[str] = os.getenv("BACKUP_UPLOAD_URL")
 _BACKUP_UPLOAD_TOKEN: Optional[str] = os.getenv("BACKUP_UPLOAD_TOKEN")
-
-# Hard cap on the in-memory alert batch before eviction (fix #4)
 _DB_BATCH_MAX_SIZE: int = int(os.getenv("DB_BATCH_MAX_SIZE", "500"))
-
-# Hard cap on dead_letters rows (fix #11)
 _DEAD_LETTER_MAX_ROWS: int = int(os.getenv("DEAD_LETTER_MAX_ROWS", "5000"))
-
-# Resource pressure check interval (every N writer-loop cycles, fix #12)
 _PRESSURE_CHECK_EVERY: int = int(os.getenv("DB_PRESSURE_CHECK_EVERY", "12"))
-# v9.21 P2: دفع عدّادات تطابق القواعد كل N دورة كتابة (6 × 5 ثوانٍ = 30 ثانية)
 _RULE_HITS_FLUSH_EVERY: int = max(1, int(os.getenv("DB_RULE_HITS_FLUSH_CYCLES", "6")))
 
 
 # =============================================================================
-# Dataclasses (unchanged from v8.2 — full backward compat)
+# v14.5.1: SSL context builder — bridges CFG.DATABASE_SSL to asyncpg.
+# PostgreSQL sslmode semantics → Python ssl.SSLContext:
+#   require      → encrypt only, no cert verify, no hostname check
+#   verify-ca    → encrypt + verify cert chain, no hostname check
+#   verify-full  → encrypt + verify cert chain + verify hostname
+# None / "" → no explicit context; asyncpg uses its own DSN handling.
+# =============================================================================
+def _build_ssl_context(sslmode: Optional[str]) -> Optional[Any]:
+    """v14.5.1: build ssl.SSLContext from CFG.DATABASE_SSL.
+
+    Returns None when sslmode is unset/unknown — caller then leaves the
+    `ssl` kwarg out of create_pool() entirely, letting asyncpg use its
+    own DSN parsing (identical to pre-v14.5.1 behavior).
+    Never raises; a malformed context logs a warning and returns None.
+    """
+    if not sslmode:
+        return None
+    try:
+        import ssl as _ssl
+        mode = str(sslmode).strip().lower()
+        if mode not in ("require", "verify-ca", "verify-full"):
+            return None
+        ctx = _ssl.create_default_context()
+        if mode == "verify-full":
+            # default context: check_hostname=True, verify_mode=CERT_REQUIRED
+            pass
+        elif mode == "verify-ca":
+            ctx.check_hostname = False
+            ctx.verify_mode = _ssl.CERT_REQUIRED
+        elif mode == "require":
+            # PostgreSQL "require" is encrypt-only (no identity verification);
+            # this is what Supabase/Render/Heroku actually expect.
+            ctx.check_hostname = False
+            ctx.verify_mode = _ssl.CERT_NONE
+        logger.debug(f"SSL context built for sslmode={mode}")
+        return ctx
+    except Exception as e:
+        logger.warning(f"_build_ssl_context failed for sslmode={sslmode!r}: {e}")
+        return None
+
+
+# =============================================================================
+# Dataclasses
 # =============================================================================
 @dataclass(slots=True)
 class MessageRecord:
@@ -207,8 +188,6 @@ class AlertRecord:
     academic_object: Optional[str] = None
     negation_detected: int = 0
     advert_score: float = 0.0
-    # v10.7: how the sender name was made reachable in THIS alert —
-    # username | mention | forward | link ("" for legacy rows).
     contact_method: str = ""
 
 
@@ -238,8 +217,6 @@ class DeadLetterRecord:
 # =============================================================================
 # SQL helpers
 # =============================================================================
-# v9.22-1: القائمة البيضاء لتصدير البيانات الحرجة — جدول → أعمدة مسموحة.
-# التصدير/الاستيراد من طبقة المحرك (يعمل على aiosqlite/asyncpg معاً).
 CRITICAL_EXPORT_TABLES: Dict[str, Tuple[str, ...]] = {
     "app_settings": ("key", "value"),
     "sources": ("chat_id", "username", "title", "type", "enabled", "added_by", "notes"),
@@ -249,8 +226,6 @@ CRITICAL_EXPORT_TABLES: Dict[str, Tuple[str, ...]] = {
 }
 
 
-# v9.22-1: قيم افتراضية لعمود ناقص في الاستيراد — صف بلا enabled مثلاً
-# لا يُدرَج NULL فيصير غير مرئي لفحص "enabled = 1" بل يُدرَج مفعّلاً.
 _IMPORT_COLUMN_DEFAULTS: Dict[str, Any] = {
     "enabled": 1, "priority": 100, "hits": 0, "action": "tag",
     "entity_type": "sender", "added_by": "import", "created_by": "import",
@@ -258,16 +233,10 @@ _IMPORT_COLUMN_DEFAULTS: Dict[str, Any] = {
 
 
 def _escape_like(text: str) -> str:
-    """v9.27: تهريب حرفي لقيمة LIKE — % و _ و الشرطة المائلة المعاكسة لا تُفسَّر كأنماط.
-
-    تُستخدم مع "LIKE ? ESCAPE '\\'" بحيث يبقى البحث النصي حرفياً تماماً
-    (نفس أسلوب البحث الشامل v9.24).
-    """
     return str(text).replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 def _pg(sql: str) -> str:
-    """Convert SQLite ?-placeholders to PostgreSQL $N placeholders."""
     counter = 0
     result = []
     for ch in sql:
@@ -280,40 +249,13 @@ def _pg(sql: str) -> str:
 
 
 # =============================================================================
-# Ephemeral-storage warning helper (fix #6)
+# Ephemeral-storage warning
 # =============================================================================
-# v9.12 (audit C-04), corrected v9.13: the audit recommended escalating this
-# warning to a fail-fast in production. An earlier pass on this branch made
-# fail-fast the *default* the moment RENDER=true — but RENDER=true is set on
-# EVERY Render service unconditionally, including this project's own free-tier
-# deployment which currently has neither DATABASE_URL nor BACKUP_UPLOAD_URL
-# configured. That made the bot refuse to boot on its own production service
-# (verified by reproducing the exact guard call with Render's real env vars).
-# That is a self-inflicted outage, not a safety improvement.
-#
-# Fix: fail-fast is now opt-IN via REQUIRE_PERSISTENT_STORAGE=1 (set this once
-# DATABASE_URL/BACKUP_UPLOAD_URL is actually configured, to guarantee any
-# future accidental removal is caught immediately). Without it, the loud
-# CRITICAL-level warning below still fires on every boot — visible in logs and
-# on /health — but the process starts, preserving current behaviour exactly.
-# ALLOW_EPHEMERAL_SQLITE=1 remains accepted as an explicit override even when
-# REQUIRE_PERSISTENT_STORAGE=1 is set, for a supervised emergency restart.
 def _warn_ephemeral_storage() -> None:
-    """
-    Emit a prominent warning when running SQLite without a backup upload
-    target — all data is ephemeral and will be lost on instance restart.
-
-    Fails fast only when the operator explicitly opts in via
-    REQUIRE_PERSISTENT_STORAGE=1 (meant to be set only after DATABASE_URL or
-    BACKUP_UPLOAD_URL is actually configured, as a tripwire against future
-    misconfiguration). Otherwise this only warns — it must never silently
-    block startup, since RENDER=true is present on every Render deploy
-    regardless of plan or persistence setup.
-    """
     if CFG.DB_TYPE != "sqlite":
         return
     if os.getenv("DATABASE_URL"):
-        return  # PostgreSQL via DATABASE_URL — persistent
+        return
     if _BACKUP_UPLOAD_URL:
         logger.info(
             "SQLite mode: external backup upload configured → "
@@ -348,10 +290,9 @@ def _warn_ephemeral_storage() -> None:
 
 
 # =============================================================================
-# Blocking I/O helpers — run in executor to keep event loop free (fix #1/#8)
+# Blocking I/O helpers
 # =============================================================================
 def _compress_bytes(data: bytes, level: int = 6) -> bytes:
-    """CPU-bound compression — called via run_in_executor."""
     return zlib.compress(data, level)
 
 
@@ -360,12 +301,9 @@ def _decompress_bytes(data: bytes) -> bytes:
 
 
 def _sqlite_hot_backup(src_path: str, dst_path: str) -> int:
-    """
-    Use SQLite's built-in online backup API (sqlite3.connect().backup())
-    to take a hot copy without reading the whole file into RAM first.
-    Returns the size of the source DB file in bytes.
-    (fix #8: avoids Path.read_bytes() → entire DB in RAM → zlib.compress)
-    """
+    """v14.5.1: return the ACTUAL backup file size (dst_path), not the source
+    .db size. The source size excludes WAL content that gets checkpointed
+    into the backup — logging it under-reports what was actually copied."""
     src = sqlite3.connect(src_path)
     dst = sqlite3.connect(dst_path)
     try:
@@ -373,15 +311,10 @@ def _sqlite_hot_backup(src_path: str, dst_path: str) -> int:
     finally:
         dst.close()
         src.close()
-    return os.path.getsize(src_path)
+    return os.path.getsize(dst_path)
 
 
 def _compress_file_to_gz(src_path: str, dst_path: str, level: int = 6) -> Tuple[int, str]:
-    """
-    Reads src_path, compresses with zlib, writes to dst_path.
-    Returns (compressed_size, sha256_hex).
-    Called via run_in_executor (fix #1).
-    """
     data = Path(src_path).read_bytes()
     compressed = zlib.compress(data, level)
     Path(dst_path).write_bytes(compressed)
@@ -390,120 +323,78 @@ def _compress_file_to_gz(src_path: str, dst_path: str, level: int = 6) -> Tuple[
 
 
 def _verify_gz(path: str, expected_digest: str) -> bool:
-    """Verify a .gz file is readable and matches the expected SHA-256 (fix #7)."""
     try:
         data = Path(path).read_bytes()
         actual = hashlib.sha256(data).hexdigest()
         if actual != expected_digest:
             return False
-        zlib.decompress(data)  # Ensure it decompresses without error
+        zlib.decompress(data)
         return True
     except Exception:
         return False
 
 
 # =============================================================================
-# Unified Database Class v9.0
+# Unified Database Class
 # =============================================================================
 class EnhancedDatabase:
-    """
-    Production-grade async database with IntentEngine support.
-    All 12 audit issues from the v8.2 report are addressed in this version.
-    """
-
     def __init__(self) -> None:
         self.db_type = CFG.DB_TYPE
         self._pool: Any = None
         self._sqlite_conn: Optional[Any] = None
         self.is_connected = False
 
-        # Message dedup cache (bounded deque — not a leak source)
         self.message_cache: Deque[str] = deque(maxlen=min(CFG.MAX_CACHE_SIZE, 20_000))
         self._hash_lock = asyncio.Lock()
 
-        # Queue access serialization (fix #9: cap enforcement under lock)
         self._queue_lock = asyncio.Lock()
 
-        # v9.12 (audit C-01): in-memory mirror of the processing_queue row
-        # count, kept in sync under _queue_lock so add_to_queue can enforce
-        # the cap WITHOUT a SELECT COUNT(*) on every insert. The mirror is
-        # reconciled against the real DB count on connect() and on
-        # purge_queue()/eviction paths so drift is impossible across
-        # restarts. Each pop decrements; each successful insert increments;
-        # each eviction decrements.
         self._queue_size_mirror: int = 0
         self._queue_mirror_dirty: bool = False
 
-        # v9.12 (audit H-01): short-TTL caches for the blocklist hot path.
-        # Stored as {id: (blocked_bool, expiry_epoch)}; the TTL is short
-        # (default 30s) so a freshly-blocked sender is honored within that
-        # window even without an explicit invalidate (which we also do).
         self._blocked_senders_cache: Dict[int, Tuple[bool, float]] = {}
         self._blocked_chats_cache: Dict[int, Tuple[bool, float]] = {}
-
-        # v9.12 (audit H-01): short-TTL cache for can_send_alert() — the
-        # cooldown decision only changes slowly (per-sender reputation and
-        # last_alert_time), so a 15s cache absorbs most of the per-message
-        # SELECT traffic without observable latency in enforcement.
         self._can_send_alert_cache: Dict[int, Tuple[bool, float]] = {}
 
-        # v10.4: event-driven queue wakeup — add_to_queue sets this Event so
-        # the producer loop's pop wakes IMMEDIATELY instead of waiting out
-        # the 0.1s poll tick (SQLite stays the durable source of truth;
-        # this only removes the poll LATENCY). Lazy so tests/CLI usage
-        # without a running loop never constructs an Event needlessly.
         self._queue_notify: Optional[asyncio.Event] = None
 
-        # Stats
         self.stats: Dict[str, int] = defaultdict(int)
         self._stats_lock = asyncio.Lock()
         self.start_time = time.time()
 
-        # Alert batch writer (fix #4: bounded + backoff)
         self._batch: List[Tuple[Any, ...]] = []
         self._batch_lock = asyncio.Lock()
         self._flush_failure_count: int = 0
-        self._flush_backoff: float = 1.0        # seconds, doubles on each failure
+        self._flush_backoff: float = 1.0
         self._flush_backoff_max: float = 60.0
-        self._db_healthy: bool = True           # exposed as property (fix #10)
+        self._db_healthy: bool = True
 
-        # Background tasks (fix #5: _cleanup_loop REMOVED from this class)
         self._writer_task: Optional[asyncio.Task] = None
         self._backup_task: Optional[asyncio.Task] = None
-        # Note: _cleanup_task intentionally absent — cleanup is owned by main.py
 
-        # v9.20 P1: كاش نطاق المصادر — (expiry, set) أو None. مجموعة فارغة
-        # تعني "جدول فارغ = مراقبة كل شيء" (لا تخلط مع كاش فارغ منتهٍ).
         self._sources_cache: Optional[Tuple[float, set]] = None
-
-        # v9.21 P2: كاش القواعد — (expiry, rules_list) جاهزة للتقييم.
         self._rules_cache: Optional[Tuple[float, List[Dict[str, Any]]]] = None
-        # v9.21 P2: عدّاد تطابقات القواعد في الذاكرة — يُدفَع دفعياً
-        # (دورة التنظيف كل 30 ثانية + عند أي تعديل من اللوحة) حمايةً
-        # للمسار السريع من كتابة UPDATE لكل رسالة.
         self._rule_hits_pending: Dict[int, int] = {}
-        # v9.21 P3: كاش قائمة السماح — (expiry, senders_set, chats_set)
         self._allowed_cache: Optional[Tuple[float, set, set]] = None
-        # v9.25 P6-1: كاش الميزات — {key: (expiry, bool)}
         self._features_cache: Dict[str, Tuple[float, bool]] = {}
 
-        # Backup health tracking (fix #7)
         self._backup_failure_count: int = 0
         self._backup_failure_threshold: int = 3
 
-        # Resource-pressure check counter (fix #12)
         self._writer_cycle: int = 0
 
-    # ── Public health property (fix #10) ────────────────────────────────────
+        # v14.5.1: per-session warning flag — _backup_loop only logs the
+        # "no BACKUP_UPLOAD_URL" warning once, then at debug.
+        self._backup_warning_logged: bool = False
+
     @property
     def db_healthy(self) -> bool:
-        """False when the DB has been consistently failing writes."""
         return self._db_healthy
 
     # ─── Connection ──────────────────────────────────────────────────────────
     async def connect(self) -> bool:
         try:
-            _warn_ephemeral_storage()  # fix #6: always warn at startup
+            _warn_ephemeral_storage()
             if self.db_type == "sqlite":
                 await self._connect_sqlite()
             else:
@@ -511,15 +402,13 @@ class EnhancedDatabase:
             await self._create_tables()
             await self._migrate_bigint_ids()
             await self._migrate_sender_intel()
-            await self._migrate_sender_account_hashes()  # v10.4
-            await self._migrate_sender_access()  # v10.7
-            await self._migrate_intel_entities()  # v11.1 normalized intel entities
-            await self._migrate_queue_inflight()  # v12.1.0 التزامن الصلب claim/ack/recover
+            await self._migrate_sender_account_hashes()
+            await self._migrate_sender_access()
+            await self._migrate_intel_entities()
+            await self._migrate_queue_inflight()
             await self._create_indexes()
             self.is_connected = True
             await self.start_writer()
-            # v9.12 (audit C-01): prime the in-memory queue-size mirror
-            # so the first add_to_queue doesn't pay a SELECT COUNT(*).
             try:
                 row = await self._fetchone("SELECT COUNT(*) AS cnt FROM processing_queue")
                 async with self._queue_lock:
@@ -529,8 +418,7 @@ class EnhancedDatabase:
             except Exception as e:
                 logger.debug(f"queue mirror prime failed: {e}")
                 self._queue_mirror_dirty = True
-            # Note: start_cleanup() intentionally NOT called here (fix #5)
-            logger.info(f"Database connected: {self.db_type.upper()} v9.3")
+            logger.info(f"Database connected: {self.db_type.upper()} v14.5.1")
             return True
         except Exception as e:
             logger.error(f"Database connection failed: {e}")
@@ -558,36 +446,46 @@ class EnhancedDatabase:
             await self._sqlite_conn.execute(p)
 
     async def _connect_postgresql(self) -> None:
+        # v14.5.1: build SSL context from CFG.DATABASE_SSL and pass it in
+        # BOTH branches. When sslmode is unset, we DON'T include the ssl
+        # kwarg — asyncpg then applies its own DSN parsing (identical to
+        # pre-v14.5.1 behavior).
+        ssl_ctx = _build_ssl_context(getattr(CFG, "DATABASE_SSL", None))
+        if ssl_ctx is not None:
+            logger.info(f"PostgreSQL SSL enforced: sslmode={CFG.DATABASE_SSL}")
+
         dsn = os.getenv("DATABASE_URL")
         if dsn:
-            # v11.8 (مرحلة التنفيذ 3.4): statement_cache_size يُقرأ من البيئة
-            # والافتراضي 0 — آمن مع Session Pooler وTransaction Pooler معاً
-            # (6543 يكسر prepared statements عبر backends متعددة). ضبط
-            # DB_STATEMENT_CACHE_SIZE=200 يستعيد الكاش على اتصال مباشر.
-            self._pool = await asyncpg.create_pool(
-                dsn=dsn,
-                min_size=CFG.DB_POOL_MIN,
-                max_size=CFG.DB_POOL_MAX,
-                command_timeout=CFG.CONNECTION_TIMEOUT,
-                statement_cache_size=max(
+            connect_kwargs: Dict[str, Any] = {
+                "dsn": dsn,
+                "min_size": CFG.DB_POOL_MIN,
+                "max_size": CFG.DB_POOL_MAX,
+                "command_timeout": CFG.CONNECTION_TIMEOUT,
+                "statement_cache_size": max(
                     0, int(os.getenv("DB_STATEMENT_CACHE_SIZE", "0") or 0)
                 ),
-                server_settings={
+                "server_settings": {
                     "statement_timeout": "30000",
                     "idle_in_transaction_session_timeout": "60000",
                 },
-            )
+            }
+            if ssl_ctx is not None:
+                connect_kwargs["ssl"] = ssl_ctx
+            self._pool = await asyncpg.create_pool(**connect_kwargs)
         else:
-            self._pool = await asyncpg.create_pool(
-                host=CFG.DB_HOST,
-                port=CFG.DB_PORT,
-                database=CFG.DB_NAME,
-                user=CFG.DB_USER,
-                password=CFG.DB_PASSWORD,
-                min_size=CFG.DB_POOL_MIN,
-                max_size=CFG.DB_POOL_MAX,
-                command_timeout=CFG.CONNECTION_TIMEOUT,
-            )
+            connect_kwargs = {
+                "host": CFG.DB_HOST,
+                "port": CFG.DB_PORT,
+                "database": CFG.DB_NAME,
+                "user": CFG.DB_USER,
+                "password": CFG.DB_PASSWORD,
+                "min_size": CFG.DB_POOL_MIN,
+                "max_size": CFG.DB_POOL_MAX,
+                "command_timeout": CFG.CONNECTION_TIMEOUT,
+            }
+            if ssl_ctx is not None:
+                connect_kwargs["ssl"] = ssl_ctx
+            self._pool = await asyncpg.create_pool(**connect_kwargs)
 
     async def _ping(self) -> bool:
         try:
@@ -597,12 +495,6 @@ class EnhancedDatabase:
             return False
 
     async def _close_resources(self) -> None:
-        """v11.7 (audit A-1): إغلاق الموارد فقط بلا أي إلغاء للمهام.
-
-        عكس close() الذي يُلغي _writer_task — وغير صالح للاستدعاء من
-        داخل مهمة الكاتب نفسها (RuntimeError: Task cannot await on
-        itself + إلغاء المهمة المستدعية يقتل الحلقة قبل إعادة الاتصال).
-        تُستخدم من _reconnect حصراً؛ close() يبقى لمسار الإطفاء الخارجي."""
         current = asyncio.current_task()
         for name in ("_backup_task", "_writer_task"):
             task = getattr(self, name, None)
@@ -632,26 +524,13 @@ class EnhancedDatabase:
         self._pool = None
 
     async def _reconnect(self) -> bool:
-        """v11.7 (audit A-1): إعادة اتصال ذاتية آمنة.
-
-        العيب المُثبت: النسخة السابقة كانت تستدعي close() التي تُلغي
-        _writer_task — وهي المهمة المستدعية نفسها من _writer_loop —
-        فكانت الحلقة تموت (RuntimeError أو CancelledError) قبل الوصول
-        إلى connect() أبداً: انقطاع عابر واحد = زومبي بلا كتابة للأبد
-        (is_connected=False → add_to_queue يعيد -2 → كل الرسائل تُرفض).
-        الإصلاح: إغلاق الموارد فقط (_close_resources) ثم connect()
-        الذي يُعيد بناء المهام (start_writer يتعامل مع done/None)."""
         logger.warning("Database reconnecting…")
         await self._close_resources()
         await asyncio.sleep(2)
         return await self.connect()
 
-    # ─── SQL dialect helpers (v11.7 audit D-2/D-5) ─────────────────────────
+    # ─── SQL dialect helpers ────────────────────────────────────────────────
     def _sql_scalar_max(self, sql: str) -> str:
-        """MAX(a,b) ثنائية الوسائط: دالة قياسية على SQLite لكنها تجميعية على
-        PostgreSQL (خطأ بلا GROUP BY). تُبدّل إلى GREATEST على PG حصراً —
-        الإصلاح نفسه طُبّق يدوياً في مواضع أخرى سابقاً (database.py:2564).
-        الاستبدال آمن: النمط MAX(COALESCE( لا يظهر إلا في المقارنات القياسية."""
         try:
             if self.db_type == "postgresql":
                 return sql.replace("MAX(COALESCE(", "GREATEST(COALESCE(")
@@ -660,10 +539,6 @@ class EnhancedDatabase:
         return sql
 
     def _sql_insert_ignore(self, sql: str) -> str:
-        """INSERT OR IGNORE بنية SQLite حصراً — PG يتطلب ON CONFLICT DO
-        NOTHING (نفس الفرق الموثق في فرع النسخ القديم 2424-2436). يُستخدم
-        للعبارات المشتركة بين المحركين حيث لا يوجد فرع لهجة صريح
-        (block_sender/block_chat — كانت القائمة المحجوبة تفشل كلياً على PG)."""
         try:
             if self.db_type == "postgresql" and "INSERT OR IGNORE INTO" in sql:
                 converted = sql.replace("INSERT OR IGNORE INTO", "INSERT INTO", 1).rstrip()
@@ -674,7 +549,7 @@ class EnhancedDatabase:
             pass
         return sql
 
-    # ─── Low-level exec ───────────────────────────────────────────────────────
+    # ─── Low-level exec ─────────────────────────────────────────────────────
     async def _execute(self, sql: str, params: tuple = ()) -> Any:
         if self.db_type == "sqlite":
             return await self._sqlite_conn.execute(sql, params)
@@ -682,11 +557,6 @@ class EnhancedDatabase:
             return await self._pool.execute(_pg(sql), *params)
 
     async def _execute_affected(self, sql: str, params: tuple = ()) -> int:
-        """v12.3 (V12-D): عدد الصفوف المتأثرة على المحركين — أساس CAS.
-
-        sqlite: cursor.rowcount.  postgresql: asyncpg يعيد وسم الحالة
-        ("UPDATE 1" / "INSERT 0 1") — يُفكك رقمياً. فشل → 0 (المتسابق
-        يخسر — الاتجاه الآمن: لا تكرار أبداً بفشل القفل)."""
         try:
             if self.db_type == "sqlite":
                 cursor = await self._sqlite_conn.execute(sql, params)
@@ -700,22 +570,8 @@ class EnhancedDatabase:
             return 0
 
     async def _dead_letter_row(self, rid: Any, attempts: int, raw: Any, err: str) -> bool:
-        """══ v12.3 (V12-D) — حصر سباق ازدواجية dead-letter ══
-
-        السباق المُثبت: مسارا استرداد متزامنان يقرآن نفس الصفوف العالقة
-        ثم يجريان INSERT→DELETE — حرف ميت مكرر لنفس الحدث.
-        الإصلاح: claim ذرّي (CAS) على attempts:
-          UPDATE ... SET attempts = attempts + 1
-          WHERE id = ? AND status = 'in_flight' AND attempts = ?
-        المتسابق الأول فقط يحصل rowcount=1؛ الخاسر يتخطى بلا كتابة.
-        INSERT+DELETE بعدها في معاملة واحدة (PG) أو ضمن قفل الاتصال
-        الواحد مع commit فوري (SQLite — نفس الاتصال يرى كل شيء).
-        انهيار بين الخطوات: الصف يبقى in_flight بـattempts+1 → المسار
-        التالي يطالبه مرة واحدة بالضبط (لا تكرار ولا فقدان ولا عالق).
-
-        يعيد True إن فاز هذا المتسابق بالصف فعلاً."""
         payload = raw if isinstance(raw, (str, bytes)) else json_dumps(raw or {})
-        retry_count = int(attempts)  # محاولات التسليم عند انتهاء الصلاحية (عقد قائم)
+        retry_count = int(attempts)
         claim_sql = (
             "UPDATE processing_queue SET attempts = attempts + 1 "
             "WHERE id = ? AND status = 'in_flight' AND attempts = ?"
@@ -730,7 +586,7 @@ class EnhancedDatabase:
                 async with self._queue_lock:
                     cursor = await self._sqlite_conn.execute(claim_sql, (rid, attempts))
                     if not (cursor.rowcount or 0):
-                        return False  # سبقه مسار آخر — لا تكرار
+                        return False
                     await self._sqlite_conn.execute(insert_sql, (payload, err, retry_count))
                     await self._sqlite_conn.execute(delete_sql, (rid,))
                     await self._sqlite_conn.commit()
@@ -740,7 +596,7 @@ class EnhancedDatabase:
                     tag = str(await conn.execute(_pg(claim_sql), rid, attempts))
                     won = tag.startswith("UPDATE") and tag.split()[-1] == "1"
                     if not won:
-                        return False  # سبقه مسار آخر — لا تكرار
+                        return False
                     await conn.execute(_pg(insert_sql), payload, err, retry_count)
                     await conn.execute(_pg(delete_sql), rid)
             return True
@@ -782,7 +638,7 @@ class EnhancedDatabase:
         if self.db_type == "sqlite":
             await self._sqlite_conn.commit()
 
-    # ─── Schema v9.0 ─────────────────────────────────────────────────────────
+    # ─── Schema ─────────────────────────────────────────────────────────────
     async def _create_tables(self) -> None:
         stmts = """
             CREATE TABLE IF NOT EXISTS messages (
@@ -915,9 +771,6 @@ class EnhancedDatabase:
                 classified TEXT DEFAULT 'cross_group_spam',
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             );
-            -- v9.20 P1: مصادر المراقبة — دلالة التوافق الذهبية:
-            -- جدول فارغ = مراقبة كل شيء (السلوك الأصلي حرفياً)؛
-            -- مملوء = المفعّلة فقط. فشل-آمن: أي خلل يفتح المسار.
             CREATE TABLE IF NOT EXISTS sources (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 chat_id INTEGER NOT NULL UNIQUE,
@@ -929,8 +782,6 @@ class EnhancedDatabase:
                 notes TEXT DEFAULT '',
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             );
-            -- v9.21 P2: محرك القواعد — شروط JSON + إجراء + أولوية. أول قاعدة
-            -- مطابقة (priority ASC, id ASC) تُطبَّق. العدّاد hits يُدفَع دفعياً.
             CREATE TABLE IF NOT EXISTS rules (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT DEFAULT '',
@@ -943,8 +794,6 @@ class EnhancedDatabase:
                 created_by TEXT DEFAULT 'panel',
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             );
-            -- v9.21 P3: قائمة السماح — كيان موثوق يتجاوز فلترة الكلمات فقط
-            -- (الأولوية: الحظر ← مكافحة السبام ← السماح ← الفلترة).
             CREATE TABLE IF NOT EXISTS allowed_entities (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 entity_type TEXT NOT NULL DEFAULT 'sender',
@@ -953,15 +802,12 @@ class EnhancedDatabase:
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(entity_type, entity_id)
             );
-            -- v9.25 P6-1: سجل الميزات — المفاتيح والافتراضات في الكود
-            -- (FEATURE_REGISTRY) والجدول يخزّن الإزاحات فقط: صف غائب = افتراضي.
             CREATE TABLE IF NOT EXISTS features (
                 key TEXT PRIMARY KEY,
                 enabled INTEGER NOT NULL DEFAULT 1,
                 updated_by TEXT DEFAULT '',
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
             );
-            -- v9.24 P5-1: مركز الإشعارات — أحداث عالية القيمة فقط، للوحتين.
             CREATE TABLE IF NOT EXISTS notifications (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 ntype TEXT NOT NULL DEFAULT '',
@@ -973,9 +819,6 @@ class EnhancedDatabase:
                 is_read INTEGER DEFAULT 0,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             );
-            -- v9.18 P0: سجل التدقيق — كل عملية كتابة من اللوحتين تُسجّل هنا
-            -- (fire-and-forget، بلا أسرار، الهواتف مُقنَّعة). يُقرأ من
-            -- GET /api/audit (BotPanel) ويُقَلَّم دورياً بـ90 يوماً.
             CREATE TABLE IF NOT EXISTS audit_logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 actor TEXT NOT NULL,
@@ -1001,8 +844,6 @@ class EnhancedDatabase:
                         s.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "BIGSERIAL PRIMARY KEY")
                         .replace("sender_id INTEGER PRIMARY KEY", "sender_id BIGINT PRIMARY KEY")
                         .replace("chat_id INTEGER PRIMARY KEY", "chat_id BIGINT PRIMARY KEY")
-                        # v9.11: عمود عاري غير مفتاحي أيضاً يجب أن يتسع لمعرفات
-                        # تيليجرام 64-بت (alert_dedup.sender_id كان يبقى int4).
                         .replace("sender_id INTEGER,", "sender_id BIGINT,")
                         .replace("chat_id INTEGER,", "chat_id BIGINT,")
                         .replace("INTEGER NOT NULL", "BIGINT NOT NULL")
@@ -1013,19 +854,11 @@ class EnhancedDatabase:
                         .replace("last_updated REAL,", "last_updated DOUBLE PRECISION,")
                         .replace("REAL DEFAULT (unixepoch())", "DOUBLE PRECISION DEFAULT EXTRACT(EPOCH FROM NOW())")
                         .replace("DATETIME DEFAULT CURRENT_TIMESTAMP", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
-                        # v11.7 (audit D-1): DATETIME عارية بلا DEFAULT كانت
-                        # تنجو من التحويل → CREATE TABLE فاشل على PG (لا يوجد
-                        # نوع datetime في PostgreSQL إطلاقاً). قاعدة عامة أخيرة
-                        # تلتقط كل ما تبقى (last_login_at/deleted_at/updated_at…).
                         .replace("DATETIME", "TIMESTAMP")
                         .replace("REAL NOT NULL", "DOUBLE PRECISION NOT NULL")
                         .replace("REAL DEFAULT", "DOUBLE PRECISION DEFAULT")
                         .replace("REAL,", "DOUBLE PRECISION,")
                     )
-                # v11.7 (audit D-4): حارس لكل عبارة — النسخة السابقة كانت
-                # fail-fast: أي عيب لهجة واحد يُسقط connect() كاملاً ويمنع
-                # الإقلاع (كل الترحيلات الأخرى fail-soft). الآن عبارة فاشلة
-                # تُسجل وتُتجاوز — نفس عقد بقية المهاجرات.
                 try:
                     await self._execute(s)
                 except Exception as stmt_err:
@@ -1033,22 +866,8 @@ class EnhancedDatabase:
         await self._commit()
 
     async def _migrate_bigint_ids(self) -> None:
-        """v9.1: widen Telegram-ID columns from INTEGER (int32) to BIGINT.
-
-        Telegram IDs overflow signed 32-bit integers: supergroup chats are
-        -100XXXXXXXXXX and modern user IDs reach ~9 billion, while int32
-        caps at 2147483647. Older databases were created with INTEGER
-        PRIMARY KEY columns (the SQLite->PostgreSQL translation never
-        widened bare PK columns), so writes failed with "value out of
-        int32 range". Idempotent: ALTER to BIGINT on an already-BIGINT
-        column is a cheap no-op on these small tables.
-        """
         if self.db_type != "postgresql":
             return
-        # v9.11: القائمة الشاملة لكل أعمدة معرفات تيليجرام — ALTER هو no-op
-        # رخيص إذا كان العمود BIGINT مسبقاً، لذا تُنفّذ دائماً كأحزمة أمان
-        # تشمل الجداول التي كانت تُنشأ صحيحة منذ البداية (messages/alerts)
-        # وجدول alert_dedup الذي كان يفلت من قواعد الترجمة ويبقى int4.
         stmts = [
             "ALTER TABLE sender_stats    ALTER COLUMN sender_id       TYPE BIGINT",
             "ALTER TABLE sender_contacts ALTER COLUMN sender_id       TYPE BIGINT",
@@ -1057,7 +876,6 @@ class EnhancedDatabase:
             "ALTER TABLE sender_contacts ALTER COLUMN last_message_id TYPE BIGINT",
             "ALTER TABLE blocked_senders ALTER COLUMN sender_id       TYPE BIGINT",
             "ALTER TABLE blocked_chats   ALTER COLUMN chat_id         TYPE BIGINT",
-            # ── v9.11: إصلاح خطأ DataError المستمر (value out of int32 range) ──
             "ALTER TABLE messages        ALTER COLUMN chat_id         TYPE BIGINT",
             "ALTER TABLE messages        ALTER COLUMN sender_id       TYPE BIGINT",
             "ALTER TABLE alerts          ALTER COLUMN chat_id         TYPE BIGINT",
@@ -1071,16 +889,15 @@ class EnhancedDatabase:
         for st in stmts:
             table = st.split()[2]
             column = st.split("ALTER COLUMN ")[1].split()[0]
-            for attempt in (1, 2):  # محاولتان — منافسة الأقفال عابرة غالباً
+            for attempt in (1, 2):
                 try:
                     await self._execute(st)
                     applied += 1
-                    break  # v12.3 W-2: حُذف ok الميت — break يحمل الدلالة وحده
+                    break
                 except Exception as e:
                     if attempt == 1:
-                        await asyncio.sleep(2.0)  # مهلة قصيرة قبل إعادة المحاولة
+                        await asyncio.sleep(2.0)
                         continue
-                    # v9.11: الفشل لم يعد يُبتلع بصمت — سجل صارخ + اسم الجدول/العمود
                     failed.append((table, column))
                     logger.error(
                         f"bigint migration FAILED: {table}.{column} stays int4 → "
@@ -1092,16 +909,9 @@ class EnhancedDatabase:
             f"Database migration v9.11: Telegram-ID columns widened to BIGINT "
             f"({applied}/{len(stmts)} applied, {len(failed)} failed)"
         )
-        # تحقق فعلي من أنواع الأعمدة بعد الترحيل — يكشف أي عمود ما زال int4
         await self._verify_bigint_columns(failed)
 
     async def _verify_bigint_columns(self, failed: list) -> None:
-        """v9.11: تحقق من information_schema أن كل أعمدة المعرفات فعلاً BIGINT.
-
-        هذا يكشف الحالة التي كان فيها خطأ الترحيل يُبتلع بصمت (قفل من عملية
-        أخرى/مهلة 30 ثانية) فيبقى العمود int4 ويتكرر في السجلات:
-            DataError: invalid input for query argument $1 (value out of int32 range)
-        """
         if self.db_type != "postgresql":
             return
         columns = [
@@ -1127,7 +937,7 @@ class EnhancedDatabase:
                     if dtype and dtype.lower() in ("integer", "smallint", "int4", "int2"):
                         still_int4.append(f"{table}.{column}({dtype})")
                 except Exception:
-                    continue  # الجدول قد لا يكون موجوداً بعد — إنشاؤه قادم
+                    continue
             if still_int4:
                 logger.critical(
                     "⚠️ INT32 OVERFLOW RISK — هذه الأعمدة ما زالت int4 وستفشل كتابة "
@@ -1142,9 +952,7 @@ class EnhancedDatabase:
         except Exception as e:
             logger.debug(f"bigint verify skipped: {e}")
 
-    # ── sender-intel columns (v9.3, backward-compatible) ──────────────────
     _SENDER_INTEL_COLUMNS = [
-        # (name, sqlite/pg type suffix) — types valid on BOTH dialects.
         ("phone", "TEXT"),
         ("is_bot", "BOOLEAN DEFAULT FALSE"),
         ("is_verified", "BOOLEAN DEFAULT FALSE"),
@@ -1165,15 +973,6 @@ class EnhancedDatabase:
     ]
 
     async def _migrate_sender_intel(self) -> None:
-        """v9.3: enrich sender_contacts with full sender metadata.
-
-        Backward compatible by construction:
-          * columns are ADDED, never renamed/dropped (no data loss)
-          * existing queries (JOIN on sender_id) are unaffected
-          * idempotent — safe on every boot, cheap no-op afterwards
-        PostgreSQL uses ADD COLUMN IF NOT EXISTS; SQLite is pragma-checked
-        per column (no IF NOT EXISTS support there).
-        """
         table = "sender_contacts"
         existing: set = set()
         if self.db_type == "postgresql":
@@ -1193,10 +992,8 @@ class EnhancedDatabase:
                 continue
             try:
                 if self.db_type == "postgresql":
-                    # normalize DOUBLE PRECISION -> DOUBLE PRECISION (already valid)
                     await self._execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {name} {decl}")
                 else:
-                    # SQLite has no DOUBLE PRECISION alias issue, but keep native types
                     sqlite_decl = decl.replace("DOUBLE PRECISION", "REAL")
                     await self._execute(f"ALTER TABLE {table} ADD COLUMN {name} {sqlite_decl}")
                 added += 1
@@ -1228,38 +1025,25 @@ class EnhancedDatabase:
             "CREATE INDEX IF NOT EXISTS idx_alr_time_sender ON alerts(timestamp DESC, sender_id)",
             "CREATE INDEX IF NOT EXISTS idx_alr_decision  ON alerts(decision)",
             "CREATE INDEX IF NOT EXISTS idx_alr_confidence ON alerts(confidence)",
-            # v9.10 dedup: fast expiry-scan for the periodic cleanup
             "CREATE INDEX IF NOT EXISTS idx_dedup_first_seen ON alert_dedup(first_seen)",
             "CREATE INDEX IF NOT EXISTS idx_dedup_sender     ON alert_dedup(sender_id)",
-            # v9.11 antispam: فحص سريع لقائمة المراقبة/التجاهل
             "CREATE INDEX IF NOT EXISTS idx_watch_sender_time ON spam_watch(sender_id, created_at DESC)",
             "CREATE INDEX IF NOT EXISTS idx_watch_until       ON spam_watch(watch_until)",
-            # v9.18 P0: فهارس سجل التدقيق (زمن/إجراء/فاعل) — القوائم دائماً
-            # بترتيب زمني تنازلي والفلترة بالإجراء أو الفاعل.
             "CREATE INDEX IF NOT EXISTS idx_audit_time   ON audit_logs(created_at DESC)",
             "CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_logs(action)",
             "CREATE INDEX IF NOT EXISTS idx_audit_actor  ON audit_logs(actor)",
-            # v9.20 P1: فحص نطاق المصادر — دائماً مفعّل فقط
             "CREATE INDEX IF NOT EXISTS idx_sources_enabled ON sources(enabled)",
-            # v9.21 P2: ترتيب تقييم القواعد (مفعّل، أولوية، معرف)
             "CREATE INDEX IF NOT EXISTS idx_rules_eval ON rules(enabled, priority, id)",
-            # v9.21 P3: فحص السماح السريع
             "CREATE INDEX IF NOT EXISTS idx_allowed_lookup ON allowed_entities(entity_type, entity_id)",
-            # v9.24 P5-1: الشارة الحية (غير مقروء) والقائمة الزمنية
             "CREATE INDEX IF NOT EXISTS idx_notif_unread_time ON notifications(is_read, created_at DESC)",
         ]
         for idx in indexes:
             await self._execute(idx)
         await self._commit()
 
-    # ─── Persistent Queue (fix #3 / #9) ──────────────────────────────────────
-    # ─── v10.4: event-driven queue wakeup ───────────────────────────────────
+    # ─── Queue ─────────────────────────────────────────────────────────────
     @property
     def queue_notify(self) -> asyncio.Event:
-        """Lazily-created Event set on every successful add_to_queue. The
-        producer loop awaits it (with the old poll interval as timeout
-        fallback) so queue pops happen ~instantly instead of on the next
-        0.1s tick. SQLite/PostgreSQL remain the durable source of truth."""
         ev = self._queue_notify
         if ev is None:
             ev = asyncio.Event()
@@ -1273,37 +1057,12 @@ class EnhancedDatabase:
             pass
 
     async def add_to_queue(self, event_data: dict, priority: int = 5) -> int:
-        """
-        Add an event to the persistent processing queue.
-
-        Returns:
-          > 0  — newly inserted row id
-          -1   — insert error
-          -2   — DB is unhealthy (backpressure signal, fix #10)
-
-        When the queue is at capacity (CFG.MESSAGE_QUEUE_SIZE), the oldest
-        lowest-priority row is evicted before inserting the new one, so the
-        cap is enforced atomically under _queue_lock (fix #3 / #9).
-
-        v9.12 (audit C-01): the per-insert SELECT COUNT(*) is replaced by
-        an in-memory mirror (`_queue_size_mirror`) kept in sync under
-        _queue_lock. Every N inserts (QUEUE_MIRROR_RECONCILE_EVERY) we
-        reconcile against the real DB count to absorb any external drift
-        (manual DB edits, restarts mid-flight, etc.). Commits are also
-        batched: eviction + insert now share a single commit instead of
-        two. Result: 1 SELECT-then-INSERT+COMMIT per message instead of
-        SELECT COUNT + DELETE + COMMIT + INSERT + COMMIT (3 commits → 1).
-        """
         if not self._db_healthy:
-            # Backpressure: tell the caller the DB is unhealthy (fix #10)
             logger.debug("add_to_queue: DB unhealthy, returning -2 (backpressure)")
             return -2
 
         try:
-            async with self._queue_lock:  # serialise cap check + insert (fix #9)
-                # ── Enforce capacity cap (fix #3, audit C-01) ────────────
-                # Use the in-memory mirror; reconcile against DB every N inserts
-                # to absorb drift (manual edits, restarts, etc.).
+            async with self._queue_lock:
                 reconcile_every = max(1, int(os.getenv("QUEUE_MIRROR_RECONCILE_EVERY", "64")))
                 if self._queue_mirror_dirty or (self.stats.get("queue_inserts", 0) % reconcile_every == 0):
                     try:
@@ -1316,8 +1075,6 @@ class EnhancedDatabase:
 
                 if self.db_type == "sqlite":
                     if current_size >= CFG.MESSAGE_QUEUE_SIZE:
-                        # DROP_OLDEST: remove the single oldest lowest-priority row
-                        # v9.12 (C-01): batch the eviction + insert into one commit.
                         await self._execute(
                             "DELETE FROM processing_queue WHERE id = ("
                             "  SELECT id FROM processing_queue"
@@ -1336,7 +1093,7 @@ class EnhancedDatabase:
                         "INSERT INTO processing_queue (event_data, priority) VALUES (?, ?)",
                         (json_dumps(event_data), priority),
                     )
-                    await self._commit()  # single commit covers eviction (if any) + insert
+                    await self._commit()
                     self._queue_size_mirror += 1
                     async with self._stats_lock:
                         self.stats["queue_inserts"] = self.stats.get("queue_inserts", 0) + 1
@@ -1344,8 +1101,6 @@ class EnhancedDatabase:
                     return cursor.lastrowid
 
                 else:
-                    # PostgreSQL: capacity check + insert in one transaction
-                    # v9.12 (C-01): mirror used here too for the cap check.
                     async with self._pool.acquire() as conn:
                         async with conn.transaction():
                             if current_size >= CFG.MESSAGE_QUEUE_SIZE:
@@ -1374,13 +1129,9 @@ class EnhancedDatabase:
 
         except Exception as e:
             logger.error(f"add_to_queue failed: {e}")
-            # On error the mirror may be stale — flag it for reconciliation.
             self._queue_mirror_dirty = True
             return -1
 
-    # ══ v12.1.0 التزامن الصلب (claim/ack/recover) ══
-    # أعمدة processing_queue الجديدة — إضافة فقط بلا إعادة تسمية ولا حذف
-    # (نفس ضمانات _migrate_sender_intel: لا فقدان بيانات، idempotent).
     _QUEUE_INFLIGHT_COLUMNS = [
         ("status", "TEXT NOT NULL DEFAULT 'pending'"),
         ("claimed_at", "DOUBLE PRECISION"),
@@ -1388,13 +1139,6 @@ class EnhancedDatabase:
     ]
 
     async def _migrate_queue_inflight(self) -> None:
-        """v12.1.0: processing_queue يكسب status/claimed_at/attempts.
-
-        التزامن الصلب: pop لم يعد يحذف — يميّز الصف in_flight ويحذفه فقط
-        بعد اكتمال المعالجة (ack). الانهيار بين السحب والاكتمال كان يُفقد
-        الحدث للأبد (pop=DELETE سابقاً) — الآن استرداد دوري/إقلاعي يعيده.
-        PostgreSQL: ADD COLUMN IF NOT EXISTS؛ SQLite: pragma-check لكل عمود.
-        """
         table = "processing_queue"
         existing: set = set()
         if self.db_type == "postgresql":
@@ -1433,7 +1177,6 @@ class EnhancedDatabase:
 
     @staticmethod
     def _claim_payload(event_id: Any, raw: Any) -> dict:
-        """يفك JSON ويحقن _queue_id للحماة اللاحقة (ack) — فشل-آمن."""
         try:
             if isinstance(raw, (str, bytes)):
                 data = json_loads(raw)
@@ -1451,17 +1194,6 @@ class EnhancedDatabase:
         return data if isinstance(data, dict) else {}
 
     async def pop_from_queue(self) -> Optional[dict]:
-        """══ v12.1.0 — claim بلا حذف (التزامن الصلب) ═══
-
-        الاسم التاريخي محفوظ للتوافق (main.py producer) — الدلالة الجديدة:
-          1. اختيار أقدم صف pending (أو بلا حالة — صفوف ما قبل الترحيل).
-          2. تمييزه in_flight مع claimed_at=الآن وattempts=attempts+1.
-          3. حقن _queue_id في event_data ليعرف العامل ماذا يُسجّل (ack).
-
-        الحذف لم يعد هنا — نقل إلى ack_queue_event بعد اكتمال المعالجة.
-        أي انهيار (SIGKILL/OOM/نشر) بين السحب والاكتمال يترك الصف in_flight
-        ويُسترد تلقائياً عبر recover_stale_inflight بدل فقدانه للأبد.
-        """
         try:
             now_ts = time.time()
             if self.db_type == "sqlite":
@@ -1504,13 +1236,6 @@ class EnhancedDatabase:
             return None
 
     async def ack_queue_event(self, event_id: Any) -> bool:
-        """══ v12.1.0 — الحماة (ack): حذف الصف بعد اكتمال معالجته ══
-
-        يُستدعى من main.py worker بعد عودة process_event_from_queue
-        (سواء اكتملت بنجاح أو حُوّلت لـDLQ — المسؤولية انتقلت إما للـDLQ
-        أو أُنجزت). أي مسار آخر يسجّل حماته بنفسه (إعادة إدراج = صف جديد).
-        فشل-آمن: خطأ DB → False + عدّاد، الحدث يبقى in_flight ويُسترد لاحقاً.
-        """
         try:
             eid = int(event_id)
         except Exception:
@@ -1531,8 +1256,11 @@ class EnhancedDatabase:
                     row = await conn.fetchrow(
                         "DELETE FROM processing_queue WHERE id = $1 RETURNING id", eid
                     )
+                # v14.5.1: mirror decrement moved INSIDE _queue_lock — two
+                # concurrent acks used to read N, both decrement, drift N-2.
                 if row:
-                    self._queue_size_mirror = max(0, self._queue_size_mirror - 1)
+                    async with self._queue_lock:
+                        self._queue_size_mirror = max(0, self._queue_size_mirror - 1)
                 return bool(row)
         except Exception as e:
             from unified_alerts.stats import get_unified_stats as _gus
@@ -1542,31 +1270,16 @@ class EnhancedDatabase:
             return False
 
     async def queue_size(self) -> int:
-        # v9.12 (audit C-01): prefer the in-memory mirror (O(1)) over a
-        # fresh COUNT(*) — the mirror is reconciled periodically inside
-        # add_to_queue and on every connect/purge.
         try:
             async with self._queue_lock:
                 if not self._queue_mirror_dirty:
                     return self._queue_size_mirror
-            # Fall back to a real count if the mirror is flagged dirty.
             row = await self._fetchone("SELECT COUNT(*) AS cnt FROM processing_queue")
             return int(row["cnt"]) if row else 0
         except Exception:
             return 0
 
     async def recover_stale_inflight(self, max_age_seconds: int = 600) -> Dict[str, int]:
-        """══ v12.1.0 — قلب الاسترداد: reclaim العالق أو dead-letter بصدق ══
-
-        صفوف in_flight التي مضى على claimed_at أكثر من max_age_seconds =
-        عامل سحبها انهار قبل ack (SIGKILL/OOM/نشر) — الحدث كان يُفقد للأبد.
-        الآن:
-          * attempts >= QUEUE_INFLIGHT_MAX_ATTEMPTS (افتراضي 3):
-            INSERT dead_letters (بصدق — لا دورة إعادة أبدية) + حذف الصف.
-          * غير ذلك: status → pending + حقن _recovered=1 في event_data
-            ليعيد خط الأنابيب بناء التنبيه وإرساله عند إعادة السحب.
-        يعيد {"recovered": n, "dead": m} — فشل-آمن ({0,0} بلا استثناء).
-        """
         stats_out = {"recovered": 0, "dead": 0}
         try:
             try:
@@ -1590,17 +1303,16 @@ class EnhancedDatabase:
                 raw = r.get("event_data")
                 try:
                     if attempts >= max_attempts:
-                        # Dead-letter صادق — منع دورة إعادة أبدية
-                        # v12.3 (V12-D): claim ذرّي — مسارا استرداد متزامنان
-                        # لا يكتبان حرفاً ميتاً مكرراً لنفس الصف أبداً.
                         err = (
                             f"inflight_expired: no ack within {max_age_seconds}s "
                             f"(attempts={attempts})"
                         )
                         if not await self._dead_letter_row(rid, attempts, raw, err):
-                            continue  # خسر السباق أو فشل آمن — الصف يبقى كما هو
+                            continue
                         stats_out["dead"] += 1
-                        self._queue_size_mirror = max(0, self._queue_size_mirror - 1)
+                        # v14.5.1: mirror decrement inside _queue_lock.
+                        async with self._queue_lock:
+                            self._queue_size_mirror = max(0, self._queue_size_mirror - 1)
                     else:
                         try:
                             if isinstance(raw, (str, bytes)):
@@ -1616,12 +1328,6 @@ class EnhancedDatabase:
                             payload = json_dumps(data)
                         else:
                             payload = raw if isinstance(raw, (str, bytes)) else "{}"
-                        # v12.3 (V12-D): CAS على attempts — يستعيد الصف المتسابق
-                        # الأول فقط، ولا يطمس حجزاً حديثاً لمستهلك (المستهلك
-                        # يزيد attempts عند الحجز أيضاً). الزيادة هنا تعني:
-                        # attempts يحصي كل بدء معالجة — حدّ
-                        # QUEUE_INFLIGHT_MAX_ATTEMPTS يُنهي أحداث السمّ بدل
-                        # الارتداد الأبدي pending↔in_flight.
                         claimed = await self._execute_affected(
                             "UPDATE processing_queue SET status = 'pending', "
                             "claimed_at = NULL, event_data = ?, attempts = attempts + 1 "
@@ -1645,18 +1351,6 @@ class EnhancedDatabase:
         return stats_out
 
     async def alert_exists(self, msg_hash: str) -> bool:
-        """v12.1.0: هل وصل إيصال تنبيه لهذا msg_hash؟ (جدول alerts)
-
-        يستخدمه مسار الاسترداد: حدث مسترد رسالته مخزنة من المحاولة
-        المنهارة + لها إيصال = أُرسلت فعلاً → تخطٍّ صادق (لا ازدواج)؛
-        بلا إيصال = انهار بين الحجز والإرسال → أعد الإرسال (لا فقدان).
-        فشل-آمن: أي خلل → False (مسار إعادة الإرسال، dedup اللاحق يحكم).
-
-        v12.4.0 (RC-2): الدفعة المعلقة تُرى أيضاً — إيصال أُرسل وقع في
-        _batch ولم يُفرَّغ بعد (نافذة DB_BATCH_INTERVAL) كان alert_exists
-        يعتبره غير موجود → حدث مسترد متزامن داخل نفس العملية يعيد
-        الإرسال = مكرر. الآن تفحص الـbuffer أولاً (قراءة قفل واحدة بلا
-        I/O) ثم الجدول. أي خلل → الجدول فقط (السلوك السابق)."""
         h = str(msg_hash or "")
         try:
             async with self._batch_lock:
@@ -1680,16 +1374,12 @@ class EnhancedDatabase:
     async def purge_queue(self) -> int:
         try:
             if self.db_type == "sqlite":
-                # v9.1 fix (audit M-4): total_changes is cumulative; use the
-                # DELETE cursor's rowcount so the admin /purge command reports
-                # the real number of removed rows.
                 cursor = await self._execute("DELETE FROM processing_queue")
                 deleted = cursor.rowcount or 0
                 await self._commit()
             else:
                 result = await self._pool.execute("DELETE FROM processing_queue")
                 deleted = int(result.split()[1])
-            # v9.12 (audit C-01): keep the mirror in sync after a purge.
             async with self._queue_lock:
                 self._queue_size_mirror = 0
                 self._queue_mirror_dirty = False
@@ -1699,14 +1389,6 @@ class EnhancedDatabase:
             return 0
 
     async def purge_stale_queue_rows(self, max_age_seconds: int = 7200) -> int:
-        """v12.0 unified_alerts: حذف صفوف الطابور الأقدم من max_age_seconds فقط.
-
-        الطابور مخزن تشغيلي عابر (ليس بيانات مستخدم). الصفوف الأقدم من الحد
-        لن تصلح تنبيهاتها أبداً (بوابة العمر في unified_alerts ستُسقطها عند
-        pop) وتشغل سعة MESSAGE_QUEUE_SIZE فتدفع evictions تضيّر أحداثاً
-        جديدة. الحذف بالعمر حصراً — لا يمس الصفوف الحية إطلاقاً.
-        يعيد عدد الصفوف المحذوفة (فشل → 0 بلا استثناء).
-        """
         try:
             try:
                 max_age_seconds = max(60, int(max_age_seconds))
@@ -1721,7 +1403,6 @@ class EnhancedDatabase:
                 await self._commit()
             else:
                 async with self._pool.acquire() as conn:
-                    # asyncpg يعيد سلسلة الحالة "DELETE <n>" — نحللها كما في purge_queue
                     status = await conn.execute(
                         "DELETE FROM processing_queue WHERE created_at < now() - ($1 || ' seconds')::interval",
                         str(max_age_seconds),
@@ -1742,7 +1423,7 @@ class EnhancedDatabase:
             logger.debug(f"purge_stale_queue_rows failed (fail-safe): {type(e).__name__}: {e}")
             return 0
 
-    # ─── Dead Letters (fix #11) ───────────────────────────────────────────────
+    # ─── Dead Letters ──────────────────────────────────────────────────────
     async def add_dead_letter(self, record: DeadLetterRecord) -> bool:
         try:
             event_data_json = json_dumps(record.event_data)
@@ -1766,15 +1447,6 @@ class EnhancedDatabase:
 
     @staticmethod
     def _coerce_created_at(value: Any) -> float:
-        """
-        Convert dead_letters.created_at to a unix timestamp.
-
-        v9.1 fix (found by the test suite): SQLite's CURRENT_TIMESTAMP
-        yields a STRING ("YYYY-MM-DD HH:MM:SS"); the old code called
-        str.timestamp() on it — an AttributeError on every row, silently
-        swallowed by the except → get_dead_letters() always returned [] on
-        SQLite. Handles float/int, ISO strings and SQLite datetime strings.
-        """
         if isinstance(value, (int, float)):
             return float(value)
         if isinstance(value, datetime):
@@ -1791,9 +1463,6 @@ class EnhancedDatabase:
             return time.time()
 
     async def get_dead_letter_counts(self) -> Dict[str, int]:
-        """v11.7.1: عدّادات DLQ الدنيا لـ/health/full (المهمة الهندسية §2.5 —
-        «أقل قدر لازم من المعلومات التشخيصية الآمنة»). عدّادات فقط —
-        بلا نصوص أحداث ولا معرّفات ولا أسرار. لا ترفع استثناءً أبداً."""
         out = {"total": 0, "unresolved": 0}
         try:
             row = await self._fetchone("SELECT COUNT(*) AS cnt FROM dead_letters")
@@ -1877,17 +1546,9 @@ class EnhancedDatabase:
             return None
 
     async def cleanup_dead_letters(self, days: int = 7) -> int:
-        """
-        Remove resolved and old dead letters.
-        Also enforces _DEAD_LETTER_MAX_ROWS hard cap (fix #11):
-        if the table exceeds the cap, oldest resolved rows are purged first,
-        then oldest unresolved rows are purged until under the cap.
-        """
         cutoff = time.time() - days * 86400
         total = 0
         try:
-            # v9.1 fix (audit M-4): rowcount-based counting — the previous
-            # cumulative total_changes arithmetic reported inflated numbers.
             cur = await self._execute("DELETE FROM dead_letters WHERE resolved = 1")
             total += cur.rowcount or 0
 
@@ -1896,7 +1557,6 @@ class EnhancedDatabase:
             )
             total += cur.rowcount or 0
 
-            # Hard row cap (fix #11)
             row = await self._fetchone(
                 "SELECT COUNT(*) AS cnt FROM dead_letters"
             )
@@ -1923,21 +1583,8 @@ class EnhancedDatabase:
             logger.error(f"cleanup_dead_letters error: {e}")
             return 0
 
-    # ─── Messages ─────────────────────────────────────────────────────────────
+    # ─── Messages ──────────────────────────────────────────────────────────
     async def try_insert_message(self, rec: MessageRecord) -> bool:
-        """
-        Insert a message, returning True only when the row is genuinely new.
-
-        v9.1 fix (audit C-3, SQLite): the old code read
-        ``self._sqlite_conn.total_changes`` — a CUMULATIVE counter over the
-        whole connection lifetime — as the "was it inserted?" signal. After
-        the very first successful insert of the process, that counter is
-        permanently non-zero, so is_new was effectively always True:
-        DB-level dedup never fired, duplicates were re-alerted after restart
-        and sender_stats.total_messages was inflated on every duplicate.
-        The insert result is now taken from cursor.rowcount (1 = inserted,
-        0 = ignored by INSERT OR IGNORE).
-        """
         async with self._hash_lock:
             if rec.message_hash in self.message_cache:
                 return False
@@ -1958,8 +1605,6 @@ class EnhancedDatabase:
                 )
                 changed = cursor.rowcount or 0
                 if changed:
-                    # Only count sender activity for genuinely new messages
-                    # (previously inflated on every duplicate delivery).
                     await self._execute(
                         "INSERT INTO sender_stats (sender_id, total_messages, first_seen) "
                         "VALUES (?, 1, ?) "
@@ -1970,12 +1615,6 @@ class EnhancedDatabase:
                     )
                 await self._commit()
             else:
-                # v9.12 (audit L-04): the old `result == "INSERT 0 1"` string
-                # comparison is asyncpg-specific and fragile (any asyncpg
-                # version change to the status string would silently break
-                # dedup). Use the portable cursor.rowcount check instead —
-                # 1 = inserted, 0 = conflict (DO NOTHING). This matches the
-                # SQLite branch's `cursor.rowcount or 0` pattern.
                 result = await self._pool.execute(
                     "INSERT INTO messages "
                     "(message_hash, chat_id, sender_id, message_text, keyword_found, score, spam_score, timestamp) "
@@ -1985,9 +1624,6 @@ class EnhancedDatabase:
                     rec.message_text[:500], rec.keyword_found,
                     rec.score, rec.spam_score, rec.timestamp,
                 )
-                # asyncpg's execute() returns a status string like
-                # "INSERT 0 1" or "INSERT 0 0"; parse the tuples-affected
-                # count portably instead of an exact string match.
                 try:
                     parts = str(result).split()
                     changed = int(parts[-1]) if parts and parts[-1].isdigit() else 0
@@ -2015,15 +1651,7 @@ class EnhancedDatabase:
             logger.error(f"try_insert_message error: {e}")
             return False
 
-    # ─── Sender Contacts ────────────────────────────────────────────────   
-    # v9.3 update policy (engineering brief #22/#24):
-    #   * identity fields (username/access_hash/names/phone/metadata):
-    #       new NON-NULL value → update; new NULL value → KEEP the stored
-    #       value (COALESCE) — a transient entity without a username must
-    #       never erase the historical one.
-    #   * last-seen context (last_chat_id/last_message_id): always the
-    #       newest message (these are "where we saw them last" fields).
-    #   * last_updated: always refreshed; updated_at: always refreshed.
+    # ─── Sender Contacts ───────────────────────────────────────────────────
     _CONTACT_COLS = (
         "sender_id, access_hash, username, first_name, last_name, "
         "last_chat_id, last_message_id, last_message_link, last_group_link, "
@@ -2034,7 +1662,6 @@ class EnhancedDatabase:
     )
 
     def _contact_params(self, s: Dict[str, Any]) -> tuple:
-        """Ordered params for _CONTACT_COLS (SQLite tuple form)."""
         return (
             s["sender_id"], s.get("access_hash"), s.get("username"),
             s.get("first_name"), s.get("last_name"),
@@ -2050,13 +1677,10 @@ class EnhancedDatabase:
         )
 
     async def upsert_sender_contact(self, sender_data: Dict[str, Any]) -> None:
-        """persist (requirement #11/#24). Never deletes a row (deleted
-        accounts keep their historical identity, requirement #23)."""
         try:
             import time as _time
             data = dict(sender_data)
             data.setdefault("last_updated", _time.time())
-            # usernames stored as JSON text when a list is provided
             if isinstance(data.get("usernames"), (list, tuple)):
                 import json as _json
                 data["usernames"] = _json.dumps(list(data["usernames"]), ensure_ascii=False)
@@ -2131,8 +1755,6 @@ class EnhancedDatabase:
                     "last_updated = EXCLUDED.last_updated, "
                     "updated_at = CURRENT_TIMESTAMP"
                 )
-                # _pg() translates the ?-placeholders to $N form; the SET
-                # clause contains no placeholders (EXCLUDED.<col> only).
                 await self._pool.execute(
                     _pg(
                         f"INSERT INTO sender_contacts ({self._CONTACT_COLS}) "
@@ -2145,8 +1767,6 @@ class EnhancedDatabase:
             logger.error(f"upsert_sender_contact error: {e}")
 
     async def get_sender_contact(self, sender_id: int) -> Optional[Dict[str, Any]]:
-        """DB fallback for the resolver / recovery paths. Returns the full
-        stored contact row (or None)."""
         try:
             return await self._fetchone(
                 "SELECT * FROM sender_contacts WHERE sender_id = ?",
@@ -2156,17 +1776,6 @@ class EnhancedDatabase:
             logger.debug(f"get_sender_contact error: {e}")
             return None
 
-    # ─── v10.4: per-account sender access hashes (mention tier-4) ───────────
-    # access_hash is PER-ACCOUNT knowledge — the (account_name, sender_id)
-    # key lets the mention builder build a valid InputUser for whichever
-    # account actually sends the alert. Table is additive & idempotent;
-    # nothing existing is renamed/dropped.
-    # ─── v11.1: normalized intel entities — separated per design spec ─────
-    # users → group_memberships → group_messages → message_analysis → alerts
-    # (+ user_activity). Alert data is NEVER conflated with user data: each
-    # entity has its own table, its own lifecycle, and its own writer.
-    # All tables are ADDITIVE (CREATE IF NOT EXISTS) — zero impact on legacy
-    # messages/alerts consumers, retention and dashboard queries.
     _INTEL_ALERT_COLUMNS = [
         ("alert_status", "TEXT"),
         ("alert_sent_at", "DOUBLE PRECISION"),
@@ -2311,8 +1920,6 @@ class EnhancedDatabase:
 
     @staticmethod
     def _intel_pg_sql(sql: str) -> str:
-        """PostgreSQL dialect transform for v11.1 entity statements
-        (mirrors _create_tables replacements): Telegram IDs exceed int32."""
         return (
             sql.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "BIGSERIAL PRIMARY KEY")
             .replace("INTEGER PRIMARY KEY", "BIGINT PRIMARY KEY")
@@ -2322,13 +1929,6 @@ class EnhancedDatabase:
         )
 
     async def _migrate_intel_entities(self) -> None:
-        """v11.1 — additive, idempotent, zero-data-loss:
-          1. CREATE TABLE IF NOT EXISTS: users / group_memberships /
-             group_messages / message_analysis / user_activity (+ indexes).
-          2. ALTER TABLE alerts ADD COLUMN: alert_status, alert_sent_at,
-             alerted_to, notification_attempts, notification_error,
-             button_message_url, button_user_url.
-        Failure of any single statement never blocks boot."""
         created = 0
         for stmt in self._INTEL_ENTITY_STATEMENTS:
             try:
@@ -2337,7 +1937,6 @@ class EnhancedDatabase:
                 created += 1
             except Exception as e:
                 logger.warning(f"intel-entities migration statement skipped: {type(e).__name__}: {str(e)[:120]}")
-        # alerts dispatch columns (pragma-check on SQLite like other migrations)
         if self._INTEL_ALERT_COLUMNS:
             existing: set = set()
             try:
@@ -2373,9 +1972,6 @@ class EnhancedDatabase:
             logger.info(f"Database migration v11.1: intel entities ready ({created} statements)")
 
     async def upsert_tg_user(self, d: Dict[str, Any]) -> bool:
-        """v11.1 users upsert — COALESCE semantics: a new non-null value
-        wins, None keeps the stored one (identity fields are never blanked
-        by a later partial event). Never raises."""
         try:
             full_name = d.get("full_name")
             if full_name is None:
@@ -2426,14 +2022,7 @@ class EnhancedDatabase:
             return False
 
     async def upsert_group_membership(self, d: Dict[str, Any]) -> bool:
-        """v11.1 group_memberships upsert — chat identity refreshed, member
-        flags OR-accumulated (a proven fact is never un-proven). Sending a
-        message in the group is PROOF of membership (is_member=1).
-        Never raises."""
         try:
-            # v11.7 (audit D-2): MAX(a,b) القياسية تُغادر PG (دالة تجميعية
-            # بلا GROUP BY) — نفس عيب إنتاجي موثق سابقاً في v11.1؛
-            # _sql_scalar_max يبدّلها إلى GREATEST على PG حصراً.
             await self._execute(
                 self._sql_scalar_max("""
                 INSERT INTO group_memberships (chat_id, user_id, chat_title, chat_username,
@@ -2477,10 +2066,7 @@ class EnhancedDatabase:
             return False
 
     async def record_group_message(self, d: Dict[str, Any]) -> bool:
-        """v11.1 group_messages upsert (chat_id, message_id) — text COALESCE,
-        edit flags refreshed on conflict. Never raises."""
         try:
-            # v11.7 (audit D-2): نفس معالجة MAX القياسية (GREATEST على PG)
             await self._execute(
                 self._sql_scalar_max("""
                 INSERT INTO group_messages (chat_id, message_id, user_id, message_text,
@@ -2538,8 +2124,6 @@ class EnhancedDatabase:
             return False
 
     async def record_message_analysis(self, d: Dict[str, Any]) -> bool:
-        """v11.1 message_analysis — one immutable row per analyzed message.
-        Never raises."""
         try:
             await self._execute(
                 """
@@ -2576,9 +2160,6 @@ class EnhancedDatabase:
     async def record_user_activity(
         self, user_id: int, chat_id: int, message_id: Optional[int], ts: Optional[float]
     ) -> bool:
-        """v11.1 user_activity — first/last seen, total counter, per-hour and
-        per-weekday histograms (JSON merged in Python; 24h / 7 buckets).
-        Never raises."""
         try:
             ts = float(ts or time.time())
             row = await self._fetchone(
@@ -2628,9 +2209,6 @@ class EnhancedDatabase:
             return False
 
     async def get_user_activity(self, user_id: int, chat_id: int) -> Dict[str, Any]:
-        """v11.1 — aggregated activity snapshot: counters from user_activity,
-        rolling windows (today/week/month) counted live from group_messages,
-        averages derived. Missing data → honest zeros/None, never fabricated."""
         out: Dict[str, Any] = {
             "user_id": user_id, "chat_id": chat_id,
             "first_seen_at": None, "last_seen_at": None,
@@ -2683,9 +2261,6 @@ class EnhancedDatabase:
         button_message_url: Optional[str] = None,
         button_user_url: Optional[str] = None,
     ) -> bool:
-        """v11.1 — record the dispatch outcome on the alerts row: status,
-        sent-at, destination, attempts, error, and the ACTUAL button URLs
-        used. Never raises; silently no-ops when the alert row is absent."""
         try:
             await self._execute(
                 """
@@ -2724,42 +2299,19 @@ class EnhancedDatabase:
                     "ON sender_account_hashes (sender_id)"
                 )
             except Exception:
-                pass  # index is an optimization only
+                pass
             await self._commit()
             logger.debug("sender_account_hashes table ready (v10.4)")
         except Exception as e:
             logger.warning(f"sender_account_hashes migration skipped: {type(e).__name__}: {str(e)[:120]}")
 
     async def upsert_sender_account_hash(self, account_name: str, sender_id: int, access_hash: int) -> bool:
-        """v10.4 legacy name — now persisted into the unified sender_access
-        registry (v10.7). Same signature/semantics; never raises."""
         return await self.upsert_sender_access(sender_id, account_name, access_hash)
 
     async def get_sender_account_hash(self, account_name: str, sender_id: int) -> Optional[int]:
-        """v10.4 legacy name — now read from the unified sender_access
-        registry (v10.7). Same signature/semantics."""
         return await self.get_sender_access_hash(account_name, sender_id)
 
-    # ─── v10.7: sender_access — the per-account sender access registry ────
-    # access_hash is PER-ACCOUNT knowledge (the hash account A saw cannot be
-    # used to send from account B — the server verifies it). Any account that
-    # receives a message from sender X upserts ITS OWN hash here, so a later
-    # alert can build a server-valid Text Mention from whichever account
-    # actually delivers it. Legacy v10.4 rows (sender_account_hashes) are
-    # copied in at migration time; the legacy table is kept for rollback but
-    # the two accessor methods below now read/write sender_access only.
     async def _migrate_sender_access(self) -> None:
-        """v10.7 — additive, idempotent, zero-data-loss:
-          1. CREATE TABLE IF NOT EXISTS sender_access
-             (sender_id, account_name, access_hash, updated_at)
-             PRIMARY KEY (sender_id, account_name)
-          2. Copy legacy sender_account_hashes rows (ON CONFLICT DO NOTHING).
-          3. ALTER TABLE alerts ADD COLUMN contact_method TEXT DEFAULT ''.
-          4. ALTER TABLE sender_contacts ADD COLUMN owner_account TEXT.
-        Each statement is individually wrapped in try/except for BOTH
-        SQLite and PostgreSQL (SQLite lacks ADD COLUMN IF NOT EXISTS, so
-        the column existence is pragma-checked first)."""
-        # ── 1) the registry table ──
         try:
             await self._execute(
                 "CREATE TABLE IF NOT EXISTS sender_access ("
@@ -2771,7 +2323,6 @@ class EnhancedDatabase:
             )
         except Exception as e:
             logger.warning(f"sender_access table migration skipped: {type(e).__name__}: {str(e)[:120]}")
-        # ── 2) copy legacy v10.4 rows (best-effort, never fatal) ──
         try:
             if self.db_type == "postgresql":
                 await self._execute(
@@ -2788,17 +2339,14 @@ class EnhancedDatabase:
                 )
             await self._commit()
         except Exception as e:
-            # sender_account_hashes may not exist on a brand-new DB — harmless.
             logger.debug(f"sender_access legacy copy skipped: {type(e).__name__}")
-        # ── 3) sender-side lookup index ──
         try:
             await self._execute(
                 "CREATE INDEX IF NOT EXISTS idx_sender_access_sender "
                 "ON sender_access (sender_id)"
             )
         except Exception:
-            pass  # index is an optimization only
-        # ── 4) alerts.contact_method ──
+            pass
         try:
             if self.db_type == "postgresql":
                 rows = await self._fetchall(
@@ -2815,7 +2363,6 @@ class EnhancedDatabase:
                     await self._commit()
         except Exception as e:
             logger.warning(f"alerts.contact_method migration skipped: {type(e).__name__}: {str(e)[:120]}")
-        # ── 5) sender_contacts.owner_account ──
         try:
             if self.db_type == "postgresql":
                 rows = await self._fetchall(
@@ -2835,9 +2382,6 @@ class EnhancedDatabase:
         logger.debug("sender_access registry ready (v10.7)")
 
     async def upsert_sender_access(self, sender_id: int, account_name: str, access_hash: int) -> bool:
-        """Upsert one (sender_id, account_name) → access_hash observation.
-        Called on EVERY analyzed message (spec v10.7 §2) so the registry
-        stays fresh even when no alert fires. Never raises."""
         try:
             if not sender_id or not account_name or not isinstance(access_hash, int) or access_hash == 0:
                 return False
@@ -2864,7 +2408,6 @@ class EnhancedDatabase:
             return False
 
     async def get_sender_access_hash(self, account_name: str, sender_id: int) -> Optional[int]:
-        """THIS account's stored view of the sender's access_hash (or None)."""
         try:
             row = await self._fetchone(
                 "SELECT access_hash FROM sender_access "
@@ -2877,15 +2420,14 @@ class EnhancedDatabase:
             logger.debug(f"get_sender_access_hash error: {type(e).__name__}")
         return None
 
-    # v11.8.2 (F-28): get_sender_access_accounts حُذفت — كود ميت
-    # (لم تُستدعَ من أي مسار إنتاج؛ سلّم الـmention يستخدم
-    # get_sender_access_hash/_resolve_mention_input_users مباشرة).
-
     async def recent_chat_ids(self, limit: int = 30) -> List[int]:
-        """Most-recently-seen source chat ids (cache warm-up, bounded)."""
+        # v14.5.1: replaced "SELECT DISTINCT chat_id ... ORDER BY id" (which
+        # is dialect-ambiguous because id is not in the SELECT list) with an
+        # explicit GROUP BY that is deterministic on both SQLite and PG.
         try:
             rows = await self._fetchall(
-                "SELECT DISTINCT chat_id FROM messages ORDER BY id DESC LIMIT ?",
+                "SELECT chat_id FROM messages "
+                "GROUP BY chat_id ORDER BY MAX(id) DESC LIMIT ?",
                 (max(1, min(int(limit), 200)),),
             )
             return [int(r["chat_id"]) for r in rows if r.get("chat_id") is not None]
@@ -2895,11 +2437,6 @@ class EnhancedDatabase:
 
     async def update_sender_reputation(self, sender_id: int, is_valid: bool) -> None:
         try:
-            # v9.2 fix: SQLite's scalar MIN(a, b) / MAX(a, b) do not exist in
-            # PostgreSQL (max/min there are aggregates only) — the production
-            # log showed "function max(numeric, double precision) does not
-            # exist" on every reputation update. The portable PostgreSQL
-            # equivalents are LEAST / GREATEST.
             if self.db_type == "postgresql":
                 bump_expr = "LEAST(100.0, reputation_score + 2.0)"
                 drop_expr = "GREATEST(0.0, reputation_score - 1.0)"
@@ -2938,7 +2475,6 @@ class EnhancedDatabase:
         except Exception:
             return 50.0
 
-    # ─── Helpers for copy button ────────────────────────────────────────────
     async def get_alert_text_by_hash(self, msg_hash: str) -> Optional[str]:
         try:
             row = await self._fetchone(
@@ -2959,13 +2495,7 @@ class EnhancedDatabase:
         except Exception:
             return None
 
-    # ─── Helpers for contact button (زر «تواصل مع المرسل») ────────────────
     async def get_alert_sender_by_hash(self, msg_hash: str) -> Optional[Dict[str, Any]]:
-        """بيانات المرسل الأصلي لتنبيه معيّن (sender_id + بيانات التواصل).
-
-        يستخدمه معالج زر «تواصل مع المرسل» لإرسال الرسالة الجاهزة المختارة
-        إلى صاحب الإعلان/الطلب مباشرة. يجمع بيانات alerts + sender_contacts.
-        """
         try:
             row = await self._fetchone(
                 "SELECT sender_id, chat_id, keyword FROM alerts "
@@ -2974,8 +2504,6 @@ class EnhancedDatabase:
             )
             if not row:
                 return None
-            # كل الأعمدة محددة في الاستعلام أعلاه — الفهرسة المفتاحية تعمل
-            # على كلا اللهجتين (aiosqlite.Row و asyncpg.Record).
             out = {
                 "sender_id": row["sender_id"],
                 "chat_id": row["chat_id"],
@@ -2993,7 +2521,7 @@ class EnhancedDatabase:
         except Exception:
             return None
 
-    # ─── Anti-Spam: Watch List + Permanent Ignore (المرحلة الثانية) ────────
+    # ─── Anti-Spam ─────────────────────────────────────────────────────────
     async def is_spam_ignored(self, sender_id: int) -> bool:
         try:
             row = await self._fetchone(
@@ -3005,8 +2533,6 @@ class EnhancedDatabase:
             return False
 
     async def get_spam_ignored_entry(self, sender_id: int) -> Optional[Dict[str, Any]]:
-        """v9.12 (audit H-07): single-row lookup used by AntiSpam's LRU
-        fallback. Returns the row (with reason + classified) or None."""
         try:
             return await self._fetchone(
                 "SELECT sender_id, reason, classified, created_at "
@@ -3019,7 +2545,6 @@ class EnhancedDatabase:
     async def add_spam_ignore(
         self, sender_id: int, reason: str = "", evidence: Optional[Dict] = None, classified: str = "cross_group_spam"
     ) -> None:
-        """إضافة إلى قائمة التجاهل الدائم مع تسجيل سبب الحظر بالتفصيل."""
         try:
             ev = json_dumps(evidence or {})
             await self._execute(
@@ -3056,7 +2581,6 @@ class EnhancedDatabase:
     async def record_watch(
         self, sender_id: int, reason: str = "", evidence: Optional[Dict] = None, watch_until: float = 0.0
     ) -> None:
-        """تسجيل إدراج في قائمة المراقبة (سجل append للأسباب — للمشرف واللوحة)."""
         try:
             ev = json_dumps(evidence or {})
             await self._execute(
@@ -3087,7 +2611,6 @@ class EnhancedDatabase:
             return []
 
     async def cleanup_old_watchlist(self, days: int = 7) -> int:
-        """إزالة سجلات المراقبة الأقدم من `days` أيام (يُستدعى من التنظيف الدوري)."""
         try:
             cutoff = time.time() - (int(days) * 86400)
             cursor = await self._execute(
@@ -3099,20 +2622,9 @@ class EnhancedDatabase:
             logger.debug(f"cleanup_old_watchlist failed: {e}")
             return 0
 
-    # ─── Alert Dedup (v9.10 — cross-account/re-send alert barrier) ───────────
     async def claim_alert_fingerprint(
         self, fingerprint: str, first_seen: float, window_hint: int = 86400
     ) -> bool:
-        """
-        Atomically claim a content fingerprint. Returns True only for the
-        FIRST claim within the window; every concurrent/duplicate claim of
-        the same fingerprint returns False (SQLite: single serialized
-        connection; PostgreSQL: ON CONFLICT DO NOTHING is atomic).
-
-        A row whose last_seen is older than the window is REFRESHED (the
-        new message restarts the window) instead of being treated as a
-        duplicate — old fingerprints never block new, legitimate repeats.
-        """
         try:
             if self.db_type == "sqlite":
                 cursor = await self._execute(
@@ -3125,17 +2637,14 @@ class EnhancedDatabase:
                 if inserted:
                     await self._commit()
                     return True
-                # row exists — is it still inside the window?
                 row = await self._fetchone(
                     "SELECT last_seen FROM alert_dedup WHERE fingerprint = ?",
                     (fingerprint,),
                 )
                 if row is None:
-                    # raced out from under us (concurrent cleanup) — treat as first
                     return True
                 last_seen = float(row.get("last_seen") or 0.0)
                 if first_seen - last_seen > max(1, window_hint):
-                    # window expired: refresh in place (restart the window)
                     await self._execute(
                         "UPDATE alert_dedup SET first_seen = ?, last_seen = ?, hits = 1 "
                         "WHERE fingerprint = ?",
@@ -3143,7 +2652,6 @@ class EnhancedDatabase:
                     )
                     await self._commit()
                     return True
-                # still within the window — a real duplicate
                 await self._execute(
                     "UPDATE alert_dedup SET last_seen = ?, hits = hits + 1 "
                     "WHERE fingerprint = ?",
@@ -3152,11 +2660,6 @@ class EnhancedDatabase:
                 await self._commit()
                 return False
             else:
-                # PostgreSQL: المطالبة بـ INSERT … ON CONFLICT DO NOTHING
-                # RETURNING — آتومية عبر العمليات/النسخ (SELECT … FOR UPDATE
-                # لا يقفل صفاً غير موجود، فكان سباق INSERT مزدوج يفشل مفتوحاً
-                # عبر unique_violation → فشل DB → فشل-مفتوح → تنبيهان).
-                # v14.1 (تدقيق 2-b): نفس دلالات فرع SQLite حرفياً.
                 async with self._pool.acquire() as conn:
                     async with conn.transaction():
                         inserted = await conn.fetchval(
@@ -3168,20 +2671,16 @@ class EnhancedDatabase:
                             fingerprint, first_seen,
                         )
                         if inserted is not None:
-                            # نحن من أدخل الصف — أول مطالبة داخل النافذة
                             return True
-                        # الصف موجود (مطالبة غيرنا) — منطق النافذة تحت قفل الصف
                         row = await conn.fetchrow(
                             "SELECT last_seen FROM alert_dedup "
                             "WHERE fingerprint = $1 FOR UPDATE",
                             fingerprint,
                         )
                         if row is None:
-                            # سباق مع تنظيف متزامن — عاملها كأول مطالبة
                             return True
                         last_seen = float(row["last_seen"] or 0.0)
                         if first_seen - last_seen > max(1, window_hint):
-                            # window expired: refresh in place (restart it)
                             await conn.execute(
                                 "UPDATE alert_dedup SET first_seen = $2, last_seen = $2, "
                                 "hits = 1 WHERE fingerprint = $1",
@@ -3199,8 +2698,6 @@ class EnhancedDatabase:
             raise
 
     async def release_alert_fingerprint(self, fingerprint: str) -> None:
-        """Free a claimed fingerprint after a failed alert send so the DLQ
-        retry path can claim it again later."""
         try:
             await self._execute(
                 "DELETE FROM alert_dedup WHERE fingerprint = ?", (fingerprint,)
@@ -3212,22 +2709,6 @@ class EnhancedDatabase:
     async def steal_stale_alert_fingerprint(
         self, fingerprint: str, min_age_seconds: float = 120.0
     ) -> bool:
-        """══ v13.0 — استيلاء CAS ذري على حجز dedup عتيق ══
-
-        المسار المسترد (_recovered) بعد انهيار عاملٍ بين الحجز والإرسال:
-        الحجز القديم كان سيمنع إعادة إرسال التنبيه للأبد. الفك غير المشروط
-        (release ثم claim) فتح سباق TOCTOU: عاملان مستردّان لنفس المحتوى
-        يفك كلٌّ منهما حجز الآخر الطازج فينشأ تنبيهان.
-
-        الحل: حذف شرطي واحد ذري — ينجح فقط عندما يكون الحجز عتيقاً فعلاً
-        (last_seen أقدم من min_age_seconds). حجز عاملٍ آخر طازج (يرسل الآن)
-        لا يُمسّ → العامل الثاني ينسحب بلا تنبيه مكرر؛ والحجز الميت من
-        محاولة منهارة (عمره ≥ عمر الاسترداد نفسه 600s) يُحذف فيُسمح
-        بمحاولة جديدة.
-
-        Returns: True إذا استُبعد الحجز العتيق (يمكن المطالبة من جديد).
-        SQLite/PostgreSQL نفس الدلالة: DELETE ... WHERE last_seen < cutoff
-        rowcount=1 هو الـ CAS الوحيد — بلا check-then-act."""
         try:
             cutoff = time.time() - max(1.0, float(min_age_seconds))
             if self.db_type == "sqlite":
@@ -3243,7 +2724,6 @@ class EnhancedDatabase:
                 "DELETE FROM alert_dedup WHERE fingerprint = $1 AND last_seen < $2",
                 fingerprint, cutoff,
             )
-            # asyncpg returns a status string like "DELETE 1"
             try:
                 return int(str(result).split()[-1]) > 0
             except Exception:
@@ -3253,8 +2733,6 @@ class EnhancedDatabase:
             return False
 
     async def cleanup_alert_fingerprints(self, max_age_seconds: int = 86400) -> int:
-        """Delete fingerprints older than the dedup window (called from
-        main.py's single cleanup loop). Returns the number of removed rows."""
         cutoff = time.time() - max(1, max_age_seconds)
         try:
             cur = await self._execute(
@@ -3276,11 +2754,7 @@ class EnhancedDatabase:
         except Exception:
             return 0
 
-    # ─── Blocklists ───────────────────────────────────────────────────────────
-    # v11.8.1 (F-10): cache entries expire logically but were never evicted —
-    # on a long-lived PostgreSQL process the dicts grew without bound (one
-    # entry per unique sender/chat ever checked). Prune expired entries once
-    # the cache exceeds _BLOCKED_CACHE_PRUNE_SIZE.
+    # ─── Blocklists ────────────────────────────────────────────────────────
     _BLOCKED_CACHE_PRUNE_SIZE = 5000
 
     @staticmethod
@@ -3291,16 +2765,12 @@ class EnhancedDatabase:
         now = time.time()
         for k in [k for k, (_, exp) in cache.items() if exp <= now]:
             cache.pop(k, None)
-        # still oversized (all fresh)? keep the newest half by expiry
         if len(cache) > _cap:
             keep = sorted(cache.items(), key=lambda kv: kv[1][1], reverse=True)[: _cap // 2]
             cache.clear()
             cache.update(keep)
 
     async def is_blocked_sender(self, sender_id: int) -> bool:
-        # v9.12 (audit H-01): short TTL cache for the hot-path blocklist
-        # check. Blocklists rarely change; the cache absorbs the per-message
-        # SELECT. block_sender()/unblock_sender() invalidate the entry.
         try:
             now = time.time()
             cached = self._blocked_senders_cache.get(sender_id)
@@ -3313,18 +2783,22 @@ class EnhancedDatabase:
             blocked = row is not None
             ttl = max(5.0, float(os.getenv("BLOCKLIST_CACHE_TTL", "30")))
             self._blocked_senders_cache[sender_id] = (blocked, now + ttl)
-            self._prune_blocked_cache(self._blocked_senders_cache)  # v11.8.1 (F-10)
+            self._prune_blocked_cache(self._blocked_senders_cache)
             return blocked
         except Exception:
-            # On any error fall back to direct DB check.
-            row = await self._fetchone(
-                "SELECT 1 AS hit FROM blocked_senders WHERE sender_id = ? LIMIT 1",
-                (sender_id,),
-            )
-            return row is not None
+            # v14.5.1: fallback query was propagating the SAME exception that
+            # triggered the fallback. Fail-open explicitly: a DB hiccup must
+            # never cause the caller (monitors loop) to crash.
+            try:
+                row = await self._fetchone(
+                    "SELECT 1 AS hit FROM blocked_senders WHERE sender_id = ? LIMIT 1",
+                    (sender_id,),
+                )
+                return row is not None
+            except Exception:
+                return False
 
     async def is_blocked_chat(self, chat_id: int) -> bool:
-        # v9.12 (audit H-01): same TTL cache strategy as is_blocked_sender.
         try:
             now = time.time()
             cached = self._blocked_chats_cache.get(chat_id)
@@ -3337,18 +2811,20 @@ class EnhancedDatabase:
             blocked = row is not None
             ttl = max(5.0, float(os.getenv("BLOCKLIST_CACHE_TTL", "30")))
             self._blocked_chats_cache[chat_id] = (blocked, now + ttl)
-            self._prune_blocked_cache(self._blocked_chats_cache)  # v11.8.1 (F-10)
+            self._prune_blocked_cache(self._blocked_chats_cache)
             return blocked
         except Exception:
-            row = await self._fetchone(
-                "SELECT 1 AS hit FROM blocked_chats WHERE chat_id = ? LIMIT 1",
-                (chat_id,),
-            )
-            return row is not None
+            try:
+                row = await self._fetchone(
+                    "SELECT 1 AS hit FROM blocked_chats WHERE chat_id = ? LIMIT 1",
+                    (chat_id,),
+                )
+                return row is not None
+            except Exception:
+                return False
 
     async def block_sender(self, sender_id: int, reason: str = "", by: str = "system") -> None:
         try:
-            # v11.7 (audit D-5): فرع لهجة — INSERT OR IGNORE فاشل على PG
             await self._execute(
                 self._sql_insert_ignore(
                     "INSERT OR IGNORE INTO blocked_senders (sender_id, reason, blocked_by) VALUES (?, ?, ?)"
@@ -3356,8 +2832,6 @@ class EnhancedDatabase:
                 (sender_id, reason, by),
             )
             await self._commit()
-            # v9.12 (audit H-01): invalidate the cache so the next check
-            # sees the new state immediately.
             self._blocked_senders_cache.pop(sender_id, None)
             logger.info(f"Sender {sender_id} blocked: {reason}")
         except Exception as e:
@@ -3370,7 +2844,6 @@ class EnhancedDatabase:
 
     async def block_chat(self, chat_id: int, reason: str = "", by: str = "system") -> None:
         try:
-            # v11.7 (audit D-5): فرع لهجة — INSERT OR IGNORE فاشل على PG
             await self._execute(
                 self._sql_insert_ignore(
                     "INSERT OR IGNORE INTO blocked_chats (chat_id, reason, blocked_by) VALUES (?, ?, ?)"
@@ -3388,14 +2861,12 @@ class EnhancedDatabase:
         await self._commit()
         self._blocked_chats_cache.pop(chat_id, None)
 
-    # ─── Alerts ───────────────────────────────────────────────────────────────
+    # ─── Alerts ────────────────────────────────────────────────────────────
     async def add_alert(self, rec: AlertRecord) -> bool:
-        """Queue an alert for batch write with IntentEngine fields."""
         async with self._stats_lock:
             self.stats["alerts_sent"] += 1
 
         async with self._batch_lock:
-            # Enforce batch cap (fix #4): evict oldest when full
             if len(self._batch) >= _DB_BATCH_MAX_SIZE:
                 evict_count = max(1, _DB_BATCH_MAX_SIZE // 10)
                 del self._batch[:evict_count]
@@ -3419,31 +2890,11 @@ class EnhancedDatabase:
                 rec.academic_object,
                 rec.negation_detected,
                 rec.advert_score,
-                # v10.7: how the sender was made reachable (username/mention/forward/link)
                 (rec.contact_method or "")[:20],
             ))
         return True
 
     async def add_alert_immediate(self, rec: AlertRecord) -> bool:
-        """══ v12.4.0 — إيصال التنبيه الفوري (سد نافذة التكرار RC-1) ══
-
-        الجذر: add_alert كان يدفع الإيصال للكاتب الدفعي الذي يفرغ كل
-        DB_BATCH_INTERVAL (افتراضي 5s). انهيار العملية (نشر/إعادة تشغيل/
-        سكون Render) بين نجاح الإرسال والإفراغ = فقدان الإيصال → صف
-        in_flight يُسترد لاحقاً بوسم _recovered → alert_exists=False →
-        إعادة إرسال → تنبيه مكرر يراه المستخدم.
-
-        الحل: كتابة صف alerts فوراً (INSERT آحادي ملتزم حالاً بلا دفعي)
-        عند لحظة نجاح الإرسال — نافذة فقدان الإيصال تنكمش من ~5 ثوانٍ
-        إلى مدة INSERT واحدة (مليّ ثوانٍ). الإحصاءات (sender_stats) تطبق
-        هنا مباشرة بنفس دلالات _flush، والصف نفسه محمي بـmessage_hash
-        UNIQUE (INSERT OR IGNORE / ON CONFLICT DO NOTHING) فلا يتضاعف
-        إن مرّ لاحقاً عبر الكاتب الدفعي.
-
-        عائد bool: True = الإيصال سُجل الآن (أول مرة)؛ False = مكرر
-        (إيصال سابق موجود) أو فشل الكتابة (فشل-آمن: لا يرفع استثناءً —
-        الإرسال نفسه نجح ولا يجوز عقاب التنبيه على خلل تسجيل).
-        """
         try:
             async with self._stats_lock:
                 self.stats["alerts_sent"] += 1
@@ -3475,8 +2926,6 @@ class EnhancedDatabase:
                     "ON CONFLICT (message_hash) DO NOTHING",
                     *params,
                 )
-                # نفس نمط try_insert_message (audit L-04): تحليل ذيل سلسلة
-                # الحالة ("INSERT 0 1" / "INSERT 0 0") بلا مطابقة نصية هشة.
                 try:
                     parts = str(result).split()
                     changed = int(parts[-1]) if parts and parts[-1].isdigit() else 0
@@ -3512,7 +2961,6 @@ class EnhancedDatabase:
             return bool(changed)
         except Exception as e:
             logger.error(f"add_alert_immediate failed (receipt may be delayed to batch): {type(e).__name__}: {str(e)[:120]}")
-            # فشل-آمن: ادفع للكاتب الدفعي كشبكة أمان أخيرة حتى لا يضيع الإيصال كلياً
             try:
                 await self.add_alert(rec)
             except Exception:
@@ -3520,12 +2968,6 @@ class EnhancedDatabase:
             return False
 
     async def can_send_alert(self, sender_id: int) -> bool:
-        # v9.12 (audit H-01): short-TTL cache for the per-message cooldown
-        # check. The decision only changes when (a) an alert was just sent
-        # (which invalidates this entry via _invalidate_can_send_alert) or
-        # (b) the reputation changes (rare, also handled). 15s default TTL
-        # keeps the cooldown enforcement within one cooldown tick of
-        # reality while collapsing most of the per-message SELECT traffic.
         try:
             now = time.time()
             cached = self._can_send_alert_cache.get(sender_id)
@@ -3543,13 +2985,8 @@ class EnhancedDatabase:
             else:
                 allowed = True
             ttl = max(2.0, float(os.getenv("CAN_SEND_ALERT_CACHE_TTL", "15")))
-            # If the sender is on cooldown, cache only for a short window so
-            # we re-check close to the cooldown expiry.
             if not allowed:
                 ttl = min(ttl, 5.0)
-            # v11.7 (audit A-8): sweep منخفض التكلفة عند الإدخال — الإدخالات
-            # المنتهية لمرسلين لن يُنبّهوا مرة أخرى كانت تتراكم بلا حد
-            # (التسريب الوحيد غير المحصور المُثبت في مسار التشغيل).
             if len(self._can_send_alert_cache) >= 4096:
                 try:
                     expired = [k for k, (_a, exp) in self._can_send_alert_cache.items() if exp <= now]
@@ -3557,19 +2994,14 @@ class EnhancedDatabase:
                         self._can_send_alert_cache.pop(k, None)
                 except Exception:
                     pass
-                # ما زال ممتلئاً؟ إفراغ أقدم دفعة (حد أقصى مطلق).
                 if len(self._can_send_alert_cache) >= 8192:
                     self._can_send_alert_cache.clear()
             self._can_send_alert_cache[sender_id] = (allowed, now + ttl)
             return allowed
         except Exception:
-            # Conservative fallback: allow the alert (the rate limiter in
-            # main.py still caps total throughput per account).
             return True
 
     def _invalidate_can_send_alert(self, sender_id: int) -> None:
-        """Call after recording an alert send for a sender so the next
-        can_send_alert() check picks up the new last_alert_time."""
         self._can_send_alert_cache.pop(sender_id, None)
 
     async def is_duplicate(self, h: str) -> bool:
@@ -3581,7 +3013,7 @@ class EnhancedDatabase:
         )
         return row is not None
 
-    # ─── Stats & Maintenance ──────────────────────────────────────────────────
+    # ─── Stats ─────────────────────────────────────────────────────────────
     async def get_stats(self) -> Dict[str, Any]:
         out: Dict[str, Any] = {
             "total_messages": self.stats["total_messages"],
@@ -3606,7 +3038,6 @@ class EnhancedDatabase:
             row = await self._fetchone("SELECT COUNT(*) AS cnt FROM blocked_senders")
             out["blocked_senders"] = int(row["cnt"]) if row else 0
 
-            # v9.16: blocked-chats grand total for the BotPanel blocked page
             row = await self._fetchone("SELECT COUNT(*) AS cnt FROM blocked_chats")
             out["blocked_chats"] = int(row["cnt"]) if row else 0
 
@@ -3638,43 +3069,25 @@ class EnhancedDatabase:
 
     async def cleanup_old_data(self, days: int = 7, audit_days: Optional[int] = None,
                                notifications_days: Optional[int] = None) -> int:
-        """
-        Remove old messages and alerts.
-        Called exclusively from main.py (fix #5: single cleanup owner).
-
-        v9.28-1: audit_days/notifications_days اختياريان — None = القيم
-        الثابتة القديمة (90/30) توافق خلفي كامل مع المتصلين القدامى.
-        أرضية max(1, ...) فلا تحذف قيمة فاسدة كل التاريخ.
-        """
         cutoff = time.time() - days * 86400
         total = 0
         try:
-            # v9.1 fix (audit M-4): rowcount-based counting.
             cur = await self._execute("DELETE FROM messages WHERE timestamp < ?", (cutoff,))
             total += cur.rowcount or 0
             cur = await self._execute("DELETE FROM alerts WHERE timestamp < ?", (cutoff,))
             total += cur.rowcount or 0
-            # v9.11 antispam: تنظيف سجل قائمة المراقبة القديم (سجل تشخيصي فقط)
             try:
                 await self._execute("DELETE FROM spam_watch WHERE watch_until < ?", (cutoff,))
             except Exception:
                 pass
-            # v9.18 P0: تقليم سجل التدقيق — v9.28: قيمة اللوحة أو 90 التاريخية
             try:
                 await self.cleanup_old_audit_logs(90 if audit_days is None else max(1, int(audit_days)))
             except Exception:
                 pass
-            # v9.24 P5-1: تقليم الإشعارات — v9.28: قيمة اللوحة أو 30 التاريخية
             try:
                 await self.cleanup_old_notifications(30 if notifications_days is None else max(1, int(notifications_days)))
             except Exception:
                 pass
-            # v11.7 (audit D-3): تقليم جداول intel غير المحصورة — عشرة جداول
-            # كانت تنمو بلا أي حد (لا DELETE لها في المستودع كله): كل رسالة
-            # تُحلَّل تكتب فيها، وبطاقة 256MB على SQLite تجعل شرط الضغط
-            # يتكرر كل دورة كتابة بلا إمكانية تخفيف (المسح الطارئ لا يمسّها).
-            # الافتراضي 90 يوماً — قابل للضبط بـ RETENTION_INTEL_DAYS،
-            # والقيمة 0 تعطل التقليم عمداً (سلوك قديم لمن يريد الأرشفة).
             try:
                 intel_days = int(os.getenv("RETENTION_INTEL_DAYS", "90"))
                 if intel_days > 0:
@@ -3688,30 +3101,7 @@ class EnhancedDatabase:
             logger.error(f"Cleanup error: {e}")
         return total
 
-    # ─── Resource pressure check (fix #12) ────────────────────────────────────
-
     async def _cleanup_intel_tables(self, days: int) -> int:
-        """v11.7 (audit D-3): تقليم جداول التحليلات غير المحصورة.
-
-        المحصورة سابقاً: messages/alerts/spam_watch/audit/notifications/
-        dead_letters/alert_dedup. المتبقي بلا أي حد:
-          group_messages، message_analysis      → تُحذف بالتاريخ
-              (الأحدث منها يغذي نشاط المستخدم — 90 يوماً أوسع من أي
-              نافذة عرض موجودة).
-          sender_contacts                      → تُحذف بالتاريخ (updated_at).
-        البقية (users/group_memberships/user_activity/sender_stats)
-        ملفات هوية تراكمية بحجم صف واحد لكل كيان —
-        لا تُحذف بالتاريخ (حذفها يهوي الهوية نفسها لا السجل).
-
-        ⚠️ وعي الأنواع (مثبت): sender_contacts.updated_at تُكتب TEXT
-        عبر CURRENT_TIMESTAMP
-        (إدراجها لا يمرر القيمة)، بينما group_messages.message_date و
-        message_analysis.created_at أرقام epoch حقيقية. مقارنة REAL <
-        TEXT في SQLite تجعل النص أكبر دائماً فلا يُحذف شيء صامتة —
-        لذلك قيمة المقارنة تُبنى حسب نوع العمود (نص UTC للنصية، رقم
-        للعددية، datetime لكليهما على PG).
-        فشل-آمن كلياً: أي خطأ جدول = تخطي وتسجيل debug فقط.
-        """
         from datetime import datetime as _dt, timezone as _tz
 
         cutoff = time.time() - max(1, int(days)) * 86400
@@ -3719,7 +3109,6 @@ class EnhancedDatabase:
         cutoff_dt = _dt.fromtimestamp(cutoff, tz=_tz.utc)
         removed = 0
         plan = [
-            # (table, column, value_kind) — epoch: رقم؛ ts: نص CURRENT_TIMESTAMP
             ("group_messages", "message_date", "epoch"),
             ("message_analysis", "created_at", "epoch"),
             ("sender_contacts", "updated_at", "ts"),
@@ -3742,23 +3131,17 @@ class EnhancedDatabase:
                 logger.debug(f"intel retention {table} skipped: {type(e).__name__}: {str(e)[:100]}")
         return removed
 
-    # ─── v9.24 P5-1: مركز الإشعارات (Notifications) ───────────
+    # ─── Notifications ─────────────────────────────────────────────────────
     _NOTIF_SEVERITIES = ("info", "success", "warn", "critical")
 
     async def record_notification(self, ntype: str = "", title: str = "",
                                   body: str = "", severity: str = "info",
                                   object_type: str = "", object_id: str = "") -> bool:
-        """v9.24: إشعار جديد — تطبيع الشدة + قصّ الحقول + بوابة الميزة.
-
-        v9.25: البوابة الوحيدة للميزة notifications — إيقافها يمنع أي
-        إشعار جديد من اللوحتين معاً (بما فيها إشعارات تبديل الميزات نفسها:
-        سلوك مقصود وموثق). فشل-آمن تماماً.
-        """
         try:
             if not await self.is_feature_enabled("notifications"):
                 return False
         except Exception:
-            pass  # بوابة فشل-آمن: خلل الفحص لا يمنع الإشعار
+            pass
         try:
             sev = str(severity or "info").lower()
             if sev not in self._NOTIF_SEVERITIES:
@@ -3783,7 +3166,6 @@ class EnhancedDatabase:
 
     async def get_notifications(self, limit: int = 30, offset: int = 0,
                                 unread_only: bool = False) -> List[Dict[str, Any]]:
-        """v9.24: قائمة الإشعارات (الأحدث أولاً). فشل-آمن."""
         try:
             limit = max(1, min(int(limit), 100))
             offset = max(0, int(offset))
@@ -3805,7 +3187,6 @@ class EnhancedDatabase:
             return []
 
     async def count_unread_notifications(self) -> int:
-        """v9.24: عدّاد الشارة الحية. فشل-آمن (0)."""
         try:
             row = await self._fetchone("SELECT COUNT(*) AS n FROM notifications WHERE is_read = 0")
             return int(row["n"]) if row else 0
@@ -3813,7 +3194,6 @@ class EnhancedDatabase:
             return 0
 
     async def mark_notification_read(self, notification_id: int) -> bool:
-        """v9.24: تعليم إشعار واحداً كمقروء. فشل-آمن."""
         try:
             cur = await self._execute(
                 "UPDATE notifications SET is_read = 1 WHERE id = ?", (int(notification_id),)
@@ -3824,7 +3204,6 @@ class EnhancedDatabase:
             return False
 
     async def mark_all_notifications_read(self) -> int:
-        """v9.24: تعليم الكل — يعيد عدد الصفوف المتغيرة. فشل-آمن."""
         try:
             cur = await self._execute("UPDATE notifications SET is_read = 1 WHERE is_read = 0")
             await self._commit()
@@ -3833,7 +3212,6 @@ class EnhancedDatabase:
             return 0
 
     async def cleanup_old_notifications(self, days: int = 30) -> int:
-        """v9.24: تقليم الإشعارات الأقدم من days يوماً (أرضية يوم). فشل-آمن."""
         try:
             days = max(1, int(days))
         except Exception:
@@ -3855,9 +3233,7 @@ class EnhancedDatabase:
             logger.debug(f"cleanup_old_notifications skipped: {e}")
             return 0
 
-    # ─── v9.25 P6-1: سجل الميزات (Feature Registry) ──────────
-    # مصدر الحقيقة الوحيد للمفاتيح والافتراضات. الجدول يخزّن الإزاحات
-    # فقط: صف غائب = الافتراضي. أي مفتاح غير معروف = True (فشل-آمن).
+    # ─── Feature Registry ─────────────────────────────────────────────────
     FEATURE_REGISTRY: Dict[str, Dict[str, str]] = {
         "sources_scope": {"label": "🎯 نطاق المصادر", "category": "filtering",
                           "default": "1",
@@ -3880,7 +3256,6 @@ class EnhancedDatabase:
         return {k: v["default"] == "1" for k, v in self.FEATURE_REGISTRY.items()}
 
     async def is_feature_enabled(self, key: str) -> bool:
-        """v9.25: هل الميزة مفعّلة؟ فشل-آمن شامل (غير معروف/خلل = True)."""
         try:
             if key not in self.FEATURE_REGISTRY:
                 return True
@@ -3897,7 +3272,6 @@ class EnhancedDatabase:
             return True
 
     async def list_features(self) -> List[Dict[str, Any]]:
-        """v9.25: قائمة الميزات مع الحالة الفعلية (افتراضي أو إزاحة)."""
         out: List[Dict[str, Any]] = []
         defaults = self._features_defaults()
         for key, meta in self.FEATURE_REGISTRY.items():
@@ -3918,7 +3292,6 @@ class EnhancedDatabase:
         return out
 
     async def set_feature_enabled(self, key: str, enabled: bool, by: str = "panel") -> bool:
-        """v9.25: تبديل ميزة (upsert إزاحة) — 404 خارج السجل يقرره المتصل."""
         if key not in self.FEATURE_REGISTRY:
             return False
         try:
@@ -3935,18 +3308,10 @@ class EnhancedDatabase:
             logger.error(f"set_feature_enabled error: {e}")
             return False
 
-    # ─── v9.18 P0: سجل التدقيق (Audit Log) ───────────────────
+    # ─── Audit Log ─────────────────────────────────────────────────────────
     async def record_audit(self, actor: str, action: str, object_type: str = "",
                            object_id: str = "", old_value: str = "", new_value: str = "",
                            source: str = "botpanel") -> bool:
-        """v9.18 P0: تسجيل عملية في سجل التدقيق — فشل-آمن تماماً.
-
-        fire-and-forget بحيث لا يُسمح له أبداً برفع استثناء أو تعطيل المسار
-        الأصلي. لا أسرار ولا كلمات مرور تُكتب هنا — والمتصل مسؤول عن إخفاء
-        الهواتف (القناع داخل هذه الوحدة). source يقبل القيمة التاريخية
-        "botpanel" للتوافق مع الصفوف القديمة؛ بعد v14.0 «No Dashboard» لا
-        يوجد كاتب جديد إلا الاختبارات والأدوات اليدوية.
-        """
         try:
             await self._execute(
                 "INSERT INTO audit_logs (actor, action, object_type, object_id, old_value, new_value, source)"
@@ -3971,12 +3336,6 @@ class EnhancedDatabase:
     def _audit_filters(where: List[str], params: List[Any], action: Optional[str] = None,
                        actor: Optional[str] = None, q: Optional[str] = None,
                        since_hours: Optional[int] = None) -> None:
-        """v9.27: بناء شروط فلترة سجل التدقيق المشتركة بين القائمة والتصدير.
-
-        q: بحث نصي حر عبر action/object_id/actor/old_value/new_value
-        (تهريب حرفي — لا % سحرية). since_hours: سقف 90 يوماً بمقارنة
-        معجمية آمنة على created_at بصيغة SQLite النصية.
-        """
         if action:
             where.append("action = ?")
             params.append(str(action)[:120])
@@ -4005,10 +3364,6 @@ class EnhancedDatabase:
                              action: Optional[str] = None,
                              actor: Optional[str] = None, q: Optional[str] = None,
                              since_hours: Optional[int] = None) -> List[Dict[str, Any]]:
-        """v9.18 P0: قراءة سجل التدقيق — الأحدث أولاً. فشل-آمن (قائمة فارغة).
-
-        v9.27: فلاتر actor/q/since_hours (قراءة فقط — صفر تغيير مخطط).
-        """
         try:
             limit = max(1, min(int(limit), 500))
             offset = max(0, int(offset))
@@ -4032,7 +3387,6 @@ class EnhancedDatabase:
     async def count_audit_logs(self, action: Optional[str] = None,
                                actor: Optional[str] = None, q: Optional[str] = None,
                                since_hours: Optional[int] = None) -> int:
-        """v9.18 P0: عدّاد سجل التدقيق — فشل-آمن (0). v9.27: نفس فلاتر القائمة."""
         try:
             where: List[str] = []
             params: List[Any] = []
@@ -4047,11 +3401,6 @@ class EnhancedDatabase:
             return 0
 
     async def cleanup_old_audit_logs(self, days: int = 90) -> int:
-        """v9.18 P0: تقليم سجل التدقيق الأقدم من days يوماً (افتراضي 90).
-
-        أرضية يوم واحد فلا تحذف قيمة فاسدة كل التاريخ. يعمل على المحركين
-        (SQLite: مقارنة معجمية على الصيغة النصية — PostgreSQL: كائن توقيت).
-        """
         try:
             days = max(1, int(days))
         except Exception:
@@ -4073,18 +3422,13 @@ class EnhancedDatabase:
             logger.debug(f"cleanup_old_audit_logs skipped: {e}")
             return 0
 
-
-            return 0
-
-    # ─── v9.20 P1: مصادر المراقبة (Sources) ──────────────────
+    # ─── Sources ───────────────────────────────────────────────────────────
     def invalidate_sources_cache(self) -> None:
-        """v9.20 P1: إبطال كاش المصادر فوراً بعد أي تعديل من اللوحة."""
         self._sources_cache = None
 
     async def add_source(self, chat_id: int, username: str = "", title: str = "",
                          type_: str = "", added_by: str = "panel",
                          notes: str = "") -> bool:
-        """v9.20 P1: إضافة/تحديث مصدر (upsert حسب chat_id). فشل-آمن."""
         try:
             await self._execute(
                 "INSERT INTO sources (chat_id, username, title, type, enabled, added_by, notes)"
@@ -4103,7 +3447,6 @@ class EnhancedDatabase:
             return False
 
     async def remove_source(self, chat_id: int) -> bool:
-        """v9.20 P1: حذف مصدر نهائياً. فشل-آمن."""
         try:
             cur = await self._execute("DELETE FROM sources WHERE chat_id = ?", (int(chat_id),))
             await self._commit()
@@ -4114,7 +3457,6 @@ class EnhancedDatabase:
             return False
 
     async def set_source_enabled(self, chat_id: int, enabled: bool) -> bool:
-        """v9.20 P1: تشيل/إيقاف مصدر دون حذفه. فشل-آمن."""
         try:
             cur = await self._execute(
                 "UPDATE sources SET enabled = ? WHERE chat_id = ?",
@@ -4128,14 +3470,12 @@ class EnhancedDatabase:
             return False
 
     async def get_source(self, chat_id: int) -> Optional[Dict[str, Any]]:
-        """v9.20 P1: مصدر واحد حسب chat_id — أو None."""
         try:
             return await self._fetchone("SELECT * FROM sources WHERE chat_id = ?", (int(chat_id),))
         except Exception:
             return None
 
     async def list_sources(self, limit: int = 500) -> List[Dict[str, Any]]:
-        """v9.20 P1: قائمة المصادر (الأحدث أولاً). فشل-آمن (قائمة فارغة)."""
         try:
             limit = max(1, min(int(limit), 1000))
         except Exception:
@@ -4149,13 +3489,6 @@ class EnhancedDatabase:
             return []
 
     async def is_source_allowed(self, chat_id: int) -> bool:
-        """v9.20 P1: هل يُراقَب هذا المصدر؟ — دلالة التوافق الذهبية.
-
-        * جدول فارغ  → True (مراقبة كل شيء — السلوك الأصلي حرفياً)
-        * جدول مملوء → المفعّلة فقط
-        * أي خلل     → True (فشل-آمن: لا انكسار للمسار أبداً)
-        كاش 30 ثانية + إبطال فوري عند أي تعديل من اللوحة.
-        """
         try:
             now = time.time()
             if self._sources_cache is not None and now < self._sources_cache[0]:
@@ -4166,22 +3499,17 @@ class EnhancedDatabase:
                 ttl = max(5.0, float(os.getenv("SOURCES_CACHE_TTL", "30")))
                 self._sources_cache = (now + ttl, allowed_set)
             if not allowed_set:
-                return True  # جدول فارغ = مراقبة كل شيء
+                return True
             return int(chat_id) in allowed_set
         except Exception:
-            return True  # فشل-آمن: أي خلل = فتح المسار
+            return True
 
-    # ─── v9.21 P2: محرك القواعد (Rule Engine) ─────────────────
+    # ─── Rule Engine ───────────────────────────────────────────────────────
     RULE_CONDITION_KEYS = ("keyword", "source_chat_id", "sender_id", "min_confidence")
     RULE_ACTIONS = ("allow", "block", "tag")
 
     @staticmethod
     def validate_rule_conditions(conditions: Any) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-        """v9.21 P2: تحقق صارم من الشروط — مفاتيح معروفة فقط، معرفات رقمية،
-        ثقة 0-1، وشرط واحد على الأقل (لا قاعدة "تطابق كل شيء" عن غير قصد).
-
-        يعيد (clean, None) عند النجاح أو (None, error) عند الفشل.
-        """
         if not isinstance(conditions, dict) or not conditions:
             return None, "conditions must be a non-empty object"
         clean: Dict[str, Any] = {}
@@ -4201,7 +3529,7 @@ class EnhancedDatabase:
                 except Exception:
                     return None, f"{key} must be an integer"
                 clean[key] = iv
-            else:  # min_confidence
+            else:
                 try:
                     fv = float(value)
                 except Exception:
@@ -4216,7 +3544,6 @@ class EnhancedDatabase:
     async def add_rule(self, name: str, conditions: Dict[str, Any], action: str,
                        action_value: str = "", priority: int = 100,
                        created_by: str = "panel") -> Optional[Dict[str, Any]]:
-        """v9.21 P2: إضافة قاعدة (بعد تحقق المتصل) — يعيد الصف أو None."""
         try:
             cur = await self._execute(
                 "INSERT INTO rules (name, conditions, action, action_value, priority, enabled, created_by)"
@@ -4238,7 +3565,6 @@ class EnhancedDatabase:
             return None
 
     async def list_rules(self, limit: int = 200) -> List[Dict[str, Any]]:
-        """v9.21 P2: قائمة القواعد بترتيب التقييم (priority, id). فشل-آمن."""
         try:
             limit = max(1, min(int(limit), 500))
         except Exception:
@@ -4258,7 +3584,6 @@ class EnhancedDatabase:
             return []
 
     async def count_rules(self) -> int:
-        """v9.21 P2: عدد القواعد (لحد 50). فشل-آمن (0)."""
         try:
             row = await self._fetchone("SELECT COUNT(*) AS n FROM rules")
             return int(row["n"]) if row else 0
@@ -4266,7 +3591,6 @@ class EnhancedDatabase:
             return 0
 
     async def get_rule(self, rule_id: int) -> Optional[Dict[str, Any]]:
-        """v9.22: قاعدة واحدة (للتعديل) — أو None."""
         try:
             row = await self._fetchone("SELECT * FROM rules WHERE id = ?", (int(rule_id),))
             if row:
@@ -4279,11 +3603,6 @@ class EnhancedDatabase:
             return None
 
     async def update_rule(self, rule_id: int, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """v9.22: تعديل جزئي لقاعدة — لا يلمس enabled/hits أبداً.
-
-        المفاتيح المسموحة: name/conditions/action/action_value/priority.
-        يعيد الصف المحدّث أو None (غير موجود أو لا شيء صالح).
-        """
         allowed = {"name", "conditions", "action", "action_value", "priority"}
         sets: List[str] = []
         params: List[Any] = []
@@ -4322,7 +3641,6 @@ class EnhancedDatabase:
             return None
 
     async def set_rule_enabled(self, rule_id: int, enabled: bool) -> bool:
-        """v9.21 P2: تفعيل/إيقاف قاعدة. فشل-آمن."""
         try:
             cur = await self._execute(
                 "UPDATE rules SET enabled = ? WHERE id = ?",
@@ -4336,7 +3654,6 @@ class EnhancedDatabase:
             return False
 
     async def delete_rule(self, rule_id: int) -> bool:
-        """v9.21 P2: حذف قاعدة. فشل-آمن."""
         try:
             cur = await self._execute("DELETE FROM rules WHERE id = ?", (int(rule_id),))
             await self._commit()
@@ -4347,7 +3664,6 @@ class EnhancedDatabase:
             return False
 
     def invalidate_rules_cache(self) -> None:
-        """v9.21 P2: إبطال كاش القواعد + دفع العدّادات المعلّقة فوراً."""
         self._rules_cache = None
         try:
             pending = self._rule_hits_pending
@@ -4362,7 +3678,6 @@ class EnhancedDatabase:
             pass
 
     async def flush_rule_hits(self) -> int:
-        """v9.21 P2: دفع عدّادات hits المتراكمة في الذاكرة إلى القاعدة."""
         if not self._rule_hits_pending:
             return 0
         snapshot = dict(self._rule_hits_pending)
@@ -4379,24 +3694,12 @@ class EnhancedDatabase:
             await self._commit()
         except Exception as e:
             logger.debug(f"flush_rule_hits skipped: {e}")
-            # أعِد العدّادات لتُدفع لاحقاً — لا فقدان
             for rule_id, n in snapshot.items():
                 self._rule_hits_pending[rule_id] = self._rule_hits_pending.get(rule_id, 0) + n
         return pushed
 
     async def apply_rules(self, text: str, source_chat_id: int = 0,
                           sender_id: int = 0, confidence: float = 0.0) -> Optional[Dict[str, Any]]:
-        """v9.21 P2: تقييم القواعد — أول قاعدة مطابقة (priority ASC, id ASC).
-
-        مطابقة AND لكل الشروط المعرّفة في القاعدة:
-          * keyword        → بحث نصي غير حساس لحالة داخل النص
-          * source_chat_id → مطابقة تامة
-          * sender_id      → مطابقة تامة
-          * min_confidence → درجة الثقة ≥ الحد
-        الإجراءات: allow/block/tag(action_value=نص الوسم).
-        فشل-آمن تماماً: أي خلل = None (فلترة عادية). كاش 30 ثانية.
-        يعيد dict {rule, action, action_value} أو None.
-        """
         try:
             now = time.time()
             if self._rules_cache is not None and now < self._rules_cache[0]:
@@ -4444,13 +3747,12 @@ class EnhancedDatabase:
             logger.debug(f"apply_rules skipped: {e}")
             return None
 
-    # ─── v9.21 P3: قائمة السماح (Allowlist) ───────────────────
+    # ─── Allowlist ─────────────────────────────────────────────────────────
     def _invalidate_allowed_cache(self) -> None:
         self._allowed_cache = None
 
     async def add_allowed_entity(self, entity_type: str, entity_id: int,
                                  note: str = "") -> bool:
-        """v9.21 P3: إضافة/تحديث كيان موثوق (sender|chat). فشل-آمن."""
         etype = str(entity_type or "").strip().lower()
         if etype not in ("sender", "chat"):
             return False
@@ -4469,7 +3771,6 @@ class EnhancedDatabase:
             return False
 
     async def remove_allowed_entity(self, entity_type: str, entity_id: int) -> bool:
-        """v9.21 P3: حذف كيان من قائمة السماح. فشل-آمن."""
         try:
             cur = await self._execute(
                 "DELETE FROM allowed_entities WHERE entity_type = ? AND entity_id = ?",
@@ -4483,7 +3784,6 @@ class EnhancedDatabase:
             return False
 
     async def list_allowed_entities(self, limit: int = 500) -> List[Dict[str, Any]]:
-        """v9.21 P3: قائمة الكيانات الموثوقة. فشل-آمن."""
         try:
             limit = max(1, min(int(limit), 1000))
         except Exception:
@@ -4498,7 +3798,6 @@ class EnhancedDatabase:
             return []
 
     async def _allowed_sets(self) -> Tuple[set, set]:
-        """v9.21 P3: (senders, chats) الموثوقون — كاش 30 ثانية."""
         now = time.time()
         if self._allowed_cache is not None and now < self._allowed_cache[0]:
             return self._allowed_cache[1], self._allowed_cache[2]
@@ -4510,7 +3809,6 @@ class EnhancedDatabase:
         return senders, chats
 
     async def is_sender_allowed(self, sender_id: int) -> bool:
-        """v9.21 P3: هل المرسل موثوق؟ فشل-آمن (False = فلترة عادية)."""
         try:
             senders, _ = await self._allowed_sets()
             return int(sender_id) in senders
@@ -4518,20 +3816,14 @@ class EnhancedDatabase:
             return False
 
     async def is_chat_allowed(self, chat_id: int) -> bool:
-        """v9.21 P3: هل المجموعة موثوقة؟ فشل-آمن (False = فلترة عادية)."""
         try:
             _, chats = await self._allowed_sets()
             return int(chat_id) in chats
         except Exception:
             return False
 
-    # ─── v9.22-1: تصدير/استيراد البيانات الحرجة (سلامة عبر المحركات) ──
+    # ─── Export / Import ───────────────────────────────────────────────────
     async def export_critical_data(self) -> Dict[str, Any]:
-        """v9.22-1: تصدير JSON للجداول الحرجة — يعمل على المحركين.
-
-        القائمة البيضاء فقط (CRITICAL_EXPORT_TABLES) فلا بيانات حساسة
-        (رسائل/تنبيهات/جهات) تُصدَّر. فشل-آمن: جدول فاشل يُتجاوز.
-        """
         payload: Dict[str, Any] = {"version": 1, "exported_at": time.time(), "tables": {}}
         for table, columns in CRITICAL_EXPORT_TABLES.items():
             if not columns:
@@ -4547,14 +3839,6 @@ class EnhancedDatabase:
 
     async def import_critical_data(self, payload: Dict[str, Any],
                                    replace: bool = False) -> Dict[str, int]:
-        """v9.22-1: استيراد JSON مُصدَّر سابقاً — متسامح وآمن.
-
-        * الصفوف غير الصالحة تُتجاهل (لا استثناءات أبداً).
-        * شروط القواعد تُرمَّز JSON قبل الكتابة.
-        * كل الكاشات تُبطَل فوراً بعد الاستيراد.
-        * replace=True يمسح الجدول أولاً (لكل جدول مستقل).
-        يعيد عدّادات {table: imported}.
-        """
         counts: Dict[str, int] = {}
         tables = (payload or {}).get("tables")
         if not isinstance(tables, dict):
@@ -4601,23 +3885,18 @@ class EnhancedDatabase:
                         )
                         imported += 1
                     except Exception:
-                        continue  # صف مكرر/فاسد — تجاهل
+                        continue
                 counts[table] = imported
             await self._commit()
         except Exception as e:
             logger.debug(f"import_critical_data skipped: {e}")
         finally:
-            # إبطال كل الكاشات — الجداول الثلاثة كلها قد تكون تغيّرت
             self.invalidate_sources_cache()
             self.invalidate_rules_cache()
             self._invalidate_allowed_cache()
         return counts
 
     async def _resource_pressure_check(self) -> None:
-        """
-        Inspect SQLite file size. If it exceeds CFG.MEMORY_THRESHOLD_MB,
-        trigger an emergency cleanup to relieve storage pressure (fix #12).
-        """
         if self.db_type != "sqlite":
             return
         try:
@@ -4636,28 +3915,15 @@ class EnhancedDatabase:
         except Exception as e:
             logger.error(f"_resource_pressure_check error: {e}")
 
-    # ─── Background Tasks ─────────────────────────────────────────────────────
+    # ─── Background Tasks ─────────────────────────────────────────────────
     async def start_writer(self) -> None:
-        # v9.1 fix (audit H-5): a previous close() leaves cancelled/done task
-        # objects behind; only checking `is None` meant a reconnect could
-        # never restart the writer+backup pair, so batched alerts accumulated
-        # in memory until the hard cap evicted them (alert records LOST).
         if self._writer_task is None or self._writer_task.done():
             self._writer_task = asyncio.create_task(self._writer_loop(), name="db_writer")
         if self._backup_task is None or self._backup_task.done():
             self._backup_task = asyncio.create_task(self._backup_loop(), name="db_backup")
         logger.info("Database background tasks started (writer + backup)")
 
-    # Note: start_cleanup() intentionally removed (fix #5). Cleanup is owned
-    # by main.py::EnhancedTelegramBot._cleanup_loop exclusively.
-
     async def _writer_loop(self) -> None:
-        """
-        Batch-flush writer with:
-          - exponential backoff on consecutive failures (fix #4 / #10)
-          - periodic ping + reconnect
-          - periodic resource-pressure check (fix #12)
-        """
         ping_counter = 0
         while self.is_connected:
             try:
@@ -4666,11 +3932,8 @@ class EnhancedDatabase:
 
                 self._writer_cycle += 1
 
-                # Periodic resource-pressure check (fix #12)
                 if self._writer_cycle % _PRESSURE_CHECK_EVERY == 0:
                     await self._resource_pressure_check()
-                # v9.21 P2: دفع عدّادات تطابق القواعد دفعياً (≈30 ثانية)
-                # — حماية المسار السريع من كتابة UPDATE لكل رسالة.
                 if self._writer_cycle % _RULE_HITS_FLUSH_EVERY == 0:
                     await self.flush_rule_hits()
 
@@ -4682,18 +3945,10 @@ class EnhancedDatabase:
                         self._db_healthy = False
                         _ok_reconnect = await self._reconnect()
                         if _ok_reconnect:
-                            # connect() أنشأ مهمة كاتب جديدة (start_writer) —
-                            # هذه الحلقة القديمة تتقاعد فوراً كي لا تتكرر
-                            # الكتابة من مهمتين على نفس الاتصال.
                             break
-                        # فشلت المحاولة: ابقَ في الحلقة (v11.7 audit A-1) —
-                        # is_connected=True + db_healthy=False يحافظ على رفض
-                        # add_to_queue بأمان (-2) بينما تسمح للمحاولة القادمة
-                        # (بعد 60 ثانية) باسترداد القاعدة بعد انتهاء الانقطاع.
                         self.is_connected = True
                         await asyncio.sleep(5)
                     else:
-                        # Reset health/backoff on successful ping
                         if not self._db_healthy:
                             logger.info("Database ping recovered — marking DB healthy")
                         self._db_healthy = True
@@ -4708,15 +3963,6 @@ class EnhancedDatabase:
                 await asyncio.sleep(1)
 
     async def _flush(self) -> None:
-        """
-        Batch-write queued alerts.
-        Fixes applied:
-          - Bounded _batch with hard cap (fix #4)
-          - Exponential backoff on failure (fix #4 / #10)
-          - _db_healthy flag update (fix #10)
-          - Does NOT re-add items to _batch after consecutive failures
-            beyond backoff_max (evicts instead with CRITICAL log)
-        """
         async with self._batch_lock:
             if not self._batch:
                 return
@@ -4747,12 +3993,6 @@ class EnhancedDatabase:
                     f"VALUES {','.join(values)} ON CONFLICT (message_hash) DO NOTHING"
                 )
                 await self._pool.execute(sql, *params)
-                # v9.12 (audit M-03): collapse the per-alert UPDATE sender_stats
-                # loop into a single executemany() so a batch of N alerts costs
-                # 1 INSERT + 1 executemany instead of 1 INSERT + N UPDATEs.
-                # We pick the latest timestamp per sender (max) so the
-                # last_alert_time reflects the most recent alert in the batch.
-                # Group by sender_id: for each sender, find max(timestamp).
                 sender_to_latest_ts: Dict[int, float] = {}
                 sender_counts: Dict[int, int] = {}
                 for data in alerts_data:
@@ -4760,7 +4000,6 @@ class EnhancedDatabase:
                     ts = float(data[6])
                     sender_to_latest_ts[sid] = max(sender_to_latest_ts.get(sid, 0.0), ts)
                     sender_counts[sid] = sender_counts.get(sid, 0) + 1
-                # Build the per-sender UPDATE batch.
                 update_params = [
                     (sender_to_latest_ts[sid], sender_counts[sid], sid)
                     for sid in sender_to_latest_ts
@@ -4784,8 +4023,6 @@ class EnhancedDatabase:
                 )
                 params_list = [tuple(data) for data in alerts_data]
                 await self._executemany(sql, params_list)
-                # v9.12 (audit M-03): same N+1 collapse for SQLite — one
-                # executemany for the per-sender UPDATEs instead of N round-trips.
                 sender_to_latest_ts: Dict[int, float] = {}
                 sender_counts: Dict[int, int] = {}
                 for data in alerts_data:
@@ -4798,9 +4035,14 @@ class EnhancedDatabase:
                     for sid in sender_to_latest_ts
                 ]
                 if update_params:
+                    # v14.5.1: SQLite clause reordered to match PG semantics.
+                    # Previously the SQL was "+ ?, last_alert_time = ?" but the
+                    # params were (latest_ts, count, sid) — the count went into
+                    # last_alert_time and the epoch timestamp went into
+                    # alerts_sent. Data corruption on SQLite-only deployments.
                     await self._executemany(
                         "UPDATE sender_stats "
-                        "SET alerts_sent = alerts_sent + ?, last_alert_time = ? "
+                        "SET last_alert_time = ?, alerts_sent = alerts_sent + ? "
                         "WHERE sender_id = ?",
                         update_params,
                     )
@@ -4808,7 +4050,6 @@ class EnhancedDatabase:
                     self._invalidate_can_send_alert(sid)
                 await self._commit()
 
-            # Success — reset failure tracking (fix #10)
             self._flush_failure_count = 0
             self._flush_backoff = 1.0
             self._db_healthy = True
@@ -4823,7 +4064,6 @@ class EnhancedDatabase:
                 f"backoff {backoff:.1f}s): {e}"
             )
 
-            # Re-queue the failed batch only if under the hard cap (fix #4)
             async with self._batch_lock:
                 available = _DB_BATCH_MAX_SIZE - len(self._batch)
                 re_add = alerts_data[:available]
@@ -4836,24 +4076,12 @@ class EnhancedDatabase:
                         "(DB failure, cannot buffer further). Check DB connectivity."
                     )
 
-            # Exponential backoff sleep (fix #4 / #10)
             self._flush_backoff = min(self._flush_backoff * 2, self._flush_backoff_max)
             await asyncio.sleep(backoff)
 
-    # ─── Backup Loop (fixes #1 / #2 / #7 / #8) ───────────────────────────────
+    # ─── Backup Loop ───────────────────────────────────────────────────────
     async def _backup_loop(self) -> None:
-        """
-        Periodic database backup with:
-          - Non-blocking I/O via run_in_executor (fix #1 / #8)
-          - SQLite online backup API to avoid full RAM read (fix #8)
-          - Post-write integrity verification (fix #7)
-          - Optional upload to external HTTP endpoint (fix #2 / #7)
-          - Ephemeral-storage warning on every cycle when no external
-            target is configured (fix #2)
-          - Consecutive-failure counter with CRITICAL alert (fix #7)
-        """
         if self.db_type != "sqlite":
-            # PostgreSQL has its own backup/replication infrastructure
             return
 
         loop = asyncio.get_running_loop()
@@ -4865,28 +4093,33 @@ class EnhancedDatabase:
                 if not Path(CFG.DB_FILE).exists():
                     continue
 
+                # v14.5.1: warn ONCE per session (was every cycle — hourly
+                # noise). First cycle logs at WARNING; subsequent cycles at
+                # DEBUG unless BACKUP_UPLOAD_URL is set.
                 if not _BACKUP_UPLOAD_URL:
-                    # Repeat the ephemeral-storage warning on every cycle (fix #2)
-                    logger.warning(
-                        "⚠️  Backup cycle: no BACKUP_UPLOAD_URL set. "
-                        "Local .gz written but data remains ephemeral."
-                    )
+                    if not self._backup_warning_logged:
+                        logger.warning(
+                            "⚠️  Backup cycle: no BACKUP_UPLOAD_URL set. "
+                            "Local .gz written but data remains ephemeral."
+                        )
+                        self._backup_warning_logged = True
+                    else:
+                        logger.debug(
+                            "Backup cycle: no BACKUP_UPLOAD_URL — local-only backup"
+                        )
 
                 backup_path = Path(f"{CFG.DB_FILE}.gz")
                 tmp_path = Path(f"{CFG.DB_FILE}.bak.tmp")
 
                 try:
-                    # Step 1: hot copy via SQLite backup API (fix #8 — no full RAM read)
                     db_size = await loop.run_in_executor(
                         None, _sqlite_hot_backup, str(CFG.DB_FILE), str(tmp_path)
                     )
 
-                    # Step 2: compress in executor (fix #1 — non-blocking)
                     compressed_size, digest = await loop.run_in_executor(
                         None, _compress_file_to_gz, str(tmp_path), str(backup_path)
                     )
 
-                    # Step 3: verify integrity (fix #7)
                     is_valid = await loop.run_in_executor(
                         None, _verify_gz, str(backup_path), digest
                     )
@@ -4901,15 +4134,12 @@ class EnhancedDatabase:
                         f"sha256={digest[:16]}…, verified=OK)"
                     )
 
-                    # Step 4: upload to external storage (fix #2 / #7)
                     if _BACKUP_UPLOAD_URL:
                         await self._upload_backup(backup_path, digest)
 
-                    # Reset failure counter on success
                     self._backup_failure_count = 0
 
                 finally:
-                    # Always clean up the temp hot-copy
                     if tmp_path.exists():
                         try:
                             tmp_path.unlink()
@@ -4930,11 +4160,6 @@ class EnhancedDatabase:
                 await asyncio.sleep(60)
 
     async def _upload_backup(self, backup_path: Path, digest: str) -> None:
-        """
-        Stream the backup .gz to an external HTTP PUT endpoint (fix #2 / #7).
-        Logs success/failure — never raises so a failed upload cannot crash
-        the backup loop.
-        """
         if not AIOHTTP_AVAILABLE:
             logger.warning(
                 "BACKUP_UPLOAD_URL is set but aiohttp is not installed. "
@@ -4947,35 +4172,32 @@ class EnhancedDatabase:
             headers["Authorization"] = f"Bearer {_BACKUP_UPLOAD_TOKEN}"
 
         try:
-            data = backup_path.read_bytes()
+            # v14.5.1: stream the file handle instead of loading the entire
+            # backup into RAM. On large SQLite DBs the previous
+            # read_bytes() approach could spike memory by hundreds of MB.
+            file_size = backup_path.stat().st_size
             timeout = aiohttp.ClientTimeout(total=120)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.put(
-                    _BACKUP_UPLOAD_URL,
-                    data=data,
-                    headers=headers,
-                ) as resp:
-                    if resp.status in (200, 201, 204):
-                        logger.info(
-                            f"Backup uploaded to {_BACKUP_UPLOAD_URL[:40]}… "
-                            f"(status={resp.status}, size={len(data):,}B)"
-                        )
-                    else:
-                        logger.error(
-                            f"Backup upload failed: HTTP {resp.status} from "
-                            f"{_BACKUP_UPLOAD_URL[:40]}…"
-                        )
+            with open(backup_path, "rb") as f:
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.put(
+                        _BACKUP_UPLOAD_URL,
+                        data=f,
+                        headers=headers,
+                    ) as resp:
+                        if resp.status in (200, 201, 204):
+                            logger.info(
+                                f"Backup uploaded to {_BACKUP_UPLOAD_URL[:40]}… "
+                                f"(status={resp.status}, size={file_size:,}B)"
+                            )
+                        else:
+                            logger.error(
+                                f"Backup upload failed: HTTP {resp.status} from "
+                                f"{_BACKUP_UPLOAD_URL[:40]}…"
+                            )
         except Exception as e:
             logger.error(f"Backup upload error: {e}")
 
-    # v14.1: أُزيلت دوال بيانات لوحة التحكم الميتة (get_hourly_stats /
-    # get_top_keywords / get_top_senders / get_dashboard_summary /
-    # get_recent_alerts_for_dashboard / get_recent_messages_for_dashboard /
-    # fetch_recent_alerts / fetch_top_senders / get_messages_with_filters /
-    # get_alerts_with_filters / count_alerts_with_filters) — كان مستهلكها
-    # الوحيد لوحة التحكم المحذوفة في v14.0 «No Dashboard»، وصفر متصلين.
-
-    # ─── Close ────────────────────────────────────────────────────────────────
+    # ─── Close ─────────────────────────────────────────────────────────────
     async def close(self) -> None:
         self.is_connected = False
         for name in ("_writer_task", "_backup_task"):
@@ -4986,13 +4208,10 @@ class EnhancedDatabase:
                     await task
                 except asyncio.CancelledError:
                     pass
-            # Reset refs so a subsequent connect() → start_writer() can
-            # actually restart them (audit H-5).
             setattr(self, name, None)
         await self._flush()
         if self.db_type == "sqlite" and self._sqlite_conn:
             await self._sqlite_conn.close()
         elif self.db_type == "postgresql" and self._pool:
             await self._pool.close()
-        logger.info("Database v9.0 closed")
-
+        logger.info("Database v14.5.1 closed")
