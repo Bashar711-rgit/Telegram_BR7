@@ -1,9 +1,36 @@
 #!/usr/bin/env python3
 """
-sender_resolver.py — Sender Intelligence / Sender Contact Resolver v1.0.0
+sender_resolver.py — Sender Intelligence / Sender Contact Resolver v14.5.1
 ==========================================================================
 
 طبقة استخلاص وتطبيع وحفظ وحلّ بيانات المرسل (Backend ONLY).
+
+v14.5.1 — correction pass:
+  * _USERNAME_RE aligned to {4,31} (5-32 chars) matching nav_resolver
+    v14.5.1. The previous {3,31} accepted 4-char shapes (e.g. "abcd") as
+    valid usernames — Telegram rejects those. parse_telegram_link now
+    agrees with nav_resolver.is_valid_username instead of silently
+    disagreeing (a link parsed as "valid" would be rejected by the
+    downstream validator).
+  * _USERNAME_RE is precompiled at module load (no lazy init, no local
+    `import re` inside the function). Thread-safe by construction.
+  * New is_valid_username() helper — exports the same validation shape
+    nav_resolver uses, so any internal caller can validate without
+    reaching into the regex.
+  * build_message_link now validates the username before building the
+    URL (previously built t.me/abcd/123 from a 4-char handle). Matches
+    nav_resolver.build_canonical_links' guard.
+  * build_display_name fallback is now "مرسل غير محدد" (matching
+    contact_target v14.5.1 / v11.7.1 privacy rule). The old
+    "مستخدم ({sender_id})" contradicted the "SAME output" claim in the
+    docstring: contact_target's canonical version never leaks numeric
+    IDs into the visible card.
+  * resolve_message honors the global FloodWait cooldown at start
+    (previously only resolve_entity checked — resolve_message kept
+    burning API calls during the cooldown window, each of which
+    produced another FloodWaitError and inflated counters).
+  * __version__ = "14.5.1" (docstring said v1.0.0, module said 2.0.0,
+    project is 14.5.1 — three numbers, none correct).
 
 CORE PRINCIPLE — capture at arrival:
     event → event.sender → extract (SYNC, never raises) → persist →
@@ -48,6 +75,7 @@ from __future__ import annotations
 
 import asyncio
 import random
+import re
 import time
 from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass, field
@@ -69,7 +97,7 @@ from telethon.tl.types import InputPeerUser
 
 from config import CFG
 
-__version__ = "2.0.0"
+__version__ = "14.5.1"
 
 
 # =============================================================================
@@ -152,6 +180,12 @@ def _status_label(status: Any) -> Optional[str]:
     return label
 
 
+# v14.5.1: precompiled at module load — no lazy init, no inner import re.
+# {4,31} = 5-32 chars total (1 leading + 4..31 following). Telegram rejects
+# <5; the previous {3,31} accepted 4-char shapes and produced dead links.
+_USERNAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{4,31}$")
+
+
 def _clean_username(value: Any) -> Optional[str]:
     """Normalize a Telegram username: strip @, drop empties/long-ids.
 
@@ -165,6 +199,15 @@ def _clean_username(value: Any) -> Optional[str]:
     if clean.isdigit():
         return None
     return clean
+
+
+def is_valid_username(value: Any) -> bool:
+    """v14.5.1: True only for shapes Telegram accepts as public usernames
+    (5-32 chars, letter-initial). Mirrors nav_resolver.is_valid_username —
+    kept local because importing nav_resolver here would create a cycle
+    (nav_resolver imports from this module)."""
+    clean = _clean_username(value)
+    return bool(clean) and bool(_USERNAME_RE.match(clean))
 
 
 def extract_sender(entity: Any) -> Dict[str, Any]:
@@ -265,9 +308,19 @@ def meta_to_contact_fields(data: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def build_display_name(first_name: Optional[str], last_name: Optional[str], sender_id: int = 0) -> str:
-    """Mirror of the existing _send_alert display-name rule (SAME output)."""
+    """Sender display name for the alert card.
+
+    v14.5.1: fallback is now "مرسل غير محدد" (matching contact_target.py
+    v14.5.1 / the v11.7.1 privacy rule — no numeric IDs are surfaced in
+    the visible card). The previous "مستخدم ({sender_id})" contradicted
+    the "SAME output as _send_alert" claim in the docstring: the current
+    alert builder never leaks numeric IDs, so this mirror was drifting.
+
+    `sender_id` is retained in the signature for backward compatibility
+    (callers may still pass it); it is no longer used in the fallback.
+    """
     name = f"{first_name or ''} {last_name or ''}".strip()
-    return name or f"مستخدم ({sender_id})"
+    return name or "مرسل غير محدد"
 
 
 # =============================================================================
@@ -283,9 +336,6 @@ class ParsedLink:
     chat_id: Optional[int] = None           # resolved -100<inner_id> form
     invite_hash: Optional[str] = None
     reason: Optional[FailureReason] = None
-
-
-_USERNAME_RE = None  # compiled lazily
 
 
 def parse_telegram_link(link: str) -> ParsedLink:
@@ -304,14 +354,10 @@ def parse_telegram_link(link: str) -> ParsedLink:
     Tolerated: trailing slash, query string, fragment. NOTE: an invite
     link does NOT imply the session can join — access depends on account
     permissions (checked at resolve time, never bypassed).
-    """
-    global _USERNAME_RE
-    import re
-    if _USERNAME_RE is None:
-        # v11.8.2 (F-27): موحد مع nav_resolver/message_context على {3,31}
-        # (حد تيليجرام 32 حرفاً) — كان {3,63} غير متسق مع البقية.
-        _USERNAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{3,31}$")
 
+    v14.5.1: uses the module-level precompiled _USERNAME_RE ({4,31} =
+    5-32 chars, aligned with nav_resolver v14.5.1).
+    """
     if not link or not isinstance(link, str):
         return ParsedLink(raw=str(link or ""), kind="invalid", reason=FailureReason.INVALID_LINK)
     raw = link.strip()
@@ -482,10 +528,13 @@ class SenderResolver:
 
     @staticmethod
     def build_message_link(chat_id: Optional[int], message_id: int, username: Optional[str] = None) -> Dict[str, str]:
-        """Mirror of monitors.build_telegram_links (identical output shapes)."""
+        """Mirror of nav_resolver.build_canonical_links — v14.5.1 validates
+        the username before building (the previous version accepted any
+        string and could emit t.me/abcd/123 for a 4-char handle)."""
         links = {"group": "#", "message": "#"}
-        if username:
-            clean = username.lstrip("@")
+        clean = username if is_valid_username(username) else None
+        if clean:
+            clean = clean.lstrip("@")
             links["group"] = f"https://t.me/{clean}"
             links["message"] = f"https://t.me/{clean}/{message_id}"
             return links
@@ -809,9 +858,19 @@ class SenderResolver:
           message exists, message.id == requested id, message chat matches
         the expected chat. Returns ResolveResult(message=...) or a precise
         internal failure reason.
+
+        v14.5.1: honors the resolver-wide FloodWait cooldown at the top
+        (previously only resolve_entity checked it, so resolve_message kept
+        burning API calls during the cooldown and each one produced another
+        FloodWaitError and inflated the counters).
         """
         started = time.perf_counter()
         self._inc("message_resolve_attempts")
+        # v14.5.1: flood cooldown gate — same behavior as resolve_entity.
+        if self._in_flood_cooldown():
+            self._inc("message_resolve_failure")
+            self._time("resolve_message", None, chat_id, message_id, 0, started, "fail", FailureReason.FLOOD_WAIT)
+            return ResolveResult(reason=FailureReason.FLOOD_WAIT, attempts=0)
         try:
             chat_entity = entity
             if chat_entity is None and parsed_link is not None:
