@@ -1,6 +1,25 @@
 #!/usr/bin/env python3
 """
-alert_bot.py - v11.2 Alert Bot - نظام مراسلة المرسل + واجهة التنبيهات الموحدة.
+alert_bot.py - v14.5.1 Alert Bot - نظام مراسلة المرسل + واجهة التنبيهات الموحدة.
+
+v14.5.1 — correction pass:
+  * _fill_from_context treats `0` as "missing" for numeric fields
+    (sender_id / message_id / chat_id / topic_id). Previously
+    `merged.get("sender_id") in (None, "", "#")` evaluated to False for
+    `0` — so a caller that put sender_id=0 in data (meaning "unknown")
+    blocked the fill-from-context path even when context.sender.user_id
+    knew the sender. Result: alerts lost the "مراسلة" button for no
+    reason. Now 0 is correctly treated as absent for numeric keys.
+  * _get_session is guarded by an asyncio.Lock. Two concurrent send()
+    calls hitting a cold session used to each create a ClientSession,
+    leaking one. The double-checked lock closes that.
+  * asyncio.TimeoutError now surfaces as "timeout" instead of the
+    misleading "timeout_attempt_N" (attempt is always 1 — we return
+    immediately on the first timeout, so the suffix suggested a retry
+    that did not exist).
+  * Header button-order comment aligned with the actual output
+    [ مراسلة ] [ عرض الرسالة ] (the code and docstrings already used
+    this order; only the header said the opposite).
 
 v11.2 (طلب المستخدم — نظام مراسلة المرسل): ContactTarget هو المصدر الوحيد
 لاختيار رابط المرسل (username ← user_id ← لا شيء) — الاسم والزر يشتركان في
@@ -17,7 +36,7 @@ v11.2 (طلب المستخدم — نظام مراسلة المرسل): ContactT
     (سطر فارغ)
     {النص الأصلي كاملاً - بلا حذف أجزاء وبلا إطار/اقتباس}
 
-    [ عرض الرسالة ] [ مراسلة ]   ← لوحة Inline فعلية أسفل التنبيه
+    [ مراسلة ] [ عرض الرسالة ]   ← لوحة Inline فعلية أسفل التنبيه
 
   * بلا رموز 👤/💬 وبلا <blockquote> — النص الأصلي يظهر كما ورد (الأسطر
     واللغة والرموز التعبيرية والروابط)، مهرباً HTML فقط كي تُعرض وسوم
@@ -123,7 +142,9 @@ from message_context import (  # noqa: E402
 )
 
 BOT_API_BASE = "https://api.telegram.org"
-# حد تيليجرام الأقصى لنص الرسالة — الحاجز الوحيد المسموح لتقصير المحتوى
+# حد تيليجرام الأقصى لنص الرسالة — الحاجز الوحيد المسموح لتقصير المحتوى.
+# ملاحظة v14.5.1: هذا حدّ تيليجرام الصلب؛ طبقة unified_alerts/card.py قد
+# تقصّ أكثر إلى CFG.ALERT_CARD_MAX_CHARS (افتراضي 4000) قبل أي إرسال.
 TELEGRAM_MAX_TEXT_LEN = 4096
 
 # ══ القالب الموحد — نصوص ثابتة (لا تُغيَّر: عقد واجهة) ══
@@ -132,7 +153,7 @@ TELEGRAM_MAX_TEXT_LEN = 4096
 MSG_LINK_UNAVAILABLE = "غير متاح"  # محتفظ به للتوافق الخلفي (لم يعد في النص)
 
 # نصوص الزرين (v11.6) — صف واحد بالترتيب الحرفي للمواصفة:
-#     [ عرض الرسالة ] [ مراسلة ]
+#     [ مراسلة ] [ عرض الرسالة ]
 BTN_CONTACT = "مراسلة"
 BTN_VIEW = "عرض الرسالة"
 
@@ -429,7 +450,13 @@ def _ctxv(section: Any, key: str) -> Any:
 def _fill_from_context(data: Dict[str, Any], context: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """v11.7.1 (المهمة §5.3): املأ مفاتيح data الغائبة من كائن السياق —
     fill-if-absent حصراً: المستدعون القدامى بلا سياق كما هم، والحقول
-    الموجودة في data تبقى المرجع (القيم المحلّلة تتفوق)."""
+    الموجودة في data تبقى المرجع (القيم المحلّلة تتفوق).
+
+    v14.5.1: للـحقول الرقمية (sender_id / message_id / chat_id / topic_id)
+    القيمة 0 تعني "غائب" — كانت تُعتبر موجودة فيمنع التعبئة من السياق،
+    فيخسر المرسل زر المراسلة رغم أن السياق يعرفه. الآن 0 يُعامَل كـ None
+    لهذه المفاتيح فقط.
+    """
     if not isinstance(context, dict):
         return data
     try:
@@ -449,10 +476,21 @@ def _fill_from_context(data: Dict[str, Any], context: Optional[Dict[str, Any]]) 
             ("chat_username", _ctxv(c, "chat_username")),
             ("topic_id", _ctxv(c, "topic_id")),
         )
+        # v14.5.1: المفاتيح الرقمية تُعامِل 0 كـ "غائب"
+        _numeric_keys = ("sender_id", "message_id", "chat_id", "topic_id")
         for k, v in pairs:
             if v is None:
                 continue
-            if merged.get(k) in (None, "", "#"):
+            existing = merged.get(k)
+            if k in _numeric_keys:
+                missing = (
+                    existing is None
+                    or existing == ""
+                    or (isinstance(existing, (int, float)) and existing == 0)
+                )
+            else:
+                missing = existing is None or existing == "" or existing == "#"
+            if missing:
                 merged[k] = v
         return merged
     except Exception:
@@ -656,13 +694,22 @@ class AlertBot:
         # v11.8.1 (F-24): جلسة HTTP دائمة — كانت _post تفتح TLS handshake
         # جديداً لكل استدعاء (getMe/sendMessage/...) — إهدار زمن ومآخذ.
         self._session: Optional[Any] = None
+        # v14.5.1: قفل إنشاء الجلسة — استدعاءان متزامنان على جلسة باردة
+        # كانا يُنشئان جلستين ويُسرّبان واحدة.
+        self._session_lock = asyncio.Lock()
 
     async def _get_session(self) -> Any:
-        """جلسة مشتركة معاد استخدامها (F-24) — يُعاد إنشاؤها إن أُغلقت."""
+        """جلسة مشتركة معاد استخدامها (F-24) — يُعاد إنشاؤها إن أُغلقت.
+
+        v14.5.1: فحص مزدوج تحت قفل — race سابق بين async send() calls
+        كان يُنشئ جلستين متزامنتين ويُسرّب واحدة.
+        """
         if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=self.timeout)
-            )
+            async with self._session_lock:
+                if self._session is None or self._session.closed:
+                    self._session = aiohttp.ClientSession(
+                        timeout=aiohttp.ClientTimeout(total=self.timeout)
+                    )
         return self._session
 
     async def aclose(self) -> None:
@@ -774,7 +821,7 @@ class AlertBot:
         sanitize_tg: bool = False,
     ) -> Dict[str, Any]:
         """حمولة sendMessage — الدالة المركزية build_alert_buttons تبني
-        صف الأزرار الموحد [ عرض الرسالة ][ مراسلة ] (v11.6).
+        صف الأزرار الموحد [ مراسلة ][ عرض الرسالة ] (v11.6).
         الزر بلا بيانات لا يُعرض إطلاقاً؛ include_user_button=False بعد
         رفض tg://user (يسقط زر «مراسلة» فقط)؛ sanitize_tg=True بعد رفض
         عام للوحة (يحذف أزرار tg:// ويبقي t.me الصالحة عالمياً)."""
@@ -895,7 +942,10 @@ class AlertBot:
             try:
                 status, body = await self._post("sendMessage", payload)
             except asyncio.TimeoutError:
-                return False, "", f"timeout_attempt_{attempt}"
+                # v14.5.1: الرسالة السابقة كانت f"timeout_attempt_{attempt}"
+                # رغم أن return فوري (attempt دائماً 1) — توحي بإعادة محاولة
+                # غير موجودة.
+                return False, "", "timeout"
             except Exception as e:
                 return False, "", f"network_error:{type(e).__name__}"
 
