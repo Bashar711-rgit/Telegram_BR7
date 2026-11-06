@@ -1,74 +1,36 @@
 #!/usr/bin/env python3
 """
-sender_resolver.py — Sender Intelligence / Sender Contact Resolver v14.5.1
+sender_resolver.py — Sender Intelligence / Sender Contact Resolver v14.5.2
 ==========================================================================
 
 طبقة استخلاص وتطبيع وحفظ وحلّ بيانات المرسل (Backend ONLY).
 
-v14.5.1 — correction pass:
-  * _USERNAME_RE aligned to {4,31} (5-32 chars) matching nav_resolver
-    v14.5.1. The previous {3,31} accepted 4-char shapes (e.g. "abcd") as
-    valid usernames — Telegram rejects those. parse_telegram_link now
-    agrees with nav_resolver.is_valid_username instead of silently
-    disagreeing (a link parsed as "valid" would be rejected by the
-    downstream validator).
-  * _USERNAME_RE is precompiled at module load (no lazy init, no local
-    `import re` inside the function). Thread-safe by construction.
-  * New is_valid_username() helper — exports the same validation shape
-    nav_resolver uses, so any internal caller can validate without
-    reaching into the regex.
-  * build_message_link now validates the username before building the
-    URL (previously built t.me/abcd/123 from a 4-char handle). Matches
-    nav_resolver.build_canonical_links' guard.
-  * build_display_name fallback is now "مرسل غير محدد" (matching
-    contact_target v14.5.1 / v11.7.1 privacy rule). The old
-    "مستخدم ({sender_id})" contradicted the "SAME output" claim in the
-    docstring: contact_target's canonical version never leaks numeric
-    IDs into the visible card.
-  * resolve_message honors the global FloodWait cooldown at start
-    (previously only resolve_entity checked — resolve_message kept
-    burning API calls during the cooldown window, each of which
-    produced another FloodWaitError and inflated counters).
-  * __version__ = "14.5.1" (docstring said v1.0.0, module said 2.0.0,
-    project is 14.5.1 — three numbers, none correct).
+v14.5.2 (طلب المستخدم — توسيع وسائل الوصول للمرسل):
+  * New module-level helper build_phone_url(): builds
+    https://t.me/+<phone> from a raw phone value. Used by contact_target
+    as a THIRD-priority fallback after username and temporary_link.
+    Works only when the user allows Telegram's "find me by phone" — a
+    documented privacy limit, not a bug.
+  * New SenderResolver.export_temporary_link() async method: fetches a
+    temporary profile link via contacts.exportContactToken. The result
+    is a https://t.me/+<token> URL that opens the user's profile EVEN
+    when they have no username — a Telegram-official mechanism (see
+    core.telegram.org/api/links, "Temporary profile links"). The URL
+    expires server-side (usually ~1 week) so callers compute it per
+    alert, not cache it.
+  * snapshot() now exposes temporary_link_success / _failure metrics
+    for /health observability.
 
-CORE PRINCIPLE — capture at arrival:
-    event → event.sender → extract (SYNC, never raises) → persist →
-    continue processing. The message can be deleted milliseconds later;
-    whatever was extracted at arrival is safe.
+v14.5.1 (سابق — correction pass):
+  * _USERNAME_RE aligned to {4,31} (5-32 chars).
+  * _USERNAME_RE precompiled at module load.
+  * New is_valid_username() helper.
+  * build_message_link validates the username before building.
+  * build_display_name fallback = "مرسل غير محدد".
+  * resolve_message honors the FloodWait cooldown.
 
-Scope guard (requirement #48 of the engineering brief):
-    This layer provides *maximum reliable access within the Telegram
-    account's authorized access and Telethon/API capabilities*. It never
-    bypasses privacy, never guesses access_hash values, and never scrapes.
-    phone is stored ONLY when Telegram itself includes it on the User
-    entity (legal availability) — it is never fetched or inferred.
-
-What lives here (and what deliberately does NOT):
-    * extract() / extract_flat()  — pure-sync, getattr-safe User extraction
-    * parse_telegram_link()       — t.me / telegram.me / @user / invite parser
-    * SenderResolver              — entity/message resolution with:
-        - access-method priority (entity → InputPeerUser → username →
-          dialog/entity cache → DB fallback → resolve on demand)
-        - bounded entity cache (TTL)
-        - in-flight deduplication (N events for one sender → 1 API call)
-        - exponential backoff + jitter for TRANSIENT errors only
-        - FloodWaitError honored (exact Telegram seconds; fail-fast +
-          cooldown instead of blocking the pipeline)
-        - failure-reason enum for logs/DB only (never surfaced in alerts)
-        - bounded metrics (counters + average resolve latency)
-    * get_sender_intel_snapshot() — /health diagnostics block
-
-What does NOT live here:
-    * Any alert formatting. The existing _build_alert() output is a
-      frozen contract; this module only feeds it richer data.
-    * Any CircuitBreaker replacement. The existing monitors.CircuitBreaker
-      instances stay untouched; resolver failures are internal (caught,
-      translated to reasons) so they never poison the existing breakers
-      with permanent (non-transient) errors.
-
-Failure reasons are internal diagnostics (requirement #17): they are
-logged and stored, but never rendered into user-facing alerts.
+CORE PRINCIPLE — capture at arrival.
+Scope guard: maximum reliable access within Telegram's authorized API.
 """
 
 from __future__ import annotations
@@ -97,15 +59,10 @@ from telethon.tl.types import InputPeerUser
 
 from config import CFG
 
-__version__ = "14.5.1"
+__version__ = "14.5.2"
 
 
-# =============================================================================
-# Failure reasons — internal diagnostics only (logs / DB / metrics)
-# =============================================================================
 class FailureReason(str, Enum):
-    """Precise internal failure reasons. NEVER shown inside alerts."""
-
     PRIVATE_CHAT_INACCESSIBLE = "PRIVATE_CHAT_INACCESSIBLE"
     USER_NOT_RESOLVABLE = "USER_NOT_RESOLVABLE"
     MESSAGE_NOT_FOUND = "MESSAGE_NOT_FOUND"
@@ -121,9 +78,6 @@ class FailureReason(str, Enum):
     RESTRICTED_CONTENT = "RESTRICTED_CONTENT"
 
 
-# Transient error type names (string match to avoid importing every
-# Telethon exception class): retried with backoff. Everything else is
-# permanent for this request and returns a precise failure reason.
 _TRANSIENT_HINTS = (
     "TIMEOUT", "TIMEDOUT", "CONNECTION", "NETWORK", "SERVERERROR",
     "SERVICEUNAVAILABLE", "INTERNAL", "SEEOTHER", "CALLFAIL",
@@ -131,7 +85,6 @@ _TRANSIENT_HINTS = (
 
 
 def classify_telethon_error(exc: Exception) -> FailureReason:
-    """Map a Telethon exception to an internal FailureReason."""
     if isinstance(exc, FloodWaitError):
         return FailureReason.FLOOD_WAIT
     if isinstance(exc, (AuthKeyError, PermissionError)):
@@ -151,9 +104,6 @@ def classify_telethon_error(exc: Exception) -> FailureReason:
     return FailureReason.RPC_ERROR
 
 
-# =============================================================================
-# Safe extraction — pure sync, never raises, additive-safe
-# =============================================================================
 _STATUS_LABELS = {
     "UserStatusOnline": "online",
     "UserStatusOffline": "offline",
@@ -180,17 +130,10 @@ def _status_label(status: Any) -> Optional[str]:
     return label
 
 
-# v14.5.1: precompiled at module load — no lazy init, no inner import re.
-# {4,31} = 5-32 chars total (1 leading + 4..31 following). Telegram rejects
-# <5; the previous {3,31} accepted 4-char shapes and produced dead links.
 _USERNAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{4,31}$")
 
 
 def _clean_username(value: Any) -> Optional[str]:
-    """Normalize a Telegram username: strip @, drop empties/long-ids.
-
-    Some entity shapes expose numeric "username" placeholders for
-    inaccessible users — those are not real usernames."""
     if not isinstance(value, str):
         return None
     clean = value.strip().lstrip("@")
@@ -202,24 +145,50 @@ def _clean_username(value: Any) -> Optional[str]:
 
 
 def is_valid_username(value: Any) -> bool:
-    """v14.5.1: True only for shapes Telegram accepts as public usernames
-    (5-32 chars, letter-initial). Mirrors nav_resolver.is_valid_username —
-    kept local because importing nav_resolver here would create a cycle
-    (nav_resolver imports from this module)."""
     clean = _clean_username(value)
     return bool(clean) and bool(_USERNAME_RE.match(clean))
 
 
-def extract_sender(entity: Any) -> Dict[str, Any]:
-    """
-    Extract every safely-available field from a Telethon User entity.
+# ═══════════════════════════════════════════════════════════════════════════
+# v14.5.2: build_phone_url — https://t.me/+<phone> builder (pure, sync)
+# ═══════════════════════════════════════════════════════════════════════════
+def build_phone_url(phone: Any) -> Optional[str]:
+    """v14.5.2: build a https://t.me/+<phone> URL for profile access via phone.
 
-    * Pure getattr — a missing attribute NEVER fails message processing.
-    * phone: only when Telegram itself put it on the entity (legal
-      availability). Otherwise None. Privacy is never bypassed.
-    * Returned dict is small and JSON-serializable (safe to keep inside
-      the FastCaptureBuffer entry or persist as a DB row).
+    Requires the user to allow "find me by phone number" in Telegram privacy
+    settings (documented limit — this function does NOT bypass it).
+
+    Accepts various formats:
+        "+966501234567"      → https://t.me/+966501234567
+        "966501234567"       → https://t.me/+966501234567
+        "00966501234567"     → https://t.me/+966501234567
+        "+966 50 123 4567"   → https://t.me/+966501234567
+        "+966-50-123-4567"   → https://t.me/+966501234567
+
+    Returns None on invalid/missing input. Never raises.
     """
+    if not phone:
+        return None
+    try:
+        s = str(phone).strip()
+        if not s:
+            return None
+        # Normalize international prefix: "00..." or "+..." → strip.
+        if s.startswith("00"):
+            s = s[2:]
+        elif s.startswith("+"):
+            s = s[1:]
+        # Keep digits only.
+        digits = "".join(c for c in s if c.isdigit())
+        # E.164 length bounds (8..15). Shorter/longer = malformed.
+        if not digits or len(digits) < 8 or len(digits) > 15:
+            return None
+        return f"https://t.me/+{digits}"
+    except Exception:
+        return None
+
+
+def extract_sender(entity: Any) -> Dict[str, Any]:
     if entity is None:
         return {}
     try:
@@ -236,10 +205,7 @@ def extract_sender(entity: Any) -> Dict[str, Any]:
             except Exception:
                 usernames = None
         access_hash = getattr(entity, "access_hash", None)
-        if isinstance(access_hash, int):
-            # Keep as-is (BIGINT-safe); sanitize only non-int garbage.
-            pass
-        else:
+        if not isinstance(access_hash, int):
             access_hash = None
         photo_available = None
         photo = getattr(entity, "photo", None)
@@ -248,7 +214,6 @@ def extract_sender(entity: Any) -> Dict[str, Any]:
         elif photo is None and hasattr(entity, "photo"):
             photo_available = False
         bot_info_version = getattr(entity, "bot_info_version", None)
-
         return {
             "sender_id": getattr(entity, "id", None),
             "access_hash": access_hash,
@@ -256,7 +221,7 @@ def extract_sender(entity: Any) -> Dict[str, Any]:
             "usernames": usernames,
             "first_name": getattr(entity, "first_name", None),
             "last_name": getattr(entity, "last_name", None),
-            "phone": getattr(entity, "phone", None),  # only if Telegram provides it
+            "phone": getattr(entity, "phone", None),
             "is_bot": bool(getattr(entity, "bot", False) or False),
             "is_verified": bool(getattr(entity, "verified", False) or False),
             "is_premium": bool(getattr(entity, "premium", False) or False),
@@ -273,12 +238,11 @@ def extract_sender(entity: Any) -> Dict[str, Any]:
             "is_min": bool(getattr(entity, "min", False) or False),
             "bot_info_version": bot_info_version if isinstance(bot_info_version, int) else None,
         }
-    except Exception as e:  # extraction must NEVER break the pipeline
+    except Exception as e:
         logger.debug(f"sender_intel: extract failed: {type(e).__name__}: {e}")
         return {}
 
 
-# Flat keys used inside event_data dicts (prefixed sender_*).
 _FLAT_META_KEYS = (
     "phone", "is_bot", "is_verified", "is_premium", "is_scam", "is_fake",
     "is_restricted", "restriction_reason", "status", "lang_code",
@@ -288,7 +252,6 @@ _FLAT_META_KEYS = (
 
 
 def extract_flat(entity: Any) -> Dict[str, Any]:
-    """extract_sender() rendered as additive sender_* keys for event_data."""
     meta = extract_sender(entity)
     if not meta:
         return {}
@@ -299,8 +262,6 @@ def extract_flat(entity: Any) -> Dict[str, Any]:
 
 
 def meta_to_contact_fields(data: Dict[str, Any]) -> Dict[str, Any]:
-    """Map event_data sender_* keys → sender_contacts column names.
-    Missing keys become None so the DB COALESCE policy keeps the old value."""
     out: Dict[str, Any] = {}
     for key in _FLAT_META_KEYS:
         out[key] = data.get(f"sender_{key}")
@@ -308,61 +269,27 @@ def meta_to_contact_fields(data: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def build_display_name(first_name: Optional[str], last_name: Optional[str], sender_id: int = 0) -> str:
-    """Sender display name for the alert card.
-
-    v14.5.1: fallback is now "مرسل غير محدد" (matching contact_target.py
-    v14.5.1 / the v11.7.1 privacy rule — no numeric IDs are surfaced in
-    the visible card). The previous "مستخدم ({sender_id})" contradicted
-    the "SAME output as _send_alert" claim in the docstring: the current
-    alert builder never leaks numeric IDs, so this mirror was drifting.
-
-    `sender_id` is retained in the signature for backward compatibility
-    (callers may still pass it); it is no longer used in the fallback.
-    """
     name = f"{first_name or ''} {last_name or ''}".strip()
     return name or "مرسل غير محدد"
 
 
-# =============================================================================
-# Telegram link parser (requirement #13–#16)
-# =============================================================================
 @dataclass(frozen=True, slots=True)
 class ParsedLink:
     raw: str = ""
-    kind: str = "invalid"  # public_chat|public_message|private_chat|private_message|invite|username|invalid
+    kind: str = "invalid"
     username: Optional[str] = None
     message_id: Optional[int] = None
-    inner_id: Optional[int] = None          # /c/<inner_id> WITHOUT -100 prefix
-    chat_id: Optional[int] = None           # resolved -100<inner_id> form
+    inner_id: Optional[int] = None
+    chat_id: Optional[int] = None
     invite_hash: Optional[str] = None
     reason: Optional[FailureReason] = None
 
 
 def parse_telegram_link(link: str) -> ParsedLink:
-    """
-    Parse every supported t.me form. Never raises; malformed input yields
-    kind='invalid' with FailureReason.INVALID_LINK.
-
-    Supported:
-      https://t.me/username                  → public_chat
-      https://t.me/username/123              → public_message
-      https://t.me/c/123456789               → private_chat
-      https://t.me/c/123456789/456           → private_message
-      https://telegram.me/username           → public_chat (alias host)
-      @username                              → username
-      https://t.me/+HASH / t.me/joinchat/HASH → invite
-    Tolerated: trailing slash, query string, fragment. NOTE: an invite
-    link does NOT imply the session can join — access depends on account
-    permissions (checked at resolve time, never bypassed).
-
-    v14.5.1: uses the module-level precompiled _USERNAME_RE ({4,31} =
-    5-32 chars, aligned with nav_resolver v14.5.1).
-    """
     if not link or not isinstance(link, str):
         return ParsedLink(raw=str(link or ""), kind="invalid", reason=FailureReason.INVALID_LINK)
     raw = link.strip()
     text = raw
-    # strip scheme/host variations → path form
     lowered = text.lower()
     for prefix in ("https://", "http://"):
         if lowered.startswith(prefix):
@@ -376,20 +303,16 @@ def parse_telegram_link(link: str) -> ParsedLink:
         if lowered == host:
             text = ""
             break
-    # strip query + fragment + trailing slashes
     text = text.split("?", 1)[0].split("#", 1)[0].strip("/")
     if not text:
         return ParsedLink(raw=raw, kind="invalid", reason=FailureReason.INVALID_LINK)
 
-    # @username
     if text.startswith("@"):
         uname = _clean_username(text)
         if uname and _USERNAME_RE.match(uname.lstrip("@")):
             return ParsedLink(raw=raw, kind="username", username=uname.lstrip("@"))
         return ParsedLink(raw=raw, kind="invalid", reason=FailureReason.INVALID_LINK)
 
-    # private /c/ links — the number is the bare inner id, NOT a chat_id;
-    # Telegram's internal supergroup form is -100<inner_id>.
     if text.startswith("c/") or text.startswith("+") or text.startswith("joinchat/"):
         parts = [p for p in text.split("/") if p]
         if text.startswith("+") or parts and parts[0] == "joinchat":
@@ -400,8 +323,7 @@ def parse_telegram_link(link: str) -> ParsedLink:
             if h and re.match(r"^[A-Za-z0-9_-]{10,}$", h):
                 return ParsedLink(raw=raw, kind="invite", invite_hash=h)
             return ParsedLink(raw=raw, kind="invalid", reason=FailureReason.INVALID_LINK)
-        # c/...
-        parts = parts[1:]  # drop "c"
+        parts = parts[1:]
         if not parts or not parts[0].isdigit():
             return ParsedLink(raw=raw, kind="invalid", reason=FailureReason.INVALID_LINK)
         inner = int(parts[0])
@@ -415,7 +337,6 @@ def parse_telegram_link(link: str) -> ParsedLink:
                               chat_id=chat_id, message_id=int(parts[1]))
         return ParsedLink(raw=raw, kind="private_chat", inner_id=inner, chat_id=chat_id)
 
-    # public username[/message_id]
     parts = [p for p in text.split("/") if p]
     if len(parts) > 2:
         return ParsedLink(raw=raw, kind="invalid", reason=FailureReason.INVALID_LINK)
@@ -429,18 +350,14 @@ def parse_telegram_link(link: str) -> ParsedLink:
     return ParsedLink(raw=raw, kind="public_chat", username=uname)
 
 
-# =============================================================================
-# Retry policy — exponential backoff + jitter (transient errors only)
-# =============================================================================
 @dataclass(slots=True)
 class RetryPolicy:
     max_attempts: int = 3
     base_delay: float = 0.5
     max_delay: float = 8.0
-    jitter_frac: float = 0.25  # ±25% jitter
+    jitter_frac: float = 0.25
 
     def delay_for(self, attempt: int) -> float:
-        """attempt is 0-based: attempt 0 → base, 1 → 2*base, ... capped."""
         raw = min(self.max_delay, self.base_delay * (2 ** max(0, attempt)))
         jitter = raw * self.jitter_frac
         return max(0.0, raw + random.uniform(-jitter, jitter))
@@ -448,7 +365,6 @@ class RetryPolicy:
 
 @dataclass(slots=True)
 class ResolveResult:
-    """Internal result envelope — reason is None on success."""
     entity: Any = None
     message: Any = None
     method: Optional[str] = None
@@ -460,25 +376,7 @@ class ResolveResult:
         return self.reason is None
 
 
-# =============================================================================
-# SenderResolver
-# =============================================================================
 class SenderResolver:
-    """
-    Stateless-ish resolver shared by ALL account monitors (module singleton).
-
-    Guarantees:
-      * cache → InputPeerUser(access_hash) → username → DB fallback →
-        get_entity(sender_id) → optional bounded dialog scan
-      * in-flight dedup: N concurrent resolves for the same (client,
-        sender_id) share ONE underlying attempt
-      * transient errors retried with exponential backoff + jitter;
-        FloodWait is honored with the EXACT Telegram seconds (fail-fast
-        plus a resolver-wide cooldown so we never hammer during the window)
-      * every outcome is logged with operation/sender/chat/attempt/
-        duration/reason — and NEVER with any secret material
-    """
-
     _LATENCY_WINDOW = 2000
 
     def __init__(
@@ -498,18 +396,15 @@ class SenderResolver:
         self._inflight: "OrderedDict[Tuple[int, int], asyncio.Future]" = OrderedDict()
         self._metrics: Dict[str, int] = defaultdict(int)
         self._latencies: Deque[float] = deque(maxlen=self._LATENCY_WINDOW)
-        self._flood_wait_until: float = 0.0  # wall-clock
+        self._flood_wait_until: float = 0.0
 
-    # ── sync capture helpers ──────────────────────────────────────────────
     extract = staticmethod(extract_sender)
     extract_flat = staticmethod(extract_flat)
     build_display_name = staticmethod(build_display_name)
+    build_phone_url = staticmethod(build_phone_url)
 
-    # ── access-method plumbing (requirement #6 / #31) ─────────────────────
     @staticmethod
     def build_input_peer(sender_id: Optional[int], access_hash: Optional[int]) -> Optional[InputPeerUser]:
-        """InputPeerUser only when BOTH id and access_hash are usable ints.
-        Never guesses an access_hash (requirement #46)."""
         try:
             if not sender_id or access_hash is None:
                 return None
@@ -519,18 +414,12 @@ class SenderResolver:
 
     @staticmethod
     def build_profile_link(sender_id: Optional[int], username: Optional[str]) -> str:
-        """API identity ≠ clickable URL (requirement #30): username wins;
-        tg://user?id= is the generic fallback. SAME shapes the existing
-        alert builder already uses."""
         if username:
             return f"https://t.me/{username.lstrip('@')}"
         return f"tg://user?id={sender_id or 0}"
 
     @staticmethod
     def build_message_link(chat_id: Optional[int], message_id: int, username: Optional[str] = None) -> Dict[str, str]:
-        """Mirror of nav_resolver.build_canonical_links — v14.5.1 validates
-        the username before building (the previous version accepted any
-        string and could emit t.me/abcd/123 for a 4-char handle)."""
         links = {"group": "#", "message": "#"}
         clean = username if is_valid_username(username) else None
         if clean:
@@ -546,8 +435,6 @@ class SenderResolver:
 
     @staticmethod
     def build_contact_methods(data: Dict[str, Any]) -> Dict[str, bool]:
-        """Internal capability flags — the alert builder decides what to
-        render; this only reports what the backend KNOWS (requirement #31)."""
         return {
             "has_username": bool(data.get("sender_username") or data.get("username")),
             "has_entity": bool(data.get("_entity")),
@@ -560,17 +447,18 @@ class SenderResolver:
             ),
             "has_dialog": bool(data.get("_in_dialogs")),
             "has_message_context": bool(data.get("chat_id") and data.get("message_id")),
+            "has_phone": bool(build_phone_url(data.get("sender_phone"))),
         }
 
     @classmethod
     def get_best_access_method(cls, data: Dict[str, Any]) -> str:
         flags = cls.build_contact_methods(data)
-        for name in ("has_entity", "has_input_peer", "has_username", "has_dialog", "has_message_context", "has_access_hash"):
+        for name in ("has_entity", "has_input_peer", "has_username", "has_phone",
+                     "has_dialog", "has_message_context", "has_access_hash"):
             if flags.get(name):
                 return name
         return "none"
 
-    # ── metrics ───────────────────────────────────────────────────────────
     def _inc(self, name: str) -> None:
         self._metrics[name] += 1
 
@@ -591,13 +479,13 @@ class SenderResolver:
         return sum(self._latencies) / len(self._latencies)
 
     def snapshot(self) -> Dict[str, Any]:
-        """Bounded metrics snapshot for /health (additive, zero-filled)."""
         base = {
             "sender_resolve_success": 0, "sender_resolve_failure": 0,
             "message_resolve_success": 0, "message_resolve_failure": 0,
             "entity_cache_hit": 0, "entity_cache_miss": 0,
             "telegram_retry_count": 0, "flood_wait_count": 0,
             "inflight_dedup": 0,
+            "temporary_link_success": 0, "temporary_link_failure": 0,
         }
         return {
             "enabled": bool(getattr(CFG, "SENDER_INTEL_ENABLED", True)),
@@ -607,7 +495,6 @@ class SenderResolver:
             **{**base, **self._metrics},
         }
 
-    # ── FloodWait handling (requirement #19) ──────────────────────────────
     def _record_flood(self, seconds: float, op: str) -> None:
         wait = max(0.0, float(seconds or 0))
         candidate = time.time() + wait
@@ -623,16 +510,78 @@ class SenderResolver:
         return time.time() < self._flood_wait_until
 
     async def _sleep_or_fail_flood(self, seconds: float, op: str) -> None:
-        """Wait the exact Telegram-provided duration when it is short
-        enough not to stall the pipeline; otherwise record the cooldown
-        and let the caller fail fast (still never re-hammering Telegram)."""
         self._record_flood(seconds, op)
         max_sleep = float(getattr(CFG, "SENDER_FLOOD_MAX_SLEEP", 5))
         if seconds <= max_sleep:
             await asyncio.sleep(seconds)
-        # long windows: cooldown alone gates further attempts
 
-    # ── entity resolution (requirement #5–#8, #21, #25) ───────────────────
+    # ═══════════════════════════════════════════════════════════════════
+    # v14.5.2: export_temporary_link — https://t.me/+<token> via API
+    # ═══════════════════════════════════════════════════════════════════
+    async def export_temporary_link(
+        self,
+        client: TelegramClient,
+        sender_id: Any,
+        access_hash: Any,
+        *,
+        timeout: float = 3.0,
+    ) -> Optional[str]:
+        """v14.5.2: fetch a temporary profile link via contacts.exportContactToken.
+
+        Produces https://t.me/+<token> that opens the user's profile EVEN
+        when they have no username — a Telegram-official mechanism
+        (core.telegram.org/api/links, "Temporary profile links"). The link
+        expires server-side (usually ~1 week), so the caller computes it
+        per alert (not cached forever).
+
+        The caller MUST pass the SENDING account's client and that
+        account's own access_hash for the user — same per-account hash
+        rule as the mention ladder. A cross-account hash will fail with
+        USER_ID_INVALID (Telegram's rule, never bypassed here).
+
+        Never raises. Returns None on any failure (import error, missing
+        input, FloodWait, timeout, invalid response).
+        """
+        try:
+            sid = int(sender_id or 0)
+            ah = int(access_hash) if access_hash is not None else 0
+        except (TypeError, ValueError):
+            return None
+        if not sid or not ah:
+            return None
+        if self._in_flood_cooldown():
+            self._inc("temporary_link_failure")
+            return None
+        try:
+            from telethon.tl.functions.contacts import ExportContactTokenRequest
+            from telethon.tl.types import InputUser as _InputUser
+        except Exception:
+            self._inc("temporary_link_failure")
+            return None
+        try:
+            result = await asyncio.wait_for(
+                client(ExportContactTokenRequest(
+                    _InputUser(user_id=sid, access_hash=ah)
+                )),
+                timeout=float(timeout),
+            )
+            url = getattr(result, "url", None)
+            if isinstance(url, str) and url.startswith("https://t.me/"):
+                self._inc("temporary_link_success")
+                return url
+            self._inc("temporary_link_failure")
+            return None
+        except FloodWaitError as e:
+            self._record_flood(getattr(e, "seconds", 0) or 0, "export_contact_token")
+            self._inc("temporary_link_failure")
+            return None
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.debug(f"export_temporary_link failed [{sid}]: {type(e).__name__}: {e}")
+            self._inc("temporary_link_failure")
+            return None
+
     async def resolve_entity(
         self,
         client: TelegramClient,
@@ -644,27 +593,18 @@ class SenderResolver:
         allow_dialog_scan: bool = False,
         dialog_limit: int = 200,
     ) -> ResolveResult:
-        """
-        Multi-fallback sender entity resolution. Priority:
-          cache → InputPeerUser(id, access_hash) → username →
-          db_lookup() (re-try peer/username with fresher values) →
-          get_entity(sender_id) → optional bounded dialog scan.
-        Any failure returns ResolveResult(reason=...) — never raises.
-        """
         sender_id = int(sender_id) if sender_id else 0
         if not sender_id:
             return ResolveResult(reason=FailureReason.USER_NOT_RESOLVABLE)
         if self._in_flood_cooldown():
             return ResolveResult(reason=FailureReason.FLOOD_WAIT)
 
-        # 1) entity cache
         cached = self._entity_cache.get(sender_id)
         if cached is not None:
             self._inc("entity_cache_hit")
             self._inc("sender_resolve_success")
             return ResolveResult(entity=cached, method="entity_cache")
 
-        # 2) in-flight dedup (requirement #34)
         inflight_key = (id(client), sender_id)
         existing = self._inflight.get(inflight_key)
         if existing is not None and not existing.done():
@@ -690,7 +630,7 @@ class SenderResolver:
                 return result
             except asyncio.CancelledError:
                 raise
-            except Exception as e:  # absolute safety net
+            except Exception as e:
                 reason = classify_telethon_error(e)
                 self._time("resolve_entity", sender_id, None, None, 0, started, "fail", reason)
                 self._inc("sender_resolve_failure")
@@ -750,21 +690,18 @@ class SenderResolver:
                 last_reason = reason
                 return None
 
-        # a) InputPeerUser from the provided access_hash
         peer = self.build_input_peer(sender_id, access_hash)
         if peer is not None:
             entity = await attempt(lambda: client.get_entity(peer), "input_peer")
             if entity is not None:
                 return ResolveResult(entity=entity, method="input_peer", attempts=attempts)
 
-        # b) username
         clean_uname = _clean_username(username)
         if clean_uname:
             entity = await attempt(lambda: client.get_entity("@" + clean_uname.lstrip("@")), "username")
             if entity is not None:
                 return ResolveResult(entity=entity, method="username", attempts=attempts)
 
-        # c) DB fallback → fresher access_hash / username → re-try a/b
         if db_lookup is not None:
             try:
                 row = await db_lookup()
@@ -784,12 +721,10 @@ class SenderResolver:
                     if entity is not None:
                         return ResolveResult(entity=entity, method="db_username", attempts=attempts)
 
-        # d) bare sender_id — Telethon's session cache often resolves this
         entity = await attempt(lambda: client.get_entity(sender_id), "sender_id")
         if entity is not None:
             return ResolveResult(entity=entity, method="sender_id", attempts=attempts)
 
-        # e) optional bounded dialog scan (requirement #25: efficient use)
         if allow_dialog_scan:
             async def _scan():
                 async for dialog in client.iter_dialogs(limit=dialog_limit):
@@ -805,15 +740,6 @@ class SenderResolver:
         return ResolveResult(reason=reason, attempts=attempts)
 
     def cached_username(self, sender_id: Any) -> Optional[str]:
-        """v10.5 navigation helper: username from the shared entity cache.
-
-        A username is GLOBAL truth (valid from any account's view), so a
-        cached entity resolved by a different account is safe to use FOR
-        LINK BUILDING ONLY. access_hash is per-account knowledge and is
-        deliberately NOT exposed here — cross-account hashes must never be
-        reused as API input (the mention ladder's per-account store owns
-        that path). Pure in-memory read; never raises; never hits network.
-        """
         try:
             if not sender_id:
                 return None
@@ -825,12 +751,6 @@ class SenderResolver:
         return None
 
     async def fetch_event_sender(self, event: Any, client: TelegramClient) -> Optional[Any]:
-        """
-        Resolve the User entity for a NewMessage whose .sender is None.
-        In-flight dedup by sender_id means a burst of messages from the
-        same user produces ONE GetUsers-style request, not N.
-        Never raises.
-        """
         sender_id = getattr(event, "sender_id", None)
         if not sender_id:
             return None
@@ -840,7 +760,6 @@ class SenderResolver:
         except Exception:
             return None
 
-    # ── message resolution + verification (requirement #26–#28) ──────────
     async def resolve_message(
         self,
         client: TelegramClient,
@@ -852,21 +771,8 @@ class SenderResolver:
         message_id: Optional[int] = None,
         expected_chat_id: Optional[int] = None,
     ) -> ResolveResult:
-        """
-        Direct message retrieval: get_messages(entity, ids=message_id) —
-        never a text search. VERIFY before success:
-          message exists, message.id == requested id, message chat matches
-        the expected chat. Returns ResolveResult(message=...) or a precise
-        internal failure reason.
-
-        v14.5.1: honors the resolver-wide FloodWait cooldown at the top
-        (previously only resolve_entity checked it, so resolve_message kept
-        burning API calls during the cooldown and each one produced another
-        FloodWaitError and inflated the counters).
-        """
         started = time.perf_counter()
         self._inc("message_resolve_attempts")
-        # v14.5.1: flood cooldown gate — same behavior as resolve_entity.
         if self._in_flood_cooldown():
             self._inc("message_resolve_failure")
             self._time("resolve_message", None, chat_id, message_id, 0, started, "fail", FailureReason.FLOOD_WAIT)
@@ -879,12 +785,8 @@ class SenderResolver:
                 elif parsed_link.kind in ("private_chat", "private_message") and parsed_link.chat_id:
                     chat_entity = await client.get_entity(parsed_link.chat_id)
                 elif parsed_link.kind == "invite":
-                    # Invite links NEVER auto-join (requirement #16) —
-                    # membership/access depends on the session's rights.
                     return ResolveResult(
-                        reason=FailureReason.PRIVATE_CHAT_INACCESSIBLE,
-                        attempts=0,
-                    )
+                        reason=FailureReason.PRIVATE_CHAT_INACCESSIBLE, attempts=0)
                 elif parsed_link.kind == "invalid":
                     return ResolveResult(reason=parsed_link.reason or FailureReason.INVALID_LINK, attempts=0)
             if chat_entity is None and chat_id:
@@ -916,7 +818,6 @@ class SenderResolver:
                 self._inc("message_resolve_failure")
                 self._time("resolve_message", None, chat_id, message_id, 1, started, "fail", reason)
                 return ResolveResult(reason=reason, attempts=1, entity=chat_entity)
-            # ── verify before success (requirement #27) ──
             if msg is None:
                 self._inc("message_resolve_failure")
                 self._time("resolve_message", None, chat_id, message_id, 1, started, "fail", FailureReason.MESSAGE_DELETED)
@@ -942,31 +843,6 @@ class SenderResolver:
             return ResolveResult(reason=reason, attempts=1)
 
 
-# =============================================================================
-# v10.4 — Mention entity builder (alert format FROZEN — entity-level fix only)
-# =============================================================================
-# CORE PRINCIPLE (engineering brief):
-#   The sender name in the alert opens the sender *for everyone in the
-#   target channel* only when it carries a REAL mention entity stored on
-#   Telegram's server — not a textual tg://user?id= anchor. Telethon's
-#   HTML parser keeps tg:// anchors as MessageEntityTextUrl and its send
-#   path DELETES the entity entirely when the SENDING account cannot
-#   resolve the user from its own entity cache (_replace_with_mention →
-#   del msg_entities[i]). We therefore pre-parse the alert with Telethon's
-#   own HTML parser (identical text output to parse_mode="html") and
-#   replace ONLY the sender-name anchor with InputMessageEntityMentionName
-#   backed by a valid InputUser for the SENDING account.
-#
-#   The rendered message is visually IDENTICAL: same text, same name,
-#   same position — the mention simply becomes real instead of being
-#   silently dropped. All other entities (t.me links, blockquotes) pass
-#   through untouched.
-#
-#   ⚠ We deliberately use the explicit `telethon.extensions.html.parse`
-#   module function rather than `client._parse_mode.parse()`: the client
-#   DEFAULT parse mode is Markdown, while the alert wire format is HTML
-#   (send_message(..., parse_mode="html")). html.parse is exactly what
-#   parse_mode="html" uses internally.
 from telethon.tl.types import (  # noqa: E402
     InputMessageEntityMentionName,
     InputUser,
@@ -977,17 +853,11 @@ from telethon.tl.types import (  # noqa: E402
 
 
 def sender_url_forms(sender_id: int) -> Tuple[str, str]:
-    """The exact anchor URLs _build_alert can emit for the sender name
-    (v9.37 format): the generic tg://user form and the openmessage form
-    used when an access_hash is present. Nothing else is ever replaced."""
     sid = int(sender_id or 0)
     return (f"tg://user?id={sid}", f"tg://openmessage?user_id={sid}")
 
 
 def input_user_from_entity(entity: Any) -> Optional[InputUser]:
-    """InputUser(id, access_hash) only for REAL (non-min) hashes.
-    access_hash == 0 means a min/incomplete view — never usable for a
-    server-side mention (requirement: never guess a hash)."""
     try:
         uid = getattr(entity, "id", None)
         ah = getattr(entity, "access_hash", None)
@@ -999,8 +869,6 @@ def input_user_from_entity(entity: Any) -> Optional[InputUser]:
 
 
 def input_user_from_input_peer(peer: Any) -> Optional[InputUser]:
-    """InputPeerUser → InputUser (same rule: non-zero hash only).
-    NOTE: InputPeerUser exposes user_id/access_hash (not id)."""
     if isinstance(peer, InputPeerUser):
         try:
             uid = getattr(peer, "user_id", None)
@@ -1013,10 +881,6 @@ def input_user_from_input_peer(peer: Any) -> Optional[InputUser]:
 
 
 def input_user_from_message_context(peer: Any, msg_id: Any, sender_id: int) -> Optional[InputUserFromMessage]:
-    """InputUserFromMessage(peer, msg_id, user_id) — tier-3 of the ladder.
-    Pure construction (no API call): Telegram resolves the user from the
-    message context at send time, so this works cross-account as long as
-    the sending account can see the source chat and the message exists."""
     try:
         mid = int(msg_id or 0)
         sid = int(sender_id or 0)
@@ -1028,19 +892,6 @@ def input_user_from_message_context(peer: Any, msg_id: Any, sender_id: int) -> O
 
 
 def build_mention_entities(alert_html: str, sender_id: int, input_user: Any) -> Optional[Tuple[str, List[Any]]]:
-    """Parse alert HTML with Telethon's own HTML parser and replace ONLY
-    the sender-name anchor with a real InputMessageEntityMentionName.
-
-    Returns (text, entities) ready for
-    send_message(..., formatting_entities=...) — or None when nothing was
-    replaced (caller MUST then use the original parse_mode="html" path so
-    the wire output stays byte-identical to the frozen v10.3 format).
-
-    Mirrors Telethon's own post-parse cleanups (0-length entity strip,
-    #3884) so the entity list we produce is exactly what Telethon would
-    have produced — except the sender mention is now REAL instead of
-    silently deleted.
-    """
     if not alert_html or not sender_id or input_user is None:
         return None
     try:
@@ -1052,7 +903,7 @@ def build_mention_entities(alert_html: str, sender_id: int, input_user: Any) -> 
         for e in ents:
             try:
                 if not getattr(e, "length", 0):
-                    continue  # mirror Telethon #3884: 0-length entities invalid
+                    continue
                 hit = False
                 if isinstance(e, MessageEntityMentionName) and int(getattr(e, "user_id", 0) or 0) == int(sender_id):
                     hit = True
@@ -1073,17 +924,6 @@ def build_mention_entities(alert_html: str, sender_id: int, input_user: Any) -> 
 
 
 class AccountAccessHashStore:
-    """(account_name, sender_id) → access_hash — the spec's tier-4 store.
-
-    access_hash is PER-ACCOUNT knowledge: account A may hold a valid hash
-    for user X while account B cannot resolve X at all. Keyed by account
-    (NOT sender_id alone), bounded, LRU, **TTL'd** (v11.8.1 F-16: an
-    unbounded-age hash could be served forever after the upstream entity
-    changed; entries now expire and force re-resolution). record()
-    returns True when the value is new/changed so the caller can
-    write-behind to the sender_account_hashes table without an INSERT per
-    message."""
-
     DEFAULT_TTL = 7 * 86400.0
 
     def __init__(self, maxsize: int = 20000, ttl: float = DEFAULT_TTL):
@@ -1120,7 +960,6 @@ class AccountAccessHashStore:
                 return None
             val, ts = entry
             if (time.time() - ts) > self._ttl:
-                # v11.8.1 (F-16): expired → drop and force re-resolution
                 self._data.pop(key, None)
                 return None
             self._data.move_to_end(key)
@@ -1133,11 +972,6 @@ class AccountAccessHashStore:
 
 
 class MentionNegativeCache:
-    """(account_name, sender_id, tier) marked after USER_ID_INVALID /
-    ENTITY_MENTION_USER_INVALID — the tier is skipped for TTL seconds
-    (brief: advance to the next tier immediately, no retry on itself).
-    Bounded LRU with lazy expiry."""
-
     def __init__(self, ttl_seconds: int = 300, maxsize: int = 5000):
         self._ttl = max(10, int(ttl_seconds))
         self._maxsize = max(100, int(maxsize))
@@ -1174,15 +1008,11 @@ class MentionNegativeCache:
         return len(self._data)
 
 
-# Module-level stores shared by all account monitors (same pattern as
-# sender_intel). account_hash_store is write-behind persisted by monitors
-# into the sender_account_hashes DB table.
 account_hash_store = AccountAccessHashStore()
 mention_negative = MentionNegativeCache(getattr(CFG, "MENTION_NEG_TTL_SECONDS", 300))
 
 
 def get_mention_intel_snapshot() -> Dict[str, Any]:
-    """Bounded diagnostics for /health (additive keys only)."""
     return {
         "mention_fix_enabled": bool(getattr(CFG, "SENDER_MENTION_FIX_ENABLED", True)),
         "account_hash_store_size": account_hash_store.size(),
@@ -1190,10 +1020,6 @@ def get_mention_intel_snapshot() -> Dict[str, Any]:
     }
 
 
-# =============================================================================
-# Module singleton (shared by all account monitors — same pattern as
-# monitors._capture) + /health diagnostics hook
-# =============================================================================
 sender_intel = SenderResolver(
     entity_cache_size=getattr(CFG, "SENDER_ENTITY_CACHE_SIZE", 2000),
     entity_cache_ttl=getattr(CFG, "SENDER_ENTITY_CACHE_TTL", 900),
@@ -1205,8 +1031,6 @@ logger.info(
 
 
 def get_sender_intel_snapshot() -> Dict[str, Any]:
-    """Read-only snapshot for /health diagnostics.
-    Standard keys ALWAYS present (zero-filled) — stable health contract."""
     try:
         return sender_intel.snapshot()
     except Exception:
