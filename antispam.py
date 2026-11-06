@@ -1,11 +1,41 @@
 #!/usr/bin/env python3
 """
-antispam.py — نظام مكافحة المعلنين والسبام (المرحلة الثانية)
+antispam.py — نظام مكافحة المعلنين والسبام (المرحلة الثانية) — v14.5.1
 
 الهدف (كما طلب المستخدم):
   * تقليل استهلاك الموارد وتقليل التنبيهات المزعجة.
   * منع المعلنين المتكررين (Cross-Group Spam / Mass Poster).
   * تحسين جودة الرسائل المرسلة للمشرفين.
+
+v14.5.1 — correction pass:
+  * is_ignored_async() no longer falls back to get_spam_ignored(limit=1)
+    when get_spam_ignored_entry() raises AttributeError. That fallback
+    was a latent data-correctness bug: get_spam_ignored(limit=1) returns
+    the FIRST ignored sender in the DB — NOT the sender being queried.
+    Any sender who happened to hit that path would be marked ignored
+    the moment ANY other sender was on the ignore list. It only stayed
+    dormant because database.py v14.5.1 ships get_spam_ignored_entry;
+    the fallback would fire the instant that method is renamed, moved,
+    or the DB layer is downgraded. Fail-safe replacement: treat a
+    missing single-row lookup as "not ignored" (False) — matching the
+    negative-cache / fail-open contract for every other DB-miss branch
+    in this engine. Old-DB callers who genuinely need the fallback can
+    pre-populate the LRU via setup(), which remains unchanged.
+  * setup() now primes the LRU using `self._ignored.maxsize` instead of
+    a hardcoded 50000. Previously an operator could set
+    ANTISPAM_IGNORE_LRU_SIZE=1000 and observe the LRU holding only
+    1000 entries — but setup() still fetched and iterated 50000 rows
+    (wasted DB work + transient memory pressure) — while a higher
+    configured value (e.g. 200000) silently got only 50000, forcing a
+    DB round-trip for the rest. Now the two are always in sync.
+  * `import os` moved to the module top (setup() previously called
+    `__import__("os").getenv(...)` inline — correct but unusual).
+  * __version__ = "14.5.1" added (was absent; the file had no version
+    marker while every other module in the stack carried one).
+  * _max_similarity() no longer rebuilds a deque via
+    `records.__class__(list(records)[:-1])`. The new deque had
+    maxlen=None and never served any purpose; a plain list slice is
+    simpler and identical.
 
 التصميم — ثلاث مراحل:
 
@@ -45,6 +75,7 @@ antispam.py — نظام مكافحة المعلنين والسبام (المر�
 
 from __future__ import annotations
 
+import os
 import time
 from collections import deque
 from typing import Any, Deque, Dict, List, Optional, Set, Tuple
@@ -61,6 +92,8 @@ from cachetools import LRUCache, TTLCache
 
 from config import CFG
 from dedup import normalize_for_fingerprint
+
+__version__ = "14.5.1"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # فئات الطلبات التعليمية (كشف خاص بمكافحة السبام — مستقل عن filter_engine)
@@ -143,25 +176,20 @@ class AntiSpamEngine:
         self._activities: TTLCache = TTLCache(maxsize=CFG.ANTISPAM_MAX_TRACKED_USERS, ttl=1800)
         self._watch: Dict[int, _WatchEntry] = {}
         # v9.12 (audit H-07): the permanent-ignore list is now a bounded
-        # LRU cache instead of an unbounded Set. Old behaviour loaded up
-        # to 100k rows at startup and grew forever — at ~80 bytes per int
-        # entry in a Python set that's ~8MB just for the set, plus the
-        # load cost. The new LRU keeps the most-recently-checked 50k
-        # senders in memory (default; env ANTISPAM_IGNORE_LRU_SIZE); on a
-        # cache miss we fall back to a DB lookup (spam_ignore table). The
-        # DB is the source of truth and survives restarts; the LRU is just
-        # a hot-path accelerator. `is_ignored` is called for every message
-        # so the cache must be fast and bounded.
-        _ignore_lru_size = max(
+        # LRU cache instead of an unbounded Set. The DB is the source of
+        # truth and survives restarts; the LRU is just a hot-path
+        # accelerator. `is_ignored` is called for every message so the
+        # cache must be fast and bounded.
+        self._ignore_lru_size: int = max(
             1000,
-            int(__import__("os").getenv("ANTISPAM_IGNORE_LRU_SIZE", "50000")),
+            int(os.getenv("ANTISPAM_IGNORE_LRU_SIZE", "50000")),
         )
-        self._ignored: LRUCache = LRUCache(maxsize=_ignore_lru_size)
+        self._ignored: LRUCache = LRUCache(maxsize=self._ignore_lru_size)
         # Track senders we KNOW are not in the DB (negative cache, short
         # TTL) so we don't re-query the DB for the same unignored sender
         # on every message.
         self._ignored_negative_cache: TTLCache = TTLCache(
-            maxsize=_ignore_lru_size, ttl=300,
+            maxsize=self._ignore_lru_size, ttl=300,
         )
         self._sweeps: int = 0
         # عدادات للوحة/الصحة
@@ -184,12 +212,16 @@ class AntiSpamEngine:
         LRU is primed with the most recent N rows (N = LRU size) ordered
         by id DESC, so the hot senders are in memory from the start. The
         rest are fetched on demand via is_ignored()'s DB fallback.
+
+        v14.5.1: uses self._ignored.maxsize (not a hardcoded 50000) so
+        the load is exactly what the LRU will hold — matching the actual
+        memory footprint and honoring ANTISPAM_IGNORE_LRU_SIZE.
         """
         self._db = db
         try:
             if db:
                 # Prime the LRU with the most-recently-added ignored senders.
-                rows = await db.get_spam_ignored(limit=50000)
+                rows = await db.get_spam_ignored(limit=self._ignored.maxsize)
                 if rows:
                     for r in rows:
                         try:
@@ -197,12 +229,8 @@ class AntiSpamEngine:
                         except Exception:
                             continue
                         # v11.7.1 (إصلاح sender=0): صفوف المعرّف 0 القديمة ليست
-                        # مستخدماً حقيقياً — كل الرسائل بلا هوية كانت تُدمج
-                        # تحت المعرّف 0 وتُصنّف «سبام» وتُكتب هنا. لا يُحمل
-                        # الصف 0 في الذاكرة إطلاقاً (التنظيف اليدوي الموثق:
-                        # SELECT ... WHERE sender_id = 0 ثم /unspam 0).
+                        # مستخدماً حقيقياً — لا يُحمل الصف 0 في الذاكرة إطلاقاً.
                         if _rid == 0:
-                            self.stats.setdefault("no_identity_skipped", 0)
                             continue
                         self._ignored[_rid] = True
             logger.info(
@@ -250,6 +278,16 @@ class AntiSpamEngine:
         sender is not in the negative cache — it queries the DB, then
         populates either the LRU (if ignored) or the negative cache (if
         not), so subsequent messages from the same sender are O(1).
+
+        v14.5.1: the previous `except AttributeError: get_spam_ignored(
+        limit=1)` fallback was a data-correctness bug — it returned the
+        FIRST ignored sender in the DB, not the requested one. Any
+        caller hitting that branch would be marked ignored the moment
+        any OTHER sender was on the ignore list. Fail-safe replacement:
+        a missing single-row lookup returns False (not ignored) — which
+        matches the negative-cache contract used everywhere else in this
+        engine. Old-DB deployments that lack the single-row method can
+        still pre-populate the LRU via setup() (unchanged).
         """
         try:
             sid = int(sender_id or 0)
@@ -265,10 +303,17 @@ class AntiSpamEngine:
             try:
                 row = await self._db.get_spam_ignored_entry(sid)
             except AttributeError:
-                # Older DB layer without the new single-row method — fall
-                # back to the list method with limit=1.
-                rows = await self._db.get_spam_ignored(limit=1)
-                row = rows[0] if rows else None
+                # v14.5.1: DB layer without the single-row method — treat
+                # as "not ignored". The prior fallback (get_spam_ignored
+                # with limit=1) returned an ARBITRARY sender, not this
+                # one. Fail-safe: prefer false negatives (message goes
+                # through) over false positives (real user banned because
+                # some other sender happens to be in the table).
+                logger.debug(
+                    "AntiSpam is_ignored_async: DB lacks get_spam_ignored_entry "
+                    "— returning False (fail-safe; use setup() to pre-prime the LRU)"
+                )
+                row = None
             except Exception as e:
                 logger.debug(f"AntiSpam is_ignored_async DB lookup error: {e}")
                 row = None
@@ -291,7 +336,6 @@ class AntiSpamEngine:
         بمعرّف 0 بعد الإصلاح)."""
         sid = int(sender_id or 0)
         if sid == 0:
-            self.stats.setdefault("no_identity_skipped", 0)
             self.stats["no_identity_skipped"] += 1
             logger.warning(
                 "🚫 AntiSpam confirm_spam(0) REFUSED — sender_id=0 ليست هوية "
@@ -351,7 +395,6 @@ class AntiSpamEngine:
                 # (قناة/مشرف مجهول/حدث بلا هوية) ليست «مستخدماً واحداً» —
                 # دمجها تحت المعرّف 0 كان يراقبها ويصنّفها سباماً ويكتب
                 # صف spam_ignore دائم وهمياً. allow فوري بلا تتبع.
-                self.stats.setdefault("no_identity_skipped", 0)
                 self.stats["no_identity_skipped"] += 1
                 info["reasons"] = ["بلا هوية مرسل (sender_id=0) — بلا مراقبة"]
                 return "allow", info
@@ -513,14 +556,19 @@ class AntiSpamEngine:
         skip_current=True يستثني السجل الأخير (الرسالة الحالية نفسها) —
         إلزامي عند الاستدعاء بعد إلحاق الرسالة الحالية بسجل النشاط، وإلا
         لكانت كل رسالة متشابهة مع نفسها بنسبة 100%.
+
+        v14.5.1: replaces records.__class__(list(records)[:-1]) with a
+        plain list slice — the reconstructed deque served no purpose and
+        lost maxlen (None) for no reason. Identical results, simpler.
         """
         best = 0.0
         best_at = 0.0
         if not norm:
             return 0.0, 0.0
-        records = act.records
+        # v14.5.1: قائمة عادية بدل deque جديد بلا maxlen — نفس السلوك.
+        records: Any = list(act.records)
         if skip_current and records:
-            records = records.__class__(list(records)[:-1])
+            records = records[:-1]
         for r in records:
             if now - r[0] > window or not r[2]:
                 continue
@@ -569,11 +617,9 @@ class AntiSpamEngine:
         # classified as Cross-Group Spam. We now require the additional
         # message to look like spam (similar to a prior one or carrying
         # a request category), not just be any second message.
+        # ملاحظة v14.5.1: recent_5m[-1] هي الرسالة الحالية (append قبل
+        # الاستدعاء، بلا await بينهما) — [:-1] يستثنيها بأمان.
         if len(recent_5m) >= 2:
-            # Look at the most recent prior record (the new one is
-            # already appended to act.records). For the message to count
-            # as a spam indicator, it must share content with a prior
-            # record OR carry a request category.
             spam_indicator = False
             if cats:
                 # New message carries a request category → spam indicator.
