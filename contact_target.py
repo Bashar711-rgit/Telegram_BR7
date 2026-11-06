@@ -1,80 +1,42 @@
 #!/usr/bin/env python3
 """
-contact_target.py — ContactTarget v14.5.1 — تجريد وسيلة الوصول إلى المرسل
+contact_target.py — ContactTarget v14.5.2 — تجريد وسيلة الوصول إلى المرسل
 ============================================================================
 
-المهمة الوحيدة (طلب المستخدم — نظام مراسلة المرسل):
-    «كل تنبيه يعرض اسم المرسل قابلًا للنقر + زر 📩 مراسلة المرسل،
-     بلا أي رابط خام يظهر للمستخدم النهائي».
+v14.5.2 (طلب المستخدم — توسيع وسائل الوصول):
+  * ContactTarget now carries two new optional fields:
+        phone_url            — https://t.me/+<phone>  (from sender_phone)
+        temporary_link_url   — https://t.me/+<token>  (from exportContactToken)
+    Both are HTTPS (Bot API accepts them as inline button URLs), and
+    both work when the sender has NO username. They sit between username
+    and openmessage in the priority ladder:
+        username > temporary_link > phone > openmessage > user_id > none
+  * resolve_contact_target() gained two optional params:
+        phone               — raw phone value (passed to build_phone_url)
+        temporary_link_url  — pre-computed by the caller (async API call)
+    phone is pure-sync (built here); temporary_link_url is optional and
+    provided as-is (the exportContactToken call is async, so it lives
+    in sender_resolver.export_temporary_link and the caller invokes it
+    BEFORE resolve_contact_target — see monitors.py activation note).
+  * build_phone_url() imported from sender_resolver — same validation
+    for both call paths (no duplicated logic).
+  * validate_contact_target() now also accepts tg://openmessage? URLs
+    (they are a legit last-resort fallback even if Bot API may reject
+    them; callers must handle rejection with the existing sanitize path).
+  * Logging (log_sender_resolution) shows phone_target / temporary_target
+    availability per alert — same shape as user_id_target / openmessage.
 
-هذا الملف هو **المكان الوحيد** في المشروع الذي يُختار فيه رابط المرسل
-(requirement: لا يوجد منطق مختلف لبناء رابط المرسل في ملفات متعددة).
-كل مستهلك — alert_bot (الاسم + زر مراسلة)، alert_ui (الإرسال الاحتياطي
-MTProto)، monitors (سلّم الإرسال الاحتياطي + سجل الأزرار) — يأخذ
-ContactTarget جاهزًا من هنا ويستخدم selected_url كما هو.
-
-v14.5.1 — correction pass:
+v14.5.1 (سابق):
   * is_bot now recognizes 1, "1", "yes", "on" (via _is_truthy helper).
-    Previously only `True` and "true" matched — `is_bot = 1` (from SQLite
-    BOOLEAN→INTEGER, or a serialization layer) was silently treated as a
-    non-bot user, so the sender's type stayed "user" while the resolver
-    was already correct elsewhere. is_deleted already handled all truthy
-    forms; is_bot now matches it.
-  * SENDER_LABEL now includes the blank line between BOT_NAME_LINE and
-    "المرسل:" that the block comment always documented. Layout is now:
-        B_Bot
-        (blank)
-        المرسل: <name> — @username
-        (blank)
-        نص الرسالة:
-        (blank)
-        <message>
-    All entity offsets in alert_bot.py and alert_ui.py derive from
-    utf16_len(SENDER_LABEL) automatically, so both remain correct
-    (14 → 15 UTF-16 units).
-  * __version__ now "14.5.1" (was "1.1.0" — three versions coexisted:
-    docstring v11.2, module __version__ 1.1.0, project 14.5.1).
-  * USER REQUEST: Hidden "B_Bot" from the card header. SENDER_LABEL
-    starts directly with "المرسل: " to clean up the visual appearance
-    of the alert card.
+  * B_Bot removed from the card header (SENDER_LABEL starts with "المرسل:").
+  * __version__ = "14.5.1".
 
-الطرق الثلاث المحفوظة داخليًا (spec #4–#6):
-    1. username        → https://t.me/{username}          (الأفضل — يعمل للجميع)
-    2. user_id         → tg://user?id={user_id}            (fallback أساسي لمن لا username)
-    3. openmessage     → tg://openmessage?user_id={user_id} (احتياطي داخلي تجريبي —
-        لا يُختار أبدًا تلقائيًا ولا يُعرض؛ تيليجرام لا يضمنه في كل العملاء)
-
-الاختيار (Resolver، spec #8):
-    Sender → هل يوجد username صالح؟ → نعم: username URL
-                                   → لا: user_id → tg://user?id=...
-                                       (openmessage يُحتفظ به داخليًا فقط)
-
-الهوية الأساسية هي user_id وليس username (spec #11/#القاعدة النهائية):
-    username مجرد وسيلة وصول إضافية. غيابه لا يمنع الاسم القابل للنقر
-    ولا زر المراسلة.
-
-أنواع المرسلين (spec #18):
-    User/Bot      → كل الطرق متاحة
-    Channel       → لا يُبنى tg://user?id إطلاقًا (id قناة وليس مستخدم) —
-                    username إن وجد وإلا بلا هدف (بلا اختلاق معلومات)
-    Anonymous     → يظهر كـ Channel في تيليجرام → نفس معاملة القناة
-    Deleted       → لا هدف (المستخدم محذوف فعلًا) — status=partial
-
-النص الظاهر ≠ الرابط (spec #14):
-    الاسم المعروض هو الاسم الكامل للشخص (أول + أخير ← أول ← username)،
-    والرابط يُحمل ككيان MessageEntityTextUrl داخل النص — لا يظهر
-    المستخدم أي https://t.me أو tg:// — كل الروابط داخلية بالكامل.
-    بناء الكيانات هنا يحسب offset/length بوحدات UTF-16 (حساب تيليجرام
-    الرسمي) — الحروف العربية والإيموجي خارج BMP تُحسب صحيحة.
-
-الأداء (spec #24):
-    كل شيء هنا pure-sync وبلا أي I/O أو استدعاء Telegram API —
-    resolve_contact_target يعمل من البيانات الملتقطة مع الحدث نفسه.
-    جلب الكيان (get_sender/get_input_sender) مسؤولية الطبقات الأعلى
-    (sender_resolver مع كاشه) — لا حل مكرر ولا FloodWait من هذا الملف.
-
-أمان الاختبار: استيراد telethon اختياري — بلا telethon تعيد الدوال
-البيانات والروابط فقط (كيانات = قائمة فارغة) فتعمل الاختبارات واللوحة.
+الطرق المحفوظة داخليًا (spec #4–#8):
+    1. username         → https://t.me/{username}             (الأفضل)
+    2. temporary_link   → https://t.me/+{token}               (HTTPS مؤقت)
+    3. phone            → https://t.me/+{phone}               (HTTPS عند توفر الرقم)
+    4. openmessage      → tg://openmessage?user_id={id}        (قد يُرفض)
+    5. user_id          → tg://user?id={id}                    (قد يُرفض)
 """
 
 from __future__ import annotations
@@ -86,56 +48,35 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from loguru import logger
 
-try:  # pragma: no cover — بيئة الإنتاج لديها telethon دائمًا
-    from telethon.tl.types import (
-        MessageEntityTextUrl,
-    )
-
+try:
+    from telethon.tl.types import MessageEntityTextUrl
     _TL_OK = True
-except Exception:  # pragma: no cover
+except Exception:
     MessageEntityTextUrl = None
     _TL_OK = False
 
-# بطيء الاستيراد لكنه بلا دورة: nav_resolver لا يستورد contact_target.
 from nav_resolver import clean_username as _clean_username  # noqa: E402
 from nav_resolver import is_valid_username as _is_valid_username  # noqa: E402
+# v14.5.2: نفس منطق تطبيع رقم الهاتف المستخدم في sender_resolver.
+from sender_resolver import build_phone_url as _build_phone_url  # noqa: E402
 
-__version__ = "14.5.1"
+__version__ = "14.5.2"
 
 _TG_URL = "https://t.me/"
 
-# ── نصوص القالب (المصدر الوحيد — alert_bot وalert_ui يستوردها) ─────────────
-# شكل التنبيه النهائي الفعال (v14.5.1 — يطابق SENDER_LABEL أدناه حرفياً):
+# شكل التنبيه الفعال (v14.5.1 — B_Bot مخفي):
 #     المرسل: [اسم المرسل قابل للنقر] — @username
 #     (سطر فارغ)
 #     نص الرسالة:
 #     (سطر فارغ)
-#     [النص الأصلي كاملاً — أسطره ورموزه وروابطه كما وردت]
-#     ثم لوحة أزرار فعلية (Inline Keyboard): [ مراسلة ] [ عرض الرسالة ]
-# ملاحظات العقد:
-#   * تم إخفاء سطر اسم البوت (BOT_NAME_LINE) من العرض بناءً على طلب
-#     المستخدم لتنظيف شكل البطاقة.
-#   * «— @username» تُعرض فقط عند توفر username صالح — لا يُختلق أبداً.
-#   * اسم المرسل وحده هو الرابط (كيان/وسم anchor) — ليس السطر كله ولا
-#     نص الرسالة، و«@username» نص مستقل بجانب الاسم.
-#   * SENDER_LABEL يحدد إزاحة كيان الاسم (UTF-16) في كل المستهلكين
-#     (alert_bot فحص الاسم + alert_ui الإصلاح الذاتي) — تغييره هنا
-#     ينتشر تلقائياً.
-BOT_NAME_LINE = "B_Bot" # مطلوب في monitors.py لفحص البطاقات
-# v14.5.1: حُذف اسم البوت والأسطر الفارغة من العرض — البطاقة تبدأ بالمرسل مباشرة.
+#     [النص الأصلي كاملاً]
+BOT_NAME_LINE = "B_Bot"  # مطلوب في monitors.py لفحص البطاقات
 SENDER_LABEL = "المرسل: "
-
-# تسمية قسم نص الرسالة (سطر مستقل يسبق النص الأصلي مباشرة بعد سطر فارغ)
 MSG_TEXT_LABEL = "نص الرسالة:"
-
-# الفاصل بين اسم المرسل و«@username» في سطر الترويسة
 SENDER_DASH = " — "
 
 
 def build_username_suffix(username: Any = None) -> str:
-    """الجزء النصي الملاصق لاسم المرسل: « — @username» عند توفر username
-    صالح، وإلا سلسلة فارغة (لا يُختلق @username أبداً — مواصفة v11.6 §3.6).
-    الرابط لا يُبنى هنا — هذا نص العرض المستقل فقط (الاسم نفسه يحمل الرابط)."""
     try:
         u = str(username or "").strip().lstrip("@")
     except Exception:
@@ -146,13 +87,6 @@ def build_username_suffix(username: Any = None) -> str:
 
 
 def build_username_suffix_linked(username: Any = None, url: Any = None) -> str:
-    """══ v12.1.0 — صيغة الصورة المرفقة من المستخدم ══
-
-    « — <a href="url">@username</a>» — الـ@username نفسه رابط HTML
-    (يظهر أزرق مثل اسم المرسل في اللقطة المرجعية: كلاهما أزرق).
-    تُستخدم في قالب Bot API (parse_mode=HTML) حصراً؛ مسار MTProto يضيف
-    الكيان بنفسه في build_alert_entity_pack.
-    بلا username صالح أو بلا url → سلسلة فارغة (المستدعي يرجع للنصي)."""
     try:
         u = str(username or "").strip().lstrip("@")
         link = str(url or "").strip()
@@ -165,12 +99,11 @@ def build_username_suffix_linked(username: Any = None, url: Any = None) -> str:
         return ""
     return f'{SENDER_DASH}<a href="{link}">@{u}</a>'
 
-# أنواع المرسل التي يُسمح لها بـ tg://user?id (لا القنوات ولا المحذوفون)
+
 _USER_ID_CAPABLE_TYPES = frozenset({"user", "bot", "assumed_user"})
 
 
 def _is_truthy(value: Any) -> bool:
-    """v14.5.1: تطبيع أشكال 'الصواب' إلى True."""
     if value is True:
         return True
     if value is False or value is None:
@@ -182,9 +115,6 @@ def _is_truthy(value: Any) -> bool:
     return False
 
 
-# =============================================================================
-# Metrics (spec #23) — عدادات محصورة بلا I/O
-# =============================================================================
 _CONTACT_METRICS: Dict[str, int] = defaultdict(int)
 
 _METRIC_KEYS = (
@@ -192,6 +122,9 @@ _METRIC_KEYS = (
     "sender_resolution_failure",
     "username_available",
     "user_id_fallback",
+    "temporary_link_used",      # v14.5.2
+    "phone_fallback",            # v14.5.2
+    "openmessage_fallback",      # v14.5.2
     "clickable_sender_success",
     "clickable_sender_failure",
     "contact_button_success",
@@ -206,7 +139,6 @@ _METRIC_KEYS = (
 
 
 def metric_inc(name: str, by: int = 1) -> None:
-    """زيادة عداد آمن — لا ترفع استثناءً أبدًا."""
     try:
         if name in _METRIC_KEYS:
             _CONTACT_METRICS[name] += int(by)
@@ -215,27 +147,19 @@ def metric_inc(name: str, by: int = 1) -> None:
 
 
 def get_contact_metrics_snapshot() -> Dict[str, Any]:
-    """لقطة محصورة للـ/health واللوحة — مفاتيح الصفر موجودة دائمًا."""
     snap: Dict[str, Any] = {"enabled": True, "version": __version__}
     for key in _METRIC_KEYS:
         snap[key] = int(_CONTACT_METRICS.get(key, 0))
     return snap
 
 
-# =============================================================================
-# UTF-16 helpers — تيليجرام يقيس offset/length بوحدات UTF-16
-# =============================================================================
 def utf16_len(value: str) -> int:
-    """طول النص بوحدات UTF-16 (الحرف خارج BMP = وحدتان)."""
     try:
         return len(value.encode("utf-16-le")) // 2
     except Exception:
         return len(value or "")
 
 
-# =============================================================================
-# Display name (spec #17) — أول+أخير ← أول ← username ← fallback
-# =============================================================================
 def build_display_name(
     first_name: Any = None,
     last_name: Any = None,
@@ -243,7 +167,6 @@ def build_display_name(
     user_id: Any = 0,
     display: Any = None,
 ) -> str:
-    """اسم المرسل المعروض — بلا user_id كاسم ظاهر (يظهر في الـdebug فقط)."""
     if display and str(display).strip():
         return str(display).strip()
     full = f"{first_name or ''} {last_name or ''}".strip()
@@ -255,9 +178,6 @@ def build_display_name(
     return "مرسل غير محدد"
 
 
-# =============================================================================
-# ContactTarget — التجريد الوحيد لوسيلة الوصول (spec #7)
-# =============================================================================
 @dataclass(slots=True)
 class ContactTarget:
     user_id: int = 0
@@ -268,6 +188,9 @@ class ContactTarget:
     username_url: Optional[str] = None
     user_id_url: Optional[str] = None
     openmessage_url: Optional[str] = None
+    # v14.5.2: مسارات HTTPS إضافية تعمل حتى بلا username
+    phone_url: Optional[str] = None
+    temporary_link_url: Optional[str] = None
     selected_url: Optional[str] = None
     target_type: str = "none"
     resolution_status: str = "failed"
@@ -288,8 +211,10 @@ class ContactTarget:
             "targets_available": ",".join(
                 [k for k, v in (
                     ("username", self.username_url),
-                    ("user_id", self.user_id_url),
+                    ("temporary", self.temporary_link_url),
+                    ("phone", self.phone_url),
                     ("openmessage", self.openmessage_url),
+                    ("user_id", self.user_id_url),
                 ) if v]
             ) or "none",
             "resolution_status": self.resolution_status,
@@ -297,9 +222,6 @@ class ContactTarget:
         }
 
 
-# =============================================================================
-# Resolver — السياسة المركزية الوحيدة لاختيار الرابط (spec #8)
-# =============================================================================
 def resolve_contact_target(
     sender_id: Any = 0,
     username: Any = None,
@@ -310,6 +232,8 @@ def resolve_contact_target(
     sender_type: Any = "",
     is_bot: Any = None,
     is_deleted: Any = None,
+    phone: Any = None,                       # v14.5.2: NEW
+    temporary_link_url: Optional[str] = None, # v14.5.2: NEW
 ) -> ContactTarget:
     """
     يبني ContactTarget من بيانات المرسل الملتقطة — **بلا أي I/O**.
@@ -360,16 +284,40 @@ def resolve_contact_target(
     if st == "channel":
         reasons.append("channel_sender_no_user_id")
 
+    # ── المسارات المتاحة ──
     username_url = f"{_TG_URL}{uname}" if uname else None
+
+    # v14.5.2: temporary link من exportContactToken (HTTPS، يعمل بلا username).
+    temp_url: Optional[str] = None
+    if temporary_link_url:
+        _t = str(temporary_link_url).strip()
+        if _t.startswith("https://t.me/"):
+            temp_url = _t
+
+    # v14.5.2: phone → https://t.me/+<phone> (HTTPS، يعمل بلا username).
+    phone_url: Optional[str] = _build_phone_url(phone) if phone else None
+
+    # openmessage: مقيَّد بنفس قيد user_id_url (لا للقنوات/المحذوفين).
+    openmessage_url = (
+        f"tg://openmessage?user_id={sid}"
+        if (sid and st in _USER_ID_CAPABLE_TYPES)
+        else None
+    )
     user_id_url = (
         f"tg://user?id={sid}"
         if (sid and st in _USER_ID_CAPABLE_TYPES)
         else None
     )
-    openmessage_url = f"tg://openmessage?user_id={sid}" if sid else None
 
+    # ── الاختيار: username > temporary_link > phone > openmessage > user_id ──
     if username_url:
         selected_url, target_type = username_url, "username"
+    elif temp_url:
+        selected_url, target_type = temp_url, "temporary_link"
+    elif phone_url:
+        selected_url, target_type = phone_url, "phone"
+    elif openmessage_url:
+        selected_url, target_type = openmessage_url, "openmessage"
     elif user_id_url:
         selected_url, target_type = user_id_url, "user_id"
     else:
@@ -379,6 +327,12 @@ def resolve_contact_target(
         metric_inc("username_available")
     if target_type == "user_id":
         metric_inc("user_id_fallback")
+    if target_type == "temporary_link":
+        metric_inc("temporary_link_used")
+    if target_type == "phone":
+        metric_inc("phone_fallback")
+    if target_type == "openmessage":
+        metric_inc("openmessage_fallback")
 
     if selected_url:
         status = "resolved"
@@ -403,6 +357,8 @@ def resolve_contact_target(
         username_url=username_url,
         user_id_url=user_id_url,
         openmessage_url=openmessage_url,
+        phone_url=phone_url,
+        temporary_link_url=temp_url,
         selected_url=selected_url,
         target_type=target_type,
         resolution_status=status,
@@ -418,9 +374,6 @@ def resolve_contact_target(
     return target
 
 
-# =============================================================================
-# Validation chain (spec #20)
-# =============================================================================
 def validate_contact_target(target: Optional[ContactTarget]) -> Tuple[bool, str]:
     if target is None:
         return False, "no_target"
@@ -430,9 +383,12 @@ def validate_contact_target(target: Optional[ContactTarget]) -> Tuple[bool, str]
         return False, "no_display_name"
     if not target.selected_url:
         return False, "no_reachable_target"
+    # v14.5.2: مسموح أيضاً tg://openmessage? (احتياطي أخير قد يقبله Bot API
+    # أو يُرفض — alert_bot يعالجه بالـsanitize).
     if not (
         target.selected_url.startswith("https://t.me/")
         or target.selected_url.startswith("tg://user?id=")
+        or target.selected_url.startswith("tg://openmessage?")
     ):
         return False, "unknown_url_shape"
     if MessageEntityTextUrl is None:
@@ -440,9 +396,6 @@ def validate_contact_target(target: Optional[ContactTarget]) -> Tuple[bool, str]
     return True, ""
 
 
-# =============================================================================
-# Clickable-name entities (spec #14)
-# =============================================================================
 def build_alert_entity_pack(
     display_name: str,
     message_text: str,
@@ -513,9 +466,6 @@ def build_alert_entity_pack(
     }
 
 
-# =============================================================================
-# [SENDER] logging (spec #22)
-# =============================================================================
 def log_sender_resolution(
     target: Optional[ContactTarget],
     *,
@@ -537,6 +487,9 @@ def log_sender_resolution(
             f"resolution={resolution}",
             "user_id_target=" + ("AVAILABLE" if t.user_id_url else "UNAVAILABLE"),
             "openmessage_target=" + ("AVAILABLE" if t.openmessage_url else "UNAVAILABLE"),
+            # v14.5.2: مسارات جديدة في اللوج
+            "phone_target=" + ("AVAILABLE" if t.phone_url else "UNAVAILABLE"),
+            "temporary_target=" + ("AVAILABLE" if t.temporary_link_url else "UNAVAILABLE"),
             f"selected_target={t.target_type}",
         ]
         if clickable is not None:
