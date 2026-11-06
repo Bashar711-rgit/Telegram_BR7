@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-contact_target.py — ContactTarget v11.2 — تجريد وسيلة الوصول إلى المرسل
-========================================================================
+contact_target.py — ContactTarget v14.5.1 — تجريد وسيلة الوصول إلى المرسل
+============================================================================
 
 المهمة الوحيدة (طلب المستخدم — نظام مراسلة المرسل):
     «كل تنبيه يعرض اسم المرسل قابلًا للنقر + زر 📩 مراسلة المرسل،
@@ -12,6 +12,28 @@ contact_target.py — ContactTarget v11.2 — تجريد وسيلة الوصول
 كل مستهلك — alert_bot (الاسم + زر مراسلة)، alert_ui (الإرسال الاحتياطي
 MTProto)، monitors (سلّم الإرسال الاحتياطي + سجل الأزرار) — يأخذ
 ContactTarget جاهزًا من هنا ويستخدم selected_url كما هو.
+
+v14.5.1 — correction pass:
+  * is_bot now recognizes 1, "1", "yes", "on" (via _is_truthy helper).
+    Previously only `True` and "true" matched — `is_bot = 1` (from SQLite
+    BOOLEAN→INTEGER, or a serialization layer) was silently treated as a
+    non-bot user, so the sender's type stayed "user" while the resolver
+    was already correct elsewhere. is_deleted already handled all truthy
+    forms; is_bot now matches it.
+  * SENDER_LABEL now includes the blank line between BOT_NAME_LINE and
+    "المرسل:" that the block comment always documented. Layout is now:
+        B_Bot
+        (blank)
+        المرسل: <name> — @username
+        (blank)
+        نص الرسالة:
+        (blank)
+        <message>
+    All entity offsets in alert_bot.py and alert_ui.py derive from
+    utf16_len(SENDER_LABEL) automatically, so both remain correct
+    (14 → 15 UTF-16 units).
+  * __version__ now "14.5.1" (was "1.1.0" — three versions coexisted:
+    docstring v11.2, module __version__ 1.1.0, project 14.5.1).
 
 الطرق الثلاث المحفوظة داخليًا (spec #4–#6):
     1. username        → https://t.me/{username}          (الأفضل — يعمل للجميع)
@@ -75,12 +97,12 @@ except Exception:  # pragma: no cover
 from nav_resolver import clean_username as _clean_username  # noqa: E402
 from nav_resolver import is_valid_username as _is_valid_username  # noqa: E402
 
-__version__ = "1.1.0"
+__version__ = "14.5.1"
 
 _TG_URL = "https://t.me/"
 
 # ── نصوص القالب (المصدر الوحيد — alert_bot وalert_ui يستوردها) ─────────────
-# شكل التنبيه النهائي الفعال (مواصفة المستخدم v13 — بطاقة موحدة بلا تكرار):
+# شكل التنبيه النهائي الفعال (v14.5.1 — يطابق SENDER_LABEL أدناه حرفياً):
 #     B_Bot
 #     (سطر فارغ)
 #     المرسل: [اسم المرسل قابل للنقر] — @username
@@ -91,7 +113,8 @@ _TG_URL = "https://t.me/"
 #     ثم لوحة أزرار فعلية (Inline Keyboard): [ مراسلة ] [ عرض الرسالة ]
 # ملاحظات العقد:
 #   * سطر اسم البوت (BOT_NAME_LINE) يظهر في أعلى كل بطاقة بصورة ثابتة
-#     (مواصفة v13 §9 — «أولًا: اسم البوت») — قبل سطر المرسل مباشرة.
+#     (مواصفة v13 §9 — «أولًا: اسم البوت») — يفصله سطر فارغ عن سطر المرسل.
+#     تغيير BOT_NAME_LINE يتطلب إعادة نشر (ليس من CFG — قرار تشغيلي).
 #   * «— @username» تُعرض فقط عند توفر username صالح — لا يُختلق أبداً.
 #   * اسم المرسل وحده هو الرابط (كيان/وسم anchor) — ليس السطر كله ولا
 #     نص الرسالة، و«@username» نص مستقل بجانب الاسم.
@@ -100,7 +123,9 @@ _TG_URL = "https://t.me/"
 #     ينتشر تلقائياً. تضمين سطر اسم البوت داخل SENDER_LABEL يجعل كل
 #     الإزاحات المشتقة من utf16_len(SENDER_LABEL) صحيحة تلقائياً.
 BOT_NAME_LINE = "B_Bot"
-SENDER_LABEL = f"{BOT_NAME_LINE}\nالمرسل: "
+# v14.5.1: سطران (\n\n) بعد BOT_NAME_LINE — يطابق التعليق أعلاه
+# (كان \n واحداً في v11.2 رغم أن التعليق يوضّح سطراً فارغاً).
+SENDER_LABEL = f"{BOT_NAME_LINE}\n\nالمرسل: "
 
 # تسمية قسم نص الرسالة (سطر مستقل يسبق النص الأصلي مباشرة بعد سطر فارغ)
 MSG_TEXT_LABEL = "نص الرسالة:"
@@ -151,6 +176,24 @@ _USER_ID_CAPABLE_TYPES = frozenset({"user", "bot", "assumed_user"})
 # sender_type="none" بينما sender_id موجودة — إسقاط tg://user?id هنا كان
 # سيعيد الشكوى الأصلية (اسم المرسل غير قابل للنقر) لأكثر حالة فشل شيوعاً.
 # لا هوية إطلاقاً (sender_id=0) فقط تعني none فعلياً.
+
+
+def _is_truthy(value: Any) -> bool:
+    """v14.5.1: تطبيع أشكال 'الصواب' إلى True.
+
+    يقبل: True, 1, "1", "true", "yes", "on" — كلها شائعة عبر طبقات
+    serialization (SQLite BOOLEAN→INTEGER، JSON، CSV exports).
+    يرفض: False, 0, "0", "false", "no", "off", None, "".
+    """
+    if value is True:
+        return True
+    if value is False or value is None:
+        return False
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return int(value) == 1
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "yes", "on")
+    return False
 
 
 # =============================================================================
@@ -216,7 +259,11 @@ def build_display_name(
     user_id: Any = 0,
     display: Any = None,
 ) -> str:
-    """اسم المرسل المعروض — بلا user_id كاسم ظاهر (يظهر في الـdebug فقط)."""
+    """اسم المرسل المعروض — بلا user_id كاسم ظاهر (يظهر في الـdebug فقط).
+
+    ملاحظة: user_id مقبول للتوافق الخلفي لكنه غير مستخدم — v12.3 W-2
+    حذف الحساب الميت الذي كان يُنتج «مستخدم (1234)».
+    """
     if display and str(display).strip():
         return str(display).strip()
     full = f"{first_name or ''} {last_name or ''}".strip()
@@ -225,8 +272,6 @@ def build_display_name(
     uname = _clean_username(username)
     if uname:
         return uname  # بلا @ — الاسم نفسه قابل للنقر
-    # v11.7.1 (المهمة §5.1): لا معرفات رقمية ظاهرة كبطاقة — «مرسل غير محدد»
-    # (v12.3 W-2: حُذف حساب sid الميت — كان يُحسب ولا يُقرأ أبداً)
     return "مرسل غير محدد"
 
 
@@ -359,9 +404,12 @@ def resolve_contact_target(
     st = str(sender_type or "").strip().lower()
     if st in ("", "unknown", "none"):
         st = "assumed_user" if sid else "none"
-    if is_deleted and str(is_deleted).strip().lower() in ("true", "1", "yes"):
+    # v14.5.1: _is_truthy يقبل True/1/"1"/"true"/"yes"/"on" — التطبيع موحّد
+    # لـ is_bot وis_deleted. النسخة السابقة كانت تفحص is_bot نصياً فقط
+    # فيضيع `is_bot = 1` (SQLite/JSON) ويبقى sender_type="user" عن خطأ.
+    if _is_truthy(is_deleted):
         st = "deleted"
-    elif st in ("user", "assumed_user") and (is_bot is True or str(is_bot or "").lower() == "true"):
+    elif st in ("user", "assumed_user") and _is_truthy(is_bot):
         st = "bot"
     if st == "channel":
         reasons.append("channel_sender_no_user_id")
