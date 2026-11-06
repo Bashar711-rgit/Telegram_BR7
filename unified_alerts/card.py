@@ -1,24 +1,31 @@
 #!/usr/bin/env python3
 """
-unified_alerts/card.py — عقد سلامة البطاقة (v12.0.0)
+unified_alerts/card.py — عقد سلامة البطاقة (v14.5.1)
 
 «لا يصل مستخدم أبداً تنبيه لم يُبنَ صحيحاً» — كل بطاقة (نص HTML + أزرار)
 تُفحص قبل الإرسال عبر Bot API أو مسار الحسابات الاحتياطي:
 
-  1. النص غير فارغ بعد التطبيع (فراغات/صفر-عرض لا تُعد محتوى).
-  2. حد تيليجرام الصلب: 4096 وحدة UTF-16 للنص كله (الإيموجي وحدة×2).
-     الحد التشغيلي ALERT_CARD_MAX_CHARS (افتراضي 4000) أضيق من الصلب.
-  3. وسوم <a href="…"> متوازنة — وسم غير مغلق بعد القص يُصلَّح أو يُحذف
-     (Bot API يرفض HTML مكسوراً بخطأ 400 can't parse entities → تنبيه
-     يفشل كلياً؛ هذا العقد يمنع الحالة من الجذور).
-  4. الأزرار: لكل زر نص + رابط (t.me/https/tg://) — الزر المعطوب يُحذف
-     بصدق بدل رفض الحمولة كلها.
+1. النص غير فارغ بعد التطبيع (فراغات/صفر-عرض لا تُعد محتوى).
+2. حد تيليجرام الصلب: 4096 وحدة UTF-16 للنص كله (الإيموجي وحدة×2).
+   الحد التشغيلي ALERT_CARD_MAX_CHARS (افتراضي 4000) أضيق من الصلب.
+3. وسوم HTML متوازنة — لا فقط <a>: <b>/<i>/<u>/<s>/<code>/<pre>/...
+   وسم غير مغلق بعد القص يُصلَّح أو يُحذف (Bot API يرفض HTML مكسوراً
+   بخطأ 400 can't parse entities → تنبيه يفشل كلياً).
+4. الأزرار: لكل زر نص + رابط (t.me/https/tg://) — الزر المعطوب يُحذف
+   بصدق بدل رفض الحمولة كلها.
 
-القص الآمن (repair):
-  * نقص عند حد UTF-16 مع الحفاظ على وسوم <a> السالمة: نقص قبل فتح أي وسم
-    جديد، ونغلق الوسوم المفتوحة صراحة، ونضيف علامة اختصار «…».
-  * الإصلاح لا يفتح ثغرة HTML: أي بقايا وسوم غير قابلة للإصلاح تُهرَّب
-    إلى نص عادي (عقد escape-first).
+v14.5.1 — إصلاح جذري للقص:
+  * النسخة السابقة كانت توازن <a> فقط. عند قص بطاقة تحتوي <b>/<i>،
+    يبقى الوسم مفتوحاً فيرفض Bot API الرسالة كلياً — نفس العطب الذي
+    وُجد card.py لمنعه. الآن:
+      - _find_unclosed_tags يحلل كل وسوم تيليجرام المعروفة
+        (b/strong/i/em/u/ins/s/strike/del/code/pre/a/blockquote/
+        tg-spoiler/span) ويستخدم stack لتحديد المفتوح في النهاية.
+      - _truncate_safe_html يغلقها كلها بترتيب معاكس بعد القص.
+      - _ANCHOR_OPEN (الذي كان يفوت <a href='...'> و<a href="..." target=...>)
+        لم يعد مستخدماً في القص — استُبدل بـ_TAG_OPEN_RE العام.
+  * لا تغيير في السلوك للمسارات السليمة: بطاقة تحت 4000 وحدة تمر كما هي.
+  * فشل-آمن كما هو: أي خلل في الفحص يُعيد البطاقة الأصلية.
 
 فشل-آمن: أي خلل في الفحص نفسه يعيد البطاقة كما هي (ok=True بلا تعديل) —
 الفحص ميزة، وأخطاؤه لا تُسقط تنبيهات صالحة.
@@ -35,6 +42,21 @@ from unified_alerts.stats import get_unified_stats
 # حد تيليجرام الصلب (وحدات UTF-16)
 _TG_HARD_LIMIT = 4096
 
+# ─────────────────────────────────────────────────────────────────────────────
+# v14.5.1: مجموعة وسوم HTML التي يفهمها Bot API ويجب موازنتها عند القص.
+# <strong>/<em>/<ins>/<strike>/<del> مرادفات لـ<b>/<i>/<u>/<s> — تُطبَّع
+# عند التتبع كي لا يُنشئ <b>...</strong> عدم توازن كاذب.
+# ─────────────────────────────────────────────────────────────────────────────
+_TG_TAGS = (
+    "b", "strong", "i", "em", "u", "ins", "s", "strike", "del",
+    "code", "pre", "a", "blockquote", "tg-spoiler", "span",
+)
+_TG_TAGS_ALT = "|".join(_TG_TAGS)
+_TAG_OPEN_RE = re.compile(r"<(" + _TG_TAGS_ALT + r")(?:\s[^>]*)?>", re.IGNORECASE)
+_TAG_CLOSE_RE = re.compile(r"</(" + _TG_TAGS_ALT + r")\s*>", re.IGNORECASE)
+_TAG_CANON = {"strong": "b", "em": "i", "ins": "u", "strike": "s", "del": "s"}
+
+# Legacy: يبقى مستخدماً في _balance_anchors فقط — لم يعد داخل القص.
 _ANCHOR_OPEN = re.compile(r'<a\s+href="[^"]*">', re.IGNORECASE)
 _ANY_TAG = re.compile(r"<[^>]+>")
 _ZERO_WIDTH = re.compile(r"[\u200b\u200c\u200d\u200e\u200f\u2060\ufeff]")
@@ -46,6 +68,37 @@ def utf16_len(text: str) -> int:
         return len(text.encode("utf-16-le")) // 2
     except Exception:
         return len(text)
+
+
+def _canonical_tag(name: str) -> str:
+    low = name.lower()
+    return _TAG_CANON.get(low, low)
+
+
+def _find_unclosed_tags(text: str) -> List[str]:
+    """أسماء الوسوم المفتوحة في نهاية النص، بترتيب الفتح.
+
+    المسح خطي (regex finditer) + stack، فيتعامل مع:
+      * تعدد الوسوم المتداخلة <b><i>...</i></b>
+      * وسوم مغلقة بمرادفها <b>...</strong>
+      * فوضى خفيفة <b><i>...</b></i> (يُغلق من الداخل للأعلى عند رؤية </b>)
+    """
+    stack: List[str] = []
+    events: List[Tuple[int, str, str]] = []
+    for m in _TAG_OPEN_RE.finditer(text):
+        events.append((m.start(), "open", _canonical_tag(m.group(1))))
+    for m in _TAG_CLOSE_RE.finditer(text):
+        events.append((m.start(), "close", _canonical_tag(m.group(1))))
+    events.sort(key=lambda e: e[0])
+    for _, kind, name in events:
+        if kind == "open":
+            stack.append(name)
+        else:
+            for i in range(len(stack) - 1, -1, -1):
+                if stack[i] == name:
+                    del stack[i:]
+                    break
+    return stack
 
 
 @dataclass(slots=True)
@@ -74,7 +127,7 @@ def _is_valid_url(url: Any) -> bool:
 
 
 def _clean_buttons(buttons: Any) -> Tuple[Optional[List[List[Dict[str, Any]]]], int]:
-    """إزالة الأزرار المعطوبة — يعيد (اللوحة النظيفة أو None إن لم تُمرَّر، عدد المحذوف)."""
+    """إزالة الأزرار المعطوبة — يعيد (اللوحة النظيفة أو None، عدد المحذوف)."""
     if buttons is None:
         return None, 0
     dropped = 0
@@ -100,17 +153,15 @@ def _clean_buttons(buttons: Any) -> Tuple[Optional[List[List[Dict[str, Any]]]], 
 
 
 def _truncate_safe_html(text: str, max_units: int) -> str:
-    """قص النص عند حد UTF-16 مع إصلاح وسوم <a> المقطوعة.
+    """قص النص عند حد UTF-16 مع إغلاق كل وسوم HTML المفتوحة.
 
-    المنطق:
-      * إذا كان النص داخل الحد أصلاً → كما هو.
-      * نقص عدد الأحرف حتى النقطة التي تبقي كل الوسوم المفتوحة قبلها سليمة:
-        نقص عند آخر نهاية وسم </a> أو قبل أول <a مفتوح بعد نقطة النقص.
-      * نغلق أي <a> ما زال مفتوحاً بـ</a> ونضيف «…».
+    v14.5.1: كانت النسخة السابقة توازن <a> فقط. القص داخل <b>/<i>/...
+    كان يُنتج HTML غير متوازن يرفضه Bot API (400 can't parse entities).
+    الآن نكشف كل الوسوم المفتوحة (بأي اسم تيليجرام) ونغلقها بترتيب معاكس.
     """
     if utf16_len(text) <= max_units:
         return text
-    # خريطة مواضع UTF-16 → مؤشر بايثون (المقطع قد يقسم زوجاً بديلاً)
+    # 1) حساب نقطة القص بوحدات UTF-16 (لا نقسم زوجاً بديلاً)
     cut_py = 0
     units = 0
     for i, ch in enumerate(text):
@@ -120,25 +171,25 @@ def _truncate_safe_html(text: str, max_units: int) -> str:
         units += w
         cut_py = i + 1
     head = text[:cut_py]
-    # لا نقص في منتصف وسم: لو قطعنا داخل وسم نرجع لقبله
+    # 2) لا نقص في منتصف وسم — نقص قبله
     last_lt = head.rfind("<")
     last_gt = head.rfind(">")
     if last_lt > last_gt:
-        # وسم مفتوح (غير مكتمل) في النهاية — نقص قبله
         head = head[:last_lt]
-    # أغلق آخر <a ...> غير مغلق إن وجد (v14.1: حُذف المتغير الميت `tail`
-    # — كان يُحسب ولا يُقرأ؛ نافذة الكلوسينج تقارن head فقط)
-    opens_in_head = len(_ANCHOR_OPEN.findall(head))
-    closes_in_head = head.lower().count("</a>")
-    if opens_in_head > closes_in_head:
-        # هل يوجد </a> في الباقي لو أكملنا؟ لا — قصّنا؛ أغلق صراحة
-        head += "</a>"
+    # 3) v14.5.1: أغلق كل وسوم HTML المفتوحة، لا <a> فقط
+    unclosed = _find_unclosed_tags(head)
+    for tag in reversed(unclosed):
+        head += f"</{tag}>"
     head = head.rstrip() + "…"
     return head
 
 
 def _balance_anchors(text: str) -> Tuple[str, bool]:
-    """موازنة وسوم <a> — يعيد (النص، هل عدّل)."""
+    """موازنة <a> — يعيد (النص، هل عدّل).
+
+    تُستخدم كطبقة أولية (input cleanup) قبل الطول. إصلاح الوسوم الأخرى
+    يتم في _truncate_safe_html فقط.
+    """
     try:
         opens = len(_ANCHOR_OPEN.findall(text))
         closes = text.lower().count("</a>")
@@ -146,7 +197,6 @@ def _balance_anchors(text: str) -> Tuple[str, bool]:
             return text, False
         if opens > closes:
             return text + "</a>" * (opens - closes), True
-        # إغلاق زائد — حذف الزائد من النهاية
         fixed = text
         extra = closes - opens
         for _ in range(extra):
@@ -183,7 +233,7 @@ def validate_and_repair_card(
             stats.inc("card_dropped")
             return CardReport(ok=False, reasons=["empty_text"])
 
-        # 2) موازنة وسوم <a>
+        # 2) موازنة وسوم <a> (input cleanup — التصفية النهائية في القص)
         text, changed = _balance_anchors(text)
         if changed:
             repaired = True
@@ -196,7 +246,7 @@ def validate_and_repair_card(
             cfg_max = int(getattr(CFG, "ALERT_CARD_MAX_CHARS", 4000) or 4000)
         except Exception:
             cfg_max = 4000
-        limit = min(max(256, cfg_max), _TG_HARD_LIMIT - 96)  # هامش للكيانات
+        limit = min(max(256, cfg_max), _TG_HARD_LIMIT - 96)
         if max_chars:
             limit = min(limit, max(256, int(max_chars)))
         if utf16_len(text) > limit:
