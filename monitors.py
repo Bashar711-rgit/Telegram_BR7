@@ -1,49 +1,48 @@
 #!/usr/bin/env python3
 """
-monitors.py – Account Monitor v14.5.1 (v9.10.0 LINE, aligned to the v14.5.1 stack)
+monitors.py – Account Monitor v14.5.2 (v9.10.0 LINE, aligned to the v14.5.2 stack)
 
-v14.5.1 — correction pass (real bugs, no behavior changes intended):
-  * _is_current_card_header now matches SENDER_LABEL from contact_target
-    v14.5.1 (which emits "B_Bot\\n\\nالمرسل: " — TWO newlines after the
-    bot line, per the layout the docstring always described). The
-    previous check only accepted a single "\\n" (v11.2 shape), so every
-    card the CURRENT system produces was INVISIBLE to the anti-echo
-    guard: is_alert_card_echo() returned False for our own cards, and
-    the echo loop the guard exists to prevent could fire. The check now
-    accepts all three historical shapes:
-        v14.5.1+     B_Bot\\n\\nالمرسل: ...
-        v11.2-14.5.0 B_Bot\\nالمرسل: ...
-        pre-v12      المرسل: ... (no bot line)
-  * _enrich_sender_via_resolver was treating the SenderResolver's
-    ResolveResult (a dataclass with .entity / .ok / .reason) as if it
-    were a raw Telethon User object. getattr(result, "username") was
-    always None, so no field was ever populated. Fixed to unwrap
-    `result.entity` first (and skip cleanly when !result.ok or entity
-    is None).
-  * Both _enrich_sender_via_resolver and _spawn_recovery_task were
-    calling sender_resolver.meta_to_contact_fields() with input that
-    does NOT contain the "sender_<key>" prefixed keys that function
-    expects (it looks for data["sender_phone"], etc.). The result was
-    always {key: None for key in _FLAT_META_KEYS}, so recovery and
-    enrichment silently discarded sender flags (is_bot / is_premium /
-    is_scam / status / ...). Fixed by explicitly projecting the raw
-    extract_sender() output into event_data's "sender_<key>" keys.
-  * build_telegram_links now validates the username before building
-    the URL (previously it produced dead t.me/abcd links from 4-char
-    handles — the same gap fixed in sender_resolver and nav_resolver).
-  * _send_alert now returns bool explicitly (False on all early exits,
-    True on confirmed delivery). Previously mixed None/True in a way
-    that the caller tolerated but was easy to misread.
-  * Removed `Button` from the telethon import (dead since v10.7).
-  * The text-artifact regexes (_URL_RE / _MENTION_RE / _HASHTAG_RE /
-    _PHONE_RE) are now compiled once at class definition time instead
-    of a lazy `if cls._X is None` check (identical output; cheaper and
-    clearer). The mention pattern was also aligned to the {4,31}
-    (5-32 char) form used everywhere else in the v14.5.1 stack.
+v14.5.2 (طلب المستخدم — توسيع وسائل الوصول للمرسل):
+  * _send_alert() now passes TWO new optional parameters to
+    contact_target.resolve_contact_target():
+        phone                — data["sender_phone"] (raw phone number)
+        temporary_link_url   — a https://t.me/+<token> URL fetched via
+                               sender_resolver.sender_intel.export_temporary_link()
+                               (which uses contacts.exportContactToken under the hood).
+    The contact_target v14.5.2 prioritizes:
+        username > temporary_link > phone > openmessage > user_id > none
+    so the alert's "مراسلة" button works even when the sender has no
+    username AND hides their phone — via a Telegram-official temporary
+    link (expires server-side ~7 days, cached in-process 6 hours to
+    eliminate redundant API calls across alerts and accounts).
+  * The temporary-link fetch is gated on "no username in ANY source"
+    (nav_sender_username OR sender_username OR data["sender_username"]).
+    When a username exists, the fetch is skipped entirely — zero API
+    cost, zero added latency for the common case.
+  * Failure-safe: any error from export_temporary_link() is swallowed
+    (returns None), and the priority ladder falls through to the next
+    option. The alert is NEVER dropped or delayed by this addition.
+
+v14.5.1 (سابق — correction pass):
+  * _is_current_card_header matches SENDER_LABEL from contact_target
+    v14.5.1 (which emits "المرسل: " — the B_Bot line was removed per
+    user request, see contact_target v14.5.1). The check now accepts
+    all three historical shapes:
+        v14.5.1+      المرسل: ... (B_Bot hidden)
+        v11.2-14.5.0  B_Bot\nالمرسل: ...
+        pre-v12       المرسل: ... (no bot line ever)
+  * _enrich_sender_via_resolver unwraps ResolveResult.entity (was
+    treated as a raw User; all fields ended up None).
+  * Both _enrich_sender_via_resolver and _spawn_recovery_task project
+    extract_sender() output into event_data's "sender_<key>" keys
+    (was calling meta_to_contact_fields on data that lacked those keys).
+  * build_telegram_links validates usernames before building.
+  * _send_alert returns bool explicitly.
+  * Removed Button from telethon import.
+  * Text-artifact regexes compiled once at class definition.
 
 The v9.x – v11.x changelog that follows is preserved verbatim — every
-behavior documented there still holds. Only the six items above were
-changed in this pass.
+behavior documented there still holds.
 
 ──────────────────────────────────────────────────────────────────────
 Account Monitor v9.10.0 (STABLE 24/7 EDITION, HARDENED + FAST CAPTURE + SENDER INTELLIGENCE + CROSS-ACCOUNT DEDUP + DYNAMIC BUTTONS)
@@ -113,10 +112,6 @@ v9.10 (this pass) — Cross-Account Dedup + Dynamic Alert Buttons:
     one alert, cross-account, in-memory LRU + DB alert_dedup table.
   * Dedup claim is released on every failure path so DLQ retries work.
 
-The v10.x – v13.x sections (sender access registry, mention ladder,
-alert nav resolver, unified alerts) are unchanged from the previous
-version; see the file history for those changelogs.
-
 See the accompanying engineering report for the full list of changes,
 the retry_count propagation fix (process_event_from_queue / _send_alert),
 and documented FOLLOW-UP items for other files.
@@ -162,16 +157,15 @@ from telethon.tl.types import (
     User as TgUser,
     MessageEntityMentionName,
 )
-from config import CFG, InputSanitizer, fast_hash, BOT_VERSION  # v14.1: + إصدار البوت
-from filter_engine import FILTER_ENGINE_VERSION  # v14.1: مصدر واحد لإصدار المحرك
-from task_util import spawn_bg  # v11.8.1 (F-17): مرجع محفوظ لمهام background
+from config import CFG, InputSanitizer, fast_hash, BOT_VERSION
+from filter_engine import FILTER_ENGINE_VERSION
+from task_util import spawn_bg
 from database import EnhancedDatabase, MessageRecord, AlertRecord, DeadLetterRecord
 from filter_engine import EnhancedFilter
-from dedup import content_fingerprint, get_deduplicator, normalize_for_fingerprint  # v9.10 dedup + v11.5.2 verify
-from similarity import get_similarity_gate  # v10.0 Precision: near-duplicate gate
-from antispam import get_antispam  # v9.11 anti-spam (Watch List → Permanent Ignore)
-# v12.0 unified_alerts — التنبيهات الموحدة: بوابة العمر + عقد سلامة البطاقة.
-from unified_alerts import get_alert_gate, validate_and_repair_card  # v12.0
+from dedup import content_fingerprint, get_deduplicator, normalize_for_fingerprint
+from similarity import get_similarity_gate
+from antispam import get_antispam
+from unified_alerts import get_alert_gate, validate_and_repair_card
 from sender_resolver import (
     extract_flat as _sender_extract_flat,
     extract_sender as _sender_extract,
@@ -184,43 +178,24 @@ from sender_resolver import (
     input_user_from_message_context as _input_user_from_message_context,
     get_mention_intel_snapshot,
 )
-from nav_resolver import nav_resolver as _nav_resolver  # v10.5 navigation multi-strategy resolver
-from nav_resolver import is_valid_username as _nav_valid_username      # v10.5 link validation
-from nav_resolver import private_supergroup_inner_id as _nav_inner_id  # v10.5 -100 id guard
-from nav_resolver import harden_sender_anchor as _nav_harden_anchor    # v10.6 guaranteed-reachable anchor
-from alert_bot import build_alert_html as _build_alert_v108            # v10.8 alert format + AlertBot buttons
-from contact_target import (                                           # v11.2 نظام مراسلة المرسل
+from nav_resolver import nav_resolver as _nav_resolver
+from nav_resolver import is_valid_username as _nav_valid_username
+from nav_resolver import private_supergroup_inner_id as _nav_inner_id
+from nav_resolver import harden_sender_anchor as _nav_harden_anchor
+from alert_bot import build_alert_html as _build_alert_v108
+from contact_target import (
     resolve_contact_target as _resolve_contact_target,
     log_sender_resolution as _log_sender_resolution,
     metric_inc as _contact_metric,
-    BOT_NAME_LINE as _CARD_BOT_NAME_LINE,  # v12.4: سطر اسم البوت أعلى البطاقة (v12.1.0+)
-    SENDER_LABEL as _SENDER_LABEL,          # v14.5.1: ترويسة البطاقة الفعلية (B_Bot\n\nالمرسل:)
+    BOT_NAME_LINE as _CARD_BOT_NAME_LINE,
+    SENDER_LABEL as _SENDER_LABEL,
 )
-from reply_fix import get_reply_fixer as _get_reply_fixer              # v11.5 الرد التعويضي F (مواصفة §11)
+from reply_fix import get_reply_fixer as _get_reply_fixer
 
-
-# ══ v11.5.2: حاجز صدى التنبيهات (Anti-Echo) — ترويسات v11.6 ══
-# المشكلة الحقيقية من الإنتاج: القالب الموحد يقع ضمن حد 6..65 حرفاً في
-# بعض الحالات → عندما يُرسل التنبيه إلى مجموعة الهدف والمراقبة مفتوحة على
-# كل شيء (جدول sources فارغ)، تراه المراقبة كرسالة جديدة → تُصنّف (تحوي
-# الكلمة المفتاحية الأصلية) → تنبيه جديد يحوي بطاقة سابقة → سلسلة صدى.
-# الحل من طبقتين:
-#   1) سجل هوياتنا الذاتية (معرّف بوت التنبيهات + معرّف كل حساب من
-#      حساباتنا) — أي حدث مرسله هوية من هويّاتنا يُتجاهل قبل أي فلترة.
-#   2) بصمة القالب: نص يبدأ بترويسة بطاقتنا ويحوي تسمية قسم النص قريباً
-#      من البداية = بطاقة تنبيه منتجرة — يُتجاهل حتى لو فشل تحديد هوية
-#      المرسل (مجهول/أنون).
-# v14.5.1: الترويسة الحالية هي SENDER_LABEL من contact_target
-# (B_Bot\n\nالمرسل: ) — إصلاح جذري للكشف: كان الفحص القديم يقبل \n واحداً
-# فقط (v11.2) فلا يكتشف بطاقات v14.5.1 إطلاقاً = حاجز الصدى معطّل.
 _SELF_SENDER_IDS: set = set()
 
 
 def register_self_sender(sender_id) -> bool:
-    """تسجيل هوية من هويّاتنا (بوت التنبيهات أو أحد حسابات المراقبة).
-
-    أعداد صحيحة موجبة فقط — القيم غير القابلة للتحويل أو الكسرية غير
-    الصحيحة (1.5) تُرفض (لا int-truncation خفي يسجّل هوية خاطئة)."""
     if isinstance(sender_id, bool):
         return False
     try:
@@ -242,36 +217,33 @@ def is_self_sender(sender_id) -> bool:
         return False
 
 
-# ── تواقيع بطاقة التنبيه (v11.6: القالب الجديد + القديم للتوافق) ──
 _ALERT_CARD_HEADER = "المرسل:"
-_ALERT_CARD_NAME_LINE = _CARD_BOT_NAME_LINE  # "B_Bot"
+_ALERT_CARD_NAME_LINE = _CARD_BOT_NAME_LINE
 _ALERT_CARD_MSG_LABEL = "نص الرسالة:"
-_ECHO_SCAN_WINDOW = 300  # سطر الاسم + الاسم ≤128 + لاحقة username + هامش
+_ECHO_SCAN_WINDOW = 300
 _LEGACY_CARD_HEADER = "👤:"
 _LEGACY_CARD_MSG_LABEL = "💬:"
 
 
 def _is_current_card_header(t: str) -> bool:
-    """v14.5.1: ثلاث توقيعات تاريخية مقبولة:
-
-      * v14.5.1+      : "B_Bot\\n\\nالمرسل: "  ← SENDER_LABEL الحالي
-      * v11.2-14.5.0 : "B_Bot\\nالمرسل: "      ← توقيع سابق (\n واحد)
-      * pre-v12      : "المرسل: "              ← أقدم (بلا سطر B_Bot)
-
-    النسخة السابقة قبلت الثاني والثالث فقط — فبطاقات v14.5.1 (بعد أن
-    أضفنا \n\n في contact_target) صارت غير مرئية للحاجز = حلقة صدى.
+    """v14.5.2: أربع توقيعات تاريخية مقبولة:
+      * v14.5.1+      : "المرسل: ..."          ← SENDER_LABEL الحالي (B_Bot مخفي)
+      * v14.5.1      : "B_Bot\\n\\nالمرسل: "    ← قديم قبل إخفاء B_Bot
+      * v11.2-14.5.0 : "B_Bot\\nالمرسل: "      ← توقيع سابق
+      * pre-v12      : "المرسل: "              ← أقدم (بلا B_Bot)
     """
     if not t:
         return False
-    if t.startswith(_SENDER_LABEL):  # v14.5.1+ (B_Bot\n\nالمرسل: )
+    if t.startswith(_SENDER_LABEL):
         return True
-    if t.startswith(f"{_ALERT_CARD_NAME_LINE}\n{_ALERT_CARD_HEADER}"):  # v11.2-14.5.0
+    if t.startswith(f"{_ALERT_CARD_NAME_LINE}\n\n{_ALERT_CARD_HEADER}"):
         return True
-    return t.startswith(_ALERT_CARD_HEADER)  # pre-v12
+    if t.startswith(f"{_ALERT_CARD_NAME_LINE}\n{_ALERT_CARD_HEADER}"):
+        return True
+    return t.startswith(_ALERT_CARD_HEADER)
 
 
 def is_alert_card_echo(text) -> bool:
-    """True إذا كان النص نفسه بطاقة تنبيه منتجرة (صدى) — فحص نصي فقط."""
     if not text:
         return False
     t = str(text).lstrip()
@@ -283,7 +255,6 @@ def is_alert_card_echo(text) -> bool:
 
 
 def unknown_send_result_policy(reason: str, has_verifier: bool) -> str:
-    """v11.5.2: سياسة النتيجة المجهولة — لا إعادة إرسال أعمى أبداً."""
     r = str(reason or "")
     if not (r.startswith("timeout") or r.startswith("network_error")):
         return "fallback"
@@ -292,9 +263,7 @@ def unknown_send_result_policy(reason: str, has_verifier: bool) -> str:
     return "stop" if r.startswith("timeout") else "fallback"
 
 
-# ══ v12.4.0 (FIX-3a/RC-3): إصلاح جذري للمُحقّق — كان معطوباً بنيوياً ══
 def visible_card_text(card_text: str) -> str:
-    """النص الظاهر للبطاقة: نزع وسوم HTML ثم فك الترميز."""
     import html as _html_mod
     return _html_mod.unescape(_TAG_STRIP_RE.sub("", str(card_text or "")))
 
@@ -333,14 +302,7 @@ async def resolve_chat_entity(client: TelegramClient, data: Dict[str, Any]) -> A
 
 
 def build_telegram_links(chat_id: int, message_id: int, username: str = None) -> Dict[str, str]:
-    """بناء روابط القروب/الرسالة.
-
-    v14.5.1: يتحقق من username عبر nav_resolver.is_valid_username قبل بناء
-    t.me/{u} — كان يقبل أي نص فيبني رابطاً ميتاً من 4-char handle
-    ("t.me/abcd"). نفس العيب الذي أُصلح في sender_resolver/nav_resolver.
-    """
     links = {"group": "#", "message": "#"}
-    # v14.5.1: validation — نفس شرط nav_resolver.build_canonical_links
     clean_uname = None
     if username:
         try:
@@ -360,7 +322,6 @@ def build_telegram_links(chat_id: int, message_id: int, username: str = None) ->
 
 
 def _verify_mention_entity(sent_msg: Any, sender_id: int) -> Tuple[bool, str]:
-    """v10.7 §4 — التحقق الإلزامي بعد الإرسال."""
     try:
         ents = getattr(sent_msg, "entities", None) or []
         for e in ents:
@@ -376,17 +337,10 @@ def _verify_mention_entity(sent_msg: Any, sender_id: int) -> Tuple[bool, str]:
         return False, f"verify_error:{type(e).__name__}"
 
 
-# =============================================================================
-# FastCaptureBuffer — save-first protection against deletion bots (v9.8)
-# =============================================================================
 class FastCaptureBuffer:
-    """
-    In-memory save-first buffer keyed by (chat_id, msg_id).
-    """
-
     __slots__ = ("_buf", "_maxsize", "_ttl", "_last_gc", "_stats")
 
-    _GC_EVERY = 5.0  # seconds between lazy TTL sweeps
+    _GC_EVERY = 5.0
 
     def __init__(self, maxsize: int = 1000, ttl: int = 30):
         self._buf: "OrderedDict[Tuple[int, int], Dict[str, Any]]" = OrderedDict()
@@ -528,7 +482,6 @@ logger.info(
     f"maxsize={_capture._maxsize} | ttl={_capture._ttl}s"
 )
 
-# v9.12 (audit M-09): early cross-account delivery dedup.
 try:
     _EARLY_DELIVERY_DEDUP_SIZE = max(
         1000,
@@ -539,9 +492,6 @@ except Exception:
 _early_delivery_dedup: LRUCache = LRUCache(maxsize=_EARLY_DELIVERY_DEDUP_SIZE)
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# v10.4 — Sender Mention Intelligence state
-# ═══════════════════════════════════════════════════════════════════════════
 _RECENT_INPUT_SENDERS_MAX = 500
 _RECENT_INPUT_SENDERS_TTL = 600.0
 _recent_input_senders: "OrderedDict[Tuple[int, int], Dict[str, Any]]" = OrderedDict()
@@ -550,8 +500,6 @@ _target_membership_warned: Set[str] = set()
 
 
 class AlertLatencyTracker:
-    """Bounded percentiles for alert delivery latency (logs/health only)."""
-
     def __init__(self, maxlen: int = 2000):
         self._recv: "deque[float]" = deque(maxlen=maxlen)
         self._total: "deque[float]" = deque(maxlen=maxlen)
@@ -596,7 +544,6 @@ alert_latency = AlertLatencyTracker()
 
 
 def get_capture_snapshot() -> Dict[str, Any]:
-    """Read-only snapshot for /health diagnostics."""
     try:
         base = {
             "saved": 0, "expired": 0, "evicted": 0,
@@ -611,9 +558,6 @@ def get_capture_snapshot() -> Dict[str, Any]:
         return {"enabled": False, "size": 0}
 
 
-# =============================================================================
-# CircuitBreaker — account-scoped FloodWait gate
-# =============================================================================
 class CircuitState:
     CLOSED = "closed"; OPEN = "open"; HALF_OPEN = "half_open"
 
@@ -622,10 +566,6 @@ class CircuitBreakerOpen(Exception): pass
 
 
 class CircuitBreaker:
-    """
-    One instance per account/purpose.
-    """
-
     def __init__(self, name: str, failure_threshold: int = 5, recovery_timeout: float = 60.0):
         self.name = name; self._threshold = failure_threshold; self._recovery = recovery_timeout
         self._failures = 0; self._successes = 0; self._last_fail: Optional[float] = None
@@ -706,9 +646,6 @@ class CircuitBreaker:
         return max(0.0, self._flood_wait_until - time.monotonic())
 
 
-# =============================================================================
-# DeadLetterQueue — genuine retry, reusing the existing processing pipeline
-# =============================================================================
 class DeadLetterQueue:
     def __init__(
         self,
@@ -754,7 +691,7 @@ class DeadLetterQueue:
 
         delay = min(2 ** retry_count, 60)
         try:
-            _re = re  # module-level re is imported
+            _re = re
             _flood = int(getattr(error, "seconds", 0) or 0)
             if _flood <= 0:
                 _m = _re.search(r"FLOOD_WAIT active,\s*([\d.]+)s remaining", str(error or ""))
@@ -1008,9 +945,6 @@ class EnhancedAccountMonitor:
         self._session_rotate_task: Optional[asyncio.Task] = None; self._last_rotation = 0.0
         self._media_tasks: Set[asyncio.Task] = set()
         self._media_task_lock = asyncio.Lock()
-        # v11.6: account-scoped flag set after the FIRST time this account's
-        # buttons were rejected by Telegram — subsequent sends skip the
-        # doomed attempt (silent-drop awareness).
         self._user_buttons_kb_rejected: bool = False
 
     def set_bot(self, bot: Any) -> None: self._bot_ref = bot
@@ -1037,7 +971,7 @@ class EnhancedAccountMonitor:
         return dict(
             api_id=self.account["api_id"],
             api_hash=self.account["api_hash"],
-            device_model="Render Cloud", system_version="Linux", app_version="14.5.1",
+            device_model="Render Cloud", system_version="Linux", app_version="14.5.2",
             timeout=CFG.CONNECTION_TIMEOUT, connection_retries=5, retry_delay=5,
             auto_reconnect=False,
             sequential_updates=False,
@@ -1083,7 +1017,6 @@ class EnhancedAccountMonitor:
         return {"entity": entity, "title": title, "group_link": links["group"], "msg_link": links["message"]}
 
     def _build_alert(self, sender: Dict, chat: Dict, keyword: str, text: str, analysis: Dict = None, contact_target: Any = None, context: Any = None) -> Tuple[str, Optional[List]]:
-        """v11.6 — القالب الموحد (parse_mode=HTML)."""
         data_view = {
             "sender_id": sender.get("id", 0) or 0,
             "sender_username": sender.get("username"),
@@ -1540,13 +1473,6 @@ class EnhancedAccountMonitor:
             logger.debug(f"deleted-event handling error [{self.account['name']}]: {e}")
 
     async def _spawn_recovery_task(self, entry: Dict[str, Any]) -> None:
-        """v14.5.1: مسار الاسترداد — ترميم بيانات المرسل بطريقة تعمل فعلاً.
-
-        كان `_sender_meta_to_contact(meta_full)` يعيد `{key: None}` لكل
-        مفتاح (لأن `meta_full` من `extract_sender` يحوي "phone"/"is_bot"
-        مباشرة، وليس "sender_phone") — فيضيع كل metadata المرسل بصمت.
-        الآن نُسقط مباشرة إلى نفس أسماء event_data المتوقعة (sender_<k>).
-        """
         entry_sender_id = entry.get("sender_id", 0) or 0
         event_data: Dict[str, Any] = {
             "chat_id": entry.get("chat_id"),
@@ -1566,8 +1492,6 @@ class EnhancedAccountMonitor:
             "timestamp": entry.get("ts") or time.time(),
             "_fast_capture_recovery": True,
         }
-        # v14.5.1: استخدم الأسماء الصحيحة "sender_<key>" — بدل استدعاء
-        # meta_to_contact_fields على data لا يحوي هذه الأسماء (no-op سابق).
         meta_full = entry.get("sender_meta_full")
         if isinstance(meta_full, dict) and meta_full:
             for key in (
@@ -1637,13 +1561,6 @@ class EnhancedAccountMonitor:
             logger.debug(f"sender_db_enrich error [{self.account['name']}]: {type(e).__name__}")
 
     async def _enrich_sender_via_resolver(self, data: Dict[str, Any]) -> None:
-        """v14.5.1: worker-side network-bound sender enrichment.
-
-        إصلاح جذري: كان الكود يعالج ResolveResult كأنه User entity
-        (getattr(result, "username") دائماً None) — الإثراء no-op صامت.
-        الآن نستخرج `result.entity` أولاً؛ وبعدها نستعمل الأسماء
-        الصحيحة (sender_<key>) لكل metadata.
-        """
         if not data.pop("_sender_needs_enrichment", False):
             return
         if not CFG.SENDER_INTEL_ENABLED or not self.client:
@@ -1653,14 +1570,12 @@ class EnhancedAccountMonitor:
             return
         try:
             from sender_resolver import sender_intel as _si
-            # v14.5.1: resolve_entity يرجع ResolveResult — نستخرج .entity
             result = await _si.resolve_entity(self.client, int(sender_id))
             if result is None or not getattr(result, "ok", False):
                 return
             entity = getattr(result, "entity", None)
             if entity is None:
                 return
-            # COALESCE — never overwrite an existing non-null with None.
             if not data.get("sender_username"):
                 u = getattr(entity, "username", None)
                 if u:
@@ -1677,16 +1592,13 @@ class EnhancedAccountMonitor:
                 ln = getattr(entity, "last_name", None)
                 if ln:
                     data["sender_last_name"] = ln
-            # v14.5.1: استخراج metadata مباشرة إلى مفاتيح sender_<key>
-            # (كان meta_to_contact_fields على data لا يحوي هذه الأسماء =
-            # نتائج كلها None = metadata مفقود).
             try:
                 _meta = _sender_extract(entity)
                 if _meta:
                     for key, val in _meta.items():
                         if key in ("sender_id", "access_hash", "username",
                                    "first_name", "last_name", "usernames"):
-                            continue  # identity fields handled above
+                            continue
                         if val is not None and not data.get(f"sender_{key}"):
                             data[f"sender_{key}"] = val
                     if _meta.get("usernames") and not data.get("sender_usernames"):
@@ -2104,7 +2016,6 @@ class EnhancedAccountMonitor:
         processing_time = (time.perf_counter() - start_time) * 1000
         await self._update_avg_time(processing_time)
 
-    # ── v14.5.1: النصوص النمطية في نطاق الفئة (compile مرة واحدة) ──
     _URL_RE: "re.Pattern[str]" = re.compile(r"https?://\S+|www\.\S+|t\.me/\S+")
     _MENTION_RE: "re.Pattern[str]" = re.compile(r"@[A-Za-z][A-Za-z0-9_]{4,31}")
     _HASHTAG_RE: "re.Pattern[str]" = re.compile(r"#\S{1,80}")
@@ -2432,9 +2343,13 @@ class EnhancedAccountMonitor:
     ) -> bool:
         """Send one alert; return True only on confirmed delivery.
 
-        v14.5.1: returns bool explicitly (False on ALL early exits, True on
-        confirmed delivery). The previous version mixed None and True,
-        which the caller tolerated but was easy to misread.
+        v14.5.2: expanded the contact_target call to pass `phone` and
+        `temporary_link_url` — see the changelog at the top of the module.
+        Both are populated here (the temporary link is fetched via
+        exportContactToken only when no username exists anywhere), then
+        handed to resolve_contact_target() which applies its own priority
+        ladder. Failure-safe: any error fetching the temporary link is
+        swallowed and the ladder falls through.
         """
         if not self._bot_ref:
             return False
@@ -2549,6 +2464,23 @@ class EnhancedAccountMonitor:
                 _nav_resolver.verify_navigation(chat_info, sender_username, sender_id)
             except Exception:
                 pass
+
+        # ══ v14.5.2: جلب رابط المرسل المؤقت عند غياب username ══
+        # https://t.me/+<token> يعمل بلا username (موثق في تيليجرام).
+        # الفشل-آمن: None عند أي خطأ → سلّم contact_target يستمر.
+        _temp_link: Optional[str] = None
+        if not (nav_sender_username or sender_username or data.get("sender_username")):
+            try:
+                _temp_link = await sender_intel.export_temporary_link(
+                    send_client, sender_id, sender_access_hash,
+                )
+            except Exception as _tl_err:
+                logger.debug(
+                    f"export_temporary_link skipped [{account_name}]: "
+                    f"{type(_tl_err).__name__}"
+                )
+                _temp_link = None
+
         sender_target = _resolve_contact_target(
             sender_id=sender_id,
             username=nav_sender_username or sender_username or data.get("sender_username"),
@@ -2557,6 +2489,8 @@ class EnhancedAccountMonitor:
             sender_type=data.get("sender_type") or "",
             is_bot=data.get("sender_is_bot"),
             is_deleted=data.get("sender_is_deleted"),
+            phone=data.get("sender_phone"),                # v14.5.2
+            temporary_link_url=_temp_link,                  # v14.5.2
         )
         if not display_name:
             display_name = sender_target.display_name or "مرسل غير محدد"
