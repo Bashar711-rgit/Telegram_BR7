@@ -19,6 +19,10 @@ v14.5.1 — correction pass (fixes for regressions found in v14.5.0):
 * `_search_first_valid` stops at the first valid match (lazy).
 * `reload_keywords` is guarded by a `threading.Event`: in-flight analyses
   wait for the reload to finish before reading trie/weight state.
+* `_is_arabic` now reads its Arabic-ratio threshold from
+  CFG.MIN_ARABIC_CONFIDENCE (default 0.12) instead of hard-coding 0.12.
+  Default = 0.12 → identical out-of-the-box behavior; the field is now
+  actually enforceable via Render/accounts.env.
 
 v14.5.0 — performance + normalization pass (بدون أي تغيير في دلالات القرار):
 * EARLY EXIT («Fail Fast»): الرسائل بلا كلمة مفتاحية تخرج فوراً.
@@ -1157,6 +1161,10 @@ class EnhancedFilter:
         return cleaned, original
 
     def _is_arabic(self, text: str) -> Tuple[bool, float]:
+        """v14.5.1: عتبة النسبة العربية أصبحت من CFG (MIN_ARABIC_CONFIDENCE)
+        بدلاً من 0.12 المضمّنة. الافتراضي في config.py = 0.12 → نفس السلوك
+        القديم حرفياً إلا إذا ضبط المشغّل الحقل صراحةً في accounts.env/Render.
+        """
         if not text:
             return False, 0.0
         arabic_count = sum(1 for c in text if c in self.ARABIC_CHARS)
@@ -1164,7 +1172,9 @@ class EnhancedFilter:
             return False, 0.0
         letter_count = sum(1 for c in text if c.isalpha())
         ratio = arabic_count / max(letter_count, 1)
-        if ratio >= 0.12:
+        # v14.5.1: عتبة من CFG — تقبل الضبط عبر MIN_ARABIC_CONFIDENCE
+        threshold = _cfg("MIN_ARABIC_CONFIDENCE", 0.12)
+        if ratio >= threshold:
             return True, ratio
         if LANGDETECT_AVAILABLE:
             try:
@@ -1172,7 +1182,7 @@ class EnhancedFilter:
                 return lang == "ar", (0.85 if lang == "ar" else ratio)
             except Exception as exc:
                 logger.debug("langdetect failed: {}", exc)
-        return ratio >= 0.12, ratio
+        return ratio >= threshold, ratio
 
     _REPEAT_CHARS_PATTERN: Final = re.compile(r"(.)\1{4,}")
 
