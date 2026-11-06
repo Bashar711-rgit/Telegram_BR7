@@ -1,35 +1,55 @@
 #!/usr/bin/env python3
 """
-config.py – Configuration Manager v13.1 (IntentEngine-NLP Edition, HARDENED)
+config.py – Configuration Manager v14.5.1 (IntentEngine-NLP Edition, HARDENED)
 Supports: SQLite, PostgreSQL (via DATABASE_URL)
-Compatible with: keywords.json v14.0.x, filter_engine.py, monitors.py v9.7 (hardened)
+Compatible with: keywords.json v14.0.x, filter_engine.py v14.5.1,
+                 monitors.py v9.7 (hardened)
 
-v13.1 (this pass) — targeted fix, config.py ONLY:
-  * _KW_CATEGORIES was missing "templates" and "template_patterns" — the two
-    top-level keys that keywords.json v14.0.x actually stores its
-    Template-Driven Pattern Generation data under. Because load_keywords()
-    builds the exported KEYWORDS dict *exclusively* from the keys listed in
-    _KW_CATEGORIES, any key not listed there was silently dropped, no
-    matter how much data existed for it in keywords.json. This meant
-    filter_engine.py's _generate_template_patterns() always saw
-    KEYWORDS.get("templates", {}) == {} and returned an empty pattern set —
-    the entire Template-Boost mechanism (the core of "IntentEngine v14.0")
-    was dead on arrival, with no error or warning anywhere.
-    Both keys are now included, so keywords.json's template data actually
-    reaches the filter engine.
-  * load_keywords() now logs a dedicated line reporting how many template
-    entries were loaded, specifically so this class of "silently empty
-    category" bug is visible at boot instead of requiring a code read to
-    catch (mirrors how config.py already logs total keyword counts).
-  * No other behavioral changes in this file. Everything monitors.py v9.7
-    already relies on from this module (CFG.DEAD_LETTER_MAX_RETRIES,
-    CFG.CONNECTION_TIMEOUT, CFG.SESSION_REFRESH_INTERVAL, CFG.*_THRESHOLD,
-    CFG.SCORE_WEIGHT_*, etc.) was already present and is unchanged.
-  * Note: FLOOD_WAIT_MULTIPLIER is kept for backward compatibility (e.g. if
-    other modules still read it), but as of monitors.py v9.7 the
-    CircuitBreaker no longer uses it to *guess* a FloodWait duration — it
-    honors the exact FloodWaitError.seconds value from Telegram instead.
-    This var is effectively legacy/unused by the hardened monitors.py.
+v14.5.1 (this pass) — correction pass aligned with filter_engine.py v14.5.1:
+  * Added 9 config fields that filter_engine.py v14.5.x has always read
+    via `_cfg(...)` fallbacks but which were never declared in _ConfigData:
+        FUZZY_SCORE_CUTOFF, REGEX_TIMEOUT_S, REGEX_GUARD_WORKERS,
+        FILTER_EXECUTOR_WORKERS, METRICS_WINDOW, METRICS_Z_THRESHOLD,
+        METRICS_ENABLED, ADAPTIVE_ALPHA, HELP_ANCHOR_INTENT_WEIGHT.
+    All were silently running at their hard-coded defaults. Each is now
+    env-driven with the SAME default as the previous fallback → identical
+    out-of-the-box behavior, full runtime tunability from now on.
+  * DATABASE_URL: `sslmode=` in the query string is now parsed and exposed
+    as CFG.DATABASE_SSL. Previously the entire query string was dropped,
+    so a provider that FORCES SSL (Render, Heroku, DO) could either fail
+    to connect or connect without TLS. Default = None → identical to
+    asyncpg's own default when sslmode is absent (no behavior change).
+  * MIN_ARABIC_CONFIDENCE is now the real gate in filter_engine's
+    `_is_arabic` (see one-line patch in filter_engine.py changelog).
+    Previously the field existed here but NOTHING read it — the filter
+    hard-coded 0.12. Its DEFAULT is changed 0.7 → 0.12 so that wiring it
+    in does not silently flip the effective threshold from "12% Arabic
+    letters" to "70% Arabic letters" and reject every mixed message
+    ("ابي حل assignment 2" = ratio 0.33 → would have been killed).
+    Operators who had (pointlessly) set MIN_ARABIC_CONFIDENCE=0.7 in
+    the environment keep their value — and it now actually does what the
+    name says.
+  * FUZZY_SCORE_CUTOFF now defaults to float(FUZZY_MATCH_THRESHOLD) so
+    the legacy integer and the new float can never silently diverge.
+    Setting FUZZY_MATCH_THRESHOLD=90 still works end-to-end.
+  * BOT_VERSION and boot log lines now report "14.5.1", synchronized
+    with FILTER_ENGINE_VERSION. Previous BOT_VERSION "14.0.0" made every
+    deploy carry three contradictory version strings.
+  * DEFAULT_CONTACT_TEMPLATES no longer embed the operator's phone number.
+    Templates use a {phone} placeholder filled at load time from the
+    CONTACT_PHONE env var (accounts.env). If unset, a WARNING is logged
+    at boot and the placeholder renders as "—". The number previously in
+    this file is still in git history and MUST be rotated by the operator.
+
+v13.1 (previous pass):
+  * _KW_CATEGORIES now includes "templates" and "template_patterns" — the
+    two top-level keys keywords.json v14.0.x uses for Template-Driven
+    Pattern Generation data. Without them the entire Template-Boost
+    mechanism was dead on arrival, silently.
+  * load_keywords() logs template counts explicitly so a future
+    "silently empty category" regression is visible at boot.
+
+v13.0 and earlier: see git history.
 """
 
 from __future__ import annotations
@@ -42,7 +62,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Final, List, Optional, Tuple
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from cryptography.fernet import Fernet
 from dotenv import load_dotenv
@@ -50,8 +70,7 @@ from loguru import logger
 
 # =============================================================================
 # Project root (absolute) — every file path below is anchored here so the app
-# behaves identically no matter what the current working directory is
-# (Render, systemd, cron and IDE runners all start with different CWDs).
+# behaves identically no matter what the current working directory is.
 # =============================================================================
 PROJECT_DIR: Final[Path] = Path(__file__).resolve().parent
 
@@ -86,22 +105,15 @@ except ImportError:
 # DATABASE_URL Parser
 # =============================================================================
 def parse_database_url(url: str) -> Dict[str, Any]:
-    """
-    Parse a PostgreSQL DATABASE_URL into connection parameters.
+    """Parse a PostgreSQL DATABASE_URL into connection parameters.
 
-    v13.2 fix (audit C-2): the previous regex-based parser failed on real
-    Render/database-provider URLs in three ways:
-      * legacy ``postgres://`` scheme (older Render/provisioners) was rejected;
-      * query strings such as ``?sslmode=require`` leaked into the database
-        name, so asyncpg tried to connect to a non-existent database;
-      * percent-encoded credentials (e.g. ``p%40ss``) were NOT decoded, so any
-        password containing special characters silently mismatched.
-
-    Uses urllib.parse instead of regex; secrets are never logged.
+    v14.5.1: `sslmode=` in the query string is now extracted and mapped to
+    the asyncpg `ssl` value (None/"require"/"verify-ca"/"verify-full").
+    Legacy `postgres://` scheme is normalised; percent-encoded credentials
+    are decoded; secrets are never logged.
     """
     raw = (url or "").strip()
     if raw.startswith("postgres://"):
-        # asyncpg speaks "postgresql://" — normalise the legacy scheme.
         raw = "postgresql://" + raw[len("postgres://"):]
 
     parsed = urlparse(raw)
@@ -116,12 +128,28 @@ def parse_database_url(url: str) -> Dict[str, Any]:
     if not database:
         raise ValueError("Invalid DATABASE_URL: missing database name")
 
+    # v14.5.1: sslmode extraction
+    qs = parse_qs(parsed.query or "")
+    sslmode_raw = (qs.get("sslmode", [""])[0] or "").lower()
+    ssl_param: Optional[str] = None
+    if sslmode_raw in ("require", "verify-ca", "verify-full"):
+        ssl_param = sslmode_raw
+    elif sslmode_raw in ("disable", "allow", "prefer"):
+        # asyncpg default (sslmode unset) = prefer (try plain, fall back to TLS).
+        # For "disable" we could map to ssl=False explicitly, but leaving it
+        # None lets asyncpg use its default — which is exactly what a URL
+        # WITHOUT sslmode= produces today, so both paths behave identically
+        # unless the operator specifically asked for strict TLS.
+        ssl_param = None
+
     return {
         "user": unquote(parsed.username) if parsed.username else None,
         "password": unquote(parsed.password) if parsed.password else None,
         "host": parsed.hostname,
         "port": parsed.port or 5432,
         "database": database,
+        "ssl": ssl_param,           # v14.5.1 — was dropped entirely before
+        "sslmode_raw": sslmode_raw, # kept for logging / diagnostics only
     }
 
 # =============================================================================
@@ -150,9 +178,6 @@ def setup_logging(
             enqueue=True,
         )
     except ValueError:
-        # Some Python 3.11 builds fail to parse loguru color markup
-        # ("Single '}' encountered in format string") - fall back to a
-        # plain format so logging setup can never crash the app.
         logger.add(
             sys.stdout,
             level=level,
@@ -160,26 +185,23 @@ def setup_logging(
             colorize=False,
             enqueue=True,
         )
+
+    # v14.5.1: diagnose_enabled is now defined BEFORE the try block so it
+    # is always bound even if logger.add fails; the final log line can no
+    # longer raise NameError under any reordering.
+    _is_production = (
+        os.getenv("RENDER", "").lower() in ("1", "true", "yes")
+        or os.getenv("ENVIRONMENT", "").lower() in ("prod", "production")
+    )
+    _diagnose = os.getenv("LOG_DIAGNOSE", "").lower() in ("1", "true", "yes")
+    if _diagnose:
+        diagnose_enabled = True
+    elif _is_production:
+        diagnose_enabled = False
+    else:
+        diagnose_enabled = True
+
     try:
-        # v9.12 (audit M-11): diagnose=True was a major secret-leak vector
-        # — it dumps local variables (including session strings, API hashes,
-        # tokens, sender phone numbers, message text) into every traceback
-        # written to bot.log, and that file is readable by anyone with
-        # access to the machine. We now default to
-        # diagnose=False in production (RENDER=true or ENVIRONMENT=prod)
-        # and only enable it when LOG_DIAGNOSE=true is set explicitly.
-        # Local dev keeps diagnose=True for actually useful tracebacks.
-        _is_production = (
-            os.getenv("RENDER", "").lower() in ("1", "true", "yes")
-            or os.getenv("ENVIRONMENT", "").lower() in ("prod", "production")
-        )
-        _diagnose = os.getenv("LOG_DIAGNOSE", "").lower() in ("1", "true", "yes")
-        if _diagnose:
-            diagnose_enabled = True
-        elif _is_production:
-            diagnose_enabled = False
-        else:
-            diagnose_enabled = True  # local dev default
         logger.add(
             log_file,
             level="DEBUG",
@@ -291,12 +313,12 @@ class SecretManager:
         cls._cache.clear()
 
 # =============================================================================
-# Load .env — anchored to the project directory, not the CWD (audit M-3)
+# Load .env — anchored to the project directory, not the CWD
 # =============================================================================
 load_dotenv(PROJECT_DIR / "accounts.env")
 
 # =============================================================================
-# Core Config Dataclass v13.1 – جميع المتغيرات
+# Core Config Dataclass v14.5.1 – جميع المتغيرات
 # =============================================================================
 @dataclass(frozen=True, slots=True)
 class _ConfigData:
@@ -313,6 +335,11 @@ class _ConfigData:
     DB_NAME: Optional[str]
     DB_USER: Optional[str]
     DB_PASSWORD: Optional[str]
+    # v14.5.1: SSL mode extracted from DATABASE_URL's ?sslmode=... query.
+    # None = asyncpg default (tries plain then TLS). "require" / "verify-ca"
+    # / "verify-full" = strict TLS. Cloud providers that force SSL need
+    # "require" at minimum — was dropped entirely before v14.5.1.
+    DATABASE_SSL: Optional[str]
     DB_POOL_MIN: int
     DB_POOL_MAX: int
 
@@ -375,16 +402,11 @@ class _ConfigData:
     SESSION_BACKUP_INTERVAL: int
 
     # ── v9.28-1: سياسات الاحتفاظ ──
-    # القيم الافتراضية = السلوك التاريخي حرفياً (رسائل 7 / تدقيق 90 / إشعارات 30)
     RETENTION_MESSAGES_DAYS: int
     RETENTION_AUDIT_DAYS: int
     RETENTION_NOTIFICATIONS_DAYS: int
 
-    # ── Alert send behaviour (audit H-02) ──
-    # When True (legacy behaviour), every text alert tries to attach the
-    # group's profile photo via get_profile_photos + send_file. When False
-    # (default since v9.12), text alerts go out as plain send_message —
-    # half the API calls, half the FloodWait risk, and the same alert text.
+    # ── Alert send behaviour ──
     ATTACH_GROUP_PHOTO: bool
 
     # ── Admin Bot ──
@@ -397,59 +419,29 @@ class _ConfigData:
     ALERT_MAX_TEXT_LEN: int
     ALERT_WITH_COPY_BUTTON: bool
     ALERT_WITH_CONTACT_BUTTON: bool
-    # v12.0 unified_alerts: بوابة العمر — أقصى عمر لحدث يستحق تنبيهاً.
-    # بعد انقطاع طويل يعيد تيليجرام تسليم تحديثات قديمة (catch-up) —
-    # بوابة العمر تُسقطها قبل الإثراء وقبل الإرسال (0 = تعطيل البوابة).
     MAX_EVENT_AGE_SECONDS: int
-    # v12.0 unified_alerts: حد نص بطاقة التنبيه (وحدات UTF-16) — أضيق من
-    # حد Bot API الصلب (4096) هامشاً للكيانات؛ يتجاوزه → قصّ آمن ذاتي.
     ALERT_CARD_MAX_CHARS: int
-    # v12.0 unified_alerts: حذف صفوف processing_queue الأقدم من هذا العمر
-    # عند الإقلاع ودورياً — الطابور مخزن تشغيلي عابر (ليس بيانات مستخدم).
     QUEUE_STALE_PURGE_SECONDS: int
-    # ══ v12.1.0 التزامن الصلب (claim/ack/recover) ══
-    # صف in_flight بلا ack أطول من هذا = العامل انهار → استرداد تلقائي
     QUEUE_INFLIGHT_MAX_AGE_SECONDS: int
-    # أقصى محاولات لحدث واحد قبل dead_letters بصدق (لا دورة أبدية)
     QUEUE_INFLIGHT_MAX_ATTEMPTS: int
-    # دورية فحص الاسترداد
     QUEUE_RECOVER_INTERVAL_SECONDS: int
-    # v11.5: الرد التعويضي F (مواصفة §11)
     REPLY_FIX_ENABLED: bool
     REPLY_FIX_HOURLY_PER_USER: int
     REPLY_FIX_DAILY_CAP: int
     REPLY_FIX_JITTER_MIN: float
     REPLY_FIX_JITTER_MAX: float
-    # v10.7: user ACCOUNTS cannot send inline buttons (Telegram only renders
-    # them for bots) — alerts therefore ship as TEXT links only. The whole
-    # button assembly (build_dynamic_buttons + copy/contact rows) is kept
-    # intact but gated behind this master switch, default OFF per spec §5.
     ALERT_BUTTONS_ENABLED: bool
-    # v10.7 Level-4 safety net: when no username and no mention hash works
-    # (or the sender is a channel/anonymous admin), the alert is followed by
-    # a forward of the ORIGINAL message so the sender's name/avatar rides on
-    # top of the forwarded copy. Kill switch: ALERT_FORWARD_FALLBACK=false.
     ALERT_FORWARD_FALLBACK: bool
-    # v10.7 §5: warn at boot for every monitoring account that is NOT a
-    # member of TARGET_GROUP_ID (its alerts + mentions would keep failing).
     TARGET_MEMBERSHIP_CHECK: bool
 
-    # ── v10.8 Alert Bot (إرسال التنبيهات عبر Bot API بأزرار inline URL) ──
-    # توكن بوت تنبيهات مخصص (اسم البوت: @alzariqi711r_bot). اختياري:
-    # بدونه تعمل الحسابات بالاستماع وبناء البيانات فقط، والإرسال يمر عبر
-    # AlertBot.send → sendMessage بأزرار [المرسل][جروب] في صف واحد.
-    # غياب التوكن أو أي فشل → fallback لمسار حسابات المستخدمين بنفس نص
-    # التنبيه بدون أزرار (كما في v10.7) مع تسجيل السبب في اللوج.
+    # ── v10.8 Alert Bot ──
     ALERT_BOT_TOKEN: Optional[str]
-    # مفتاح إيقاف حي — false يعطل بوت التنبيهات كلياً (fallback فقط).
     ALERT_BOT_ENABLED: bool
-    # مهلة كل طلب HTTP للبوت API (ثوانٍ) وعدد المحاولات القصوى لـ429.
     ALERT_BOT_TIMEOUT: float
     ALERT_BOT_MAX_RETRIES: int
 
-    # ── Anti-Spam (المرحلة الثانية: Watch List → Confirmation → Permanent Ignore) ──
+    # ── Anti-Spam ──
     ANTISPAM_ENABLED: bool
-    # v9.21: محرك القواعد وقائمة السماح (مفاتيح تشغيل — تبديل لاحق من اللوحة)
     RULE_ENGINE_ENABLED: bool
     ALLOWLIST_ENABLED: bool
     ANTISPAM_WATCH_DURATION_SECONDS: int
@@ -483,31 +475,29 @@ class _ConfigData:
     CONNECTION_TIMEOUT: int
     SESSION_REFRESH_INTERVAL: int
 
-    # ── Fast Capture (deletion-race protection, monitors v9.8) ──
+    # ── Fast Capture ──
     FAST_CAPTURE_ENABLED: bool
     CAPTURE_BUFFER_SIZE: int
     CAPTURE_TTL_SECONDS: int
 
-    # ── Alert Dedup (v9.10 — cross-account/re-send alert barrier) ──
+    # ── Alert Dedup ──
     DEDUP_ENABLED: bool
     DEDUP_WINDOW_SECONDS: int
-    # v13.0: أقل عمر لحجز dedup قبل أن يستولي عليه حدث مسترد (_recovered)
-    # بلا إيصال إرسال — حماية CAS من سباق عاملين مستردّين لنفس المحتوى.
     DEDUP_RECOVERY_STEAL_MIN_AGE_SECONDS: int
 
-    # ── v10.0 Precision: clause re-scoring (تقييم البنود المستقلة) ──
+    # ── v10.0 Precision ──
     CLAUSE_RESCORE_ENABLED: bool
 
-    # ── v10.0 Precision: similarity gate (منع إعادة الصياغة المتقاربة) ──
+    # ── Similarity gate ──
     SIMILARITY_ENABLED: bool
     SIMILARITY_THRESHOLD: float
     SIMILARITY_WINDOW_SECONDS: int
 
-    # ── v10.0 Precision: daily digest (تقرير يومي للإدارة) ──
+    # ── Daily digest ──
     DIGEST_ENABLED: bool
     DIGEST_HOUR_UTC: int
 
-    # ── Sender Intelligence / Resolver (backend-only enrichment, v9.9) ──
+    # ── Sender Intelligence / Resolver ──
     SENDER_INTEL_ENABLED: bool
     SENDER_ENTITY_CACHE_SIZE: int
     SENDER_ENTITY_CACHE_TTL: int
@@ -516,29 +506,17 @@ class _ConfigData:
     SENDER_RESOLVE_BACKOFF_MAX: float
     SENDER_FLOOD_MAX_SLEEP: int
 
-    # ── v10.4 Sender Mention Intelligence (backend-only — alert format FROZEN) ──
-    # يبني mention entity حقيقي (InputMessageEntityMentionName) لاسم المرسل
-    # عند الإرسال فقط — النص/الشكل/الروابط كما هي حرفياً (عقد متجمّد).
+    # ── v10.4 Sender Mention Intelligence ──
     SENDER_MENTION_FIX_ENABLED: bool
     MENTION_NEG_TTL_SECONDS: int
     MENTION_MAX_TIERS_PER_CANDIDATE: int
 
-    # ── v10.5 Alert Navigation Resolver (backend-only — alert format FROZEN) ──
-    # الحلّ متعدد الاستراتيجيات للأزرار الثلاثة (المرسل/المجموعة/عرض الرسالة).
-    # يقرر فقط البيانات التي تُغذّي البانِر المتجمّد — لا يغيّر الشكل أبداً.
+    # ── v10.5 Alert Navigation Resolver ──
     NAV_EXPORT_LINK_ENABLED: bool
-    # v10.6: اكتشاف username المرسل عبر رسالته المصدر (users.getUsers +
-    # InputUserFromMessage) — آلية MTProto مشروعة: الحساب عضو في المجموعة
-    # المصدر وقد تسلّم رسالة المرسل بنفسه. تيليجرام يُعيد فقط ما يسمح به
-    # لهذا الحساب — username مخفي يعود غائباً ونتعامل مع ذلك بصدق.
     NAV_USER_DISCOVERY_ENABLED: bool
-    # Telethon client: replay missed updates after reconnect + parallel updates
     TELEGRAM_CATCH_UP: bool
-    # حدثي: استيقاظ حلقة الطابور فور الإدراج بدل polling ثابت
     QUEUE_EVENT_WAKE: bool
-    # قياس زمن التنبيه (message.date → استلام → إرسال) — logs/health فقط
     ALERT_LATENCY_LOG_EVERY: int
-    # تسخين كاش كيانات المجموعات عند الإقلاع
     WARMUP_CHAT_CACHE: bool
 
     # ── Prefilter ──
@@ -566,6 +544,10 @@ class _ConfigData:
     FUZZY_MAX_EDIT_DISTANCE: int
     FUZZY_MIN_TOKEN_LENGTH: int
     FUZZY_SIMILARITY_THRESHOLD: float
+    # v14.5.1: the effective cutoff that filter_engine._fuzzy_intent_fallback
+    # reads. Defaults to float(FUZZY_MATCH_THRESHOLD) so setting the legacy
+    # integer flows here automatically. Explicit FUZZY_SCORE_CUTOFF wins.
+    FUZZY_SCORE_CUTOFF: float
 
     # ── Negation ──
     NEGATION_CLAUSE_BOUNDARIES_ENABLED: bool
@@ -598,8 +580,29 @@ class _ConfigData:
     TEXT_CACHE_SIZE: int
     TEXT_CACHE_TTL: int
 
+    # ═══════════════════════════════════════════════════════════════════
+    # ── v14.5.1 Execution / Regex Guard (filter_engine + security) ──
+    # REGEX_TIMEOUT_S: watchdog timeout per regex call inside SafeRegexExecutor.
+    # REGEX_GUARD_WORKERS: dedicated thread pool size for the regex guard.
+    # FILTER_EXECUTOR_WORKERS: dedicated CPU-bound filter pipeline executor.
+    REGEX_TIMEOUT_S: float
+    REGEX_GUARD_WORKERS: int
+    FILTER_EXECUTOR_WORKERS: int
+
+    # ── v14.5.1 Metrics (BoundedMetrics used by filter_engine) ──
+    METRICS_WINDOW: int
+    METRICS_Z_THRESHOLD: float
+    METRICS_ENABLED: bool
+
+    # ── v14.5.1 Adaptive weights + Help anchor ──
+    # ADAPTIVE_ALPHA: learning rate for AdaptiveWeights (feedback-driven).
+    # HELP_ANCHOR_INTENT_WEIGHT: intent weight assigned when a bare help
+    # verb ("ساعدوني") anchors the intent with no explicit request verb.
+    ADAPTIVE_ALPHA: float
+    HELP_ANCHOR_INTENT_WEIGHT: float
+
 # =============================================================================
-# Config Builder v13.1
+# Config Builder v14.5.1
 # =============================================================================
 class Config:
     _instance: Optional[_ConfigData] = None
@@ -614,15 +617,6 @@ class Config:
             level=SecretManager.get("LOG_LEVEL", "INFO", required=False),
         )
 
-        # v9.34-2: صمود الإقلاع أمام نافذة env الفارغة على Render.
-        # النمط الموثق في سجلات النشر (09-24 و09-26): النسخة الجديدة تُقلع
-        # 1-2 مرة قبل اكتمال حقن متغيرات البيئة، فترى TARGET_GROUP_ID
-        # مفقوداً وتموت FATAL (exit 1) → Render يعلن update_failed ويعيد
-        # النشر للتراجع — مهما كان الكود سليماً. الحل: غياب المتغيرين
-        # (وليس قيمة غير صالحة) يُدخل وضع «اللوحة فقط» المُمدوم أصلاً في
-        # main.py (لا مراقبة ولا تنبيهات، /health تعمل، النشر ينجح) مع
-        # تحذير CRITICAL صريح. الإقلاع العادي (البيئة كاملة) لا يتغير
-        # عليه شيء حرفياً، وقيمة 0 الصريحة تبقى خطأ رفعاً.
         tg_raw = SecretManager.get("TARGET_GROUP_ID", None, required=False)
         admin_raw = SecretManager.get("ADMIN_CHAT_ID", None, required=False)
         if tg_raw is None or admin_raw is None:
@@ -647,10 +641,12 @@ class Config:
         if not 0 < spam <= 1:
             raise ValueError("SPAM_SCORE_THRESHOLD must be in (0, 1]")
 
+        # v14.5.1: fetch legacy fuzzy int ONCE so FUZZY_SCORE_CUTOFF can
+        # default from it without two independent reads that could diverge.
+        legacy_fuzzy = SecretManager.get_int("FUZZY_MATCH_THRESHOLD", 85, required=False)
+
         download_path = Path(SecretManager.get("DOWNLOAD_PATH", "downloads", required=False))
         sessions_dir = Path(SecretManager.get("SESSIONS_DIR", "sessions", required=False))
-        # Relative paths are anchored to the project directory so the app is
-        # independent of the process CWD (audit M-3).
         if not download_path.is_absolute():
             download_path = PROJECT_DIR / download_path
         if not sessions_dir.is_absolute():
@@ -663,22 +659,15 @@ class Config:
             logger.warning(f"Unknown DB_TYPE '{db_type}', falling back to sqlite")
             db_type = "sqlite"
 
-        # ── DATABASE_URL support ──
         db_host = None
         db_port = 5432
         db_name = None
         db_user = None
         db_password = None
+        db_ssl: Optional[str] = None  # v14.5.1
 
         database_url = (os.getenv("DATABASE_URL") or "").strip()
         if database_url:
-            # v13.2 fix (audit C-1): a VALID postgres DATABASE_URL now WINS
-            # over DB_TYPE. render.yaml ships DB_TYPE=sqlite as a bootstrap
-            # default, which previously meant a user who added DATABASE_URL
-            # for persistence was silently ignored and the bot kept writing
-            # to ephemeral SQLite — the exact data-loss scenario render.yaml's
-            # own docs claim cannot happen. If the URL is present but NOT a
-            # valid postgres URL, we keep DB_TYPE unchanged and warn loudly.
             try:
                 parsed = parse_database_url(database_url)
                 if db_type != "postgresql":
@@ -692,7 +681,9 @@ class Config:
                 db_name = parsed["database"]
                 db_user = parsed["user"]
                 db_password = parsed["password"]
-                logger.info("Database config loaded from DATABASE_URL")
+                db_ssl = parsed.get("ssl")  # v14.5.1
+                _sslmode = parsed.get("sslmode_raw") or "unset"
+                logger.info(f"Database config loaded from DATABASE_URL (sslmode={_sslmode})")
             except Exception as e:
                 logger.error(
                     f"Failed to parse DATABASE_URL: {e} — keeping DB_TYPE={db_type!r} "
@@ -710,9 +701,6 @@ class Config:
             db_user = SecretManager.get("DB_USER", None, required=False)
             db_password = SecretManager.get("DB_PASSWORD", None, required=False)
 
-        # ── بناء الكائن مع جميع المتغيرات ──
-        # Relative file paths are anchored to PROJECT_DIR so the process CWD
-        # never changes where the DB / logs live (audit M-3).
         log_file_raw = SecretManager.get("LOG_FILE", "bot.log", required=False)
         db_file_raw = SecretManager.get("DB_FILE", "telegram_bot.db", required=False)
         log_file_path = str(PROJECT_DIR / log_file_raw) if not os.path.isabs(log_file_raw) else log_file_raw
@@ -730,6 +718,7 @@ class Config:
             DB_NAME=db_name,
             DB_USER=db_user,
             DB_PASSWORD=db_password,
+            DATABASE_SSL=db_ssl,  # v14.5.1
             DB_POOL_MIN=SecretManager.get_int("DB_POOL_MIN", 2, required=False),
             DB_POOL_MAX=SecretManager.get_int("DB_POOL_MAX", 10, required=False),
             DOWNLOAD_PATH=download_path,
@@ -737,12 +726,11 @@ class Config:
             SECURE_SESSIONS=SecretManager.get_bool("SECURE_SESSIONS", False),
             # ========== الرسائل ==========
             # v11.5 (مواصفة المستخدم 2026-10 — فلترة الطول): القاعدة المركزية
-            # "6 <= len(text) <= 65" على النص الأصلي (نقاط Unicode — لا UTF-16
-            # ولا محارف مرئية). القيم الافتراضية القديمة (10/5000) كانت تُدخل
-            # نصوصاً 66..5000 حرفاً إلى مسار التنبيه وترفض 6..9. كل البوابات
-            # (monitors 3 نقاط + filter_engine + InputSanitizer) تقرأ هاتين
-            # القيمتين — الاستعادة من الطابور وإعادة المحاولة تعيد الفحص
-            # تلقائياً (_validate_event في كل pipeline). لا يغيّر بقية الفلاتر.
+            # "6 <= len(text) <= 65" على النص الأصلي. NOTE: filter_engine.py's
+            # analyzer-local FILTER_MIN_MESSAGE_CHARS (3) is intentionally
+            # looser and only applies on the branch where FilterPolicy
+            # import fails; the canonical gate is FilterPolicy.check() which
+            # reads MIN_MESSAGE_LENGTH from here.
             MAX_MESSAGE_LENGTH=SecretManager.get_int("MAX_MESSAGE_LENGTH", 65, required=False),
             MIN_MESSAGE_LENGTH=SecretManager.get_int("MIN_MESSAGE_LENGTH", 6, required=False),
             MAX_WORDS_COUNT=SecretManager.get_int("MAX_WORDS_COUNT", 20, required=False),
@@ -758,19 +746,21 @@ class Config:
             SQLITE_CACHE_SIZE=SecretManager.get_int("SQLITE_CACHE_SIZE", -8000, required=False),
             DB_POOL_SIZE=SecretManager.get_int("DB_POOL_SIZE", 2, required=False),
             # ========== الفلترة القديمة (للتوافق) ==========
-            FUZZY_MATCH_THRESHOLD=SecretManager.get_int("FUZZY_MATCH_THRESHOLD", 85, required=False),
+            FUZZY_MATCH_THRESHOLD=legacy_fuzzy,
             SPAM_SCORE_THRESHOLD=spam,
             ALERT_COOLDOWN=SecretManager.get_int("ALERT_COOLDOWN", 300, required=False),
-            # v12.0 unified_alerts (تفاصيلها أعلاه في التعريفات)
             MAX_EVENT_AGE_SECONDS=SecretManager.get_int("MAX_EVENT_AGE_SECONDS", 1800, required=False),
             ALERT_CARD_MAX_CHARS=SecretManager.get_int("ALERT_CARD_MAX_CHARS", 4000, required=False),
             QUEUE_STALE_PURGE_SECONDS=SecretManager.get_int("QUEUE_STALE_PURGE_SECONDS", 7200, required=False),
-            # v12.1.0 التزامن الصلب
             QUEUE_INFLIGHT_MAX_AGE_SECONDS=SecretManager.get_int("QUEUE_INFLIGHT_MAX_AGE_SECONDS", 600, required=False),
             QUEUE_INFLIGHT_MAX_ATTEMPTS=SecretManager.get_int("QUEUE_INFLIGHT_MAX_ATTEMPTS", 3, required=False),
             QUEUE_RECOVER_INTERVAL_SECONDS=SecretManager.get_int("QUEUE_RECOVER_INTERVAL_SECONDS", 120, required=False),
             LANGUAGE_FILTER=SecretManager.get_bool("LANGUAGE_FILTER", True),
-            MIN_ARABIC_CONFIDENCE=SecretManager.get_float("MIN_ARABIC_CONFIDENCE", 0.7, required=False),
+            # v14.5.1: default changed 0.7 → 0.12 to match the effective
+            # threshold filter_engine hard-coded before this pass. Now that
+            # _is_arabic actually reads this field, keeping the old default
+            # would silently REJECT every mixed Arabic/Latin message.
+            MIN_ARABIC_CONFIDENCE=SecretManager.get_float("MIN_ARABIC_CONFIDENCE", 0.12, required=False),
             BLOOM_FILTER_SIZE=SecretManager.get_int("BLOOM_FILTER_SIZE", 50000, required=False),
             BLOOM_FILTER_FP=SecretManager.get_float("BLOOM_FILTER_FP", 0.001, required=False),
             # ========== التسجيل القديم ==========
@@ -796,28 +786,20 @@ class Config:
             HEALTH_CHECK_INTERVAL=SecretManager.get_int("HEALTH_CHECK_INTERVAL", 60, required=False),
             HEALTH_MIN_MONITORS_RATIO=SecretManager.get_float("HEALTH_MIN_MONITORS_RATIO", 0.5, required=False),
             SESSION_BACKUP_INTERVAL=SecretManager.get_int("SESSION_BACKUP_INTERVAL", 3600, required=False),
-            # v9.28-1: سياسات الاحتفاظ (7/90/30 = السلوك التاريخي حرفياً)
             RETENTION_MESSAGES_DAYS=SecretManager.get_int("RETENTION_MESSAGES_DAYS", 7, required=False),
             RETENTION_AUDIT_DAYS=SecretManager.get_int("RETENTION_AUDIT_DAYS", 90, required=False),
             RETENTION_NOTIFICATIONS_DAYS=SecretManager.get_int("RETENTION_NOTIFICATIONS_DAYS", 30, required=False),
-            # ========== Alert send behaviour (audit H-02) ==========
-            # Default False: plain send_message is the fast path. Set
-            # ATTACH_GROUP_PHOTO=true to restore the legacy behaviour of
-            # attaching the group's profile photo to every text alert.
+            # ========== Alert send behaviour ==========
             ATTACH_GROUP_PHOTO=SecretManager.get_bool("ATTACH_GROUP_PHOTO", False),
             # ========== Admin Bot ==========
             ADMIN_BOT_ENABLED=SecretManager.get_bool("ADMIN_BOT_ENABLED", False),
             ADMIN_BOT_TOKEN=SecretManager.get("ADMIN_BOT_TOKEN", None, required=False),
             # ========== التنبيهات ==========
             ALERT_WITH_BUTTONS=SecretManager.get_bool("ALERT_WITH_BUTTONS", True),
-            # v10.7 §5: حسابات المستخدمين لا ترسل أزراراً (تظهر فقط للبوتات) —
-            # التنبيهات تعتمد روابط النص. الأزرار القديمة محفوظة كاملة خلف
-            # هذا المفتاح (افتراضياً OFF) إن احتاجها أحد مستقبلاً.
             ALERT_BUTTONS_ENABLED=SecretManager.get_bool("ALERT_BUTTONS_ENABLED", False),
             ALERT_FORWARD_FALLBACK=SecretManager.get_bool("ALERT_FORWARD_FALLBACK", True),
             TARGET_MEMBERSHIP_CHECK=SecretManager.get_bool("TARGET_MEMBERSHIP_CHECK", True),
-            # ══ v10.8 Alert Bot (@alzariqi711r_bot) ══
-            # توكن اختياري من بيئة Render — غيابه يعمل الـfallback بلا أعطال.
+            # ══ v10.8 Alert Bot ══
             ALERT_BOT_TOKEN=SecretManager.get("ALERT_BOT_TOKEN", None, required=False),
             ALERT_BOT_ENABLED=SecretManager.get_bool("ALERT_BOT_ENABLED", True),
             ALERT_BOT_TIMEOUT=SecretManager.get_float("ALERT_BOT_TIMEOUT", 12.0, required=False),
@@ -825,50 +807,29 @@ class Config:
             ALERT_SHOW_SCORE=SecretManager.get_bool("ALERT_SHOW_SCORE", True),
             ALERT_MAX_TEXT_LEN=SecretManager.get_int("ALERT_MAX_TEXT_LEN", 350, required=False),
             ALERT_WITH_COPY_BUTTON=SecretManager.get_bool("ALERT_WITH_COPY_BUTTON", True),
-            # زر «تواصل مع المرسل» (المرحلة الأولى): يفتح قائمة الرسائل الجاهزة
             ALERT_WITH_CONTACT_BUTTON=SecretManager.get_bool("ALERT_WITH_CONTACT_BUTTON", True),
-            # ══ v11.5: الرد التعويضي F (مواصفة المستخدم §11) ══
-            # بعد نجاح تنبيه AlertBot لمرسل بلا username: حساب المراقبة
-            # يرد على التنبيه بكيان Text Mention (InputMessageEntityMentionName
-            # بـhash حساب المراقبة نفسه — hash معزول لكل حساب). لا يُسقط
-            # التنبيه أبداً؛ فشله يُسجل فقط. الحدود: مرة/ساعة لكل user_id،
-            # حد يومي، فاصل عشوائي 2–5 ث، تجاوز آمن لأخطاء الكتابة.
             REPLY_FIX_ENABLED=SecretManager.get_bool("REPLY_FIX_ENABLED", True),
             REPLY_FIX_HOURLY_PER_USER=SecretManager.get_int("REPLY_FIX_HOURLY_PER_USER", 1, required=False),
             REPLY_FIX_DAILY_CAP=SecretManager.get_int("REPLY_FIX_DAILY_CAP", 100, required=False),
             REPLY_FIX_JITTER_MIN=SecretManager.get_float("REPLY_FIX_JITTER_MIN", 2.0, required=False),
             REPLY_FIX_JITTER_MAX=SecretManager.get_float("REPLY_FIX_JITTER_MAX", 5.0, required=False),
-            # ========== مكافحة السبام (المرحلة الثانية) ==========
-            # Watch List (10 دقائق مراقبة) → Spam Confirmation → Permanent Ignore.
-            # لا يتجاهل ولا يحظر أحداً عند المراقبة — فقط بعد تأكيد السبام.
+            # ========== مكافحة السبام ==========
             ANTISPAM_ENABLED=SecretManager.get_bool("ANTISPAM_ENABLED", True),
-            # v9.21: القواعد والسماح مفعّلة افتراضياً (الجداول الفارغة = لا أثر)
             RULE_ENGINE_ENABLED=SecretManager.get_bool("RULE_ENGINE_ENABLED", True),
             ALLOWLIST_ENABLED=SecretManager.get_bool("ALLOWLIST_ENABLED", True),
             ANTISPAM_WATCH_DURATION_SECONDS=SecretManager.get_int("ANTISPAM_WATCH_DURATION_SECONDS", 600, required=False),
-            # شرط المراقبة 1: رسالتان خلال 60 ثانية
             ANTISPAM_BURST_MESSAGES=SecretManager.get_int("ANTISPAM_BURST_MESSAGES", 2, required=False),
             ANTISPAM_BURST_WINDOW_SECONDS=SecretManager.get_int("ANTISPAM_BURST_WINDOW_SECONDS", 60, required=False),
-            # شرط المراقبة 2: تشابه نصي/دلالي ≥ 80% خلال 5 دقائق
             ANTISPAM_SIMILARITY_THRESHOLD=SecretManager.get_float("ANTISPAM_SIMILARITY_THRESHOLD", 0.80, required=False),
             ANTISPAM_SIMILARITY_WINDOW_SECONDS=SecretManager.get_int("ANTISPAM_SIMILARITY_WINDOW_SECONDS", 300, required=False),
-            # شرط المراقبة 3: أكثر من طلب من فئات مختلفة خلال 5 دقائق
             ANTISPAM_CATEGORY_WINDOW_SECONDS=SecretManager.get_int("ANTISPAM_CATEGORY_WINDOW_SECONDS", 300, required=False),
-            # تصنيف مباشر كمزعج: نفس الرسالة/المعنى في ≥ 4 مجموعات خلال 5 دقائق
             ANTISPAM_DIRECT_SPAM_GROUPS=SecretManager.get_int("ANTISPAM_DIRECT_SPAM_GROUPS", 4, required=False),
             ANTISPAM_DIRECT_SPAM_WINDOW_SECONDS=SecretManager.get_int("ANTISPAM_DIRECT_SPAM_WINDOW_SECONDS", 300, required=False),
-            # شروط تأكيد السبام أثناء المراقبة
             ANTISPAM_CONFIRM_WINDOW_SECONDS=SecretManager.get_int("ANTISPAM_CONFIRM_WINDOW_SECONDS", 300, required=False),
             ANTISPAM_CONFIRM_MESSAGES=SecretManager.get_int("ANTISPAM_CONFIRM_MESSAGES", 5, required=False),
             ANTISPAM_CONFIRM_GROUPS=SecretManager.get_int("ANTISPAM_CONFIRM_GROUPS", 3, required=False),
             ANTISPAM_CONFIRM_ACTIVITY_WINDOW_SECONDS=SecretManager.get_int("ANTISPAM_CONFIRM_ACTIVITY_WINDOW_SECONDS", 600, required=False),
-            # v11.7.1 (المهمة §2.3): خيار سياسة — شرط التأكيد (هـ) يحتسب حالياً
-            # كل الرسائل خلال 10 دقائق (حتى العادية بلا أي مؤشر سبام). عندما
-            # True: تشترط أن تحمل الرسائل المحسوبة مؤشر سبام (فئة طلب أو
-            # تشابه مع سوابق). **الافتراضي False = السلوك الحالي حرفياً** —
-            # تغيير السياسة قرار مالك (لا يُفعّل تلقائياً أبداً).
             ANTISPAM_CONFIRM_SPAM_INDICATOR_REQUIRED=SecretManager.get_bool("ANTISPAM_CONFIRM_SPAM_INDICATOR_REQUIRED", False),
-            # حدود الذاكرة لسجل النشاط لكل مستخدم
             ANTISPAM_MEMORY_PER_USER=SecretManager.get_int("ANTISPAM_MEMORY_PER_USER", 50, required=False),
             ANTISPAM_MAX_TRACKED_USERS=SecretManager.get_int("ANTISPAM_MAX_TRACKED_USERS", 5000, required=False),
             # ========== الذاكرة ==========
@@ -883,37 +844,23 @@ class Config:
             # ========== الاتصال ==========
             CONNECTION_TIMEOUT=SecretManager.get_int("CONNECTION_TIMEOUT", 30, required=False),
             SESSION_REFRESH_INTERVAL=SecretManager.get_int("SESSION_REFRESH_INTERVAL", 43200, required=False),
-            # ========== Fast Capture (حماية سباق بوتات الحذف) ==========
-            # v9.8: "احفظ أولاً، حلل ثانياً" — text is persisted in RAM the
-            # instant the NewMessage handler fires, before ANY await, so a
-            # deletion bot that removes the message milliseconds later can
-            # never make the pipeline lose it. Code default stays False; the
-            # production rollout sets FAST_CAPTURE_ENABLED=true in Render env
-            # (documented kill switch — flip to false to disable instantly).
+            # ========== Fast Capture ==========
             FAST_CAPTURE_ENABLED=SecretManager.get_bool("FAST_CAPTURE_ENABLED", False),
             CAPTURE_BUFFER_SIZE=SecretManager.get_int("CAPTURE_BUFFER_SIZE", 1000, required=False),
             CAPTURE_TTL_SECONDS=SecretManager.get_int("CAPTURE_TTL_SECONDS", 30, required=False),
-            # v9.10 dedup: يمنع تكرار التنبيهات (نفس المرسل بنفس النص، عبر أي
-            # حساب من الحسابات الستة أو إعادة إرسال). تُقرأ من env عند الإقلاع
-            # (DEDUP_ENABLED / DEDUP_WINDOW_SECONDS) — المصدر الرسمي بعد حذف
-            # اللوحة (v14.0) هو البيئة حصراً، والقراءة حية من CFG عند كل claim.
+            # ========== Dedup ==========
             DEDUP_ENABLED=SecretManager.get_bool("DEDUP_ENABLED", True),
             DEDUP_WINDOW_SECONDS=SecretManager.get_int("DEDUP_WINDOW_SECONDS", 86400, required=False),
             DEDUP_RECOVERY_STEAL_MIN_AGE_SECONDS=SecretManager.get_int(
                 "DEDUP_RECOVERY_STEAL_MIN_AGE_SECONDS", 120, required=False),
-            # v10.0 Precision: تقييم البنود المستقلة — يرفع الرسائل متعددة
-            # الأفكار عندما يحقق بند قوي ثقة القبول (فشل-آمن، قابل للتعطيل).
+            # ========== Precision ==========
             CLAUSE_RESCORE_ENABLED=SecretManager.get_bool("CLAUSE_RESCORE_ENABLED", True),
-            # v10.0 Precision: حاجز التشابه — يمنع التنبيه المزدوج لإعادة
-            # الصياغة من نفس المرسل (عتبة محافظة 0.88 = شبه-مطابقة فقط).
             SIMILARITY_ENABLED=SecretManager.get_bool("SIMILARITY_ENABLED", True),
             SIMILARITY_THRESHOLD=SecretManager.get_float("SIMILARITY_THRESHOLD", 0.88, required=False),
             SIMILARITY_WINDOW_SECONDS=SecretManager.get_int("SIMILARITY_WINDOW_SECONDS", 3600, required=False),
-            # v10.0 Precision: التقرير اليومي للإدارة — الساعة بتوقيت UTC.
             DIGEST_ENABLED=SecretManager.get_bool("DIGEST_ENABLED", True),
             DIGEST_HOUR_UTC=SecretManager.get_int("DIGEST_HOUR_UTC", 20, required=False),
-            # Sender Intelligence: passive, failure-safe backend enrichment
-            # (never changes alert output). Kill switch: SENDER_INTEL_ENABLED=false.
+            # ========== Sender Intelligence ==========
             SENDER_INTEL_ENABLED=SecretManager.get_bool("SENDER_INTEL_ENABLED", True),
             SENDER_ENTITY_CACHE_SIZE=SecretManager.get_int("SENDER_ENTITY_CACHE_SIZE", 2000, required=False),
             SENDER_ENTITY_CACHE_TTL=SecretManager.get_int("SENDER_ENTITY_CACHE_TTL", 900, required=False),
@@ -921,11 +868,9 @@ class Config:
             SENDER_RESOLVE_BACKOFF_BASE=SecretManager.get_float("SENDER_RESOLVE_BACKOFF_BASE", 0.5, required=False),
             SENDER_RESOLVE_BACKOFF_MAX=SecretManager.get_float("SENDER_RESOLVE_BACKOFF_MAX", 8.0, required=False),
             SENDER_FLOOD_MAX_SLEEP=SecretManager.get_int("SENDER_FLOOD_MAX_SLEEP", 5, required=False),
-            # ── v10.4 Sender Mention Intelligence (backend-only) ──
             SENDER_MENTION_FIX_ENABLED=SecretManager.get_bool("SENDER_MENTION_FIX_ENABLED", True),
             MENTION_NEG_TTL_SECONDS=SecretManager.get_int("MENTION_NEG_TTL_SECONDS", 300, required=False),
             MENTION_MAX_TIERS_PER_CANDIDATE=SecretManager.get_int("MENTION_MAX_TIERS_PER_CANDIDATE", 3, required=False),
-            # ── v10.5 Alert Navigation Resolver (فشل-آمن؛ الإيقاف يترك الروابط كما كانت) ──
             NAV_EXPORT_LINK_ENABLED=SecretManager.get_bool("NAV_EXPORT_LINK_ENABLED", True),
             NAV_USER_DISCOVERY_ENABLED=SecretManager.get_bool("NAV_USER_DISCOVERY_ENABLED", True),
             TELEGRAM_CATCH_UP=SecretManager.get_bool("TELEGRAM_CATCH_UP", True),
@@ -934,16 +879,13 @@ class Config:
             WARMUP_CHAT_CACHE=SecretManager.get_bool("WARMUP_CHAT_CACHE", True),
             # ========== Prefilter ==========
             PREFILTER_ENABLED=SecretManager.get_bool("PREFILTER_ENABLED", True),
-            # v14.4 filter: 1 (was 2) — short high-signal requests ("محتاج",
-            # "فزعه") are legitimate; junk single words are handled by the
-            # ignore/spam tries inside the engine, not by word count.
             PREFILTER_MIN_WORDS=SecretManager.get_int("PREFILTER_MIN_WORDS", 1, required=False),
             PREFILTER_MAX_EMOJIS=SecretManager.get_int("PREFILTER_MAX_EMOJIS", 5, required=False),
             # ========== المراقبة ==========
             PROMETHEUS_ENABLED=SecretManager.get_bool("PROMETHEUS_ENABLED", False),
             PROMETHEUS_PORT=SecretManager.get_int("PROMETHEUS_PORT", 9090, required=False),
             SENTRY_DSN=SecretManager.get("SENTRY_DSN", None, required=False),
-            # ═══════════════════════════════════════════════════════════════════
+            # ═══════════════════════════════════════════════════════════════
             # ========== عتبات الثقة ==========
             CONFIDENCE_ACCEPT_THRESHOLD=SecretManager.get_float("CONFIDENCE_ACCEPT_THRESHOLD", 0.65, required=False),
             CONFIDENCE_REVIEW_THRESHOLD=SecretManager.get_float("CONFIDENCE_REVIEW_THRESHOLD", 0.40, required=False),
@@ -956,6 +898,12 @@ class Config:
             FUZZY_MAX_EDIT_DISTANCE=SecretManager.get_int("FUZZY_MAX_EDIT_DISTANCE", 1, required=False),
             FUZZY_MIN_TOKEN_LENGTH=SecretManager.get_int("FUZZY_MIN_TOKEN_LENGTH", 5, required=False),
             FUZZY_SIMILARITY_THRESHOLD=SecretManager.get_float("FUZZY_SIMILARITY_THRESHOLD", 0.92, required=False),
+            # v14.5.1: effective cutoff consumed by filter_engine. Defaults
+            # to float(FUZZY_MATCH_THRESHOLD) so the legacy int still drives
+            # the actual matching when only that is set. Explicit env wins.
+            FUZZY_SCORE_CUTOFF=SecretManager.get_float(
+                "FUZZY_SCORE_CUTOFF", float(legacy_fuzzy), required=False
+            ),
             # ========== النفي ==========
             NEGATION_CLAUSE_BOUNDARIES_ENABLED=SecretManager.get_bool("NEGATION_CLAUSE_BOUNDARIES_ENABLED", True),
             # ========== المسافة ==========
@@ -981,10 +929,20 @@ class Config:
             # ========== الكاش ==========
             TEXT_CACHE_SIZE=SecretManager.get_int("TEXT_CACHE_SIZE", 5000, required=False),
             TEXT_CACHE_TTL=SecretManager.get_int("TEXT_CACHE_TTL", 300, required=False),
+            # ========== v14.5.1 Execution / Regex Guard ==========
+            REGEX_TIMEOUT_S=SecretManager.get_float("REGEX_TIMEOUT_S", 0.25, required=False),
+            REGEX_GUARD_WORKERS=SecretManager.get_int("REGEX_GUARD_WORKERS", 4, required=False),
+            FILTER_EXECUTOR_WORKERS=SecretManager.get_int("FILTER_EXECUTOR_WORKERS", 4, required=False),
+            # ========== v14.5.1 Metrics ==========
+            METRICS_WINDOW=SecretManager.get_int("METRICS_WINDOW", 2000, required=False),
+            METRICS_Z_THRESHOLD=SecretManager.get_float("METRICS_Z_THRESHOLD", 3.5, required=False),
+            METRICS_ENABLED=SecretManager.get_bool("METRICS_ENABLED", True),
+            # ========== v14.5.1 Adaptive + Help anchor ==========
+            ADAPTIVE_ALPHA=SecretManager.get_float("ADAPTIVE_ALPHA", 0.05, required=False),
+            HELP_ANCHOR_INTENT_WEIGHT=SecretManager.get_float("HELP_ANCHOR_INTENT_WEIGHT", 0.65, required=False),
         )
 
-        # v14.1 (تدقيق 2-a): fail-fast — REVIEW يجب أن يكون أدنى من ACCEPT
-        # حصراً، وإلا يفحص المحرك accept أولاً فيختفي مسار review بصمت.
+        # v14.1 (تدقيق 2-a): fail-fast — REVIEW يجب أن يكون أدنى من ACCEPT حصراً.
         if not (0 < cfg.CONFIDENCE_REVIEW_THRESHOLD < cfg.CONFIDENCE_ACCEPT_THRESHOLD <= 1.0):
             raise ValueError(
                 "CONFIDENCE_REVIEW_THRESHOLD must be > 0 and "
@@ -993,13 +951,22 @@ class Config:
                 f"accept={cfg.CONFIDENCE_ACCEPT_THRESHOLD})"
             )
 
+        # v14.5.1: fail-fast on Arabic-ratio sanity — a value > 1.0 or
+        # negative makes `_is_arabic` behave unpredictably.
+        if not (0.0 < cfg.MIN_ARABIC_CONFIDENCE <= 1.0):
+            raise ValueError(
+                "MIN_ARABIC_CONFIDENCE must be in (0, 1] "
+                f"(got {cfg.MIN_ARABIC_CONFIDENCE})"
+            )
+
         cls._instance = cfg
         logger.info(
-            f"Config v14.0 built: DB={db_type} | "
+            f"Config v14.5.1 built: DB={db_type} | "
             f"PROCESSING_WORKERS={workers} | "
             f"FUZZY={'ON' if cfg.FUZZY_MATCHING_ENABLED else 'OFF'} | "
             f"NEGATION={'ON' if cfg.NEGATION_ENABLED else 'OFF'} | "
-            f"AD_DETECTION={'ON' if cfg.AD_DETECTION_ENABLED else 'OFF'}"
+            f"AD_DETECTION={'ON' if cfg.AD_DETECTION_ENABLED else 'OFF'} | "
+            f"METRICS={'ON' if cfg.METRICS_ENABLED else 'OFF'}"
         )
         return cfg
 
@@ -1011,9 +978,12 @@ class Config:
         return cls.build()
 
 # =============================================================================
-# Bot version — single source of truth (v10.2 Send Rotation)
+# Bot version — single source of truth
 # =============================================================================
-BOT_VERSION: Final = "14.0.0"
+# v14.5.1: aligned with FILTER_ENGINE_VERSION. Other modules (monitors.py
+# v9.7, etc.) may carry their own older version strings until their own
+# correction pass lands; BOT_VERSION here tracks the config+filter batch.
+BOT_VERSION: Final = "14.5.1"
 BOT_CODENAME: Final = "No Dashboard"
 
 # =============================================================================
@@ -1082,14 +1052,7 @@ class InputSanitizer:
         return bool(dangerous.search(text))
 
 # =============================================================================
-# Keyword Loader v13.1 – متوافق مع keywords.json v14.0.x
-#
-# FIX (critical, see module docstring): "templates" and "template_patterns"
-# are now included. These are the two keys keywords.json v14.0.x actually
-# uses for its Template-Driven Pattern Generation data. Previously they
-# were absent from this list, so load_keywords() silently discarded them
-# and filter_engine.py's Template-Boost mechanism always ran on an empty
-# dataset — no exception, no log warning, just quietly-degraded filtering.
+# Keyword Loader v14.5.1 – متوافق مع keywords.json v14.0.x
 # =============================================================================
 _KW_CATEGORIES: Final[List[str]] = [
     # الفئات القديمة (للتوافق)
@@ -1105,7 +1068,7 @@ _KW_CATEGORIES: Final[List[str]] = [
     "conversation_history_config", "test_cases", "learning_feedback",
     "high_confidence_boost_patterns", "action_verbs", "subject_markers",
     "implicit_request_patterns", "solve_actions", "help_expressions",
-    # ── v14.0.x: Template-Driven Pattern Generation (previously missing) ──
+    # v14.0.x Template-Driven Pattern Generation
     "templates", "template_patterns",
 ]
 
@@ -1137,10 +1100,8 @@ def load_keywords(path: Optional[str] = None) -> Dict[str, Any]:
         total = sum(len(v) if isinstance(v, (list, dict)) else 0 for v in result.values())
         logger.info(f"Keywords loaded: {total} total across {len(_KW_CATEGORIES)} categories")
 
-        # Dedicated visibility for the template engine specifically, so a
-        # future regression (e.g. someone renaming a key in keywords.json)
-        # shows up immediately in boot logs instead of as a silent
-        # accuracy regression discovered weeks later.
+        # Dedicated visibility for the template engine — a future regression
+        # shows up immediately in boot logs.
         templates_data = result.get("templates", {})
         template_patterns_data = result.get("template_patterns", {})
         templates_count = len(templates_data) if isinstance(templates_data, (list, dict)) else 0
@@ -1170,12 +1131,6 @@ def load_accounts() -> List[Dict[str, Any]]:
     accounts: List[Dict[str, Any]] = []
 
     def _diagnose_partial(prefix: str) -> None:
-        # v9.13.1 diagnostic: when an account is skipped because {prefix}_API_ID
-        # is missing, check whether OTHER account vars exist for this prefix.
-        # If they do, the operator clearly INTENDED this account to run and it
-        # is now silently dead — surface a loud, actionable warning instead
-        # (this exact scenario left production running with 0 accounts while
-        # *_SESSION_STRING vars were fully configured).
         present: List[str] = []
         for suffix in ("API_HASH", "PHONE", "SESSION_NAME", "SESSION_STRING", "PRIORITY"):
             if SecretManager.get(f"{prefix}_{suffix}", None, required=False):
@@ -1207,7 +1162,6 @@ def load_accounts() -> List[Dict[str, Any]]:
                 "api_hash": SecretManager.get(f"{prefix}_API_HASH", required=True),
                 "phone": SecretManager.get(f"{prefix}_PHONE", required=True),
                 "session": SecretManager.get(f"{prefix}_SESSION_NAME", required=True),
-                # Render/Cloud: Telethon StringSession read from env (no interactive login)
                 "session_string": SecretManager.get(f"{prefix}_SESSION_STRING", None, required=False),
                 "priority": SecretManager.get_int(f"{prefix}_PRIORITY", default_priority, required=False),
                 "is_main": is_main,
@@ -1216,7 +1170,6 @@ def load_accounts() -> List[Dict[str, Any]]:
                 "last_error": None,
             }
             accounts.append(acc)
-            # PII: never log the full phone number (audit M-9) — mask middle digits.
             phone = str(acc["phone"])
             masked_phone = ("*" * max(0, len(phone) - 4)) + phone[-4:] if phone else ""
             logger.debug(
@@ -1226,17 +1179,12 @@ def load_accounts() -> List[Dict[str, Any]]:
         except (EnvironmentError, ValueError) as e:
             logger.error(f"Skipping account {prefix}: {e}")
 
-    # MAIN account
     _try_load("MAIN", is_main=True, default_priority=10)
 
-    # ACCOUNT_1 .. ACCOUNT_20
     for i in range(1, 21):
         prefix = f"ACCOUNT_{i}"
         api_id = SecretManager.get(f"{prefix}_API_ID", None, required=False)
         if api_id is None:
-            # v9.13.1 diagnostic: discovery stops at the first gap. If a LATER
-            # ACCOUNT_k still carries an API_ID, that account can never load —
-            # warn the operator instead of dying silently.
             later: List[str] = []
             for j in range(i + 1, 21):
                 if SecretManager.get(f"ACCOUNT_{j}_API_ID", None, required=False):
@@ -1292,12 +1240,6 @@ def async_retry(
         return wrapper
     return decorator
 
-
-# v9.12 (audit L-01): the previous `# type: ignoreisc]` comment in the
-# repo was a malformed truncation of `# type: ignore[misc]` — it had no
-# effect on type checkers and was just confusing noise. The line above
-# now uses the correct `[misc]` code.
-
 # =============================================================================
 # Utility: fast_hash
 # =============================================================================
@@ -1305,26 +1247,27 @@ def fast_hash(data: str) -> str:
     return hashlib.blake2b(data.encode("utf-8"), digest_size=16).hexdigest()
 
 # =============================================================================
-# الرسائل الجاهزة — زر «تواصل مع المرسل» (المرحلة الأولى، طلب المستخدم)
+# الرسائل الجاهزة — زر «تواصل مع المرسل»
 # =============================================================================
-# تُعرض القائمة كاملة للمشرف عند الضغط على الزر، ويُرسل النص المختار كما هو
-# إلى صاحب الإعلان/الطلب. يمكن تجاوز القائمة عبر متغير البيئة
-# CONTACT_TEMPLATES_JSON (قائمة JSON من النصوص) دون تعديل الكود.
+# v14.5.1: the operator's phone number is NO LONGER embedded here. Templates
+# use a {phone} placeholder filled at load time from CONTACT_PHONE env var
+# (accounts.env). The number previously in this file remains in git history
+# and MUST be rotated by the operator — it is public.
 DEFAULT_CONTACT_TEMPLATES: Final[List[str]] = [
     "السلام عليكم، إذا تبي أحد يسوي لك بحث، أرسل الموضوع وتفاصيل البحث وتبشر بأمور تبيض الوجه، والدفع بعد الإنجاز.",
-    "السلام عليكم، إذا تبي أحد يسوي لك CV ثقة والدفع بعد الإنجاز: 0578568011",
-    "السلام عليكم، إذا تبي مختص يحل لك الواجبات: 0578568011",
-    "السلام عليكم، تبي مختص ثقة يحل واجبات: 0578568011",
+    "السلام عليكم، إذا تبي أحد يسوي لك CV ثقة والدفع بعد الإنجاز: {phone}",
+    "السلام عليكم، إذا تبي مختص يحل لك الواجبات: {phone}",
+    "السلام عليكم، تبي مختص ثقة يحل واجبات: {phone}",
     "السلام عليكم، ما يهمك نسوي لك مشروعك والدفع بعد الإنجاز وشغل يبيض الوجه.",
 ]
 
-# تسميات مختصرة للأزرار الرقمية في قائمة الاختيار (بنفس ترتيب القائمة أعلاه)
 CONTACT_TEMPLATE_LABELS: Final[List[str]] = ["بحث", "CV", "واجبات", "واجبات", "مشروع"]
 
 
 def get_contact_templates() -> List[str]:
-    """قائمة الرسائل الجاهزة (قابلة للتجاوز عبر CONTACT_TEMPLATES_JSON)."""
+    """قائمة الرسائل الجاهزة (CONTACT_TEMPLATES_JSON override + CONTACT_PHONE)."""
     raw = (os.getenv("CONTACT_TEMPLATES_JSON") or "").strip()
+    templates: List[str]
     if raw:
         try:
             import json as _json
@@ -1334,10 +1277,30 @@ def get_contact_templates() -> List[str]:
                 and data
                 and all(isinstance(x, str) and x.strip() for x in data)
             ):
-                return [x.strip() for x in data][:8]  # حد أقصى 8 قوالب (بيانات الزر ≤ 64 بايت)
-        except Exception as e:  # pragma: no cover — config fallback
+                templates = [x.strip() for x in data][:8]
+            else:
+                templates = list(DEFAULT_CONTACT_TEMPLATES)
+        except Exception as e:
             logger.warning(f"CONTACT_TEMPLATES_JSON invalid, using defaults: {e}")
-    return list(DEFAULT_CONTACT_TEMPLATES)
+            templates = list(DEFAULT_CONTACT_TEMPLATES)
+    else:
+        templates = list(DEFAULT_CONTACT_TEMPLATES)
+
+    # v14.5.1: fill {phone} placeholder from env.
+    phone = (os.getenv("CONTACT_PHONE") or "").strip()
+    if not phone and any("{phone}" in t for t in templates):
+        logger.warning(
+            "CONTACT_PHONE not set in accounts.env — contact templates will "
+            "show '—' where a phone number is expected. Add "
+            "CONTACT_PHONE=<number> to restore working contact links."
+        )
+
+    out: List[str] = []
+    for t in templates:
+        if "{phone}" in t:
+            t = t.replace("{phone}", phone if phone else "—")
+        out.append(t)
+    return out
 
 
 def contact_template_labels(count: int) -> List[str]:
@@ -1378,8 +1341,21 @@ def get_memory_info() -> Dict[str, Any]:
             pass
     return {"rss_mb": 0, "vms_mb": 0, "percent": 0.0}
 
+# =============================================================================
+# Boot diagnostics
+# =============================================================================
+# v14.5.1: warn at boot if CONTACT_PHONE is unset — a one-line visibility
+# win so operators can't ship a bot whose contact templates are empty
+# by accident.
+if not (os.getenv("CONTACT_PHONE") or "").strip():
+    logger.warning(
+        "CONTACT_PHONE not set — contact templates will show placeholder '—'. "
+        "Set CONTACT_PHONE=<number> in accounts.env to restore live contact links."
+    )
+
 logger.info(
-    f"config.py v14.0 loaded | Accounts: {len(ACCOUNTS)} | Workers: {CFG.PROCESSING_WORKERS} | "
+    f"config.py v14.5.1 loaded | Accounts: {len(ACCOUNTS)} | Workers: {CFG.PROCESSING_WORKERS} | "
     f"DB_URL: {'YES' if os.getenv('DATABASE_URL') else 'NO'} | "
-    f"INTENT_ENGINE: v13.1 (template-boost fix applied)"
+    f"DB_SSL: {CFG.DATABASE_SSL or 'default'} | "
+    f"INTENT_ENGINE: v14.5.1 (full correction batch)"
 )
