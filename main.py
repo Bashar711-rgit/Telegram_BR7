@@ -1,10 +1,44 @@
 #!/usr/bin/env python3
 """
-main.py – Enhanced Telegram Bot v13.1 (RENDER CLOUD EDITION, HARDENED)
+main.py – Enhanced Telegram Bot v14.5.1 (RENDER CLOUD EDITION, HARDENED)
 متوافق مع استضافة Render المجانية (Web Service) – تشغيل 24/7
-متوافق مع: monitors.py v9.7, config.py v13.1, filter_engine.py v14.1, database.py v9.0
+متوافق مع: monitors.py v14.5.1, config.py v14.5.1, filter_engine.py v14.5.1, database.py v14.5.1
 
-v13.1 (this pass) — targeted fixes, main.py ONLY. Maps to the audit's M-01..M-17:
+v14.5.1 — correction pass (main.py aligned with the v14.5.1 stack):
+  * ACCOUNTS is used directly from config (the module-level list). The
+    previous code called getattr(CFG, "ACCOUNTS", None) — which is
+    ALWAYS None, because ACCOUNTS is not a field on the frozen CFG
+    dataclass. That made _pick_alertui_account() start from an empty
+    candidate list and skip the is_main preference entirely, without any
+    warning. The dead `next(... if a.get("is_main") ...)` line right
+    above the live call is also removed (it was immediately overwritten
+    and could only cause confusion).
+  * stop() now awaits task_util.cancel_all() after cancelling its own
+    tracked tasks. Tasks created via task_util.spawn_bg() from
+    nav_resolver._discover_sender_username_via_message and from
+    sender_resolver's write-behind persist path lived in
+    task_util._tasks — NOT in self._background_tasks — so they were
+    never awaited before db.close(). Result: an "Event loop is closed"
+    RuntimeError during asyncio.run() cleanup, or a silently lost
+    write-behind persist (access_hash, username) if it happened to be
+    mid-flight at shutdown. cancel_all() waits up to 5s per pending
+    task, then gives up cleanly.
+  * All boot/stats/shutdown messages now read BOT_VERSION (imported
+    from config) instead of a hard-coded "v13.1". Three contradictory
+    version strings (v13.1 in three places, v14.5.1 everywhere else)
+    used to appear in the operator's own logs.
+  * /dashboard admin-command branch is reachable now. The handler
+    existed in _handle_admin_command, but "dashboard" was missing from
+    the regex alternation in the @client.on(NewMessage(...)) filter —
+    so the intended "dashboard removed" reply never fired. Added
+    "dashboard" to the pattern.
+  * Removed getattr(CFG, "ALERT_UI_CLIENT_ENABLED", True) from the
+    AlertUI boot gate. That field has never been declared in config.py,
+    so the clause was always True — a phantom env switch that could
+    never be set. The remaining guard (ALERT_BOT_ENABLED) is the real,
+    documented kill switch for the alert subsystem.
+
+v13.1 (historical) — targeted fixes, main.py ONLY. Maps to the audit's M-01..M-17:
 
   M-01/M-02/M-03/M-13/M-14/M-15 — MemoryMonitor rewritten:
       * tracemalloc is now actually used: on a suspected leak it takes a
@@ -331,7 +365,7 @@ class MemoryMonitor:
 
 
 # =============================================================================
-# Main Bot Class v13.1 (hardened)
+# Main Bot Class v14.5.1 (hardened)
 # =============================================================================
 class EnhancedTelegramBot:
     def __init__(self) -> None:
@@ -1010,7 +1044,7 @@ class EnhancedTelegramBot:
                 hit_rate = (filter_tele.get("valid", 0) / total * 100) if (total := filter_tele.get("processed", 0)) else 0.0
 
                 text = (
-                    f"<b>📊 إحصائيات البوت v13.1 (Render)</b>\n\n"
+                    f"<b>📊 إحصائيات البوت v{BOT_VERSION} (Render)</b>\n\n"
                     f"⏱ وقت التشغيل: {h}س {m_min}د\n"
                     f"📨 الرسائل: {stats.get('total_messages', 0):,}\n"
                     f"🚨 التنبيهات: {stats.get('alerts_sent', 0):,}\n"
@@ -1337,7 +1371,7 @@ class EnhancedTelegramBot:
 
         @self.main_client.on(tl_events.NewMessage(
             chats=CFG.ADMIN_CHAT_ID, incoming=True,
-            pattern=r"^/(stats|status|help|block|unblock|purge|accounts|health|filter_stats|spam|unspam|contact)(.*)$",
+            pattern=r"^/(stats|status|help|block|unblock|purge|accounts|health|filter_stats|spam|unspam|contact|dashboard)(.*)$",
         ))
         async def _admin_handler(event: Any) -> None:
             try:
@@ -1485,7 +1519,7 @@ class EnhancedTelegramBot:
     # ─── Initialization ────────────────────────────────────────────────────────
     async def initialize(self) -> bool:
         logger.info("=" * 60)
-        logger.info("Enhanced Telegram Bot v13.1 (RENDER EDITION, HARDENED) – Initializing...")
+        logger.info(f"Enhanced Telegram Bot v{BOT_VERSION} (RENDER EDITION, HARDENED) – Initializing...")
         logger.info("=" * 60)
 
         if not await self.db.connect():
@@ -1602,21 +1636,22 @@ class EnhancedTelegramBot:
         # نفس توكن البوت عبر MTProto: يستقبل CallbackQuery (معالج «copy_»
         # يجيب بنص التنبيه من DB) ويعمل طبقة إرسال احتياطية بالأزرار إن
         # فشل Bot API. فشل التشغيل لا يوقف الإقلاع أبداً (فشل-آمن).
-        if self.alert_bot.enabled and getattr(CFG, "ALERT_BOT_ENABLED", True) \
-                and getattr(CFG, "ALERT_UI_CLIENT_ENABLED", True):
+        # v14.5.1: حُذف فحص ALERT_UI_CLIENT_ENABLED غير المعرّف في config
+        # (كان دائماً True فيبدو أنه مفتاح تشغيلي وهو ليس كذلك). البوابة
+        # الوحيدة الحقيقية هي ALERT_BOT_ENABLED.
+        if self.alert_bot.enabled and getattr(CFG, "ALERT_BOT_ENABLED", True):
             try:
-                _main_acc = next(
-                    (a for a in (getattr(CFG, "ACCOUNTS", None) or []) if a.get("is_main")),
-                    None,
-                )
                 # v11.5.3: لا حساب is_main في بيئة الإنتاج (بلاغ لوج Render:
                 # «api_id/api_hash مفقود — عميل أزرار التنبيهات معطّل») —
                 # الاختيار في _pick_alertui_account: is_main أولاً ثم أول
                 # حساب متصل فعلاً. تفعيل العميل يُشغّل: معالجات أزرار
                 # التنبيهات، طبقة الإرسال الاحتياطي بالأزرار، وتحقق تسليم
                 # timeout (v11.5.2) — وكلها لا تعمل بدونه.
-                _main_acc = _pick_alertui_account(
-                    getattr(CFG, "ACCOUNTS", None), getattr(self, "monitors", None))
+                # v14.5.1: ACCOUNTS module-level في config.py (ليس حقلاً على
+                # CFG) — getattr(CFG, "ACCOUNTS", None) كان None دائماً،
+                # فأولوية is_main معطلة بلا تحذير. حُذف السطر الميت (next(...))
+                # وACCOUNTS يُمرَّر مباشرة الآن.
+                _main_acc = _pick_alertui_account(ACCOUNTS, getattr(self, "monitors", None))
                 if _main_acc is not None and not (_main_acc or {}).get("is_main"):
                     logger.info(
                         f"🤖 AlertUI creds from connected account: {_main_acc.get('name')}"
@@ -1757,7 +1792,7 @@ class EnhancedTelegramBot:
         try:
             await self._send_startup_message()
             logger.info("=" * 60)
-            logger.info("🤖 Bot v13.1 running on Render Cloud - 24/7 mode (hardened)")
+            logger.info(f"🤖 Bot v{BOT_VERSION} running on Render Cloud - 24/7 mode (hardened)")
             logger.info("=" * 60)
             while self.is_running:
                 try:
@@ -1804,6 +1839,20 @@ class EnhancedTelegramBot:
 
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+
+        # v14.5.1: مهام task_util العابرة (spawn_bg من nav_resolver و
+        # sender_resolver) كانت تُلغى عند asyncio.run() cleanup بعد إغلاق
+        # DB → RuntimeError: Event loop is closed أو فقدان كتابة write-behind.
+        # cancel_all ينتظرها حتى 5s ثم يعود بهدوء.
+        try:
+            from task_util import cancel_all as _tu_cancel_all
+            _n_cancelled = await _tu_cancel_all(timeout=5.0)
+            if _n_cancelled:
+                logger.info(
+                    f"Shutdown: cancelled {_n_cancelled} task_util background task(s)"
+                )
+        except Exception as _tu_err:
+            logger.debug(f"task_util.cancel_all skipped: {type(_tu_err).__name__}")
 
         try:
             if self.main_client and await self._client_ok(self.main_client):
