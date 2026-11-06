@@ -1,7 +1,25 @@
-"""message_context.py — v11.7.1: طبقة توحيد جمع معلومات المرسل/المحادثة/الرسالة.
+"""message_context.py — v14.5.1: طبقة توحيد جمع معلومات المرسل/المحادثة/الرسالة.
 
 المهمة الهندسية §3: طبقة مركزية واحدة تجمع البيانات مرة واحدة ثم تمررها
 إلى بناء التنبيه والأزرار — بدل أن تعيد كل دالة الاستخراج المستقل.
+
+v14.5.1 — correction pass:
+  * _USERNAME_RE aligned to {4,31} (5-32 chars) matching nav_resolver
+    v14.5.1 and sender_resolver v14.5.1. The previous {3,31} accepted
+    4-char shapes; when nav_resolver import fails and this fallback kicks
+    in, the two validators disagreed on short usernames.
+  * sender["is_bot"] now uses a proper truthy-coercion helper. The old
+    `bool(_bot)` turned the string "false" into True (rare but real when
+    event data passes through a serialization layer that yields strings).
+    Mirrors contact_target._is_truthy's shape.
+  * _TG_USER_BLOCKED eviction now drops by OLDEST TIMESTAMP (not by
+    insertion order). Re-marked sids (refreshed) stayed at the front of
+    the dict and were evicted first — a minor cache-ineffectiveness under
+    sustained load. Fixed with a single min() over the map (only runs
+    when the cap is hit, which is rare).
+  * _COLLECTOR_VERSION = "14.5.1" (was "1.0.0"; docstring said v11.7.1 —
+    three numbers coexisted).
+  * build_contact_action: unused `ContactTarget as _CT` import removed.
 
 التصميم (حاكم):
   * غلاف رقيق فوق الوحدات القائمة حصراً (_event_to_dict data /
@@ -34,7 +52,7 @@ import asyncio
 import logging
 import re
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +60,7 @@ logger = logging.getLogger(__name__)
 UNAVAILABLE = "UNAVAILABLE"          # تعذر الجلب (فشل مصدر/غياب بيانات)
 NOT_APPLICABLE = "NOT_APPLICABLE"    # لا ينطبق على هذا النوع
 
-_COLLECTOR_VERSION = "1.0.0"
+_COLLECTOR_VERSION = "14.5.1"
 _LIVE_SENDER_TIMEOUT = 1.5           # الطلب الوحيد المسموح — مهلة قصوى
 
 # ══ v11.7.1: ذاكرة سلبية tg://user (إصلاح 3 من بروتوكول المهلة) ════════
@@ -90,6 +108,25 @@ except Exception:  # pragma: no cover — الوحدة اختيارية (فشل-
     _negmem = None
 
 
+def _is_truthy(value: Any) -> bool:
+    """v14.5.1: تطبيع أشكال 'الصواب' إلى True.
+
+    يقبل: True, 1, "1", "true", "yes", "on".
+    يرفض: False, 0, "0", "false", "no", "off", None, "".
+    يستخدمه `sender["is_bot"]` — بديل `bool(_bot)` الذي حوّل `"false"`
+    نصياً إلى True (خطأ نادر لكن حقيقي عبر طبقات serialization).
+    """
+    if value is True:
+        return True
+    if value is False or value is None:
+        return False
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return int(value) == 1
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "yes", "on")
+    return False
+
+
 def mark_tg_user_blocked(sender_id: Any) -> bool:
     """سجّل رفض tg://user لهذا المعرّف (TTL 6h). لا يرفع استثناءً."""
     try:
@@ -101,11 +138,16 @@ def mark_tg_user_blocked(sender_id: Any) -> bool:
     now = time.time()
     _TG_USER_BLOCKED[sid] = now
     if len(_TG_USER_BLOCKED) > _TG_USER_BLOCKED_MAX:
+        # Phase 1: purge expired
         for k in [k for k, v in _TG_USER_BLOCKED.items()
                   if now - v > _TG_USER_BLOCKED_TTL]:
             _TG_USER_BLOCKED.pop(k, None)
-    while len(_TG_USER_BLOCKED) > _TG_USER_BLOCKED_MAX:
-        _TG_USER_BLOCKED.pop(next(iter(_TG_USER_BLOCKED)))
+        # Phase 2 (v14.5.1): لو ما زال فوق السقف، أسقط الأقدم بالطابع
+        # الزمني — لا بترتيب الإدخال. يتجنب إخلاء سجلات طازجة أُعيد
+        # تسجيلها بعد سجلات أقدم منها زمنياً.
+        while len(_TG_USER_BLOCKED) > _TG_USER_BLOCKED_MAX:
+            oldest_k = min(_TG_USER_BLOCKED.items(), key=lambda kv: kv[1])[0]
+            _TG_USER_BLOCKED.pop(oldest_k, None)
     if _negmem is not None:
         try:
             _negmem.mark_dirty("tg_user_blocked")
@@ -155,7 +197,10 @@ def _safe_call(fn: Any, what: str) -> Any:
         return None
 
 
-_USERNAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{3,31}$")
+# v14.5.1: {4,31} = 5-32 chars — يطابق nav_resolver v14.5.1 /
+# sender_resolver v14.5.1. كان {3,31} (4-32) في fallback فقط، فيختلف عن
+# المسار الأساسي (nav_resolver) الذي يرفض 4-char usernames.
+_USERNAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{4,31}$")
 
 
 def is_valid_username(value: Any) -> bool:
@@ -449,7 +494,9 @@ async def collect_message_context(
         _bot = ev_data.get("sender_is_bot")
         if _bot is None and sender_obj is not None:
             _bot = _safe_call(lambda: getattr(sender_obj, "bot", None), "sender.bot")
-        sender["is_bot"] = bool(_bot) if _bot is not None else False
+        # v14.5.1: _is_truthy بدل bool(_bot) — يقبل True/1/"1"/"true"/"yes"
+        # ويرفض False/0/"0"/"false"/"no"/None/"" بشكل صحيح.
+        sender["is_bot"] = _is_truthy(_bot) if _bot is not None else False
 
         # مصدر الهوية — توثيق صادق لمكان المعلومات
         if (sid or 0) > 0:
@@ -810,9 +857,9 @@ def build_contact_action(ctx: Dict[str, Any]) -> Dict[str, Any]:
 
         # resolve_contact_target هو الحكم — يعيد نفس selected_url الذي
         # يستخدمه الاسم (spec #16 للمشروع)؛ هنا نحترم ذاكرة الحظر فوقه.
+        # v14.5.1: حُذف استيراد ContactTarget غير المستخدم.
         try:
             from contact_target import resolve_contact_target as _rct
-            from contact_target import ContactTarget as _CT
         except Exception:
             return {"url": None, "kind": "none",
                     "reason_if_none": "contact_target_unavailable"}
