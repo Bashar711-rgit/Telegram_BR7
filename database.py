@@ -406,6 +406,7 @@ class EnhancedDatabase:
             await self._migrate_sender_access()
             await self._migrate_intel_entities()
             await self._migrate_queue_inflight()
+            await self._ensure_queue_dedup_index()
             await self._create_indexes()
             self.is_connected = True
             await self.start_writer()
@@ -738,6 +739,7 @@ class EnhancedDatabase:
                 status TEXT DEFAULT 'pending',
                 claimed_at REAL,
                 attempts INTEGER DEFAULT 0,
+                dedup_key TEXT,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             );
             CREATE TABLE IF NOT EXISTS dead_letters (
@@ -1061,6 +1063,12 @@ class EnhancedDatabase:
             logger.debug("add_to_queue: DB unhealthy, returning -2 (backpressure)")
             return -2
 
+        # ══ v14.2.0-dedup (rebased on v14.5.2): المعرف الفريد للرسالة ══
+        # chat:message يعرّف رسالة المجموعة بشكل قاطع — يمنع ازدواج صفوف
+        # الطابور الناشئ عن إعادة الإدراج (إقلاع/انهيار) أو التقاط نفس
+        # الرسالة من عدة حسابات مراقبة متزامنة (فهرس فريد جزئي).
+        dedup_key = self._queue_dedup_key(event_data)
+
         try:
             async with self._queue_lock:
                 reconcile_every = max(1, int(os.getenv("QUEUE_MIRROR_RECONCILE_EVERY", "64")))
@@ -1072,6 +1080,22 @@ class EnhancedDatabase:
                     except Exception as e:
                         logger.debug(f"queue mirror reconcile failed: {e}")
                 current_size = self._queue_size_mirror
+
+                # ══ v14.2.0-dedup: حارس التكرار — الصف النشط نفسه يكفي ══
+                if dedup_key:
+                    try:
+                        dup = await self._fetchone(
+                            "SELECT id FROM processing_queue WHERE dedup_key = ? "
+                            "AND (status IS NULL OR status IN ('pending', 'in_flight')) LIMIT 1",
+                            (dedup_key,),
+                        )
+                        if dup is not None:
+                            async with self._stats_lock:
+                                self.stats["queue_dedup_hits"] = self.stats.get("queue_dedup_hits", 0) + 1
+                            self._notify_queue_wakeup()
+                            return int(dup["id"])
+                    except Exception as e:
+                        logger.debug(f"queue dedup pre-check failed: {e}")
 
                 if self.db_type == "sqlite":
                     if current_size >= CFG.MESSAGE_QUEUE_SIZE:
@@ -1090,8 +1114,8 @@ class EnhancedDatabase:
                         )
 
                     cursor = await self._execute(
-                        "INSERT INTO processing_queue (event_data, priority) VALUES (?, ?)",
-                        (json_dumps(event_data), priority),
+                        "INSERT INTO processing_queue (event_data, priority, dedup_key) VALUES (?, ?, ?)",
+                        (json_dumps(event_data), priority, dedup_key),
                     )
                     await self._commit()
                     self._queue_size_mirror += 1
@@ -1117,9 +1141,9 @@ class EnhancedDatabase:
                                     "evicted oldest/lowest-priority row"
                                 )
                             result = await conn.fetchrow(
-                                "INSERT INTO processing_queue (event_data, priority) "
-                                "VALUES ($1, $2) RETURNING id",
-                                json_dumps(event_data), priority,
+                                "INSERT INTO processing_queue (event_data, priority, dedup_key) "
+                                "VALUES ($1, $2, $3) RETURNING id",
+                                json_dumps(event_data), priority, dedup_key,
                             )
                             self._queue_size_mirror += 1
                             async with self._stats_lock:
@@ -1128,9 +1152,82 @@ class EnhancedDatabase:
                             return result["id"]
 
         except Exception as e:
+            # ══ v14.2.0-dedup: سباق الفهرس الفريد ليس فشلاً — الخاسر في
+            # السباق يعيد id الصف الموجود بدل -1 (الحدث محفوظ فعلاً —
+            # لا فقدان ولا ازدواج).
+            is_unique_violation = (
+                "UNIQUE constraint failed" in str(e)
+                or "duplicate key" in str(e).lower()
+                or type(e).__name__ in ("UniqueViolationError", "IntegrityError")
+            )
+            if is_unique_violation and dedup_key:
+                try:
+                    dup = await self._fetchone(
+                        "SELECT id FROM processing_queue WHERE dedup_key = ? "
+                        "AND (status IS NULL OR status IN ('pending', 'in_flight')) LIMIT 1",
+                        (dedup_key,),
+                    )
+                    if dup is not None:
+                        async with self._stats_lock:
+                            self.stats["queue_dedup_hits"] = self.stats.get("queue_dedup_hits", 0) + 1
+                        self._notify_queue_wakeup()
+                        return int(dup["id"])
+                except Exception:
+                    pass
             logger.error(f"add_to_queue failed: {e}")
             self._queue_mirror_dirty = True
             return -1
+
+    # ══ v14.2.0-dedup (rebased on v14.5.2) ══
+    @staticmethod
+    def _queue_dedup_key(event_data: dict) -> Optional[str]:
+        """المعرف الفريد للرسالة في الطابور (chat:message).
+
+        نفس اصطلاح DeadLetterQueue._event_key. الرسالة بلا معرفين
+        معاً (أحداث نادرة) بلا معرف dedup — تُدرج بلا حماية ازدواج
+        كما سابقاً.
+        """
+        try:
+            if not isinstance(event_data, dict):
+                return None
+            chat_id = event_data.get("chat_id")
+            message_id = event_data.get("message_id")
+            if chat_id is None or message_id is None:
+                return None
+            return f"chat:{chat_id}:msg:{message_id}"
+        except Exception:
+            return None
+
+    async def _ensure_queue_dedup_index(self) -> None:
+        """فهرس فريد جزئي على الصفوف النشطة فقط (pending/in_flight).
+
+        الصفوف المنتهية (محذوفة عبر ack) لا تحجز المعرّف — إعادة
+        إدراج نفس الرسالة لاحقاً (إعادة نشر/تكرار حقيقي بعد زمن)
+        تُدرج بلا عوائق. قبل إنشاء الفهرس: تنظيف التكرارات النشطة
+        الموجودة مسبقاً (يُبقى على الأحدث) حتى ينجح الإنشاء حتى على
+        جداول قديمة ملوّثة بالتكرار. فشل-آمن: أي خطأ يُسجل ويُتجاهل.
+        """
+        idx = "uq_queue_active_dedup"
+        active = "(status IS NULL OR status IN ('pending', 'in_flight'))"
+        try:
+            await self._execute(
+                "DELETE FROM processing_queue WHERE dedup_key IS NOT NULL "
+                "AND " + active + " AND id NOT IN ("
+                "  SELECT MAX(id) FROM processing_queue"
+                "  WHERE dedup_key IS NOT NULL AND " + active + ""
+                "  GROUP BY dedup_key)"
+            )
+            await self._commit()
+            await self._execute(
+                f"CREATE UNIQUE INDEX IF NOT EXISTS {idx} ON processing_queue (dedup_key) "
+                f"WHERE dedup_key IS NOT NULL AND {active}"
+            )
+            await self._commit()
+            logger.info("Database migration: processing_queue dedup_key unique index ready")
+        except Exception as e:
+            logger.warning(
+                f"queue dedup index ensure skipped: {type(e).__name__}: {str(e)[:120]}"
+            )
 
     _QUEUE_INFLIGHT_COLUMNS = [
         ("status", "TEXT NOT NULL DEFAULT 'pending'"),
