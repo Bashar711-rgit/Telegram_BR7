@@ -1,14 +1,138 @@
 #!/usr/bin/env python3
+"""task_util.py — v14.5.1 (background task tracker)
+
+v11.8.1 (F-17): مرجع محفوظ لمهام background عابرة.
+
+Python لا يضمن بقاء Task بدون مرجع — GC قد يجمعها قبل اكتمالها
+(حتى مع وجود coroutine قيد التشغيل). هذه الوحدة تحفظ مراجع قوية في
+مجموعة وحدة-مستوى مع done_callback ينظّف تلقائياً — نفس نمط main.py
+`_background_tasks` لكن للاستخدام من الوحدات التي لا تمتلك نسخة البوت.
+
+الاستخدام:
+    from task_util import spawn_bg
+    spawn_bg(self._persist_account_hash(sid, ah), name="persist_hash")
+
+v14.5.1 — correction pass:
+  * _on_task_done callback now RETRIEVES the task's exception via
+    task.exception() and logs unexpected failures through loguru with the
+    task name attached. The previous callback was `_tasks.discard` only —
+    any exception raised inside a spawned coroutine was never retrieved,
+    so asyncio emitted "Task exception was never retrieved" at task-GC
+    time with no context (no name, no traceback in bot.log). Callers had
+    no way to know their background work failed. Now every unexpected
+    exception is logged with `logger.opt(exception=exc)` and CancelledError
+    stays silent (it is the expected outcome at shutdown).
+  * New async `cancel_all(timeout=5.0)` — main.py can call it during
+    shutdown to cancel + await every spawned task cleanly. Without it,
+    pending background tasks continued running through process teardown
+    (racing against closed DB connections / closed loguru sinks) and got
+    force-cancelled only when `asyncio.run()` cleaned up the loop at a
+    less controlled point.
+  * Coroutine type annotation is now parameterized
+    `Coroutine[Any, Any, Any]` to match `asyncio.create_task`'s contract
+    (was the bare `Coroutine`). Zero runtime change; typing clarity only.
+  * `pending_count()` now uses a generator (O(1) memory) instead of a
+    list comprehension. Same result, no temporary list.
+  * `__version__ = "14.5.1"` — matches the rest of the project.
+
+from __future__ import annotations
 """
-database.py – Unified Async Database Layer v14.5.2 (HARDENED EDITION)
+
+import asyncio
+from typing import Any, Coroutine, Optional, Set
+
+from loguru import logger
+
+__version__ = "14.5.1"
+
+_tasks: Set[asyncio.Task] = set()
+
+
+def _on_task_done(task: asyncio.Task) -> None:
+    """v14.5.1: إزالة من المجموعة + استرجاع الاستثناء + لوج عند الخطأ.
+
+    بدون استرجاع استثناء (task.exception())، asyncio يطبع "Task exception
+    was never retrieved" عند GC المهمة بلا أي سياق قابل للعمل عليه — لا
+    اسم المهمة، لا موضع الخطأ، ولا شيء في bot.log. الآن كل استثناء غير
+    متوقع يُسجَّل عبر loguru بكامل تتبع الأثر. CancelledError (إيقاف
+    تشغيل متوقع) يبقى صامتاً.
+    """
+    _tasks.discard(task)
+    if task.cancelled():
+        return  # إلغاء متوقع (shutdown أو cancel_all) — لا لوج
+    try:
+        exc = task.exception()
+    except (asyncio.CancelledError, asyncio.InvalidStateError):
+        # سباق نادر: المهمة أُلغيت بين cancelled() وexception() — تجاهل
+        return
+    if exc is not None:
+        try:
+            name = task.get_name()
+        except Exception:
+            name = "unknown"
+        logger.opt(exception=exc).error(f"spawn_bg task {name} raised")
+
+
+def spawn_bg(
+    coro: "Coroutine[Any, Any, Any]",
+    name: Optional[str] = None,
+) -> asyncio.Task:
+    """create_task + مرجع محفوظ — بديل آمن من GC للإطلاق العابر.
+
+    v14.5.1: done_callback يسترجع الاستثناء (لا يتركه يتسرب لتحذير asyncio).
+    """
+    task = asyncio.create_task(coro, name=name)
+    _tasks.add(task)
+    task.add_done_callback(_on_task_done)
+    return task
+
+
+def pending_count() -> int:
+    """عدد المهام العابرة الجارية (تشخيص/اختبارات).
+
+    v14.5.1: مولّد بدل قائمة مؤقتة — O(1) ذاكرة.
+    """
+    return sum(1 for t in _tasks if not t.done())
+
+
+async def cancel_all(timeout: float = 5.0) -> int:
+    """v14.5.1: إلغاء كل المهام العابرة وانتظارها — إيقاف نظيف.
+
+    يُستدعى من main.py في نهاية shutdown (قبل إغلاق DB وloguru sinks).
+    يعيد عدد المهام التي كانت جارية لحظة الاستدعاء.
+
+    المهام التي تتجاوز timeout تبقى في مدار asyncio.run() — إلغاؤها
+    يحدث عند إغلاق الـevent loop. تسجَّل تحذيراً بالعدد المتبقي.
+    """
+    # لقطة فورية للجاري فقط — done tasks يزيلها _on_task_done أصلاً
+    pending = [t for t in _tasks if not t.done()]
+    if not pending:
+        return 0
+    for t in pending:
+        t.cancel()
+    try:
+        _, still_running = await asyncio.wait(pending, timeout=timeout)
+        if still_running:
+            logger.warning(
+                f"task_util.cancel_all: {len(still_running)} task(s) did not "
+                f"finish within {timeout}s — leaving to asyncio.run cleanup"
+            )
+    except Exception as e:
+        # لا نُسقط shutdown بسبب خطأ في التنظيف نفسه
+        logger.debug(f"task_util.cancel_all failed: {type(e).__name__}: {e}")
+    return len(pending)
+
+
+
+
+
+وهذا ملف database.py:
+
+#!/usr/bin/env python3
+"""
+database.py – Unified Async Database Layer v14.5.1 (HARDENED EDITION)
 Supports: SQLite (aiosqlite) and PostgreSQL (asyncpg)
 Compatible with: config.py v14.5.1, monitors.py v9.7, filter_engine.py v14.5.1
-
-v14.5.2 — Memory Hardening:
-  * Added prune_memory_caches() to explicitly clear in-memory caches
-    (_can_send_alert_cache, _blocked_senders_cache, _blocked_chats_cache,
-    _features_cache, message_cache) when invoked periodically by main.py.
-    This prevents memory fragmentation and uncontrolled growth.
 
 v14.5.1 (this pass) — database-layer correction pass:
   * CFG.DATABASE_SSL is now ACTUALLY consumed. _connect_postgresql() builds
@@ -424,7 +548,7 @@ class EnhancedDatabase:
             except Exception as e:
                 logger.debug(f"queue mirror prime failed: {e}")
                 self._queue_mirror_dirty = True
-            logger.info(f"Database connected: {self.db_type.upper()} v14.5.2")
+            logger.info(f"Database connected: {self.db_type.upper()} v14.5.1")
             return True
         except Exception as e:
             logger.error(f"Database connection failed: {e}")
@@ -443,8 +567,8 @@ class EnhancedDatabase:
             "PRAGMA busy_timeout=30000",
             "PRAGMA synchronous=NORMAL",
             f"PRAGMA cache_size={CFG.SQLITE_CACHE_SIZE}",
-            "PRAGMA temp_store=FILE",
-            f"PRAGMA mmap_size={int(os.getenv('SQLITE_MMAP_SIZE', '67108864'))}",
+            "PRAGMA temp_store=MEMORY",
+            "PRAGMA mmap_size=268435456",
             "PRAGMA page_size=4096",
             "PRAGMA foreign_keys=ON",
         ]
@@ -3921,43 +4045,6 @@ class EnhancedDatabase:
         except Exception as e:
             logger.error(f"_resource_pressure_check error: {e}")
 
-    # ─── Memory Pruning (v14.5.2) ──────────────────────────────────────────
-    async def prune_memory_caches(self) -> Dict[str, int]:
-        """v16.1.2: تنظيف دوري للـ caches لمنع تراكم الذاكرة.
-        
-        يُستدعى من main.py كل 5 دقائق (Stateless Cleanup).
-        يعيد إحصائيات عن عدد المدخلات التي تمت إزالتها.
-        """
-        pruned: Dict[str, int] = {}
-        try:
-            now = time.time()
-            
-            # 1. تنظيف كاشات الصلاحية (TTL)
-            for cache_name in ("_can_send_alert_cache", "_blocked_senders_cache", "_blocked_chats_cache"):
-                cache = getattr(self, cache_name, {})
-                before = len(cache)
-                expired = [k for k, (_v, exp) in list(cache.items()) if exp <= now]
-                for k in expired:
-                    cache.pop(k, None)
-                pruned[cache_name.lstrip("_")] = before - len(cache)
-            
-            # 2. تنظيف كاش الميزات
-            before = len(self._features_cache)
-            self._features_cache = {k: v for k, v in self._features_cache.items() if v[0] > now}
-            pruned["features"] = before - len(self._features_cache)
-            
-            # 3. تنظيف كاش الرسائل إذا تجاوز 90% من الحد الأقصى
-            max_len = self.message_cache.maxlen or 10000
-            if len(self.message_cache) > int(max_len * 0.9):
-                pruned["message_cache"] = len(self.message_cache)
-                self.message_cache.clear()
-            
-            if any(pruned.values()):
-                logger.info(f"DB cache prune: {pruned}")
-        except Exception as e:
-            logger.debug(f"prune_memory_caches failed: {type(e).__name__}: {e}")
-        return pruned
-
     # ─── Background Tasks ─────────────────────────────────────────────────
     async def start_writer(self) -> None:
         if self._writer_task is None or self._writer_task.done():
@@ -4257,4 +4344,4 @@ class EnhancedDatabase:
             await self._sqlite_conn.close()
         elif self.db_type == "postgresql" and self._pool:
             await self._pool.close()
-        logger.info("Database v14.5.2 closed")
+        logger.info("Database v14.5.1 closed")
