@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
 """
-database.py – Unified Async Database Layer v14.5.1 (HARDENED EDITION)
+database.py – Unified Async Database Layer v14.5.2 (HARDENED EDITION)
 Supports: SQLite (aiosqlite) and PostgreSQL (asyncpg)
 Compatible with: config.py v14.5.1, monitors.py v9.7, filter_engine.py v14.5.1
+
+v14.5.2 — Memory Hardening:
+  * Added prune_memory_caches() to explicitly clear in-memory caches
+    (_can_send_alert_cache, _blocked_senders_cache, _blocked_chats_cache,
+    _features_cache, message_cache) when invoked periodically by main.py.
+    This prevents memory fragmentation and uncontrolled growth.
 
 v14.5.1 (this pass) — database-layer correction pass:
   * CFG.DATABASE_SSL is now ACTUALLY consumed. _connect_postgresql() builds
@@ -418,7 +424,7 @@ class EnhancedDatabase:
             except Exception as e:
                 logger.debug(f"queue mirror prime failed: {e}")
                 self._queue_mirror_dirty = True
-            logger.info(f"Database connected: {self.db_type.upper()} v14.5.1")
+            logger.info(f"Database connected: {self.db_type.upper()} v14.5.2")
             return True
         except Exception as e:
             logger.error(f"Database connection failed: {e}")
@@ -437,8 +443,8 @@ class EnhancedDatabase:
             "PRAGMA busy_timeout=30000",
             "PRAGMA synchronous=NORMAL",
             f"PRAGMA cache_size={CFG.SQLITE_CACHE_SIZE}",
-            "PRAGMA temp_store=MEMORY",
-            "PRAGMA mmap_size=268435456",
+            "PRAGMA temp_store=FILE",
+            f"PRAGMA mmap_size={int(os.getenv('SQLITE_MMAP_SIZE', '67108864'))}",
             "PRAGMA page_size=4096",
             "PRAGMA foreign_keys=ON",
         ]
@@ -3915,6 +3921,43 @@ class EnhancedDatabase:
         except Exception as e:
             logger.error(f"_resource_pressure_check error: {e}")
 
+    # ─── Memory Pruning (v14.5.2) ──────────────────────────────────────────
+    async def prune_memory_caches(self) -> Dict[str, int]:
+        """v16.1.2: تنظيف دوري للـ caches لمنع تراكم الذاكرة.
+        
+        يُستدعى من main.py كل 5 دقائق (Stateless Cleanup).
+        يعيد إحصائيات عن عدد المدخلات التي تمت إزالتها.
+        """
+        pruned: Dict[str, int] = {}
+        try:
+            now = time.time()
+            
+            # 1. تنظيف كاشات الصلاحية (TTL)
+            for cache_name in ("_can_send_alert_cache", "_blocked_senders_cache", "_blocked_chats_cache"):
+                cache = getattr(self, cache_name, {})
+                before = len(cache)
+                expired = [k for k, (_v, exp) in list(cache.items()) if exp <= now]
+                for k in expired:
+                    cache.pop(k, None)
+                pruned[cache_name.lstrip("_")] = before - len(cache)
+            
+            # 2. تنظيف كاش الميزات
+            before = len(self._features_cache)
+            self._features_cache = {k: v for k, v in self._features_cache.items() if v[0] > now}
+            pruned["features"] = before - len(self._features_cache)
+            
+            # 3. تنظيف كاش الرسائل إذا تجاوز 90% من الحد الأقصى
+            max_len = self.message_cache.maxlen or 10000
+            if len(self.message_cache) > int(max_len * 0.9):
+                pruned["message_cache"] = len(self.message_cache)
+                self.message_cache.clear()
+            
+            if any(pruned.values()):
+                logger.info(f"DB cache prune: {pruned}")
+        except Exception as e:
+            logger.debug(f"prune_memory_caches failed: {type(e).__name__}: {e}")
+        return pruned
+
     # ─── Background Tasks ─────────────────────────────────────────────────
     async def start_writer(self) -> None:
         if self._writer_task is None or self._writer_task.done():
@@ -4214,4 +4257,4 @@ class EnhancedDatabase:
             await self._sqlite_conn.close()
         elif self.db_type == "postgresql" and self._pool:
             await self._pool.close()
-        logger.info("Database v14.5.1 closed")
+        logger.info("Database v14.5.2 closed")
