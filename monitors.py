@@ -1,13 +1,6 @@
 #!/usr/bin/env python3
 """
-monitors.py – Account Monitor v14.5.3 (v9.10.0 LINE, aligned to the v14.5.2 stack)
-
-v14.5.3 — Stateless Memory Hardening:
-  * Strict Stateless Restart: Any message with a timestamp before the bot's
-    started_at is now rejected immediately. This prevents catch-up backlogs
-    from flooding the queue and exhausting memory.
-  * Reduced negative entity cache size and TTL to minimize memory footprint
-    between the 5-minute memory cleanup cycles in main.py.
+monitors.py – Account Monitor v14.5.2 (v9.10.0 LINE, aligned to the v14.5.2 stack)
 
 v14.5.2 (طلب المستخدم — توسيع وسائل الوصول للمرسل):
   * _send_alert() now passes TWO new optional parameters to
@@ -933,9 +926,8 @@ class EnhancedAccountMonitor:
         }
         self._stats_lock = asyncio.Lock()
         self._entity_cache: TTLCache = TTLCache(maxsize=CFG.ENTITY_CACHE_MAX_SIZE, ttl=600)
-        # v16.1.3: Negative cache is now halved in size and TTL to reduce memory footprint
         self._entity_negative_cache: TTLCache = TTLCache(
-            maxsize=max(100, CFG.ENTITY_CACHE_MAX_SIZE // 2), ttl=15,
+            maxsize=CFG.ENTITY_CACHE_MAX_SIZE, ttl=30,
         )
         self._cache_lock = asyncio.Lock()
         self._processed_hashes: LRUCache = LRUCache(maxsize=CFG.PROCESSED_HASHES_MAX_SIZE)
@@ -979,7 +971,7 @@ class EnhancedAccountMonitor:
         return dict(
             api_id=self.account["api_id"],
             api_hash=self.account["api_hash"],
-            device_model="Render Cloud", system_version="Linux", app_version="14.5.3",
+            device_model="Render Cloud", system_version="Linux", app_version="14.5.2",
             timeout=CFG.CONNECTION_TIMEOUT, connection_retries=5, retry_delay=5,
             auto_reconnect=False,
             sequential_updates=False,
@@ -1172,17 +1164,20 @@ class EnhancedAccountMonitor:
                 if event.chat_id == CFG.ADMIN_CHAT_ID: return
 
                 # ══ 1. الحفظ السريع أولاً ══
+                # نضعه هنا ليلتقط النص قبل أن يقوم أي بوت آخر بحذفه
                 if _capture.enabled:
                     self._fast_capture(event)
 
                 # ══ 2. إلغاء تجاهل البوتات ══
+                # تم تعطيل هذا السطر لكي يقوم البوت بمراقبة رسائل البوتات (مثل رسائل التأكيد)
                 # if event.sender and getattr(event.sender, "bot", False): return
 
-                # ══ 3. تجاهل صارم لأي رسالة قبل وقت التشغيل (Stateless Restart) ══
+                # ══ 3. حماية الطابور (تجاهل الرسائل القديمة جداً فوراً) ══
+                # هذا يمنع الطابور من الامتلاء بالرسائل القديمة عند إعادة تشغيل البوت
                 msg_date = event.message.date
                 if msg_date and self.started_at > 0:
-                    # أي رسالة تاريخها قبل لحظة تشغيل البوت تُرفض فوراً
-                    if msg_date.timestamp() < self.started_at:
+                    # إذا كانت الرسالة أقدم من 10 دقائق (600 ثانية) نتجاهلها فوراً
+                    if msg_date.timestamp() < time.time() - 600:
                         return
 
                 early_key = (event.chat_id, event.message.id)
@@ -2488,6 +2483,8 @@ class EnhancedAccountMonitor:
                 pass
 
         # ══ v14.5.2: جلب رابط المرسل المؤقت عند غياب username ══
+        # https://t.me/+<token> يعمل بلا username (موثق في تيليجرام).
+        # الفشل-آمن: None عند أي خطأ → سلّم contact_target يستمر.
         _temp_link: Optional[str] = None
         if not (nav_sender_username or sender_username or data.get("sender_username")):
             try:
@@ -2755,4 +2752,569 @@ class EnhancedAccountMonitor:
                             f"reply_fix schedule skipped: "
                             f"{type(_rf_sched_err).__name__}: {_rf_sched_err}"
                         )
-                    if user_media is not
+                    if user_media is not None:
+                        await _forward_supplement(None)
+                    _bmsg_v11 = chat_info.get("msg_link")
+                    _bmsg_v11 = _bmsg_v11 if _bmsg_v11 and _bmsg_v11 != "#" else None
+                    _busr_v11 = sender_target.selected_url or None
+                    try:
+                        await self._record_sent_alert(
+                            None, data, msg_hash, account_name, keyword, alert_text,
+                            chat_id, sender_id, display_name, contact_method=_method,
+                            button_message_url=_bmsg_v11, button_user_url=_busr_v11,
+                        )
+                    except Exception as _bot_rec_err:
+                        from unified_alerts.stats import get_unified_stats as _gus_r
+                        try: _gus_r().inc("record_after_send_failed")
+                        except Exception: pass
+                        logger.error(
+                            f"Alert WAS delivered via AlertBot but post-send recording failed "
+                            f"[{account_name}] msg_hash={msg_hash}: "
+                            f"{type(_bot_rec_err).__name__}: {str(_bot_rec_err)[:150]} — NOT resending (v13 RC-2)"
+                        )
+                    return True
+                try:
+                    await self.db.mark_alert_dispatched(
+                        msg_hash, status="failed", error=str(_reason or "")[:300])
+                except Exception:
+                    pass
+                _unk_reason = str(_reason or "")
+                _ui = getattr(self._bot_ref, "alert_ui_client", None) if self._bot_ref is not None else None
+                _policy = unknown_send_result_policy(_unk_reason, _ui is not None)
+                if _policy == "verify":
+                    _expected = normalize_for_fingerprint(
+                        visible_card_text(alert_text or ""))[:48]
+                    _verified = False
+                    try:
+                        _verified = await self._verify_alertbot_delivery(_ui, _expected)
+                    except Exception as _ver_err:
+                        logger.debug(f"alert delivery verify error [{account_name}]: {type(_ver_err).__name__}")
+                    if _verified:
+                        logger.info(
+                            f"AlertBot {_unk_reason.split(':')[0]} but delivery VERIFIED via AlertUI "
+                            f"[{account_name}] — no fallback resend (duplicate prevented)"
+                        )
+                        try:
+                            await self.db.mark_alert_dispatched(
+                                msg_hash, status="delivered", error="verified_after_unknown")
+                        except Exception:
+                            pass
+                        try:
+                            await self._record_sent_alert(
+                                None, data, msg_hash, account_name, keyword, alert_text,
+                                chat_id, sender_id, display_name,
+                                contact_method="bot_verified",
+                            )
+                        except Exception as _ver_rec_err:
+                            from unified_alerts.stats import get_unified_stats as _gus_r
+                            try: _gus_r().inc("record_after_send_failed")
+                            except Exception: pass
+                            logger.error(
+                                f"Alert VERIFIED-delivered but post-send recording failed "
+                                f"[{account_name}] msg_hash={msg_hash}: "
+                                f"{type(_ver_rec_err).__name__}: {str(_ver_rec_err)[:150]} — NOT resending (v13 RC-2)"
+                            )
+                        return True
+                    logger.info(
+                        f"AlertBot {_unk_reason.split(':')[0]} and NOT found in target "
+                        f"[{account_name}] — confirmed failure → user-account fallback"
+                    )
+                elif _policy == "stop":
+                    logger.warning(
+                        f"AlertBot timeout with no AlertUI verifier [{account_name}] — "
+                        f"NOT resending (unknown result; blind-resend forbidden)"
+                    )
+                    try:
+                        await self.db.mark_alert_dispatched(
+                            msg_hash, status="unknown", error="timeout_no_verifier")
+                    except Exception:
+                        pass
+                    return False
+                logger.warning(
+                    f"AlertBot failed → user-account fallback [{account_name}] "
+                    f"(msg_hash={msg_hash}): {_reason}"
+                )
+            except Exception as _ab_err:
+                try:
+                    await self.db.mark_alert_dispatched(
+                        msg_hash, status="failed",
+                        error=f"{type(_ab_err).__name__}: {str(_ab_err)[:250]}")
+                except Exception:
+                    pass
+                logger.warning(
+                    f"AlertBot error → user-account fallback [{account_name}]: "
+                    f"{type(_ab_err).__name__}: {str(_ab_err)[:150]}"
+                )
+
+        async def do_send():
+            last_exc: Optional[Exception] = None
+            if sender.get("username"):
+                for idx, c in enumerate(send_clients):
+                    try:
+                        sent_msg = await _send_alert_payload(c, None)
+                        _sticky(c)
+                        outcome["method"] = "username"
+                        if idx > 0:
+                            logger.info(
+                                f"✅ Alert send succeeded with candidate #{idx + 1} "
+                                f"[{account_name}] after rotation (sticky sender updated)"
+                            )
+                        return sent_msg
+                    except (FloodWaitError, CircuitBreakerOpen):
+                        raise
+                    except Exception as e:
+                        last_exc = e
+                        logger.warning(
+                            f"Send candidate #{idx + 1} failed [{account_name}]: "
+                            f"{type(e).__name__}: {str(e)[:120]} — trying next client"
+                        )
+                raise last_exc if last_exc else RuntimeError("no send candidate succeeded")
+            escalate_msg: Any = None
+            escalate_via: Optional[TelegramClient] = None
+            if mention_allowed and CFG.SENDER_MENTION_FIX_ENABLED:
+                escalate = False
+                for idx, c in enumerate(send_clients):
+                    if escalate:
+                        break
+                    try:
+                        try:
+                            mention_users = await self._resolve_mention_input_users(c, data)
+                        except Exception as mu_err:
+                            logger.debug(f"mention plan error [{account_name}]: {type(mu_err).__name__}")
+                            mention_users = []
+                        for tier_name, input_user in mention_users:
+                            built = _build_mention_entities(alert_text, sender_id, input_user)
+                            if built is None:
+                                continue
+                            try:
+                                sent_msg = await _send_alert_payload(c, built)
+                            except _MENTION_INVALID_ERRORS as mie:
+                                mention_negative.mark(
+                                    self._account_name_for_client(c) or "?", sender_id, tier_name
+                                )
+                                logger.info(
+                                    f"mention tier '{tier_name}' invalid for [{account_name}] "
+                                    f"sender={sender_id}: {type(mie).__name__} — next tier"
+                                )
+                                continue
+                            if tier_name == "username" and getattr(input_user, "access_hash", None):
+                                account_hash_store.record(
+                                    self._account_name_for_client(c) or "", sender_id,
+                                    int(getattr(input_user, "access_hash")),
+                                )
+                                asyncio.create_task(
+                                    self._persist_account_hash(sender_id, int(getattr(input_user, "access_hash")))
+                                )
+                            verified, why = _verify_mention_entity(sent_msg, sender_id)
+                            _sticky(c)
+                            if verified:
+                                outcome["method"] = "mention"
+                                logger.info(
+                                    f"🔗 real mention entity VERIFIED [{account_name}] "
+                                    f"via tier={tier_name} (sender={sender_id}) — visual format unchanged"
+                                )
+                                return sent_msg
+                            outcome["verify_fail_reason"] = f"{tier_name}:{why}"
+                            outcome["method"] = "link"
+                            escalate_msg = sent_msg
+                            escalate_via = c
+                            escalate = True
+                            logger.warning(
+                                f"⚠️ mention entity NOT verified after send [{account_name}] "
+                                f"tier={tier_name} sender={sender_id}: {why} — escalating to forward supplement"
+                            )
+                            break
+                    except (FloodWaitError, CircuitBreakerOpen):
+                        raise
+                    except Exception as e:
+                        last_exc = e
+                        logger.warning(
+                            f"Send candidate #{idx + 1} failed [{account_name}]: "
+                            f"{type(e).__name__}: {str(e)[:120]} — trying next client"
+                        )
+                if escalate:
+                    if await _forward_supplement(escalate_via):
+                        outcome["method"] = "forward"
+                        outcome["forward_done"] = True
+                    return escalate_msg
+            sent_msg: Any = None
+            sent_via: Optional[TelegramClient] = None
+            html_exc: Optional[Exception] = None
+            for idx, c in enumerate(send_clients):
+                try:
+                    sent_msg = await _send_alert_payload(c, None)
+                    sent_via = c
+                    _sticky(c)
+                    if outcome["method"] is None:
+                        outcome["method"] = "link"
+                    break
+                except (FloodWaitError, CircuitBreakerOpen):
+                    raise
+                except Exception as e:
+                    html_exc = e
+                    last_exc = e
+                    logger.warning(
+                        f"Send candidate #{idx + 1} failed [{account_name}]: "
+                        f"{type(e).__name__}: {str(e)[:120]} — trying next client"
+                    )
+            if sent_msg is None:
+                raise html_exc if html_exc else RuntimeError("no send candidate succeeded")
+            if await _forward_supplement(sent_via):
+                outcome["method"] = "forward"
+                outcome["forward_done"] = True
+            if idx > 0:
+                logger.info(
+                    f"✅ Alert send succeeded with candidate #{idx + 1} "
+                    f"[{account_name}] after rotation (sticky sender updated)"
+                )
+            return sent_msg
+
+        def _retry_payload() -> Dict[str, Any]:
+            payload = dict(data)
+            payload["_dlq_kind"] = "alert_resend"
+            payload["_dlq_keyword"] = keyword
+            payload["_dlq_text"] = text
+            payload["_dlq_msg_hash"] = msg_hash
+            payload["_dlq_analysis"] = analysis
+            return payload
+
+        async def _push_alert_to_dlq(exc: Exception) -> None:
+            try:
+                await get_deduplicator().release(dedup_fp)
+            except Exception as rel_err:
+                logger.debug(f"dedup release on DLQ push failed [{account_name}]: {rel_err}")
+            try:
+                await self._dlq.push(_retry_payload(), exc, retry_count=retry_count)
+            except Exception as push_err:
+                logger.error(f"DLQ push failed [{account_name}]: {push_err}")
+            await self._inc_stat("send_errors")
+
+        try:
+            sent_msg = await self._send_cb.call(do_send)
+        except (FloodWaitError, CircuitBreakerOpen) as e:
+            logger.warning(
+                f"Alert send throttled [{account_name}] msg_hash={msg_hash}: {type(e).__name__}: {e}"
+            )
+            await _push_alert_to_dlq(e)
+            raise
+        except Exception as e:
+            logger.error(f"Send alert error [{account_name}]: {e} - trying fallback")
+            fallback_sent_msg = None
+            fb_client = None
+            if self._bot_ref is not None and self._is_client_alive(getattr(self._bot_ref, "alert_sender_client", None)):
+                fb_client = self._bot_ref.alert_sender_client
+            elif send_clients:
+                fb_client = send_clients[0]
+            try:
+                if fb_client is None:
+                    raise RuntimeError("لا يوجد عميل متاح للإرسال الاحتياطي")
+                try:
+                    fallback_sent_msg = await fb_client.send_message(CFG.TARGET_GROUP_ID, _hardened_alert_text(), buttons=_kb_for_this_send(), parse_mode="html", link_preview=False)
+                except Exception as _fb_html_err:
+                    logger.debug(f"Fallback html send failed [{account_name}]: {type(_fb_html_err).__name__} — plain-text fallback")
+                    fallback_sent_msg = await fb_client.send_message(CFG.TARGET_GROUP_ID, alert_text, buttons=_kb_for_this_send(), parse_mode=None, link_preview=False)
+                if outcome.get("method") is None:
+                    outcome["method"] = "link"
+            except Exception as fe:
+                logger.error(f"Fallback failed [{account_name}]: {fe}")
+                admin_id = getattr(CFG, "ADMIN_CHAT_ID", None)
+                admin_client = fb_client
+                if admin_id and admin_client is not None:
+                    try:
+                        admin_text = (
+                            "⚠️ <b>تنبيه — تعذّر النشر في القناة الهدف</b>\n"
+                            "(فشل الإرسال من كل الحسابات — راجع صلاحيات القناة)\n"
+                            "─────────────────\n"
+                            f"{alert_text}"
+                        )
+                        await admin_client.send_message(int(admin_id), admin_text, parse_mode=None, link_preview=False)
+                        logger.warning(
+                            f"✉️ Alert delivered to ADMIN DM instead [{account_name}] "
+                            "(all target-channel candidates failed)"
+                        )
+                        await self._inc_stat("send_errors")
+                        return True
+                    except Exception as ae:
+                        logger.error(f"Admin DM fallback failed [{account_name}]: {ae}")
+                await _push_alert_to_dlq(fe)
+                return False
+            try:
+                await self._record_sent_alert(
+                    fallback_sent_msg, data, msg_hash, account_name, keyword, alert_text,
+                    chat_id, sender_id, display_name,
+                    contact_method=(outcome.get("method") or "link"),
+                )
+            except Exception as _fb_rec_err:
+                from unified_alerts.stats import get_unified_stats as _gus_r
+                try: _gus_r().inc("record_after_send_failed")
+                except Exception: pass
+                logger.error(
+                    f"Alert WAS delivered via fallback but post-send recording failed "
+                    f"[{account_name}] msg_hash={msg_hash}: "
+                    f"{type(_fb_rec_err).__name__}: {str(_fb_rec_err)[:150]} — NOT resending (v13 RC-2)"
+                )
+            return True
+        try:
+            await self._record_sent_alert(
+                sent_msg, data, msg_hash, account_name, keyword, alert_text, chat_id, sender_id, display_name,
+                contact_method=(outcome.get("method") or "link"),
+            )
+        except Exception as _rec_err:
+            from unified_alerts.stats import get_unified_stats as _gus_r
+            try: _gus_r().inc("record_after_send_failed")
+            except Exception: pass
+            logger.error(
+                f"Alert WAS delivered but post-send recording failed "
+                f"[{account_name}] msg_hash={msg_hash}: "
+                f"{type(_rec_err).__name__}: {str(_rec_err)[:150]} — NOT resending (v13 RC-2)"
+            )
+        return True
+
+    def _schedule_reply_fix(
+        self,
+        *,
+        data: Dict[str, Any],
+        sender: Dict[str, Any],
+        account_name: str,
+        target_chat_id: int,
+        alert_msg_id: Optional[int],
+    ) -> None:
+        fixer = _get_reply_fixer()
+        sender_type = str(data.get("sender_type") or "").strip().lower()
+        if sender_type not in ("", "user", "bot"):
+            _contact_metric("reply_fix_skipped")
+            logger.debug(f"[ALERT] reply_fix=SKIP reason=sender_kind:{sender_type}")
+            return
+        if sender.get("username"):
+            _contact_metric("reply_fix_skipped")
+            logger.debug("[ALERT] reply_fix=SKIP reason=username_present")
+            return
+        sender_id = int(sender.get("id") or 0)
+        access_hash = sender.get("access_hash")
+        if sender_id <= 0:
+            _contact_metric("reply_fix_skipped")
+            logger.debug("[ALERT] reply_fix=SKIP reason=no_id_or_hash")
+            return
+        if not target_chat_id:
+            _contact_metric("reply_fix_skipped")
+            logger.debug("[ALERT] reply_fix=SKIP reason=no_target")
+            return
+        client = self.client
+        if client is None:
+            _contact_metric("reply_fix_skipped")
+            logger.debug("[ALERT] reply_fix=SKIP reason=no_client")
+            return
+
+        async def _run() -> None:
+            try:
+                ladder: List[Tuple[str, Any]] = []
+                try:
+                    ladder = await self._resolve_mention_input_users(client, data)
+                except Exception as _ladder_err:
+                    logger.debug(
+                        f"reply_fix ladder resolve failed: "
+                        f"{type(_ladder_err).__name__}"
+                    )
+                    ladder = []
+                _sending_account = ""
+                try:
+                    _sending_account = self._account_name_for_client(client) or ""
+                except Exception:
+                    _sending_account = ""
+
+                def _on_tier_fail(tier: str, err_name: str) -> None:
+                    try:
+                        mention_negative.mark(_sending_account or "?", sender_id, tier)
+                    except Exception:
+                        pass
+                    logger.debug(
+                        f"[ALERT] reply_fix tier_fail tier={tier} err={err_name}"
+                    )
+
+                await fixer.run(
+                    client,
+                    chat_id=int(target_chat_id),
+                    reply_to_msg_id=alert_msg_id,
+                    user_id=sender_id,
+                    access_hash=access_hash,
+                    owner_account=account_name,
+                    ladder=ladder or None,
+                    on_tier_fail=_on_tier_fail,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.debug(f"reply_fix task error: {type(e).__name__}: {str(e)[:100]}")
+
+        task = asyncio.create_task(_run())
+
+        def _swallow(t: asyncio.Task) -> None:
+            if t.cancelled():
+                return
+            exc = t.exception()
+            if exc is not None:
+                logger.debug(f"reply_fix task crashed: {type(exc).__name__}")
+
+        task.add_done_callback(_swallow)
+
+    async def _record_sent_alert(
+        self,
+        sent_msg: Any,
+        data: Dict[str, Any],
+        msg_hash: str,
+        account_name: str,
+        keyword: Any,
+        alert_text: str,
+        chat_id: int,
+        sender_id: int,
+        display_name: str,
+        contact_method: str = "",
+        button_message_url: Optional[str] = None,
+        button_user_url: Optional[str] = None,
+        alert_status: str = "sent",
+        notification_error: Optional[str] = None,
+    ) -> None:
+        if _capture.enabled:
+            _capture.mark_alerted(data.get("chat_id"), data.get("message_id"))
+        try:
+            alert_latency.record(data.get("receive_lag_ms"), data.get("msg_date_ts"))
+        except Exception:
+            pass
+        if sent_msg is not None and self._bot_ref is not None:
+            try:
+                note = getattr(self._bot_ref, "_note_alert_message", None)
+                if note is not None:
+                    note(getattr(sent_msg, "id", None), msg_hash)
+            except Exception:
+                pass
+        safe_keyword = keyword
+        if isinstance(safe_keyword, (tuple, list)): safe_keyword = safe_keyword[0] if safe_keyword else ""
+        if not isinstance(safe_keyword, str): safe_keyword = str(safe_keyword) if safe_keyword is not None else ""
+        try:
+            await self.db.add_alert_immediate(AlertRecord(message_hash=msg_hash, chat_id=chat_id, sender_id=sender_id,
+                account_name=account_name, keyword=safe_keyword, alert_text=alert_text, timestamp=time.time(),
+                contact_method=(contact_method or "")[:20]))
+        except Exception as _air_err:
+            logger.debug(f"immediate receipt failed [{account_name}]: {type(_air_err).__name__}")
+        try:
+            _target_v11 = str(getattr(CFG, "TARGET_GROUP_ID", "") or "") or None
+            await self.db.mark_alert_dispatched(
+                msg_hash, status=alert_status, alerted_to=_target_v11,
+                error=notification_error, attempts=1,
+                button_message_url=button_message_url,
+                button_user_url=button_user_url,
+            )
+        except Exception as _md_err:
+            logger.debug(f"mark_alert_dispatched failed [{account_name}]: {type(_md_err).__name__}")
+        try:
+            self.db._invalidate_can_send_alert(sender_id)  # noqa: SLF001
+        except Exception:
+            pass
+        logger.info(
+            f"Alert sent by {account_name} | kw={keyword!r} | sender={display_name} | "
+            f"contact_method={contact_method or 'link'}"
+        )
+
+    async def disconnect(self):
+        async with self._connect_lock:
+            self.is_connected = False
+            await self._reconnect.stop(); await self._dlq.stop()
+            if self._session_rotate_task:
+                self._session_rotate_task.cancel()
+                try: await self._session_rotate_task
+                except asyncio.CancelledError: pass
+            async with self._media_task_lock:
+                media_tasks = list(self._media_tasks)
+            for t in media_tasks:
+                if not t.done(): t.cancel()
+            for t in media_tasks:
+                try: await t
+                except asyncio.CancelledError: pass
+                except Exception as e:
+                    logger.error(f"Media task error during shutdown [{self.account['name']}]: {e}")
+            async with self._media_task_lock:
+                self._media_tasks.clear()
+            self._entity_cache.clear(); self._entity_negative_cache.clear(); self._processed_hashes.clear(); self._processing_times.clear()
+            if self.client:
+                if self._handler_func:
+                    try: self.client.remove_event_handler(self._handler_func)
+                    except Exception as e: logger.debug(f"remove_event_handler during disconnect failed [{self.account['name']}]: {e}")
+                self._handler_func = None
+                if self._deleted_handler_func:
+                    try: self.client.remove_event_handler(self._deleted_handler_func)
+                    except Exception as e: logger.debug(f"remove deleted-handler during disconnect failed [{self.account['name']}]: {e}")
+                self._deleted_handler_func = None
+                if CFG.SECURE_SESSIONS:
+                    try:
+                        session_path = f"{self.account['session']}.session"
+                        secure_path = f"{self.account['session']}.session.enc"
+                        if os.path.exists(session_path):
+                            from config import SecretManager
+                            SecretManager.encrypt_session(session_path, secure_path); os.remove(session_path)
+                    except Exception as e: logger.error(f"Session encrypt error: {e}")
+                try: await self.client.disconnect()
+                except Exception as e: logger.debug(f"disconnect failed [{self.account['name']}]: {e}")
+            self.client = None
+            logger.info(f"Disconnected {self.account['name']}")
+
+    async def get_stats(self) -> Dict[str, Any]:
+        async with self._stats_lock:
+            stats = dict(self._stats)
+        return {
+            "name": self.account["name"], "phone": self.account["phone"], "connected": self.is_connected,
+            "priority": self.account.get("priority", 0), "send_cb_state": self._send_cb.state,
+            "send_cb_failures": self._send_cb.failures, "entity_cb_state": self._entity_cb.state,
+            "entity_cb_failures": self._entity_cb.failures, "connect_attempts": self._connect_attempts,
+            "last_error": self._last_connect_error, "messages_processed": stats.get("messages_processed", 0),
+            "alerts_sent": stats.get("alerts_sent", 0), "errors": stats.get("errors", 0),
+            "duplicates": stats.get("duplicates", 0), "rate_limited": stats.get("rate_limited", 0),
+            "echo_skipped": stats.get("echo_skipped", 0),
+            "send_errors": stats.get("send_errors", 0), "queue_processed": stats.get("queue_processed", 0),
+            "media_processed": stats.get("media_processed", 0), "avg_processing_time_ms": round(stats.get("avg_processing_time_ms", 0), 2),
+            "last_alert_time": stats.get("last_alert_time", 0), "dlq_stats": await self._dlq.get_stats(),
+            "cache_size": len(self._entity_cache), "processed_hashes_size": len(self._processed_hashes),
+            "accepted": stats.get("accepted", 0), "reviewed": stats.get("reviewed", 0), "ignored": stats.get("ignored", 0),
+            "avg_confidence": round(stats.get("avg_confidence", 0.0), 2), "decisions_count": stats.get("decisions_count", 0),
+        }
+
+
+class HealthStatus:
+    def __init__(self, is_healthy: bool, checks: Dict[str, Any], details: Optional[Dict[str, Any]] = None):
+        self.is_healthy = is_healthy; self.checks = checks; self.details = details or {}; self.timestamp = time.monotonic()
+
+
+class HealthMonitor:
+    def __init__(self, bot_ref: Any = None): self._bot = bot_ref; self._consecutive_fail = 0
+    @staticmethod
+    async def client_ok(client: Any) -> bool:
+        if client is None: return False
+        try:
+            attr = getattr(client, "is_connected", None)
+            return bool(attr() if callable(attr) else attr)
+        except Exception: return False
+    async def check(self) -> HealthStatus:
+        checks = {}; details = {}
+        if self._bot:
+            try:
+                if self._bot.db.is_connected:
+                    await self._bot.db._ping(); checks["database"] = "ok"
+                else: checks["database"] = "disconnected"
+                up = sum(1 for m in self._bot.monitors if m.is_connected); total = len(self._bot.monitors)
+                checks["monitors_up"] = up; checks["monitors_total"] = total
+                monitors_stats = []
+                for m in self._bot.monitors:
+                    s = await m.get_stats(); monitors_stats.append({"name": s.get("name"), "connected": s.get("connected"),
+                        "messages_processed": s.get("messages_processed", 0), "alerts_sent": s.get("alerts_sent", 0),
+                        "errors": s.get("errors", 0), "avg_time": s.get("avg_processing_time_ms", 0), "last_error": s.get("last_error"),
+                        "accepted": s.get("accepted", 0), "reviewed": s.get("reviewed", 0), "ignored": s.get("ignored", 0), "avg_confidence": s.get("avg_confidence", 0)})
+                details["monitors"] = monitors_stats
+                checks["monitors_ok"] = up >= max(1, total * CFG.HEALTH_MIN_MONITORS_RATIO)
+                main_ok = await self.client_ok(self._bot.main_client); checks["main_client"] = "up" if main_ok else "down"
+                qsize = await self._bot.db.queue_size(); checks["queue_size"] = qsize; checks["queue_ok"] = qsize < CFG.MESSAGE_QUEUE_SIZE
+                filter_tele = await self._bot.filter.get_telemetry(); checks["filter_processed"] = filter_tele.get("processed", 0)
+                checks["filter_valid"] = filter_tele.get("valid", 0); checks["filter_accepted"] = filter_tele.get("accepted", 0); checks["filter_review"] = filter_tele.get("review", 0)
+            except Exception as e: checks["database"] = f"error: {e}"
+        is_healthy = checks.get("database") == "ok" and checks.get("monitors_ok", False) and checks.get("main_client") == "up"
+        self._consecutive_fail = 0 if is_healthy else self._consecutive_fail + 1
+        details["consecutive_unhealthy"] = self._consecutive_fail
+        return HealthStatus(is_healthy=is_healthy, checks=checks, details=details)
