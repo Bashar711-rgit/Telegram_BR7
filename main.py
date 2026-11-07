@@ -423,6 +423,13 @@ class EnhancedTelegramBot:
         self._health_server_task: Optional[asyncio.Task] = None
         self._keep_alive_task: Optional[asyncio.Task] = None
         self._main_client_watchdog_task: Optional[asyncio.Task] = None
+        # v14.2.1 (wake-stability): يدل على اكتمال تهيئة البوت (DB متصل +
+        # الصيانة الإقلاعية أُنجزت). قبل اكتماله يُجيب /health بـ 200
+        # {"status": "starting"} بدلاً من 500/انعدام الاستجابة — فيستقبل
+        # Render استيقاظ الخدمة (wake) بسرعة بدل انتهاء مهلة التوجيه
+        # (hibernate-wake-error 503). بعد الاكتمال يعود العقد الأصلي
+        # (503 عند سقوط DB) بلا تغيير.
+        self._boot_complete: bool = False
 
         # ── Main-client failover (M-10 / M-11) ──────────────────────────
         self._main_client_lock = asyncio.Lock()
@@ -894,6 +901,14 @@ class EnhancedTelegramBot:
             # صار الآن على /health/full أدناه بنفس الاسم والمسار.
             # v12.3 W-2: النتيجة لا تُقرأ هنا لكن الاستدعاء مقصود — يحدّث
             # _consecutive_fail ويجري db._ping (أثر جانبي حقيقي للمراقبة).
+            # v14.2.1 (wake-stability): أثناء الإقلاع (قبل اكتمال التهيئة)
+            # نُجيب 200 {"status": "starting"} فوراً بلا لمس DB/health —
+            # يستقبل Render الاستيقاظ بسرعة، وبعد الاكتمال يعود العقد الكامل.
+            if not getattr(self, "_boot_complete", False):
+                return web.json_response({
+                    "status": "starting",
+                    "time": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                }, status=200)
             await self.health.check()
             db_down = not (self.db and getattr(self.db, "is_connected", False))
             db_healthy = bool(getattr(self.db, "db_healthy", True))
@@ -909,12 +924,19 @@ class EnhancedTelegramBot:
             # v11.8.2 (F-11): نفس مسار اللوحة /health/full. توكن اختياري
             # (HEALTH_FULL_TOKEN) للنشرات المكشوفة؛ بلا توكن يبقى متاحاً
             # كما كان المحتوى سابقاً على /health في وضع اللوحة المعطلة.
+            # v14.2.1 (wake-stability): أثناء الإقلاع نبسّط الاستجابة —
+            # لا لمس DB/health قبل اكتمال التهيئة.
             token = os.getenv("HEALTH_FULL_TOKEN", "")
             if token:
                 supplied = (request.headers.get("Authorization", "")
                             .replace("Bearer ", "").strip()) or request.query.get("token", "")
                 if supplied != token:
                     return web.json_response({"error": "unauthorized"}, status=401)
+            if not getattr(self, "_boot_complete", False):
+                return web.json_response({
+                    "status": "starting",
+                    "time": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                }, status=200)
             health = await self.health.check()
             db_down = not (self.db and getattr(self.db, "is_connected", False))
             return web.json_response({
@@ -941,18 +963,31 @@ class EnhancedTelegramBot:
         port = int(os.getenv("PORT", 10000))
         runner = web.AppRunner(app)
         await runner.setup()
-        site = web.TCPSite(runner, '0.0.0.0', port)
 
-        try:
-            await site.start()
-            logger.info(f"Health server started on port {port}")
-        except OSError as e:
-            logger.error(f"Could not bind health server to port {port}: {e}")
-            # v13.2 fix (audit M-8): on a bind failure the task used to hang
-            # forever on a never-set Event. Exit cleanly so the failure is
-            # visible and Render's supervisor can restart the process.
-            await runner.cleanup()
-            return
+        # v14.2.1 (wake-stability): إعادة محاولة ربط المنفذ (3 محاولات × 2s) —
+        # فشل الربط العابر (TIME_WAIT / تداخل إعادة تشغيل سريعة) كان يُسقط
+        # العملية فوراً ويحوّل استيقاظاً كان سينجح إلى حلقة 503.
+        site = None
+        for _attempt in range(1, 4):
+            try:
+                _site = web.TCPSite(runner, '0.0.0.0', port)
+                await _site.start()
+                site = _site
+                break
+            except OSError as e:
+                if _attempt >= 3:
+                    logger.error(f"Could not bind health server to port {port} after {_attempt} attempts: {e}")
+                    # v13.2 fix (audit M-8): on a bind failure the task used to hang
+                    # forever on a never-set Event. Exit cleanly so the failure is
+                    # visible and Render's supervisor can restart the process.
+                    await runner.cleanup()
+                    return
+                logger.warning(
+                    f"Port {port} busy (bind attempt {_attempt}/3): {e} — retrying in 2s"
+                )
+                await asyncio.sleep(2)
+
+        logger.info(f"Health server started on port {port}")
 
         await asyncio.Event().wait()
 
@@ -1522,6 +1557,13 @@ class EnhancedTelegramBot:
         logger.info(f"Enhanced Telegram Bot v{BOT_VERSION} (RENDER EDITION, HARDENED) – Initializing...")
         logger.info("=" * 60)
 
+        # v14.2.1 (wake-stability): خادم الصحة يبدأ أولاً وقبل أي شيء آخر —
+        # حتى أثناء db.connect/المهاجرات/الصيانة الإقلاعية يستجيب المنفذ
+        # فوراً بـ {"status": "starting"}، فينجح استيقاظ Render بدل أن
+        # يفتح المنفذ متأخراً جداً فيُرجع الراوتر hibernate-wake-error.
+        self._health_server_task = self._track_task(self._health_server(), "health_server")
+        logger.info("Health server task started EARLY (serves /health starting→ok on $PORT)")
+
         if not await self.db.connect():
             logger.error("Database connection failed - aborting")
             return False
@@ -1559,8 +1601,8 @@ class EnhancedTelegramBot:
 
         # v14.0: الطبقة الويب = خادم الصحة القائم بذاته (يخدم /health و /health/full
         # على $PORT). لوحة التحكم أُزيلت نهائياً من المشروع (طلب المالك).
-        self._health_server_task = self._track_task(self._health_server(), "health_server")
-        logger.info("Health server task started (serves /health on $PORT)")
+        # v14.2.1: بدء الخادم نُقل إلى أعلى initialize() — قبل db.connect —
+        # (wake-stability)؛ هنا لم يبق سوى التعليق التوثيقي.
 
         self._keep_alive_task = self._track_task(self._keep_alive_loop(), "keep_alive")
 
@@ -1702,7 +1744,10 @@ class EnhancedTelegramBot:
         # alerts skip the cold get_entity round-trip (bounded, fire-safe).
         self._track_task(self._warmup_chat_caches(), "chat_cache_warmup")
 
-        logger.info("✅ Initialization complete (Render Edition, hardened)")
+        # v14.2.1 (wake-stability): من هذه اللحظة /health يعود للعقد الكامل
+        # (503 عند سقوط DB) بدل وضع "starting".
+        self._boot_complete = True
+        logger.info("✅ Initialization complete (Render Edition, hardened) — /health now full contract")
         return True
 
     async def _alert_bot_boot_check(self) -> None:
