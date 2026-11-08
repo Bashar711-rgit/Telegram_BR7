@@ -72,6 +72,7 @@ from cachetools import TTLCache
 from loguru import logger
 
 from config import CFG, json_dumps, json_loads
+from task_util import spawn_bg  # v14.5.1 (T4): بديل آمن من GC لـloop.create_task العارية
 
 # =============================================================================
 # Conditional imports
@@ -3671,7 +3672,11 @@ class EnhancedDatabase:
                 import asyncio as _aio
                 try:
                     loop = _aio.get_running_loop()
-                    loop.create_task(self.flush_rule_hits())
+                    # v14.5.1 (T4): كان loop.create_task بلا مرجع قوي —
+                    # الـevent loop يحفظ مراجع ضعيفة فقط فربما تُجمع المهمة
+                    # قبل إتمام كتابة rule_hits. spawn_bg يحفظ مرجعاً قوياً
+                    # في task_util._tasks ويسترجع الاستثناء عند الفشل.
+                    spawn_bg(self.flush_rule_hits(), name="db_flush_rule_hits")
                 except RuntimeError:
                     pass
         except Exception:

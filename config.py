@@ -735,7 +735,12 @@ class Config:
             MIN_MESSAGE_LENGTH=SecretManager.get_int("MIN_MESSAGE_LENGTH", 6, required=False),
             MAX_WORDS_COUNT=SecretManager.get_int("MAX_WORDS_COUNT", 20, required=False),
             # ========== الكاش والطابور ==========
-            MAX_CACHE_SIZE=SecretManager.get_int("MAX_CACHE_SIZE", 10000, required=False),
+            # v14.5.1 (T3.5): 10000 → 5000 — Render Free/Starter 512MB:
+            # message_cache = deque(maxlen=min(MAX_CACHE_SIZE, 20000)) في
+            # database.py يحمل نصوص رسائل مُطبّعة؛ 5K يكفي لنافذة التكرار
+            # ويوفّر عشرات الـMB تحت الضغط (memory_guard يملأ الفراغ عند
+            # 85% بSoft Reset يشمل مسح الكاش نفسه).
+            MAX_CACHE_SIZE=SecretManager.get_int("MAX_CACHE_SIZE", 5000, required=False),
             MESSAGE_QUEUE_SIZE=SecretManager.get_int("MESSAGE_QUEUE_SIZE", 1000, required=False),
             PROCESSING_WORKERS=workers,
             CACHE_TTL=SecretManager.get_int("CACHE_TTL", 300, required=False),

@@ -2902,8 +2902,12 @@ class EnhancedAccountMonitor:
                                     self._account_name_for_client(c) or "", sender_id,
                                     int(getattr(input_user, "access_hash")),
                                 )
-                                asyncio.create_task(
-                                    self._persist_account_hash(sender_id, int(getattr(input_user, "access_hash")))
+                                # v14.5.1 (T4): كان create_task عارية بلا مرجع
+                                # قوي — خطر GC قبل إتمام الحفظ. spawn_bg يحفظ
+                                # المرجع في task_util._tasks ويسترجع الاستثناء.
+                                spawn_bg(
+                                    self._persist_account_hash(sender_id, int(getattr(input_user, "access_hash"))),
+                                    name=f"persist_acct_hash_{sender_id}",
                                 )
                             verified, why = _verify_mention_entity(sent_msg, sender_id)
                             _sticky(c)
@@ -3146,7 +3150,10 @@ class EnhancedAccountMonitor:
             except Exception as e:
                 logger.debug(f"reply_fix task error: {type(e).__name__}: {str(e)[:100]}")
 
-        task = asyncio.create_task(_run())
+        # v14.5.1 (T4): كان create_task بلا مرجع قوي محفوظ — الـloop يحفظ
+        # مراجع ضعيفة فقط فربما تُجمع المهمة قبل إتمامها. spawn_bg يحفظ
+        # مرجعاً قوياً ويسترجع الاستثناء (يغني عن _swallow اليدوي).
+        task = spawn_bg(_run(), name=f"reply_fix_{self.account.get('name', 'unknown')}")
 
         def _swallow(t: asyncio.Task) -> None:
             if t.cancelled():

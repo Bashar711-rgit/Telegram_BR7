@@ -152,6 +152,7 @@ from alert_bot import AlertBot  # v10.8: إرسال التنبيهات عبر Bo
 from alert_ui import AlertBotClient  # v11.0: عميل بوت حي — Callbacks + إرسال احتياطي بالأزرار
 from sender_resolver import get_sender_intel_snapshot, get_mention_intel_snapshot
 from contact_target import get_contact_metrics_snapshot
+from memory_guard import start_memory_guard, stop_memory_guard  # v14.5.1 (T3.4): RSS enforcement — soft 85% / hard 95%
 
 # psutil optional
 try:
@@ -1526,6 +1527,16 @@ class EnhancedTelegramBot:
             logger.error("Database connection failed - aborting")
             return False
 
+        # v14.5.1 (T3.4): حارس الذاكرة — يبدأ فور نجاح اتصال DB وقبل أي
+        # مهمة أخرى: مراقبة RSS كل 30s، تحذير 70%، Soft Reset 85% (تفريغ
+        # batch + إغلاق DB + مسح الكاشات + إعادة اتصال)، Hard Reset 95%
+        # (os._exit ليعيد Render تشغيل العملية). مرجع self.monitors يُمرر
+        # بالمرجع فتتمّ قائمة المراقبين لاحقاً في initialize.
+        try:
+            await start_memory_guard(self.db, self.monitors)
+        except Exception as _mg_err:
+            logger.warning(f"memory_guard start skipped: {type(_mg_err).__name__}: {_mg_err}")
+
         # v11.8.2 (F-18): ترطيب الذاكرة السلبية (tg_user_blocked + حدود
         # reply_fix) من app_settings بعد الاتصال مباشرة — قبل أي مراقب،
         # فلا تُعاد إعادة إرسال tg://user المرفوض ولا تُستهلك حصص
@@ -1878,6 +1889,12 @@ class EnhancedTelegramBot:
             await self.alert_bot.aclose()
         except Exception:
             pass
+        # v14.5.1 (T3.4): إيقاف حارس الذاكرة قبل إغلاق DB — حتى لا يعيد
+        # اتصال DB أو ينادي os._exit أثناء إنهاء متوقع
+        try:
+            await stop_memory_guard()
+        except Exception as _mg_err:
+            logger.debug(f"memory_guard stop skipped: {type(_mg_err).__name__}")
         await self.db.close()
         logger.info("✅ Shutdown complete")
 
