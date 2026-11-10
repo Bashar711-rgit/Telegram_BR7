@@ -1162,30 +1162,17 @@ class EnhancedAccountMonitor:
             try:
                 if event.out: return
                 if event.chat_id == CFG.ADMIN_CHAT_ID: return
-
-                # ══ 1. الحفظ السريع أولاً ══
-                # نضعه هنا ليلتقط النص قبل أن يقوم أي بوت آخر بحذفه
-                if _capture.enabled:
-                    self._fast_capture(event)
-
-                # ══ 2. إلغاء تجاهل البوتات ══
-                # تم تعطيل هذا السطر لكي يقوم البوت بمراقبة رسائل البوتات (مثل رسائل التأكيد)
-                # if event.sender and getattr(event.sender, "bot", False): return
-
-                # ══ 3. حماية الطابور (تجاهل الرسائل القديمة جداً فوراً) ══
-                # هذا يمنع الطابور من الامتلاء بالرسائل القديمة عند إعادة تشغيل البوت
+                if event.sender and getattr(event.sender, "bot", False): return
                 msg_date = event.message.date
                 if msg_date and self.started_at > 0:
-                    # إذا كانت الرسالة أقدم من 10 دقائق (600 ثانية) نتجاهلها فوراً
-                    if msg_date.timestamp() < time.time() - 600:
-                        return
-
+                    if msg_date.timestamp() < self.started_at - 5: return
+                if _capture.enabled:
+                    self._fast_capture(event)
                 early_key = (event.chat_id, event.message.id)
                 if early_key in _early_delivery_dedup:
                     await self._inc_stat("duplicates")
                     return
                 _early_delivery_dedup[early_key] = True
-                
                 if CFG.SENDER_MENTION_FIX_ENABLED:
                     try:
                         _snd = getattr(event, "sender", None)
@@ -1214,7 +1201,6 @@ class EnhancedAccountMonitor:
                                     _recent_input_senders.popitem(last=False)
                     except Exception as ins_err:
                         logger.debug(f"input_sender capture [{self.account['name']}]: {type(ins_err).__name__}")
-                
                 event_data = await self._event_to_dict(event)
                 _event_queued = False
                 if event_data.get("has_media"):
@@ -1227,7 +1213,6 @@ class EnhancedAccountMonitor:
                     await self._update_avg_time(processing_time)
                     await self._inc_stat("media_processed"); await self._inc_stat("messages_processed")
                     return
-                
                 priority = 7 if event_data.get("has_text") else 3
                 queue_result = await self.db.add_to_queue(event_data, priority=priority)
                 _event_queued = queue_result > 0
@@ -1257,10 +1242,8 @@ class EnhancedAccountMonitor:
                         RuntimeError(f"add_to_queue: insert failed (result={queue_result})"),
                         retry_count=0,
                     )
-                
                 if _capture.enabled:
                     _capture.mark_queued(event_data.get("chat_id"), event_data.get("message_id"))
-                
                 processing_time = (time.perf_counter() - start_time) * 1000
                 await self._update_avg_time(processing_time)
                 await self._inc_stat("messages_processed")
