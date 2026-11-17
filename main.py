@@ -986,6 +986,27 @@ class EnhancedTelegramBot:
                 ]
             except Exception:
                 payload["system_health"] = None
+            # ═══ v14.5.5-diag2: تفاصيل اتصال المراقبين — لماذا لا يتصل الحساب؟ ═══
+            try:
+                detail = []
+                for m in self.monitors:
+                    acct = getattr(m, "account", None)
+                    name = acct.get("name", "?") if isinstance(acct, dict) else "?"
+                    flood_until = float(getattr(m, "_connect_flood_until", 0) or 0)
+                    detail.append({
+                        "name": name,
+                        "connected": bool(getattr(m, "is_connected", False)),
+                        "last_error": str(getattr(m, "_last_connect_error", "") or "")[:180],
+                        "flood_wait_s": round(flood_until - time.time()) if flood_until > time.time() else None,
+                    })
+                payload["monitor_detail"] = detail
+            except Exception:
+                payload["monitor_detail"] = None
+            try:
+                mc = getattr(self, "main_client", None)
+                payload["main_client_connected"] = bool(mc.is_connected()) if mc is not None else None
+            except Exception:
+                payload["main_client_connected"] = None
             return web.json_response(payload, status=503 if db_down else 200)
 
         app.router.add_get('/health', health_handler)
@@ -1683,6 +1704,28 @@ class EnhancedTelegramBot:
 
             if idx < len(accounts):
                 await asyncio.sleep(3)
+
+        # ═══ v14.5.5-fix: تسليح حلقة إعادة الاتصال حتى عند فشل الإقلاع ═══
+        # كان ReconnectionManager يبدأ فقط عند نجاح الاتصال الأول (connect
+        # ناجح يستدعي _reconnect.start) — أي حساب يفشل عند الإقلاع
+        # (AuthKeyDuplicated أثناء تداخل نشر بصفر-انقطاع حيث تعمل النسخة
+        # القديمة والجديدة معاً ثوانٍ وتتصلان بنفس الجلسة، أو FloodWait
+        # قصير، أو مهلة شبكة) كان يبقى ميتاً إلى إعادة تشغيل يدوية — ساعات
+        # بلا رصد. الآن يُسلَّح مدير إعادة الاتصال لكل مراقب غير متصل:
+        # يعيد المحاولة بالتراجع التدريجي (5s→300s) ويتصلح ذاتياً بمجرد
+        # اختفاء التعارض أو زوال السبب العابر.
+        for m in self.monitors:
+            if not m.is_connected:
+                try:
+                    rm = getattr(m, "_reconnect", None)
+                    if rm is not None and not getattr(rm, "_running", False):
+                        await rm.start()
+                        logger.info(
+                            f"Reconnect supervisor armed for {m.account['name']} "
+                            "(initial connect failed — will retry with backoff)"
+                        )
+                except Exception as arm_err:
+                    logger.debug(f"Reconnect arm failed for monitor: {type(arm_err).__name__}: {arm_err}")
 
         if self.main_client is None:
             for m in self.monitors:
