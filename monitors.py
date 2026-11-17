@@ -873,6 +873,32 @@ class ReconnectionManager:
                             pass
                         await asyncio.sleep(3600); continue
                     self._consecutive_failures += 1
+                    # v14.5.5-fix: إشعار واحد للإدارة عند تكرار الجلسة
+                    # (AuthKeyDuplicated المستمر = المفتاح ملغى من تيليجرام
+                    # بسبب اصطدام نسختين بنفس الجلسة، أو نسخة موازية تعمل
+                    # بجلسة الحساب على جهاز آخر). الحلقة كانت تعيد المحاولة
+                    # بصمت بلا أي إشعار — فتبقى الحساب ميتاً بلا علم أحد.
+                    # الإشعار مرة واحدة عند الفشل السادس (لا سبام).
+                    if (
+                        self._consecutive_failures == 6
+                        and "AuthKeyDuplicated" in (self._mon._last_connect_error or "")
+                    ):
+                        try:
+                            await self._mon.db.record_notification(
+                                ntype="account_needs_relogin",
+                                title=f"الحساب {self._mon.account['name']} يحتاج توليد جلسة جديدة",
+                                body=(
+                                    "فشل الاتصال المتكرر بخطأ AuthKeyDuplicated — جلسة "
+                                    "الحساب مستخدمة من نسخة أخرى أو ملغاة من تيليجرام. "
+                                    "ولّد SESSION_STRING جديداً للحساب وحدّث متغير البيئة "
+                                    "المقابل ثم أعد نشر الخدمة."
+                                ),
+                                severity="warn",
+                                object_type="account",
+                                object_id=str(self._mon.account.get("name", "")),
+                            )
+                        except Exception:
+                            pass
                     if self._consecutive_failures > self._max_consecutive_failures:
                         logger.error(f"Too many failures for {self._mon.account['name']}, marking as dead")
                         self._mon.is_connected = False; self._mon._last_connect_error = "Too many failures"
