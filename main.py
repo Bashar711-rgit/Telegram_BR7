@@ -940,7 +940,7 @@ class EnhancedTelegramBot:
                 }, status=200)
             health = await self.health.check()
             db_down = not (self.db and getattr(self.db, "is_connected", False))
-            return web.json_response({
+            payload = {
                 "status": "ok" if health.is_healthy else "degraded",
                 "checks": health.checks,
                 "uptime": int(time.monotonic() - self._start_time),
@@ -955,7 +955,38 @@ class EnhancedTelegramBot:
                 "dedup": get_dedup_snapshot(),
                 "unified_gate": unified_snapshot(),  # v12.0 unified_alerts
                 "antispam": get_antispam_snapshot(),
-            }, status=503 if db_down else 200)
+            }
+            # ═══ v14.5.5-diag: تشخيصات الاستقرار الذاتي — كل قسم فشل-آمن ═══
+            try:
+                import psutil as _psu
+                payload["rss_mb"] = round(
+                    _psu.Process(os.getpid()).memory_info().rss / (1024 * 1024), 1
+                )
+            except Exception:
+                payload["rss_mb"] = None
+            try:
+                from memory_guard import snapshot as _mg_snap
+                payload["mem_guard"] = _mg_snap()
+            except Exception:
+                payload["mem_guard"] = None
+            try:
+                rows = await self.db._fetchall(
+                    "SELECT component, status, details, timestamp FROM system_health "
+                    "WHERE component IN ('memory', 'process') "
+                    "ORDER BY id DESC LIMIT 5"
+                )
+                payload["system_health"] = [
+                    {
+                        "c": r.get("component"),
+                        "s": r.get("status"),
+                        "d": str(r.get("details") or "")[:200],
+                        "t": r.get("timestamp"),
+                    }
+                    for r in (rows or [])
+                ]
+            except Exception:
+                payload["system_health"] = None
+            return web.json_response(payload, status=503 if db_down else 200)
 
         app.router.add_get('/health', health_handler)
         app.router.add_get('/health/full', health_full_handler)
@@ -1999,6 +2030,18 @@ async def main() -> None:
         logger.info("Interrupted by user")
     except Exception as e:
         logger.critical(f"Fatal: {e}", exc_info=True)
+        # ═══ v14.5.5-diag: تثبيت بصمة الانهيار في system_health قبل الخروج —
+        # تُقرأ لاحقاً من /health/full (system_health) لمعرفة سبب كل إعادة
+        # تشغيل بلا حاجة لسجلات Render. فشل-آمن بالكامل.
+        try:
+            if bot is not None and getattr(bot, "db", None) is not None:
+                await bot.db._execute(
+                    "INSERT INTO system_health (component, status, details) "
+                    "VALUES ('process', 'crash', ?)",
+                    (f"{type(e).__name__}: {str(e)[:400]}",),
+                )
+        except Exception:
+            pass
         sys.exit(1)
     finally:
         if bot and bot.is_running:

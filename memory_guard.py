@@ -74,6 +74,27 @@ _RESET_LOCK = asyncio.Lock()
 _guard_task: Optional[asyncio.Task] = None
 _guard_started_at: float = 0.0
 
+# ═══ v14.5.5-diag: إحصاءات حية للكشف عبر /health/full ═══
+# تُحدَّث في كل دورة فحص وعند كل إجراء — فشل-آمنة تماماً.
+_stats: Dict[str, Any] = {
+    "running": False,
+    "soft_resets": 0,
+    "hard_resets": 0,
+    "last_rss_mb": 0.0,
+    "last_check_ts": 0.0,
+    "last_action": "",
+    "last_action_ts": 0.0,
+    "limit_mb": None,
+}
+
+
+def snapshot() -> Dict[str, Any]:
+    """لقطة من إحصاءات الحارس للتشخيص البعيد (تُستدعى من /health/full)."""
+    try:
+        return dict(_stats)
+    except Exception:
+        return {}
+
 
 def _limit_mb() -> int:
     """السقف بالـMB — قابل للتجاوز عبر MEMORY_LIMIT_MB (افتراضي 480)."""
@@ -117,52 +138,69 @@ class MemoryGuard:
         soft_mb = limit_mb * MEMORY_SOFT_RATIO
         hard_mb = limit_mb * MEMORY_HARD_RATIO
         warn_mb = limit_mb * MEMORY_WARN_RATIO
+        _stats["running"] = True
+        _stats["limit_mb"] = limit_mb
         logger.info(
             f"memory_guard started: check every {MEMORY_CHECK_INTERVAL}s, "
             f"limit {limit_mb}MB (warn {warn_mb:.0f} / soft {soft_mb:.0f} / hard {hard_mb:.0f})"
         )
-        while True:
-            try:
-                await asyncio.sleep(MEMORY_CHECK_INTERVAL)
-            except asyncio.CancelledError:
-                logger.info("memory_guard loop cancelled — stopping cleanly")
-                raise
+        try:
+            while True:
+                try:
+                    await asyncio.sleep(MEMORY_CHECK_INTERVAL)
+                except asyncio.CancelledError:
+                    logger.info("memory_guard loop cancelled — stopping cleanly")
+                    raise
 
-            rss = _rss_mb()
-            now = time.monotonic()
+                rss = _rss_mb()
+                now = time.monotonic()
+                # v14.5.5-diag: تحديث اللقطة الحية (فشل-آمن — لا يرفع أبداً)
+                try:
+                    _stats["last_rss_mb"] = round(float(rss), 1)
+                    _stats["last_check_ts"] = time.time()
+                except Exception:
+                    pass
 
-            # سطر الحالة الدوري — دائماً بمستوى info كل 5 دقائق
-            if now - self._last_report >= MEMORY_REPORT_EVERY:
-                self._last_report = now
-                logger.info(f"MEM: {rss:.1f}MB / limit {limit_mb}MB")
+                # سطر الحالة الدوري — دائماً بمستوى info كل 5 دقائق
+                if now - self._last_report >= MEMORY_REPORT_EVERY:
+                    self._last_report = now
+                    logger.info(f"MEM: {rss:.1f}MB / limit {limit_mb}MB")
 
-            try:
-                if rss >= hard_mb:
-                    await self._hard_reset(f"{rss:.1f}MB >= {hard_mb:.0f}MB")
-                    return  # os._exit لا يعود أصلاً — احتياط إن فشل
-                if rss >= soft_mb:
-                    logger.warning(
-                        f"MEM: {rss:.1f}MB >= soft threshold {soft_mb:.0f}MB — soft reset scheduled"
-                    )
-                    await self._soft_reset()
-                    continue
-                if rss >= warn_mb:
-                    # rate-limit: تحذير واحد كل 5 دقائق كحد أقصى
-                    if now - self._last_warn >= MEMORY_WARN_COOLDOWN:
-                        self._last_warn = now
+                try:
+                    if rss >= hard_mb:
+                        await self._hard_reset(f"{rss:.1f}MB >= {hard_mb:.0f}MB")
+                        return  # os._exit لا يعود أصلاً — احتياط إن فشل
+                    if rss >= soft_mb:
                         logger.warning(
-                            f"MEM: {rss:.1f}MB >= 70% of {limit_mb}MB — watching trend"
+                            f"MEM: {rss:.1f}MB >= soft threshold {soft_mb:.0f}MB — soft reset scheduled"
                         )
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                # فشل-آمن: أي خطأ في الإجراء لا يموت به مهمة المراقبة
-                logger.error(f"memory_guard action error: {type(e).__name__}: {e}")
+                        await self._soft_reset()
+                        continue
+                    if rss >= warn_mb:
+                        # rate-limit: تحذير واحد كل 5 دقائق كحد أقصى
+                        if now - self._last_warn >= MEMORY_WARN_COOLDOWN:
+                            self._last_warn = now
+                            logger.warning(
+                                f"MEM: {rss:.1f}MB >= 70% of {limit_mb}MB — watching trend"
+                            )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    # فشل-آمن: أي خطأ في الإجراء لا يموت به مهمة المراقبة
+                    logger.error(f"memory_guard action error: {type(e).__name__}: {e}")
+        finally:
+            _stats["running"] = False
 
     # ── Soft Reset (85%) — بلا فقدان بيانات ────────────────────────────
     async def _soft_reset(self) -> None:
         async with _RESET_LOCK:
             self._soft_resets += 1
+            try:
+                _stats["soft_resets"] = self._soft_resets
+                _stats["last_action"] = "soft_reset"
+                _stats["last_action_ts"] = time.time()
+            except Exception:
+                pass
             logger.critical(
                 f"MEMORY SOFT RESET triggered (#{self._soft_resets}): flushing, "
                 "closing DB, clearing caches, reconnecting"
@@ -272,6 +310,12 @@ class MemoryGuard:
     # ── Hard Reset (95%) — عملية جديدة عبر إعادة تشغيل Render ──────────
     async def _hard_reset(self, reason: str) -> None:
         self._hard_resets += 1
+        try:
+            _stats["hard_resets"] = self._hard_resets
+            _stats["last_action"] = f"hard_reset: {reason}"
+            _stats["last_action_ts"] = time.time()
+        except Exception:
+            pass
         logger.critical("MEMORY HARD RESET — exiting for supervisor restart")
         db = self._db
         # علامة في system_health إن أمكن (component='memory', status='hard_reset')
