@@ -2094,12 +2094,26 @@ class EnhancedFilter:
                 return True
         return False
 
-    def _convert_result(self, result: FilterResult, is_arabic: bool, arabic_ratio: float,
+    def _convert_result(self, result, is_arabic: bool, arabic_ratio: float,
                         ad_score: float, start: float) -> Dict[str, Any]:
-        result.language = "ar" if is_arabic else "unknown"
+        # v14.5.4-fix: المسارات المبكرة (negation/spam_pattern/ignore_pattern)
+        # تُرجع dict من _result() بينما المسار الكامل يمرر FilterResult.
+        # الإسناد result.language على dict كان يرفع AttributeError فيسقط
+        # تحليل الحدث بأكمله (Filter.analyze error) بلا تنبيه ولا ignore.
+        lang = "ar" if is_arabic else "unknown"
+        analysis_time = round((time.perf_counter() - start) * 1000, 2)
+        if isinstance(result, dict):
+            result["language"] = lang
+            result["lang_conf"] = arabic_ratio
+            result["spam_score"] = ad_score
+            result["analysis_time_ms"] = analysis_time
+            result["decision"] = "ignore" if not result.get("valid") else "accept"
+            result["confidence"] = (int(result.get("score") or 0)) / 100.0
+            return result
+        result.language = lang
         result.lang_conf = arabic_ratio
         result.spam_score = ad_score
-        result.analysis_time_ms = round((time.perf_counter() - start) * 1000, 2)
+        result.analysis_time_ms = analysis_time
         result.decision = "ignore" if not result.valid else "accept"
         result.confidence = result.score / 100.0
         return result.to_dict()
