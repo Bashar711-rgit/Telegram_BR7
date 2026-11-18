@@ -104,6 +104,7 @@ import gc
 import os
 import signal
 import sys
+import threading
 import time
 import tracemalloc
 from collections import deque
@@ -162,6 +163,58 @@ try:
 except ImportError:
     PSUTIL_AVAILABLE = False
     logger.warning("psutil not installed. Memory monitoring will be limited.")
+
+
+class _HealthSnapshot:
+    """v14.6.1: لقطة الصحة المشتركة بين حلقة الرصد الرئيسية وخيط خادم الصحة.
+
+    * الكتابة: من حلقة اللقطة (كل 10s) ومن set_boot_complete عند الإقلاع.
+    * القراءة: من خيط خادم الصحة لكل طلب — بلا أي await على الحلقة الرئيسية
+      ولا DB في مسار الطلب (عقد liveness المعزول).
+    * قفل واحد + نسخ قاموس صغيرة — تأثير صفر على المسار الساخن.
+    """
+
+    __slots__ = ("_lock", "_data")
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._data: Dict[str, Any] = {
+            "boot_complete": False,
+            "db_down": None,
+            "db_healthy": None,
+            "payload": None,
+            "payload_ts": 0.0,
+        }
+
+    def set_boot_complete(self) -> None:
+        try:
+            with self._lock:
+                self._data["boot_complete"] = True
+        except Exception:
+            pass
+
+    def update_payload(
+        self,
+        *,
+        payload: Dict[str, Any],
+        db_down: bool,
+        db_healthy: bool,
+    ) -> None:
+        try:
+            with self._lock:
+                self._data["payload"] = payload
+                self._data["db_down"] = bool(db_down)
+                self._data["db_healthy"] = bool(db_healthy)
+                self._data["payload_ts"] = time.time()
+        except Exception:
+            pass
+
+    def get(self) -> Dict[str, Any]:
+        try:
+            with self._lock:
+                return dict(self._data)
+        except Exception:
+            return {"boot_complete": False, "payload": None}
 
 
 # =============================================================================
@@ -440,6 +493,8 @@ class EnhancedTelegramBot:
         self._health_task: Optional[asyncio.Task] = None
         self._memory_task: Optional[asyncio.Task] = None
         self._health_server_task: Optional[asyncio.Task] = None
+        # v14.6.1: لقطة الصحة المشتركة + خيط الخادم المستقل
+        self._health_snapshot = _HealthSnapshot()
         self._keep_alive_task: Optional[asyncio.Task] = None
         self._main_client_watchdog_task: Optional[asyncio.Task] = None
         # ═══ v14.6.0 Activity Maintenance System ═══
@@ -910,206 +965,285 @@ class EnhancedTelegramBot:
             f"{'on' if target_id else 'off'})"
         )
 
-    # ─── Health HTTP Server (الطبقة الويب الوحيدة — /health + /health/full) ───
-    async def _health_server(self):
+    # ─── Health HTTP Server (v14.6.1 — thread مستقل + لقطة مخبأة) ───
+    #
+    # السبب الجذري لحلقة انهيار 12:30-12:47 (boots #2-#7، SIGTERM كل 2-5 دقائق):
+    #   healthCheckPath=/health مفعّل على Render + خادم الصحة يعيش على نفس
+    #   event loop الرئيسي. تحت الضغط (احتياطي طابور 700+ صف + محرك فلترة
+    #   بـ24225 نمط regex على CPU مشترك) تنحسر الحلقة الرئيسية → طلبات
+    #   /health لا تُجاب في مهلة Render → SIGTERM → إعادة تشغيل → إقلاع
+    #   أثقل (استرداد in-flight + ترطيب) → تشبع أعلى → تكرار.
+    #   نفس الجواب على سؤال المواصفة §ثانياً: «هل event loop يدخل في حالة
+    #   حجب؟» — نعم، وكان يقتل الخدمة عبر فشل فحص الصحة.
+    #
+    # الإصلاح الجذري (فصل طبقات):
+    #   1. خادم الصحة يعمل في THREAD مستقل بحلقة asyncio خاصة — يجيب فوراً
+    #      من لقطة ذاكرة حتى لو انحسرت الحلقة الرئيسية ثوانياً.
+    #   2. اللقطة (snapshot) تُحدَّث دورياً من الحلقة الرئيسية كل 10s —
+    #      طلبات الصحة لا تلمس DB إطلاقاً (ضغط DB أقل أيضاً).
+    #   3. /health = liveness صرف: 200 ما دامت العملية تجيب؛ حالة DB تظهر
+    #      في الجسم (degraded) بلا 503 — إعادة تشغيل Render لا تشفي DB،
+    #      وdatabase.py يشفي اتصاله ذاتياً. /health/full = نفس اللقطة
+    #      الكاملة (حداثة ≤10s مقبولة لتشخيصات، وفشل الحلقة لا يُسقطها).
+    #
+
+    async def _build_full_payload(self) -> Dict[str, Any]:
+        """بناء حمولة /health/full كاملة — تُستدعى من حلقة اللقطة (كل 10s).
+
+        نفس منطق المسار القديم حرفياً (v14.5.5-diag + v14.6.0) — لكنه يُنفَّذ
+        دورياً في الخلفية بدل لكل طلب: ضغط DB أقل وحداثة ≤10s للعرض.
+        """
+        health = await self.health.check()
+        db_down = not (self.db and getattr(self.db, "is_connected", False))
+        payload: Dict[str, Any] = {
+            "status": "ok" if health.is_healthy else "degraded",
+            "checks": health.checks,
+            "uptime": int(time.monotonic() - self._start_time),
+            "queue_size": await self.db.queue_size(),
+            "db_healthy": self.db.db_healthy,
+            "monitors": sum(1 for m in self.monitors if m.is_connected),
+            "fast_capture": get_capture_snapshot(),
+            "sender_intel": get_sender_intel_snapshot(),
+            "mention_intel": get_mention_intel_snapshot(),
+            "sender_contact": get_contact_metrics_snapshot(),  # v11.2 مراسلة المرسل
+            "alert_latency": alert_latency.snapshot(),
+            "dedup": get_dedup_snapshot(),
+            "unified_gate": unified_snapshot(),  # v12.0 unified_alerts
+            "antispam": get_antispam_snapshot(),
+            # v14.6.1: حقل db_down صريح — المستهلكون (لوحات/سكربتات) يقرؤونه
+            # من اللقطة بدل استنتاج من كود HTTP.
+            "db_down": bool(db_down),
+        }
+        # ═══ v14.5.5-diag: تشخيصات الاستقرار الذاتي — كل قسم فشل-آمن ═══
+        try:
+            import psutil as _psu
+            payload["rss_mb"] = round(
+                _psu.Process(os.getpid()).memory_info().rss / (1024 * 1024), 1
+            )
+        except Exception:
+            payload["rss_mb"] = None
+        try:
+            from memory_guard import snapshot as _mg_snap
+            payload["mem_guard"] = _mg_snap()
+        except Exception:
+            payload["mem_guard"] = None
+        try:
+            rows = await self.db._fetchall(
+                "SELECT component, status, details, timestamp FROM system_health "
+                "WHERE component IN ('memory', 'process') "
+                "ORDER BY id DESC LIMIT 5"
+            )
+            payload["system_health"] = [
+                {
+                    "c": r.get("component"),
+                    "s": r.get("status"),
+                    "d": str(r.get("details") or "")[:200],
+                    "t": r.get("timestamp"),
+                }
+                for r in (rows or [])
+            ]
+        except Exception:
+            payload["system_health"] = None
+        # ═══ v14.5.5-diag2 + v14.6.0: تفاصيل المراقبين + آخر الأحداث ═══
+        try:
+            detail = []
+            for m in self.monitors:
+                acct = getattr(m, "account", None)
+                name = acct.get("name", "?") if isinstance(acct, dict) else "?"
+                flood_until = float(getattr(m, "_connect_flood_until", 0) or 0)
+                last_ev_ts = float(getattr(m, "last_event_ts", 0) or 0)
+                rm = getattr(m, "_reconnect", None)
+                rm_snap = None
+                if rm is not None:
+                    try:
+                        rm_snap = rm.snapshot()
+                    except Exception:
+                        rm_snap = None
+                detail.append({
+                    "name": name,
+                    "connected": bool(getattr(m, "is_connected", False)),
+                    "last_error": str(getattr(m, "_last_connect_error", "") or "")[:180],
+                    "flood_wait_s": round(flood_until - time.time()) if flood_until > time.time() else None,
+                    # v14.6.0: آخر نشاط استقبال حقيقي (بلا محتوى الرسائل — هويات فقط)
+                    "last_event_age_s": round(time.time() - last_ev_ts, 1) if last_ev_ts else None,
+                    "last_event_chat_id": int(getattr(m, "last_event_chat_id", 0) or 0) or None,
+                    "last_event_sender_id": int(getattr(m, "last_event_sender_id", 0) or 0) or None,
+                    "events_received": int(getattr(m, "events_received", 0) or 0),
+                    "last_connect_success_age_s": (
+                        round(time.time() - float(getattr(m, "last_connect_success_ts", 0) or 0), 1)
+                        if getattr(m, "last_connect_success_ts", 0) else None
+                    ),
+                    "reconnect": rm_snap,
+                })
+            payload["monitor_detail"] = detail
+        except Exception:
+            payload["monitor_detail"] = None
+        try:
+            mc = getattr(self, "main_client", None)
+            payload["main_client_connected"] = bool(mc.is_connected()) if mc is not None else None
+        except Exception:
+            payload["main_client_connected"] = None
+        # ═══ v14.6.0 Activity Maintenance: النشاط + الحسابات + إعادة التشغيل ═══
+        try:
+            payload["accounts_loaded"] = len(self.monitors)
+        except Exception:
+            payload["accounts_loaded"] = None
+        try:
+            act = getattr(self, "activity", None)
+            payload["activity"] = act.snapshot() if act is not None else {"enabled": False}
+        except Exception:
+            payload["activity"] = {"enabled": False}
+        try:
+            prev_ts = getattr(self, "_prev_boot_ts", None)
+            payload["restarts"] = {
+                "boot_count": int(getattr(self, "_boot_count", 0) or 0),
+                "prev_boot_ts": prev_ts,
+                "prev_boot_age_s": (
+                    round(max(0.0, time.time() - _parse_iso_utc(prev_ts)), 1)
+                    if prev_ts else None
+                ),
+                "version": BOT_VERSION,
+            }
+        except Exception:
+            payload["restarts"] = None
+        return payload
+
+    async def _health_snapshot_loop(self) -> None:
+        """v14.6.1: يبني اللقطة الكاملة كل 10s ويكتبها للخيط المستقل.
+
+        كل القراءات من الذاكرة/العدادات الجاهزة + استعلامين DB خفيفين
+        (queue_size + system_health) كل 10s — أقل من معدل استطلاع Render
+        السابق على نفس الطلبات. فشل الدورة لا يوقف الحلقة (فشل-آمن).
+        تعمل حتى الإلغاء (وليس على is_running — تُبدأ أثناء initialize
+        قبل أن يصبح is_running=True في run()).
+        """
+        interval = max(5, int(os.getenv("HEALTH_SNAPSHOT_INTERVAL_SECONDS", "10")))
+        while True:
+            try:
+                await asyncio.sleep(interval)
+            except asyncio.CancelledError:
+                break
+            try:
+                if not getattr(self, "_boot_complete", False):
+                    continue
+                payload = await self._build_full_payload()
+                db_down = bool(payload.get("db_down"))
+                db_healthy = bool(payload.get("db_healthy", True))
+                self._health_snapshot.update_payload(
+                    payload=payload,
+                    db_down=db_down,
+                    db_healthy=db_healthy,
+                )
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.debug(f"health snapshot update error (fail-safe): {type(e).__name__}: {e}")
+
+    def _start_health_server_thread(self) -> None:
+        """v14.6.1: خادم الصحة في thread مستقل بحلقة خاصة — liveness معزول.
+
+        المعالجات تقرأ اللقطة من الذاكرة حصراً: صفر awaits على الحلقة
+        الرئيسية، صفر DB في مسار الطلب. حتى لو انحسرت الحلقة الرئيسية
+        ثوانياً (تشبع CPU) تبقى فحوصات Render تُجاب فوراً — حلقة الانهيار
+        (فحص فاشل → SIGTERM → إعادة) مكسورة من جذورها.
+        """
         if not AIOHTTP_AVAILABLE:
             logger.warning("Aiohttp not installed. Health server disabled.")
             return
 
-        app = web.Application()
+        snapshot = self._health_snapshot
 
-        async def health_handler(request):
-            # v11.8.2 (F-11): عقد /health الأدنى (status/database/db_healthy/time) —
-            # الحد الأدنى للـ liveness فقط (status/database/db_healthy/time)
-            # بنفس دلالة 503. الـ snapshot التشغيلي الكامل كان يُفضي هنا
-            # بلا مصادقة (نقلته L-08 عمداً إلى /health/full في اللوحة) —
-            # صار الآن على /health/full أدناه بنفس الاسم والمسار.
-            # v12.3 W-2: النتيجة لا تُقرأ هنا لكن الاستدعاء مقصود — يحدّث
-            # _consecutive_fail ويجري db._ping (أثر جانبي حقيقي للمراقبة).
-            # v14.2.1 (wake-stability): أثناء الإقلاع (قبل اكتمال التهيئة)
-            # نُجيب 200 {"status": "starting"} فوراً بلا لمس DB/health —
-            # يستقبل Render الاستيقاظ بسرعة، وبعد الاكتمال يعود العقد الكامل.
-            if not getattr(self, "_boot_complete", False):
-                return web.json_response({
-                    "status": "starting",
-                    "time": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-                }, status=200)
-            await self.health.check()
-            db_down = not (self.db and getattr(self.db, "is_connected", False))
-            db_healthy = bool(getattr(self.db, "db_healthy", True))
-            payload = {
-                "status": "ok" if (not db_down and db_healthy) else "degraded",
-                "database": "down" if db_down else "ok",
-                "db_healthy": db_healthy,
-                "time": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-            }
-            return web.json_response(payload, status=503 if db_down else 200)
+        def _thread_main() -> None:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
 
-        async def health_full_handler(request):
-            # v11.8.2 (F-11): نفس مسار اللوحة /health/full. توكن اختياري
-            # (HEALTH_FULL_TOKEN) للنشرات المكشوفة؛ بلا توكن يبقى متاحاً
-            # كما كان المحتوى سابقاً على /health في وضع اللوحة المعطلة.
-            # v14.2.1 (wake-stability): أثناء الإقلاع نبسّط الاستجابة —
-            # لا لمس DB/health قبل اكتمال التهيئة.
-            token = os.getenv("HEALTH_FULL_TOKEN", "")
-            if token:
-                supplied = (request.headers.get("Authorization", "")
-                            .replace("Bearer ", "").strip()) or request.query.get("token", "")
-                if supplied != token:
-                    return web.json_response({"error": "unauthorized"}, status=401)
-            if not getattr(self, "_boot_complete", False):
-                return web.json_response({
-                    "status": "starting",
-                    "time": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-                }, status=200)
-            health = await self.health.check()
-            db_down = not (self.db and getattr(self.db, "is_connected", False))
-            payload = {
-                "status": "ok" if health.is_healthy else "degraded",
-                "checks": health.checks,
-                "uptime": int(time.monotonic() - self._start_time),
-                "queue_size": await self.db.queue_size(),
-                "db_healthy": self.db.db_healthy,
-                "monitors": sum(1 for m in self.monitors if m.is_connected),
-                "fast_capture": get_capture_snapshot(),
-                "sender_intel": get_sender_intel_snapshot(),
-                "mention_intel": get_mention_intel_snapshot(),
-                "sender_contact": get_contact_metrics_snapshot(),  # v11.2 مراسلة المرسل
-                "alert_latency": alert_latency.snapshot(),
-                "dedup": get_dedup_snapshot(),
-                "unified_gate": unified_snapshot(),  # v12.0 unified_alerts
-                "antispam": get_antispam_snapshot(),
-            }
-            # ═══ v14.5.5-diag: تشخيصات الاستقرار الذاتي — كل قسم فشل-آمن ═══
-            try:
-                import psutil as _psu
-                payload["rss_mb"] = round(
-                    _psu.Process(os.getpid()).memory_info().rss / (1024 * 1024), 1
-                )
-            except Exception:
-                payload["rss_mb"] = None
-            try:
-                from memory_guard import snapshot as _mg_snap
-                payload["mem_guard"] = _mg_snap()
-            except Exception:
-                payload["mem_guard"] = None
-            try:
-                rows = await self.db._fetchall(
-                    "SELECT component, status, details, timestamp FROM system_health "
-                    "WHERE component IN ('memory', 'process') "
-                    "ORDER BY id DESC LIMIT 5"
-                )
-                payload["system_health"] = [
-                    {
-                        "c": r.get("component"),
-                        "s": r.get("status"),
-                        "d": str(r.get("details") or "")[:200],
-                        "t": r.get("timestamp"),
+            async def _run() -> None:
+                app = web.Application()
+
+                async def health_handler(request):
+                    # v14.6.1 liveness: 200 ما دامت العملية تجيب — حالة DB
+                    # في الجسم (degraded) بلا 503 (إعادة تشغيل Render لا تشفي
+                    # DB؛ database.py يشفي اتصاله ذاتياً).
+                    snap = snapshot.get()
+                    if not snap.get("boot_complete"):
+                        return web.json_response({
+                            "status": "starting",
+                            "time": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                        }, status=200)
+                    db_down = bool(snap.get("db_down"))
+                    db_healthy = bool(snap.get("db_healthy", True))
+                    payload = {
+                        "status": "ok" if (not db_down and db_healthy) else "degraded",
+                        "database": "down" if db_down else "ok",
+                        "db_healthy": db_healthy,
+                        "time": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                     }
-                    for r in (rows or [])
-                ]
-            except Exception:
-                payload["system_health"] = None
-            # ═══ v14.5.5-diag2: تفاصيل اتصال المراقبين — لماذا لا يتصل الحساب؟ ═══
-            # ═══ v14.6.0: + آخر حدث لكل مراقب + لقطة مدير إعادة الاتصال ═══
-            try:
-                detail = []
-                for m in self.monitors:
-                    acct = getattr(m, "account", None)
-                    name = acct.get("name", "?") if isinstance(acct, dict) else "?"
-                    flood_until = float(getattr(m, "_connect_flood_until", 0) or 0)
-                    last_ev_ts = float(getattr(m, "last_event_ts", 0) or 0)
-                    rm = getattr(m, "_reconnect", None)
-                    rm_snap = None
-                    if rm is not None:
-                        try:
-                            rm_snap = rm.snapshot()
-                        except Exception:
-                            rm_snap = None
-                    detail.append({
-                        "name": name,
-                        "connected": bool(getattr(m, "is_connected", False)),
-                        "last_error": str(getattr(m, "_last_connect_error", "") or "")[:180],
-                        "flood_wait_s": round(flood_until - time.time()) if flood_until > time.time() else None,
-                        # v14.6.0: آخر نشاط استقبال حقيقي (بلا محتوى الرسائل — هويات فقط)
-                        "last_event_age_s": round(time.time() - last_ev_ts, 1) if last_ev_ts else None,
-                        "last_event_chat_id": int(getattr(m, "last_event_chat_id", 0) or 0) or None,
-                        "last_event_sender_id": int(getattr(m, "last_event_sender_id", 0) or 0) or None,
-                        "events_received": int(getattr(m, "events_received", 0) or 0),
-                        "last_connect_success_age_s": (
-                            round(time.time() - float(getattr(m, "last_connect_success_ts", 0) or 0), 1)
-                            if getattr(m, "last_connect_success_ts", 0) else None
-                        ),
-                        "reconnect": rm_snap,
-                    })
-                payload["monitor_detail"] = detail
-            except Exception:
-                payload["monitor_detail"] = None
-            try:
-                mc = getattr(self, "main_client", None)
-                payload["main_client_connected"] = bool(mc.is_connected()) if mc is not None else None
-            except Exception:
-                payload["main_client_connected"] = None
-            # ═══ v14.6.0 Activity Maintenance: النشاط + الحسابات + إعادة التشغيل ═══
-            try:
-                payload["accounts_loaded"] = len(self.monitors)
-            except Exception:
-                payload["accounts_loaded"] = None
-            try:
-                act = getattr(self, "activity", None)
-                payload["activity"] = act.snapshot() if act is not None else {"enabled": False}
-            except Exception:
-                payload["activity"] = {"enabled": False}
-            try:
-                prev_ts = getattr(self, "_prev_boot_ts", None)
-                payload["restarts"] = {
-                    "boot_count": int(getattr(self, "_boot_count", 0) or 0),
-                    "prev_boot_ts": prev_ts,
-                    "prev_boot_age_s": (
-                        # prev_boot_ts بصيغة ISO UTC — تقريب كافٍ للعرض
-                        round(max(0.0, time.time() - _parse_iso_utc(prev_ts)), 1)
-                        if prev_ts else None
-                    ),
-                    "version": BOT_VERSION,
-                }
-            except Exception:
-                payload["restarts"] = None
-            return web.json_response(payload, status=503 if db_down else 200)
+                    return web.json_response(payload, status=200)
 
-        app.router.add_get('/health', health_handler)
-        app.router.add_get('/health/full', health_full_handler)
+                async def health_full_handler(request):
+                    # v14.6.1: نفس المسار — يقرأ اللقطة (حداثة ≤10s) فوراً.
+                    token = os.getenv("HEALTH_FULL_TOKEN", "")
+                    if token:
+                        supplied = (request.headers.get("Authorization", "")
+                                    .replace("Bearer ", "").strip()) or request.query.get("token", "")
+                        if supplied != token:
+                            return web.json_response({"error": "unauthorized"}, status=401)
+                    snap = snapshot.get()
+                    if not snap.get("boot_complete"):
+                        return web.json_response({
+                            "status": "starting",
+                            "time": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                        }, status=200)
+                    payload = snap.get("payload")
+                    if not isinstance(payload, dict):
+                        return web.json_response({
+                            "status": "starting",
+                            "note": "snapshot warming",
+                            "time": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                        }, status=200)
+                    return web.json_response(payload)
 
-        # Render Web Service: MUST bind to $PORT (default 10000)
-        port = int(os.getenv("PORT", 10000))
-        runner = web.AppRunner(app)
-        await runner.setup()
+                app.router.add_get('/health', health_handler)
+                app.router.add_get('/health/full', health_full_handler)
 
-        # v14.2.1 (wake-stability): إعادة محاولة ربط المنفذ (3 محاولات × 2s) —
-        # فشل الربط العابر (TIME_WAIT / تداخل إعادة تشغيل سريعة) كان يُسقط
-        # العملية فوراً ويحوّل استيقاظاً كان سينجح إلى حلقة 503.
-        site = None
-        for _attempt in range(1, 4):
+                # Render Web Service: MUST bind to $PORT (default 10000)
+                port = int(os.getenv("PORT", 10000))
+                runner = web.AppRunner(app)
+                await runner.setup()
+
+                # v14.2.1 (wake-stability): إعادة محاولة ربط المنفذ (3 محاولات × 2s).
+                for _attempt in range(1, 4):
+                    try:
+                        site = web.TCPSite(runner, '0.0.0.0', port)
+                        await site.start()
+                        logger.info(f"Health server started on port {port} (dedicated thread, snapshot-based liveness)")
+                        break
+                    except OSError as e:
+                        if _attempt >= 3:
+                            # v13.2 fix (audit M-8): فشل الربط مرئي — Render
+                            # يعيد تشغيل العملية ويُعاد المحاولة من إقلاع جديد.
+                            logger.error(
+                                f"Could not bind health server to port {port} "
+                                f"after {_attempt} attempts: {e}"
+                            )
+                            await runner.cleanup()
+                            return
+                        logger.warning(
+                            f"Port {port} busy (bind attempt {_attempt}/3): {e} — retrying in 2s"
+                        )
+                        await asyncio.sleep(2)
+
+                # حلقة الـthread تبقى حية لخدمة الطلبات حتى إخراج العملية.
+                await asyncio.Event().wait()
+
             try:
-                _site = web.TCPSite(runner, '0.0.0.0', port)
-                await _site.start()
-                site = _site
-                break
-            except OSError as e:
-                if _attempt >= 3:
-                    logger.error(f"Could not bind health server to port {port} after {_attempt} attempts: {e}")
-                    # v13.2 fix (audit M-8): on a bind failure the task used to hang
-                    # forever on a never-set Event. Exit cleanly so the failure is
-                    # visible and Render's supervisor can restart the process.
-                    await runner.cleanup()
-                    return
-                logger.warning(
-                    f"Port {port} busy (bind attempt {_attempt}/3): {e} — retrying in 2s"
-                )
-                await asyncio.sleep(2)
+                loop.run_until_complete(_run())
+            except Exception as e:
+                logger.error(f"Health server thread crashed: {type(e).__name__}: {e}")
 
-        logger.info(f"Health server started on port {port}")
-
-        await asyncio.Event().wait()
+        t = threading.Thread(target=_thread_main, name="health_server", daemon=True)
+        t.start()
+        logger.info("Health server thread started (dedicated loop, snapshot-based)")
 
     async def _keep_alive_loop(self) -> None:
         """
@@ -1739,8 +1873,16 @@ class EnhancedTelegramBot:
         # حتى أثناء db.connect/المهاجرات/الصيانة الإقلاعية يستجيب المنفذ
         # فوراً بـ {"status": "starting"}، فينجح استيقاظ Render بدل أن
         # يفتح المنفذ متأخراً جداً فيُرجع الراوتر hibernate-wake-error.
-        self._health_server_task = self._track_task(self._health_server(), "health_server")
-        logger.info("Health server task started EARLY (serves /health starting→ok on $PORT)")
+        # v14.6.1 (liveness decoupling): خادم الصحة في thread مستقل بحلقة
+        # خاصة — يجيب فوراً من لقطة الذاكرة حتى لو انحسرت الحلقة الرئيسية
+        # (السبب الجذري لحلقة انهيار SIGTERM: فحص /health يعيش على نفس
+        # الحلقة المزدحمة → مهلة Render → قتل → إقلاع أثقل → تكرار).
+        # حلقة اللقطة تُحدّثها من الحلقة الرئيسية كل 10s.
+        self._start_health_server_thread()
+        self._health_server_task = self._track_task(
+            self._health_snapshot_loop(), "health_snapshot"
+        )
+        logger.info("Health server task started EARLY (thread + snapshot; /health starting→ok on $PORT)")
 
         if not await self.db.connect():
             logger.error("Database connection failed - aborting")
@@ -1973,9 +2115,12 @@ class EnhancedTelegramBot:
         # alerts skip the cold get_entity round-trip (bounded, fire-safe).
         self._track_task(self._warmup_chat_caches(), "chat_cache_warmup")
 
-        # v14.2.1 (wake-stability): من هذه اللحظة /health يعود للعقد الكامل
-        # (503 عند سقوط DB) بدل وضع "starting".
+        # v14.2.1 + v14.6.1: من هذه اللحظة /health يتحول من "starting" إلى
+        # liveness 200 (عبر اللقطة المشتركة للخيط المستقل) — حالة DB تظهر
+        # في الجسم بلا 503 (فشل فحص Render كان يعيد التشغيل قسرياً).
         self._boot_complete = True
+        # v14.6.1: تحرير فحص الصحة — /health يتحول من starting إلى liveness 200
+        self._health_snapshot.set_boot_complete()
         logger.info("✅ Initialization complete (Render Edition, hardened) — /health now full contract")
         return True
 

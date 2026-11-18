@@ -1046,8 +1046,10 @@ class Config:
 # v9.7, etc.) may carry their own older version strings until their own
 # correction pass lands; BOT_VERSION here tracks the config+filter batch.
 # v14.6.0: Activity Maintenance System — رسالة النشاط الدورية + حارس الخدمة.
-BOT_VERSION: Final = "14.6.0"
-BOT_CODENAME: Final = "Activity Watchdog"
+# v14.6.1: Liveness Decoupling — خادم الصحة في thread مستقل + لقطة مخبأة
+# (كسر حلقة انهيار SIGTERM: فشل فحص Render تحت تشبع event loop).
+BOT_VERSION: Final = "14.6.1"
+BOT_CODENAME: Final = "Liveness Decoupled"
 
 # =============================================================================
 # Pre-built config instance
@@ -1417,7 +1419,7 @@ if not (os.getenv("CONTACT_PHONE") or "").strip():
     )
 
 logger.info(
-    f"config.py v14.5.1 loaded | Accounts: {len(ACCOUNTS)} | Workers: {CFG.PROCESSING_WORKERS} | "
+    f"config.py {BOT_VERSION} loaded | Accounts: {len(ACCOUNTS)} | Workers: {CFG.PROCESSING_WORKERS} | "
     f"DB_URL: {'YES' if os.getenv('DATABASE_URL') else 'NO'} | "
     f"DB_SSL: {CFG.DATABASE_SSL or 'default'} | "
     f"INTENT_ENGINE: v14.5.1 (full correction batch)"

@@ -46,8 +46,14 @@ def test_f11_fallback_health_contract_matches_dashboard():
     # نفس مفاتيح العقد الأدنى في dashboard.py /health
     assert '"database": "down" if db_down else "ok"' in msrc
     assert '"db_healthy": db_healthy' in msrc
-    # نفس دلالة 503
-    assert "status=503 if db_down else 200" in msrc
+    # v14.6.1: /health = liveness معزول — 200 دائماً بعد الإقلاع (حالة DB
+    # في الجسم بلا 503: فشل فحص Render كان يقتل العملية عبر SIGTERM في
+    # حلقة انهيار — الإصلاح الجذري: خيط مستقل + لقطة).
+    assert "return web.json_response(payload, status=200)" in msrc
+    assert "status=503 if db_down else 200" not in msrc
+    # خادم الصحة يعمل في thread مستقل (عقد v14.6.1)
+    assert "_start_health_server_thread" in msrc
+    assert "_health_snapshot_loop" in msrc
     # التفاصيل انتقلت إلى /health/full (نفس مسار اللوحة)
     assert msrc.count("add_get('/health/full'") == 1
     # /health لم يعد يفضي السنابشوت التشغيلي
