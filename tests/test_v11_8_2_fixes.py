@@ -166,13 +166,13 @@ def test_f27_username_regex_unified():
     import nav_resolver
     import sender_resolver
 
-    assert nav_resolver._USERNAME_RE.pattern == "^[A-Za-z][A-Za-z0-9_]{3,31}$"
-    assert message_context._USERNAME_RE.pattern == "^[A-Za-z][A-Za-z0-9_]{3,31}$"
-    # sender_resolver يجمع بكسل — أجبره على إعادة التجميع بالنمط الجديد
-    sender_resolver._USERNAME_RE = None
+    assert nav_resolver._USERNAME_RE.pattern == "^[A-Za-z][A-Za-z0-9_]{4,31}$"
+    assert message_context._USERNAME_RE.pattern == "^[A-Za-z][A-Za-z0-9_]{4,31}$"
+    # v14.6.0: sender_resolver يجمع النمط مرة واحدة على مستوى الوحدة (بلا
+    # إعادة تجميع كسول — آلية None-forcing أزيلت في refactor v14.5.x).
     parsed = sender_resolver.parse_telegram_link("@valid_user1")
     assert parsed.kind == "username"
-    assert sender_resolver._USERNAME_RE.pattern == "^[A-Za-z][A-Za-z0-9_]{3,31}$"
+    assert sender_resolver._USERNAME_RE.pattern == "^[A-Za-z][A-Za-z0-9_]{4,31}$"
     # 33+ حرفاً ليس مستخدماً تيليجرامياً حقيقياً — مرفوض في كل الواجهات
     long_name = "a" + "b" * 33
     assert sender_resolver.parse_telegram_link("@" + long_name).kind == "invalid"

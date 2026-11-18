@@ -64,14 +64,21 @@ __version__ = "14.5.2"
 
 _TG_URL = "https://t.me/"
 
-# شكل التنبيه الفعال (v14.5.1 — B_Bot مخفي):
+# شكل التنبيه الفعال (v14.6.0 — B_Bot مستعاد في رأس البطاقة):
+# B_Bot\nالمرسل: الاسم — @username
+# v14.6.0: المواصفة الحالية للمالك (§ثالثاً) تطلب صراحة «إظهار اسم B_Bot في
+# رأس التنبيه» — توقيع v13 أعيد. كل إزاحات الكيانات المشتقة (name_off/
+# uname_off في contact_target + alert_bot + alert_ui) تُحسب من
+# utf16_len(SENDER_LABEL) فتصح تلقائياً — نفس حل v13 المدعومة باختبارات
+# القالب الذهبي. echo guard في monitors يطابق هذا التوقيع أصلاً
+# (_is_current_card_header: 'B_Bot\nالمرسل: ').
 #     المرسل: [اسم المرسل قابل للنقر] — @username
 #     (سطر فارغ)
 #     نص الرسالة:
 #     (سطر فارغ)
 #     [النص الأصلي كاملاً]
 BOT_NAME_LINE = "B_Bot"  # مطلوب في monitors.py لفحص البطاقات
-SENDER_LABEL = "المرسل: "
+SENDER_LABEL = "B_Bot\nالمرسل: "  # v14.6.0: B_Bot مستعاد (مواصفة §ثالثاً)
 MSG_TEXT_LABEL = "نص الرسالة:"
 SENDER_DASH = " — "
 

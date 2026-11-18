@@ -122,7 +122,7 @@ class TestBuildAlertHtml:
         assert "— @" not in built["text"]
         # _data() لديه chat_id=-100111222333 وmessage_id=4242 → روابط خاصة صالحة
         assert built["buttons"] == [[
-            {"text": "مراسلة", "url": f"tg://user?id={SENDER_ID}"},
+            {"text": "مراسلة", "url": f"tg://openmessage?user_id={SENDER_ID}"},
             {"text": "عرض الرسالة", "url": f"https://t.me/c/{INNER}/{MSG_ID}"},
         ]]
 
@@ -141,7 +141,7 @@ class TestBuildAlertHtml:
         (لا روابط وهمية) وتبقى أزرار المرسل فعّالة."""
         built = build_alert_html(_data(chat_id=-987654321))  # مجموعة عادية
         row = _row_of(built)
-        assert {"text": "مراسلة", "url": f"tg://user?id={SENDER_ID}"} in row
+        assert {"text": "مراسلة", "url": f"tg://openmessage?user_id={SENDER_ID}"} in row
         assert all(b["text"] not in ("عرض الرسالة", "القروب") for b in row)
         assert built["msg_link"] is None
         assert "\n\nنص الرسالة:\n\n" in built["text"]
@@ -179,7 +179,7 @@ class TestBuildAlertHtml:
         built = build_alert_html(_data(sender_first_name="<سك>rip", sender_last_name=None))
         assert '<a href="tg://user?id=6079171409">&lt;سك&gt;rip</a>' in built["text"]
         # نصوص الأزرار ثابتة (عقد الواجهة) — البيانات في الروابط/النسخ فقط
-        assert {"text": "مراسلة", "url": f"tg://user?id={SENDER_ID}"} in _row_of(built)
+        assert {"text": "مراسلة", "url": f"tg://openmessage?user_id={SENDER_ID}"} in _row_of(built)
 
     def test_sender_usernames_fallback(self):
         """بلا username أساسي → أول usernames النشطة يُستخدم."""
@@ -352,7 +352,7 @@ class TestAlertBotSend:
         assert len(bot.calls) == 2
         first_kb = _buttons_of(bot.calls[0]["payload"])
         assert first_kb == [
-            {"text": "مراسلة", "url": f"tg://user?id={SENDER_ID}"},
+            {"text": "مراسلة", "url": f"tg://openmessage?user_id={SENDER_ID}"},
             {"text": "عرض الرسالة", "url": "https://t.me/g1/9"},
         ]
         second_kb = _buttons_of(bot.calls[1]["payload"])

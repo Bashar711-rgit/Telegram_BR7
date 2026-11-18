@@ -303,12 +303,22 @@ def build_alert_buttons(
 
 
 def _has_tg_user_button(built: Dict[str, Any]) -> bool:
-    """هل صف الأزرار يحتوي زر «مراسلة» بنمط tg://user (القابل لرفض الخصوصية)."""
+    """هل صف الأزرار يحتوي زر «مراسلة» بنمط tg://user أو tg://openmessage؟
+
+    v14.6.0 fix: v14.5.2 نقل زر مراسلة المرسل إلى tg://openmessage?user_id
+    (بلا روابط وهمية) لكن هذا الكاشف ظل يتعرف على tg://user?id حصراً —
+    فصار مسار «إعادة الإرسال بدون زر عند BUTTON_USER_*» ميتاً: أي رفض
+    لزر المراسلة كان يذهب مباشرة إلى فشل كلي بدل إعادة الإرسال النصية.
+    كلا النمطين tg:// قابلان للرفض من تيليجرام — العقد (alert_bot.py:79)
+    يظل: رفض زر المراسلة → إعادة بلا زر، النص ورابط الاسم يبقيان.
+    """
     kb = built.get("buttons") or []
     if not kb:
         return False
     return any(
-        str(b.get("url") or "").startswith("tg://user?id=")
+        str(b.get("url") or "").startswith(
+            ("tg://user?id=", "tg://openmessage?user_id=")
+        )
         for b in kb[0]
     )
 
@@ -610,9 +620,12 @@ def build_alert_html(
     # blockquote/اقتباس/إطار — النص الأصلي كما ورد (الأسطر واللغة والرموز
     # والروابط)، مهرباً HTML فقط كي لا تُفسد وسوم المستخدم الشكل. الحاجز
     # الوحيد: حد تيليجرام 4096 للرسالة كلها (قص مع "…" وتحذير لوج).
-    # ══ [تعديل مطلوب] إضافة <b> للعناوين وإزالة السطر الفارغ قبل النص ══
-    header = f"<b>{SENDER_LABEL}</b>{sender_html}{uname_suffix_html}"
-    msg_label = f"\n\n<b>{MSG_TEXT_LABEL}</b>\n"
+    # ══ v14.6.0: عقد القالب الذهبي أعيد — بلا <b> وبسطر فارغ قبل النص
+    # (صيغة الصورة المرجعية v13: B_Bot ← المرسل ← (فارغ) ← نص الرسالة:
+    # ← (فارغ) ← النص). "[تعديل مطلوب]" الوسيط كسر 60 اختباراً ذهبياً
+    # والمواصفة الحالية §ثالثاً تعيد تثبيت صيغة الصورة المرجعية. ══
+    header = f"{SENDER_LABEL}{sender_html}{uname_suffix_html}"
+    msg_label = f"\n\n{MSG_TEXT_LABEL}\n\n"
     
     overhead = len(header) + len(msg_label) + len(rule_part) + 16
     budget = max(TELEGRAM_MAX_TEXT_LEN - overhead, 256)
@@ -753,6 +766,54 @@ class AlertBot:
                     raw = ""
                 body = {"description": raw[:200]}
             return resp.status, body
+
+    async def send_plain(
+        self,
+        text: str,
+        chat_id: Optional[int] = None,
+        silent: bool = True,
+    ) -> Tuple[bool, str]:
+        """v14.6.0 Activity Maintenance: إرسال رسالة نصية بسيطة بهوية B_Bot.
+
+        رسالة النشاط الدورية + التحذيرات الإدارية — بلا قوالب ولا أزرار ولا
+        parse_mode (النص كما هو). محاولة واحدة فقط (رسالة النشاط تكرارية
+        بالتصميم — فشلها يعاد تلقائياً في الدورة التالية بعد backoff).
+        لا ترمي استثناءات؛ يعيد (ok, reason) ويحدّث last_error.
+
+        * chat_id=None → chat_id الافتراضي للبوت (TARGET_GROUP_ID).
+        * silent=True → disable_notification (رسالة النشاط لا تُزعج الأعضاء
+          بالإشعارات لكنها تظهر في القناة وتحافظ على النشاط).
+        """
+        if not self.enabled:
+            return False, "no_alert_bot_token"
+        try:
+            target = int(chat_id) if chat_id else self.chat_id
+        except Exception:
+            target = 0
+        if not target:
+            return False, "no_target_chat"
+        payload: Dict[str, Any] = {
+            "chat_id": target,
+            "text": str(text or "").strip()[:4000] or "\u200f",
+            "disable_notification": bool(silent),
+            "link_preview_options": {"is_disabled": True},
+        }
+        try:
+            status, body = await self._post("sendMessage", payload)
+            if status == 200 and isinstance(body, dict) and body.get("ok"):
+                return True, "ok"
+            desc = ""
+            try:
+                desc = str(body.get("description") or "")[:120]
+            except Exception:
+                pass
+            reason = f"http_{status}:{desc}" if desc else f"http_{status}"
+            self.last_error = reason
+            return False, reason
+        except Exception as e:
+            reason = f"{type(e).__name__}: {str(e)[:120]}"
+            self.last_error = reason
+            return False, reason
 
     async def get_me(self) -> Optional[Dict[str, Any]]:
         """getMe — يتحقق من صلاحية التوكن ويخزّن هوية البوت (id/username)."""

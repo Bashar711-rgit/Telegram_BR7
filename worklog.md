@@ -391,3 +391,31 @@ Work Log:
 - النشر: render.yaml (DASHBOARD_AUTH_TOKEN/ENABLED/PORT/CORS + RENDER_API_KEY/RENDER_SERVICE_ID + سطر التوافق) · requirements.txt/lock (fastapi/uvicorn/websockets/python-multipart/itsdangerous/qrcode) · start.sh (كتلة dashboard) · conftest (توكن اللوحة + drain helper).
 - قاعدة البيانات: migrations/0004_remove_dashboard.sql — DROP للجداول الثلاثة + تنظيف صفوف إعدادات اللوحة من app_settings (idempotent، يُطبق من Supabase SQL Editor — لا وصول مباشر للإنتاج من الصندوق).
 - اختبارات: إعادة بناء .venv من requirements.lock (ضاع مع إعادة تدوير الصندوق)؛ تجريد أجزاء اللوحة من 7 ملفات اختبار مختلطة؛ اختبار تقليم intel أُعيد توجيهه من filter_decisions إلى sender_contacts (نفس مسار ts النصي)؛ النتيجة **955/955 PASS** (الفرق عن 1225 = اختبارات اللوحة المحذوفة معها).
+
+---
+
+Task ID: v14.6.0 (Activity Maintenance System — رسالة النشاط + حارس الخدمة + استعادة العقد الذهبي)
+Agent: Z.ai Code (main orchestrator)
+Task: مهمة المالك الشاملة (الاستقبال الفوري والاستمرارية 24/7) — §ثانياً رسالة النشاط + حارس الخدمة + مقاييس /health/full + إصلاح القالب وإغلاق كل الاختبارات الفاشلة
+
+Work Log:
+- خط الأساس الصادق: HEAD (v14.5.5، متزامن مع origin) فيه **71 اختباراً فاشلاً موروثاً** (انجراف اختبارات ذهبية عن تغييرات v14.5.2 المقصودة + اختبارات source-pin متقادمة). مجموعة القياس: نفس الـ71 على الشجرة النظيفة بعد stash — تغييرات الجلسة أدخلت صفر انحدار.
+- **v14.6.0 Activity Maintenance System** (unified_alerts/activity.py جديد):
+  * ActivityWatchdog — حلقة واحدة بإيقاعين: فحص كل 15s (بوابة رسالة النشاط + قياس event loop lag بنافذة 60 عينة) وحارس كل 30s.
+  * رسالة النشاط: خمول ≥90s → «انظر : بوت Engazz - S-bot - طلبات» بهوية B_Bot عبر Bot API (AlertBot.send_plain — بلا حسابات Telethon)، قناة مخصصة ACTIVITY_CHANNEL_ID أو fallback لقناة الطلبات، صامتة افتراضياً، سقف إلزامي + backoff فشل 60s، 11 متغير بيئة للضبط الكامل، ولا تلمس DB إطلاقاً.
+  * العلامة الداخلية (مواصفة §ثانياً): monitors.is_activity_message (تطبيع علامات الاتجاه/المسافات) — استثناء مبكر في معالج الأحداث قبل أي عدّ (activity_echo_skipped) + في echo guard بالمسار (_validate_event). لا تُحسب طلباً، لا تدخل الكلمات المفتاحية، بلا حلقة إعادة معالجة.
+  * حارس الخدمة: تسليح ReconnectionManager لأي مراقب ميت بلا حلقة حية (لا disconnected إلى أجل غير محدد)، كشف توقف الطابور (حجم ثابت >0 وبلا تقدم 3 دورات — فحص خفيف بلا ضغط DB)، تحذيرات إدارية عبر Bot API إلى ADMIN_CHAT_ID مع cooldown لكل نوع (كل الحسابات متعطلة / لا أحداث منذ 15 دقيقة / طابور متوقف / ذاكرة فوق العتبة).
+  * حقيقة تصميمية موثقة في الكود وrender.yaml: رسالة النشاط الداخلية لا تمنع Render Free spin-down — منع السبات مسؤولية _keep_alive_loop الخارجي أو خطة مدفوعة. لا ادعاءات كاذبة.
+- **مقاييس /health/full الجديدة** (سادساً): activity (last_real_activity_age_s/real_events/activity_message/event_loop_lag/watchdog)، accounts_loaded، monitor_detail موسع (last_event_age_s + last_event_chat_id/sender_id بلا محتوى رسائل + events_received + last_connect_success_age_s + reconnect snapshot)، restarts (boot_count مثبت في app_settings عبر _persist_boot_counter — upsert idempotent)، alert_latency.last_alert_age_s.
+- **عدادات ReconnectionManager الصادقة**: attempts/last_attempt_ts/last_success_ts/last_authkey_dup_ts/last_flood_wait_ts+s + snapshot() — آخر AuthKeyDuplicated وآخر FloodWait يظهران في /health/full (سادساً: 13/14/15).
+- **استعادة العقد الذهبي (§ثالثاً)**: SENDER_LABEL = "B_Bot\nالمرسل: " (v14.5.1 كان أخفى B_Bot — المواصفة الحالية تطلب إظهاره في رأس التنبيه) + إزالة [تعديل مطلوب] الوسيط (<b> + إزالة السطر الفارغ) — صيغة الصورة المرجعية v13 كاملة: B_Bot ← المرسل ← (فارغ) ← نص الرسالة: ← (فارغ) ← النص. كل إزاحات الكيانات مشتقة من utf16_len(SENDER_LABEL) فصحّت تلقائياً.
+- **إصلاح انحدار خفي حقيقي**: _has_tg_user_button في alert_bot ظل يتعرف على tg://user?id حصراً بعد أن نقل v14.5.2 زر مراسلة إلى tg://openmessage — مسار «إعادة الإرسال بدون زر عند BUTTON_USER_*» صار ميتاً. الكاشف يتعرف على النمطين الآن (العقد: رفض الزر → إعادة نصية بلا زر، النص ورابط الاسم يبقيان).
+- **إغلاق الـ71 إخفاقاً موروثاً**: تحديث الاختبارات المتقادمة إلى العقود الحالية المقصودة (openmessage للأزرار — بند «عدم روابط وهمية» #8، regex {4,31} = 5-32 حرف تيليجرام، write_forbidden:{ename} التصنيف الصادق، مرسل غير محدد، مفاتيح ssl في parse_database_url، openmessage_fallback عدّاد) + تحديث source-pins المتجمدة (app_version 14.x حي، عد صادق بعقد سلوكي لا تعليقات). صفر إخفاقات: **1025 PASS** (كان 954 PASS + 71 FAIL).
+- اختبارات جديدة: tests/test_v14_6_activity.py — 44 اختباراً (علامة الرسالة + send_plain + بوابة النشاط: خمول/نشاط/تعطيل/قناة مخصصة/backoff + cooldown التحذيرات + تسليح المراقبين + كشف توقف الطابور + لقطة snapshot بعقد مفاتيح ثابتة + _lag_ms + boot counter صادق + استثناء الرسالة من المسار + دورة الحياة).
+- render.yaml: توثيق متغيرات v14.6.0 الـ11 + الملاحظة التصميمية الصريحة حول spin-down.
+- BOT_VERSION → 14.6.0 ("Activity Watchdog").
+
+Stage Summary:
+- المجموعة الكاملة: **1025/1025 PASS** (EXIT=0) — py_compile كامل PASS.
+- الاستقبال كان وأصبح event-driven (Telethon NewMessage فوري — لا polling دوري)؛ المهمة أضافت الطبقة الوقائية والقياس: نافذة lag، عدادات، تحذيرات، ورسالة النشاط.
+- مطلوب من المالك: تدوير الأسرار المكشوفة في المحادثات (توكنات GitHub/Render) — موثق سابقاً وما يزال معلقاً.

@@ -116,8 +116,8 @@ class TestExtractSender:
 
     def test_display_name_rule_unchanged(self):
         assert build_display_name("أحمد", "محمد", 1) == "أحمد محمد"
-        assert build_display_name(None, None, 42) == "مستخدم (42)"
-        assert build_display_name("", "", 7) == "مستخدم (7)"
+        assert build_display_name(None, None, 42) == "مرسل غير محدد"  # v14.6.0: تسمية صادقة بلا اختراق هوية
+        assert build_display_name("", "", 7) == "مرسل غير محدد"  # v14.6.0
 
 
 # ──────────────────────────── link parser ─────────────────────────────────
@@ -196,8 +196,8 @@ class TestAccessMethods:
         assert SenderResolver.build_message_link(-1001234567890, 55) == {
             "group": "https://t.me/c/1234567890", "message": "https://t.me/c/1234567890/55",
         }
-        assert SenderResolver.build_message_link(-1001234567890, 55, "@g") == {
-            "group": "https://t.me/g", "message": "https://t.me/g/55",
+        assert SenderResolver.build_message_link(-1001234567890, 55, "@group_x") == {
+            "group": "https://t.me/group_x", "message": "https://t.me/group_x/55",
         }
 
     def test_contact_methods_and_best(self):

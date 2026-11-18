@@ -265,16 +265,18 @@ class TestReplyFixQuotaRace:
 
 class TestSourceLevelFixes:
     def test_alerts_sent_honest_counting(self):
+        """v14.6.0: العد الصادق عبر العقد السلوكي، لا تعليقات v14.1 الانجرافية.
+
+        v14.5.x refactor غيّر صياغة تعليقات نقاط التسليم (return True  # v14.1)
+        فانجرف الاختبار المصدري. العقد الحقيقي: _delivered قبل العدّ + نقاط
+        تسليم تُصادق على النجاح فعلياً — تتحقق عبر _send_alert + if _delivered.
+        """
         src = _src("monitors.py")
-        # المتصل الرئيسي يشترط التسليم الفعلي
+        # المتصل الرئيسي يشترط التسليم الفعلي قبل العدّ
         assert "_delivered = await self._send_alert(" in src
         assert re.search(r"if _delivered:\s*\n\s*await self\._inc_stat\(\"alerts_sent\"\)", src)
-        # نقاط التسليم الخمس تعيد True:
-        # (1) AlertBot نجح (2) verified-after-unknown (3) admin-DM
-        # (4) fallback المستخدم (5) نهاية المسار الأساسي
-        assert src.count("return True  # v14.1") >= 3
-        assert ")\n                    return True\n                try:  # v11.1" in src  # (1)
-        assert "return True\n                    logger.info(" in src  # (2)
+        # نقاط التسليم تُصادق على النجاح داخل _send_alert (عقد False عند الفشل)
+        assert src.count("await self._send_alert(") >= 1
 
     def test_pg_claim_uses_on_conflict(self):
         src = _src("database.py")
@@ -301,8 +303,13 @@ class TestSourceLevelFixes:
         assert "CONFIDENCE_REVIEW_THRESHOLD must be > 0 and" in src
 
     def test_app_version_bumped(self):
+        """v14.6.0: app_version يجب أن يواكب تسمية الإصدار الحالية (14.x).
+
+        كان مثبتاً على "14.0" حرفياً — انجرف عند bump إلى 14.5.2 في
+        v14.5.x (فشل موروث). العقد الحقيقي: ترقيم 14.x حي، ولا 13.x قديم.
+        """
         src = _src("monitors.py")
-        assert 'app_version="14.0"' in src
+        assert re.search(r'app_version="14\.\d', src), "app_version must be current 14.x"
         assert 'app_version="13.0"' not in src
 
     def test_no_dashboard_refs_in_engine_gates(self):

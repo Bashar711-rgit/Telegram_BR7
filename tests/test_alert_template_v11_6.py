@@ -149,7 +149,7 @@ class TestSenderIdentityCases:
                                   name="محمد العمري", body=ORIG)
         assert 'href="tg://user?id=6079171409"' in built["text"]
         contact = next(b for b in _row(built) if b["text"] == "مراسلة")
-        assert contact["url"] == "tg://user?id=6079171409"
+        assert contact["url"] == "tg://openmessage?user_id=6079171409"  # v14.5.2: بلا روابط وهمية
 
     def test_case3_insufficient_data(self):
         """حالة 3: لا هوية إطلاقاً → اسم آمن، بلا رابط مُختلق وبلا زر وهمي."""

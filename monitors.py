@@ -254,6 +254,42 @@ def is_alert_card_echo(text) -> bool:
     return False
 
 
+# ═══ v14.6.0 Activity Maintenance — علامة رسالة النشاط الدورية ═══
+# رسالة النشاط تُرسل بهوية B_Bot (Bot API) إلى قناة النشاط/الطلبات. هذه الدالة
+# هي «العلامة الداخلية» المطلوبة في المواصفة §ثانياً: أي نص مطابق يُستثنى من
+# كل الفلاتر والعدّ والإحصائيات قبل أي معالجة (echo guard في المعالج + حارس
+# مبكر في معالج الأحداث) — فلا تُحسب طلباً ولا تدخل الكلمات المفتاحية ولا
+# تُعيد معالجة نفسها بلا حدود.
+# تُطبَّع المقارنة: إزالة علامات الاتجاه/العرض + تطبيع المسافات + strip —
+# حتى لا تعتمد المطابقة على صيغة المرسل (رسالة مفصولة بـ LRM/RTL mark).
+_ZW_CHARS_RE = re.compile(r"[\u200b\u200c\u200d\u200e\u200f\u2066-\u2069\ufeff]")
+
+
+def _activity_message_normalized() -> str:
+    """النص المرجعي لرسالة النشاط — يقرأ CFG حياً (قابل للضبط من البيئة)."""
+    try:
+        return _ZW_CHARS_RE.sub("", str(getattr(CFG, "ACTIVITY_MESSAGE_TEXT", "") or "")).strip()
+    except Exception:
+        return ""
+
+
+def is_activity_message(text) -> bool:
+    """هل هذا النص هو رسالة النشاط الدورية؟ (فشل-آمن، بلا استثناءات)"""
+    try:
+        if not text:
+            return False
+        ref = _activity_message_normalized()
+        if not ref:
+            return False
+        cand = _ZW_CHARS_RE.sub("", str(text)).strip()
+        # تطبيع المسافات المتعددة إلى مسافة واحدة (توحيد سلوك المرسلين)
+        cand = " ".join(cand.split())
+        ref = " ".join(ref.split())
+        return bool(cand) and cand == ref
+    except Exception:
+        return False
+
+
 def unknown_send_result_policy(reason: str, has_verifier: bool) -> str:
     r = str(reason or "")
     if not (r.startswith("timeout") or r.startswith("network_error")):
@@ -504,9 +540,12 @@ class AlertLatencyTracker:
         self._recv: "deque[float]" = deque(maxlen=maxlen)
         self._total: "deque[float]" = deque(maxlen=maxlen)
         self._n = 0
+        # v14.6.0: آخر تنبيه ناجح أُرسل إلى القناة (لـ /health/full)
+        self.last_alert_ts: float = 0.0
 
     def record(self, receive_lag_ms: Any, msg_date_ts: Any) -> None:
         try:
+            self.last_alert_ts = time.time()
             if receive_lag_ms is not None:
                 self._recv.append(max(0.0, float(receive_lag_ms)))
             if msg_date_ts:
@@ -533,6 +572,10 @@ class AlertLatencyTracker:
 
     def snapshot(self) -> Dict[str, Any]:
         out: Dict[str, Any] = {"samples": self._n}
+        # v14.6.0: عمر آخر تنبيه ناجح (مفتاح ثابت دائماً)
+        out["last_alert_age_s"] = (
+            round(time.time() - self.last_alert_ts, 1) if self.last_alert_ts else None
+        )
         if self._recv:
             out["receive_lag_ms"] = self._pcts(self._recv)
         if self._total:
@@ -818,6 +861,43 @@ class ReconnectionManager:
             float(__import__("os").getenv("HEARTBEAT_INTERVAL_SECONDS", "90")),
         )
         self._last_heartbeat_ts: float = 0.0
+        # ═══ v14.6.0: عدادات الاتصال الصادقة لـ /health/full ═══
+        # (محاولات إعادة الاتصال، آخر AuthKeyDuplicated، آخر FloodWait)
+        self.attempts: int = 0
+        self.last_attempt_ts: float = 0.0
+        self.last_success_ts: float = 0.0
+        self.last_authkey_dup_ts: float = 0.0
+        self.last_flood_wait_ts: float = 0.0
+        self.last_flood_wait_s: float = 0.0
+
+    def snapshot(self) -> Dict[str, Any]:
+        """لقطة حالة مدير إعادة الاتصال — فشل-آمن (لـ /health/full)."""
+        try:
+            now = time.time()
+            return {
+                "running": bool(self._running),
+                "attempts": int(self.attempts),
+                "backoff_s": round(float(self._backoff), 1),
+                "consecutive_failures": int(self._consecutive_failures),
+                "last_attempt_age_s": (
+                    round(now - self.last_attempt_ts, 1) if self.last_attempt_ts else None
+                ),
+                "last_success_age_s": (
+                    round(now - self.last_success_ts, 1) if self.last_success_ts else None
+                ),
+                "last_authkey_dup_age_s": (
+                    round(now - self.last_authkey_dup_ts, 1) if self.last_authkey_dup_ts else None
+                ),
+                "last_flood_wait_age_s": (
+                    round(now - self.last_flood_wait_ts, 1) if self.last_flood_wait_ts else None
+                ),
+                "last_flood_wait_s": (
+                    round(self.last_flood_wait_s, 1) if self.last_flood_wait_s else None
+                ),
+                "last_error": str(self._last_error or "")[:160],
+            }
+        except Exception:
+            return {"running": bool(getattr(self, "_running", False)), "attempts": 0}
 
     async def start(self):
         if self._running: return
@@ -842,6 +922,9 @@ class ReconnectionManager:
                     now_ts = time.time()
                     if self._mon._connect_flood_until and now_ts < self._mon._connect_flood_until:
                         remaining = self._mon._connect_flood_until - now_ts
+                        # v14.6.0: توثيق آخر FloodWait (لـ /health/full)
+                        self.last_flood_wait_ts = now_ts
+                        self.last_flood_wait_s = max(self.last_flood_wait_s, remaining)
                         logger.debug(
                             f"Reconnect paused for {self._mon.account['name']} - "
                             f"FloodWait {remaining:.0f}s remaining"
@@ -858,6 +941,9 @@ class ReconnectionManager:
                         "UserDeactivatedError",
                     )
                     if any(x in last_error for x in _UNRECOVERABLE_CONNECT_ERRORS):
+                        # v14.6.0: توثيق آخر AuthKeyDuplicated (لـ /health/full)
+                        if "AuthKeyDuplicated" in last_error:
+                            self.last_authkey_dup_ts = now_ts
                         logger.error(f"Unrecoverable error for {self._mon.account['name']}, suspending retries")
                         self._mon._last_connect_error = f"Unrecoverable: {last_error[:100]}"
                         try:
@@ -907,8 +993,15 @@ class ReconnectionManager:
                     sleep = min(self._backoff + jitter, CFG.MAX_RECONNECT_BACKOFF)
                     logger.info(f"Reconnecting {self._mon.account['name']} in {sleep:.1f}s (attempt {self._consecutive_failures})")
                     await asyncio.sleep(sleep)
+                    # v14.6.0: عدّاد المحاولات الصادق (كل محاولة اتصال فعليّة)
+                    self.attempts += 1
+                    self.last_attempt_ts = time.time()
                     ok = await self._mon.connect()
-                    if ok: await self.reset(); logger.info(f"Reconnected: {self._mon.account['name']}")
+                    if ok:
+                        await self.reset()
+                        self.last_success_ts = time.time()
+                        self._mon.last_connect_success_ts = self.last_success_ts
+                        logger.info(f"Reconnected: {self._mon.account['name']}")
                     else: self._backoff = min(self._backoff * CFG.RETRY_BACKOFF, CFG.MAX_RECONNECT_BACKOFF)
                 else:
                     now_ts = time.time()
@@ -935,6 +1028,13 @@ class EnhancedAccountMonitor:
     def __init__(self, account: Dict[str, Any], db: EnhancedDatabase, flt: EnhancedFilter, main_client: Optional[TelegramClient] = None):
         self.account = account; self.db = db; self.filter = flt; self.main_client = main_client
         self.client: Optional[TelegramClient] = None; self.is_connected = False; self.started_at: float = 0.0
+        # ═══ v14.6.0 Activity Maintenance: آخر نشاط استقبال حقيقي لكل مراقب ═══
+        # تحديث ذرّي من معالج الأحداث (بلا I/O) — يُقرأ من /health/full
+        self.last_event_ts: float = 0.0
+        self.last_event_chat_id: int = 0
+        self.last_event_sender_id: int = 0
+        self.events_received: int = 0
+        self.last_connect_success_ts: float = 0.0
         self._connect_lock = asyncio.Lock(); self._reconnect = ReconnectionManager(self)
         self._send_cb = CircuitBreaker(f"send_{account['name']}", failure_threshold=5, recovery_timeout=60.0)
         self._entity_cb = CircuitBreaker(f"entity_{account['name']}", failure_threshold=3, recovery_timeout=30.0)
@@ -943,6 +1043,7 @@ class EnhancedAccountMonitor:
         self._stats: Dict[str, Any] = {
             "messages_processed": 0, "alerts_sent": 0, "errors": 0, "duplicates": 0, "rate_limited": 0,
             "echo_skipped": 0,
+            "activity_echo_skipped": 0,  # v14.6.0: رسائل النشاط المستثناة قبل أي عدّ
             "source_skipped": 0, "spam_skipped": 0, "length_rejected": 0,
             "send_errors": 0, "queue_processed": 0, "media_processed": 0, "avg_processing_time_ms": 0.0,
             "total_processing_time_ms": 0.0, "last_error": None, "last_alert_time": 0.0,
@@ -1198,6 +1299,29 @@ class EnhancedAccountMonitor:
                 if early_key in _early_delivery_dedup:
                     await self._inc_stat("duplicates")
                     return
+                # ═══ v14.6.0: رسالة النشاط الدورية — استثناء مبكر قبل أي عدّ ═══
+                # (لا تُحسب طلباً، ولا مكرراً، ولا تدخل الطابور أصلاً)
+                try:
+                    if is_activity_message(event.message.message if event.message else ""):
+                        await self._inc_stat("activity_echo_skipped")
+                        return
+                except Exception:
+                    pass
+                # ═══ v14.6.0 Activity Maintenance: تسجيل النشاط الحقيقي فور قبول الحدث ═══
+                # قبل أي فلترة دلالية — أي رسالة جديدة من مجموعة مراقَبة تعني أن الاستقبال حي.
+                # تعيينات ذرّية بلا I/O — لا تحجب event loop ولا تعيد ترتيب المسار الساخن.
+                self.last_event_ts = time.time()
+                self.last_event_chat_id = int(event.chat_id or 0)
+                self.last_event_sender_id = int(getattr(event, "sender_id", 0) or 0)
+                self.events_received += 1
+                try:
+                    br = getattr(self, "_bot_ref", None)
+                    if br is not None and getattr(br, "note_real_activity", None):
+                        br.note_real_activity(
+                            self.account["name"], self.last_event_chat_id, self.last_event_sender_id
+                        )
+                except Exception:
+                    pass
                 _early_delivery_dedup[early_key] = True
                 if CFG.SENDER_MENTION_FIX_ENABLED:
                     try:
@@ -1843,7 +1967,7 @@ class EnhancedAccountMonitor:
             await self._inc_stat("spam_skipped")
             return False
         text = data.get("text", "")
-        if is_self_sender(sender_id) or is_alert_card_echo(text):
+        if is_self_sender(sender_id) or is_alert_card_echo(text) or is_activity_message(text):
             await self._inc_stat("echo_skipped")
             return False
         if text:

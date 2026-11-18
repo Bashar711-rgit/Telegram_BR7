@@ -71,7 +71,7 @@ GOLDEN = {
             'أبي مساعدة في واجب الاحصاء ضروري'
         ),
         "bot_buttons": [
-            {"text": "مراسلة", "url": "tg://user?id=777000222"},
+            {"text": "مراسلة", "url": "tg://openmessage?user_id=777000222"},  # v14.5.2: بلا روابط وهمية
             {"text": "عرض الرسالة", "url": "https://t.me/c/1234567890/456"},
         ],
     },
@@ -83,7 +83,7 @@ GOLDEN = {
         ),
         # بلا روابط → يختفي زر «عرض الرسالة» بصدق (لا روابط وهمية)
         "bot_buttons": [
-            {"text": "مراسلة", "url": "tg://user?id=888000333"},
+            {"text": "مراسلة", "url": "tg://openmessage?user_id=888000333"},  # v14.5.2: بلا روابط وهمية
         ],
     },
     "S4_unknown_title": {
@@ -310,7 +310,7 @@ class TestAlertRegression:
         assert "<blockquote>" not in edit_payload["text"]
         # نفس الأزرار بقيت على الرسالة المعدّلة — الزران (مراسلة ثم عرض — ترتيب v13)
         row = edit_payload["reply_markup"]["inline_keyboard"][0]
-        assert row[0]["url"] == "tg://user?id=777000222"
+        assert row[0]["url"] == "tg://openmessage?user_id=777000222"  # v14.5.2
         assert "https://t.me/c/1234567890/456" in [b["url"] for b in row]
 
     @pytest.mark.asyncio

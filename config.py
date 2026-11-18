@@ -601,6 +601,25 @@ class _ConfigData:
     ADAPTIVE_ALPHA: float
     HELP_ANCHOR_INTENT_WEIGHT: float
 
+    # ═══════════════════════════════════════════════════════════════════
+    # ── v14.6.0 Activity Maintenance System (unified_alerts/activity.py) ──
+    # رسالة النشاط الدورية + حارس الخدمة — كلها قابلة للضبط من البيئة.
+    # ACTIVITY_CHANNEL_ID: قناة مخصصة للنشاط/الصحة (افتراضي 0 = غير محددة).
+    # إن غابت وACTIVITY_MESSAGE_FALLBACK_MAIN=true فرسالة النشاط تذهب إلى
+    # قناة الطلبات نفسها بعلامة داخلية (monitors.is_activity_message) تُستثنيها
+    # من كل الفلاتر والإحصائيات قبل أي عدّ.
+    ACTIVITY_MESSAGE_ENABLED: bool
+    ACTIVITY_MESSAGE_INTERVAL_SECONDS: int
+    ACTIVITY_MESSAGE_TEXT: str
+    ACTIVITY_CHANNEL_ID: int
+    ACTIVITY_MESSAGE_FALLBACK_MAIN: bool
+    ACTIVITY_MESSAGE_SILENT: bool
+    ACTIVITY_CHECK_INTERVAL_SECONDS: int
+    ACTIVITY_WATCHDOG_INTERVAL_SECONDS: int
+    ACTIVITY_ADMIN_ALERTS_ENABLED: bool
+    ACTIVITY_IDLE_ALERT_MINUTES: int
+    ACTIVITY_ADMIN_ALERT_COOLDOWN_SECONDS: int
+
 # =============================================================================
 # Config Builder v14.5.1
 # =============================================================================
@@ -700,6 +719,16 @@ class Config:
             db_name = SecretManager.get("DB_NAME", None, required=False)
             db_user = SecretManager.get("DB_USER", None, required=False)
             db_password = SecretManager.get("DB_PASSWORD", None, required=False)
+
+        # v14.6.0: قناة النشاط المخصصة (اختيارية) — قبول الصيغ الرقمية بما فيها
+        # -100... ; أي قيمة غير رقمية تعامل كغير محددة (فشل-آمن بلا انهيار إقلاع).
+        act_channel_raw = str(
+            SecretManager.get("ACTIVITY_CHANNEL_ID", None, required=False) or ""
+        ).strip()
+        try:
+            act_channel = int(act_channel_raw) if act_channel_raw else 0
+        except Exception:
+            act_channel = 0
 
         log_file_raw = SecretManager.get("LOG_FILE", "bot.log", required=False)
         db_file_raw = SecretManager.get("DB_FILE", "telegram_bot.db", required=False)
@@ -880,6 +909,36 @@ class Config:
             QUEUE_EVENT_WAKE=SecretManager.get_bool("QUEUE_EVENT_WAKE", True),
             ALERT_LATENCY_LOG_EVERY=SecretManager.get_int("ALERT_LATENCY_LOG_EVERY", 100, required=False),
             WARMUP_CHAT_CACHE=SecretManager.get_bool("WARMUP_CHAT_CACHE", True),
+            # ══════════ v14.6.0 Activity Maintenance System ══════════
+            ACTIVITY_MESSAGE_ENABLED=SecretManager.get_bool("ACTIVITY_MESSAGE_ENABLED", True),
+            ACTIVITY_MESSAGE_INTERVAL_SECONDS=SecretManager.get_int(
+                "ACTIVITY_MESSAGE_INTERVAL_SECONDS", 90, required=False
+            ),
+            ACTIVITY_MESSAGE_TEXT=SecretManager.get(
+                "ACTIVITY_MESSAGE_TEXT",
+                "انظر : بوت Engazz - S-bot - طلبات",
+                required=False,
+            ),
+            ACTIVITY_CHANNEL_ID=act_channel,
+            ACTIVITY_MESSAGE_FALLBACK_MAIN=SecretManager.get_bool(
+                "ACTIVITY_MESSAGE_FALLBACK_MAIN", True
+            ),
+            ACTIVITY_MESSAGE_SILENT=SecretManager.get_bool("ACTIVITY_MESSAGE_SILENT", True),
+            ACTIVITY_CHECK_INTERVAL_SECONDS=SecretManager.get_int(
+                "ACTIVITY_CHECK_INTERVAL_SECONDS", 15, required=False
+            ),
+            ACTIVITY_WATCHDOG_INTERVAL_SECONDS=SecretManager.get_int(
+                "ACTIVITY_WATCHDOG_INTERVAL_SECONDS", 30, required=False
+            ),
+            ACTIVITY_ADMIN_ALERTS_ENABLED=SecretManager.get_bool(
+                "ACTIVITY_ADMIN_ALERTS_ENABLED", True
+            ),
+            ACTIVITY_IDLE_ALERT_MINUTES=SecretManager.get_int(
+                "ACTIVITY_IDLE_ALERT_MINUTES", 15, required=False
+            ),
+            ACTIVITY_ADMIN_ALERT_COOLDOWN_SECONDS=SecretManager.get_int(
+                "ACTIVITY_ADMIN_ALERT_COOLDOWN_SECONDS", 600, required=False
+            ),
             # ========== Prefilter ==========
             PREFILTER_ENABLED=SecretManager.get_bool("PREFILTER_ENABLED", True),
             PREFILTER_MIN_WORDS=SecretManager.get_int("PREFILTER_MIN_WORDS", 1, required=False),
@@ -986,8 +1045,9 @@ class Config:
 # v14.5.1: aligned with FILTER_ENGINE_VERSION. Other modules (monitors.py
 # v9.7, etc.) may carry their own older version strings until their own
 # correction pass lands; BOT_VERSION here tracks the config+filter batch.
-BOT_VERSION: Final = "14.5.1"
-BOT_CODENAME: Final = "No Dashboard"
+# v14.6.0: Activity Maintenance System — رسالة النشاط الدورية + حارس الخدمة.
+BOT_VERSION: Final = "14.6.0"
+BOT_CODENAME: Final = "Activity Watchdog"
 
 # =============================================================================
 # Pre-built config instance

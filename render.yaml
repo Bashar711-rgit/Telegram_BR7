@@ -202,6 +202,33 @@ services:
       - key: HEALTH_CHECK_INTERVAL
         value: "60"
 
+      # ════════════════════════════════════════════════════════════
+      # v14.6.0 Activity Maintenance System — رسالة النشاط + حارس الخدمة
+      # ACTIVITY_CHANNEL_ID: قناة مخصصة للنشاط (اتركها فارغة لإرسال رسالة
+      # النشاط إلى قناة الطلبات نفسها مع استثناء كامل من الفلاتر/العدّ).
+      # ملاحظة صريحة: رسالة النشاط الداخلية لا تمنع Render Free من
+      # spin-down — منع السبات مسؤولية keep-alive الخارجي أو خطة مدفوعة.
+      # ════════════════════════════════════════════════════════════
+      - key: ACTIVITY_MESSAGE_ENABLED
+        value: "true"
+      - key: ACTIVITY_MESSAGE_INTERVAL_SECONDS
+        value: "90"
+      # ACTIVITY_MESSAGE_TEXT الافتراضي في الكود: "انظر : بوت Engazz - S-bot - طلبات"
+      - key: ACTIVITY_MESSAGE_FALLBACK_MAIN
+        value: "true"
+      - key: ACTIVITY_MESSAGE_SILENT
+        value: "true"
+      - key: ACTIVITY_CHECK_INTERVAL_SECONDS
+        value: "15"
+      - key: ACTIVITY_WATCHDOG_INTERVAL_SECONDS
+        value: "30"
+      - key: ACTIVITY_ADMIN_ALERTS_ENABLED
+        value: "true"
+      - key: ACTIVITY_IDLE_ALERT_MINUTES
+        value: "15"
+      - key: ACTIVITY_ADMIN_ALERT_COOLDOWN_SECONDS
+        value: "600"
+
       - key: CLEANUP_INTERVAL
         value: "86400"
 

@@ -147,7 +147,7 @@ class TestTgUserBlockedMemory:
         )
         assert ok is True and method == "mention_button"
         kb = _buttons_of(bot.calls[0]["payload"])
-        assert any(b.get("url", "").startswith("tg://user?id=") for b in kb)
+        assert any(b.get("url", "").startswith("tg://openmessage?user_id=") for b in kb)  # v14.5.2
 
     @pytest.mark.asyncio
     async def test_r6_rejection_marks_memory_next_send_single_call(self):

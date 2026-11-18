@@ -15,9 +15,18 @@ class TestParseDatabaseUrl:
     """Regression tests for audit C-2 (regex parser replaced with urlparse)."""
 
     def test_full_url(self):
-        assert parse_database_url("postgresql://u:p@h:5432/db") == {
-            "user": "u", "password": "p", "host": "h", "port": 5432, "database": "db",
-        }
+        """v14.6.0: v14.5.1 أضاف مفاتيح ssl/sslmode_raw للدعم الكامل للـSSL
+        (DATABASE_URL مع sslmode=require) — العقد: المفاتيح الخمسة الأساسية
+        + ssl=None على URL بلا معاملات."""
+        r = parse_database_url("postgresql://u:p@h:5432/db")
+        assert r["user"] == "u" and r["password"] == "p"
+        assert r["host"] == "h" and r["port"] == 5432 and r["database"] == "db"
+        assert r["ssl"] is None
+
+    def test_sslmode_require_surfaces_ssl(self):
+        """v14.6.0: sslmode=require يُكشف كـ ssl ('require') — يستهلكه database.py."""
+        r = parse_database_url("postgresql://u:p@h:5432/db?sslmode=require")
+        assert r["ssl"] == "require" and r["database"] == "db"
 
     def test_no_port_defaults_5432(self):
         r = parse_database_url("postgresql://u:p@h/db")

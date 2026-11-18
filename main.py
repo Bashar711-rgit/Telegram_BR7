@@ -142,6 +142,7 @@ from config import (
 from database import EnhancedDatabase
 from dedup import get_dedup_snapshot, init_deduplicator
 from unified_alerts import run_startup_maintenance, unified_snapshot  # v12.0 unified_alerts
+from unified_alerts.activity import ActivityWatchdog  # v14.6.0 Activity Maintenance System
 from antispam import get_antispam, setup_antispam, get_antispam_snapshot
 from filter_engine import EnhancedFilter
 from monitors import (
@@ -180,6 +181,23 @@ def _pick_alertui_account(accounts: Any, monitors: Any) -> Optional[dict]:
         if getattr(m, "is_connected", False) and a.get("api_id") and a.get("api_hash"):
             return a
     return None
+
+
+def _parse_iso_utc(ts: Optional[str]) -> float:
+    """v14.6.0: تحويل طابع ISO/UTC إلى epoch — فشل-آمن (0 عند أي خلل).
+
+    يقبل صيغ "2026-11-18T11:09:19.611232Z" و"+00:00" وبدون ثوانٍ كسرية.
+    """
+    if not ts:
+        return 0.0
+    try:
+        raw = str(ts).strip().replace("Z", "+00:00")
+        dt = datetime.fromisoformat(raw)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except Exception:
+        return 0.0
 
 
 # =============================================================================
@@ -424,6 +442,12 @@ class EnhancedTelegramBot:
         self._health_server_task: Optional[asyncio.Task] = None
         self._keep_alive_task: Optional[asyncio.Task] = None
         self._main_client_watchdog_task: Optional[asyncio.Task] = None
+        # ═══ v14.6.0 Activity Maintenance System ═══
+        self.activity: Optional[ActivityWatchdog] = None
+        self._activity_task: Optional[asyncio.Task] = None
+        # عدّاد إعادة التشغيل (يُثبَّت في app_settings عند الإقلاع)
+        self._boot_count: int = 0
+        self._prev_boot_ts: Optional[str] = None
         # v14.2.1 (wake-stability): يدل على اكتمال تهيئة البوت (DB متصل +
         # الصيانة الإقلاعية أُنجزت). قبل اكتماله يُجيب /health بـ 200
         # {"status": "starting"} بدلاً من 500/انعدام الاستجابة — فيستقبل
@@ -987,17 +1011,36 @@ class EnhancedTelegramBot:
             except Exception:
                 payload["system_health"] = None
             # ═══ v14.5.5-diag2: تفاصيل اتصال المراقبين — لماذا لا يتصل الحساب؟ ═══
+            # ═══ v14.6.0: + آخر حدث لكل مراقب + لقطة مدير إعادة الاتصال ═══
             try:
                 detail = []
                 for m in self.monitors:
                     acct = getattr(m, "account", None)
                     name = acct.get("name", "?") if isinstance(acct, dict) else "?"
                     flood_until = float(getattr(m, "_connect_flood_until", 0) or 0)
+                    last_ev_ts = float(getattr(m, "last_event_ts", 0) or 0)
+                    rm = getattr(m, "_reconnect", None)
+                    rm_snap = None
+                    if rm is not None:
+                        try:
+                            rm_snap = rm.snapshot()
+                        except Exception:
+                            rm_snap = None
                     detail.append({
                         "name": name,
                         "connected": bool(getattr(m, "is_connected", False)),
                         "last_error": str(getattr(m, "_last_connect_error", "") or "")[:180],
                         "flood_wait_s": round(flood_until - time.time()) if flood_until > time.time() else None,
+                        # v14.6.0: آخر نشاط استقبال حقيقي (بلا محتوى الرسائل — هويات فقط)
+                        "last_event_age_s": round(time.time() - last_ev_ts, 1) if last_ev_ts else None,
+                        "last_event_chat_id": int(getattr(m, "last_event_chat_id", 0) or 0) or None,
+                        "last_event_sender_id": int(getattr(m, "last_event_sender_id", 0) or 0) or None,
+                        "events_received": int(getattr(m, "events_received", 0) or 0),
+                        "last_connect_success_age_s": (
+                            round(time.time() - float(getattr(m, "last_connect_success_ts", 0) or 0), 1)
+                            if getattr(m, "last_connect_success_ts", 0) else None
+                        ),
+                        "reconnect": rm_snap,
                     })
                 payload["monitor_detail"] = detail
             except Exception:
@@ -1007,6 +1050,30 @@ class EnhancedTelegramBot:
                 payload["main_client_connected"] = bool(mc.is_connected()) if mc is not None else None
             except Exception:
                 payload["main_client_connected"] = None
+            # ═══ v14.6.0 Activity Maintenance: النشاط + الحسابات + إعادة التشغيل ═══
+            try:
+                payload["accounts_loaded"] = len(self.monitors)
+            except Exception:
+                payload["accounts_loaded"] = None
+            try:
+                act = getattr(self, "activity", None)
+                payload["activity"] = act.snapshot() if act is not None else {"enabled": False}
+            except Exception:
+                payload["activity"] = {"enabled": False}
+            try:
+                prev_ts = getattr(self, "_prev_boot_ts", None)
+                payload["restarts"] = {
+                    "boot_count": int(getattr(self, "_boot_count", 0) or 0),
+                    "prev_boot_ts": prev_ts,
+                    "prev_boot_age_s": (
+                        # prev_boot_ts بصيغة ISO UTC — تقريب كافٍ للعرض
+                        round(max(0.0, time.time() - _parse_iso_utc(prev_ts)), 1)
+                        if prev_ts else None
+                    ),
+                    "version": BOT_VERSION,
+                }
+            except Exception:
+                payload["restarts"] = None
             return web.json_response(payload, status=503 if db_down else 200)
 
         app.router.add_get('/health', health_handler)
@@ -1447,6 +1514,64 @@ class EnhancedTelegramBot:
         except Exception:
             return False
 
+    # ═══════════ v14.6.0 Activity Maintenance System ═══════════
+    def note_real_activity(self, account: str, chat_id: int, sender_id: int) -> None:
+        """بوابة النشاط الحقيقي — يستدعيها معالج أحداث كل مراقب فور قبول حدث.
+
+        تعيينات ذرّية بلا I/O — آمنة تماماً من المسار الساخن (لا تحجب
+        event loop ولا تلمس DB). إذا لم يبدأ ActivityWatchdog بعد
+        (نافذة الإقلاع) فالاستدعاء تجاهل صامت.
+        """
+        act = getattr(self, "activity", None)
+        if act is not None:
+            try:
+                act.note_real_activity(account, chat_id, sender_id)
+            except Exception:
+                pass
+
+    async def _persist_boot_counter(self) -> None:
+        """v14.6.0: عدّاد إعادة التشغيل الصادق — app_settings['boot:last'].
+
+        يُزاد عند كل إقلاع فعلي (بعد اتصال DB) ويعيد العدد الحالي + طابع
+        الإقلاع السابق ليظهرا في /health/full (restarts). فشل-آمن كلياً:
+        أي خلل DB لا يوقف الإقلاع ولا يرمي استثناء.
+        """
+        db = self.db
+        if db is None:
+            return
+        try:
+            import json as _json
+
+            row = await db._fetchone(
+                "SELECT value FROM app_settings WHERE key = ?", ("boot:last",)
+            )
+            prev_count = 0
+            prev_ts: Optional[str] = None
+            if row and row.get("value"):
+                try:
+                    prev = _json.loads(row["value"])
+                    prev_count = int(prev.get("count", 0) or 0)
+                    prev_ts = prev.get("ts")
+                except Exception:
+                    prev_count = 0
+                    prev_ts = None
+            self._boot_count = prev_count + 1
+            self._prev_boot_ts = prev_ts
+            payload = _json.dumps({
+                "count": self._boot_count,
+                "ts": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                "version": BOT_VERSION,
+                "pid": os.getpid(),
+            })
+            await db._execute(
+                "INSERT INTO app_settings (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                ("boot:last", payload),
+            )
+            logger.info(f"Boot counter persisted: #{self._boot_count} (version={BOT_VERSION})")
+        except Exception as e:
+            logger.debug(f"boot counter persist skipped: {type(e).__name__}: {e}")
+
     # ─── Admin Commands ────────────────────────────────────────────────────────
     async def _register_admin_commands(self) -> None:
         if not self.main_client:
@@ -1658,6 +1783,10 @@ class EnhancedTelegramBot:
         except Exception as _maint_err:
             logger.debug(f"startup maintenance skipped: {type(_maint_err).__name__}")
 
+        # v14.6.0: عدّاد إعادة التشغيل — يُثبَّت مبكراً بعد اتصال DB
+        # (فشل-آمن: لا يوقف الإقلاع أبداً).
+        await self._persist_boot_counter()
+
         # v9.11: تهيئة محرك مكافحة السبام وتحميل قائمة التجاهل الدائم من DB
         # (قبل تشغيل أي مراقب — حتى تُتجاهل رسائل المصنفين كمزعجين منذ اللحظة الأولى).
         await setup_antispam(self.db)
@@ -1806,6 +1935,21 @@ class EnhancedTelegramBot:
         await self._register_copy_handler()
         # v9.11: معالجات زر «تواصل مع المرسل» + مسار الرد البديل
         await self._register_contact_handlers()
+
+        # ══ v14.6.0 Activity Maintenance System ══
+        # رسالة النشاط الدورية + حارس الخدمة (event loop lag / تسليح إعادة
+        # اتصال المراقبين الميتين / كشف توقف الطابور / تحذيرات إدارية).
+        # يبدأ بعد تجهيز alert_bot (هوية الإرسال B_Bot). فشل البدء لا يوقف
+        # الإقلاع — السلّم الحقيقي يعمل بدونه.
+        try:
+            self.activity = ActivityWatchdog(self)
+            self._activity_task = self._track_task(
+                self.activity.run(), "activity_watchdog"
+            )
+        except Exception as _act_err:
+            logger.warning(
+                f"ActivityWatchdog start skipped: {type(_act_err).__name__}: {_act_err}"
+            )
 
         # Background Tasks (M-05/M-16: all tracked uniformly)
         self._consumer_task = self._track_task(self._consumer_loop(), "consumer")

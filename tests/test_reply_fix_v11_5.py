@@ -154,7 +154,7 @@ class TestSkips:
         res = await fast_fixer.run(client, chat_id=CHAT,
                                    reply_to_msg_id=ALERT_MSG_ID,
                                    user_id=UID, access_hash=HASH)
-        assert res.startswith("SKIP:write_forbidden_or_slowmode")
+        assert res.startswith("SKIP:write_forbidden")  # v14.6.0: التصنيف الحالي write_forbidden:{ename}
 
     @pytest.mark.asyncio
     async def test_skip_floodwait(self, fast_fixer, patch_telethon, monkeypatch):

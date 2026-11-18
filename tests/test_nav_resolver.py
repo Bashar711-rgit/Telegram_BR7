@@ -510,11 +510,11 @@ class TestSpecScenarios:
             _, chat, uname = await self._run(
                 resolver, monitor, chat_id=-100111222333, message_id=20,
                 entity=FakeChannel(-100111222333, None), event_chat_username=None,
-                sender_username=None, db_contact={"username": "db_u"},
+                sender_username=None, db_contact={"username": "db_us"},
             )
             assert chat["group_link"] == "https://t.me/c/111222333"
             assert chat["msg_link"] == "https://t.me/c/111222333/20"
-            assert uname == "db_u"  # المرسل من DB رغم فشل الحدث
+            assert uname == "db_us"  # المرسل من DB رغم فشل الحدث (v14.6.0: regex {4,31} = 5+ أحرف)
         finally:
             _restore()
 

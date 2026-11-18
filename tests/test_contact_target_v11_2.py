@@ -86,20 +86,25 @@ class TestContactTargetCore:
         assert t.resolution_status == "resolved"
 
     def test_user_id_fallback_primary(self):
-        """spec #5: بلا username → tg://user?id هو الـfallback الأساسي."""
+        """v14.6.0 spec #8 (عدم روابط وهمية): بلا username → openmessage هو
+        الـfallback المختار؛ tg://user?id يبقى محفوظاً داخلياً (رابط اسم
+        البطاقة عبر TextMention — يعمل حين يعرف البوت المرسل فقط)."""
         t = resolve_contact_target(sender_id=SENDER_ID)
         assert t.username is None
         assert t.user_id_url == f"tg://user?id={SENDER_ID}"
-        assert t.selected_url == f"tg://user?id={SENDER_ID}"
-        assert t.target_type == "user_id"
+        assert t.openmessage_url == f"tg://openmessage?user_id={SENDER_ID}"
+        assert t.selected_url == f"tg://openmessage?user_id={SENDER_ID}"
+        assert t.target_type == "openmessage"
         assert t.reachable is True
 
-    def test_openmessage_never_selected(self):
-        """spec #6: openmessage يُحتفظ به داخليًا فقط — لا يُختار أبدًا."""
+    def test_openmessage_selected_user_id_kept_internal(self):
+        """v14.5.2 spec #8 المحدّث: openmessage يُختار قبل tg://user —
+        (tg://user?id بلا access_hash يُرفض بكثرة = رابط وهمي)."""
         t = resolve_contact_target(sender_id=SENDER_ID)
-        assert t.openmessage_url  # محفوظ داخليًا
-        assert t.target_type != "openmessage"
-        assert t.selected_url != t.openmessage_url
+        assert t.openmessage_url  # محفوظ + مختار
+        assert t.target_type == "openmessage"
+        assert t.selected_url == t.openmessage_url
+        assert t.user_id_url  # يبقى داخلياً لرابط الاسم
 
     def test_sender_type_none_with_sid_is_assumed_user(self):
         """الحالة الحرجة: كيان غائب (sender_type=none) مع sender_id موجودة
@@ -178,14 +183,17 @@ class TestClickableName:
         assert "https://t.me" not in visible
 
     def test_both_targets_share_selected_url(self):
-        """spec #16: الاسم والزر من نفس ContactTarget.selected_url حصراً."""
+        """v14.5.2 المحدّث: الزر من selected_url (openmessage — بلا روابط
+        وهمية) واسم البطاقة من user_id_url (TextMention للمرسل المعروف).
+        كلاهما من نفس ContactTarget — لا روابط مُختلقة خارج الهدف."""
         built = build_alert_html(_data())
         t = built["contact_target"]
         name_url = built["text"].split('href="')[1].split('"')[0]
         button_url = next(
             b["url"] for b in built["buttons"][0] if b["text"] == "مراسلة"
         )
-        assert name_url == button_url == t.selected_url
+        assert name_url == t.user_id_url
+        assert button_url == t.selected_url == t.openmessage_url
 
     def test_entity_pack_utf16_offsets(self):
         """الكيانات تحسب offset/length بوحدات UTF-16 (عربي + إيموجي)."""
@@ -198,7 +206,8 @@ class TestClickableName:
         from contact_target import SENDER_LABEL as _SL
         assert name_ent.offset == utf16_len(_SL)  # v13: بعد سطر B_Bot\n (=14)
         assert name_ent.length == utf16_len("نواف محمد")
-        assert name_ent.url == f"tg://user?id={SENDER_ID}"
+        # v14.5.2: رابط الكيان = selected_url (openmessage) — بلا روابط وهمية
+        assert name_ent.url == f"tg://openmessage?user_id={SENDER_ID}"
         # القالب نفسه (v13): اسم البوت ← الاسم ← (فارغ) ← نص الرسالة: ← النص
         assert pack["plain_text"].startswith(
             f"{BOT_NAME_LINE}\nالمرسل: نواف محمد\n\nنص الرسالة:\n\nنص الرسالة")
@@ -250,10 +259,11 @@ class TestClickableName:
 
 class TestContactButton:
     def test_button_without_username_via_user_id(self):
-        """spec #15: username=None لكن user_id → زر tg://user?id يعمل."""
+        """spec #15 المحدّد (v14.5.2): username=None لكن user_id → زر مراسلة
+        tg://openmessage (بلا روابط وهمية)."""
         built = build_alert_html(_data())
         row = built["buttons"][0]
-        assert {"text": "مراسلة", "url": f"tg://user?id={SENDER_ID}"} in row
+        assert {"text": "مراسلة", "url": f"tg://openmessage?user_id={SENDER_ID}"} in row
 
     def test_button_with_username(self):
         built = build_alert_html(_data(sender_username="@iesk1"))
@@ -334,7 +344,7 @@ class TestAlertBotSend:
         ok, method, _ = await bot.send(_data())
         assert ok is True and method == "mention_button"
         row = bot.calls[0]["payload"]["reply_markup"]["inline_keyboard"][0]
-        assert {"text": "مراسلة", "url": f"tg://user?id={SENDER_ID}"} in row
+        assert {"text": "مراسلة", "url": f"tg://openmessage?user_id={SENDER_ID}"} in row
 
     @pytest.mark.asyncio
     async def test_privacy_rejection_retries_without_contact_only(self):
@@ -370,7 +380,7 @@ class TestAlertBotSend:
         assert ents, "الكيانات مطلوبة في المسار الاحتياطي"
         assert any(
             type(e).__name__ == "MessageEntityTextUrl"
-            and getattr(e, "url", "") == f"tg://user?id={SENDER_ID}"
+            and getattr(e, "url", "") == f"tg://openmessage?user_id={SENDER_ID}"
             for e in ents
         )
         # النص الظاهر في الطبقة الاحتياطية يطابق القالب (بلا وسوم HTML)
@@ -553,7 +563,7 @@ class TestSpecTenCases:
         built = build_alert_html(_data(sender_id=5601276336, sender_first_name="نواف",
                                        sender_last_name=None))
         assert 'href="tg://user?id=5601276336"' in built["text"]
-        assert "tg://user?id=5601276336" in [b["url"] for b in built["buttons"][0]]
+        assert "tg://openmessage?user_id=5601276336" in [b["url"] for b in built["buttons"][0]]
         assert "— @" not in built["text"]  # بلا username → لا لاحقة مُختلقّة
 
     def test_case3_no_username_uid_1630216165(self):
@@ -561,7 +571,7 @@ class TestSpecTenCases:
         built = build_alert_html(_data(sender_id=1630216165, sender_first_name="أحمد",
                                        sender_last_name=None))
         assert 'href="tg://user?id=1630216165"' in built["text"]
-        assert "tg://user?id=1630216165" in [b["url"] for b in built["buttons"][0]]
+        assert "tg://openmessage?user_id=1630216165" in [b["url"] for b in built["buttons"][0]]
 
     def test_case4_cached_user_no_api(self):
         """Test 4: cached → لا API request — مغطى في TestEntityCache.test_cache_hit_no_api_request."""
@@ -592,7 +602,7 @@ class TestSpecTenCases:
         t = resolve_contact_target(sender_id=SENDER_ID, first_name="نواف")
         # حتى لو حملت data حقول مصدر توجيه، لا تؤثر على الهدف
         assert t.user_id == SENDER_ID
-        assert t.selected_url == f"tg://user?id={SENDER_ID}"
+        assert t.selected_url == f"tg://openmessage?user_id={SENDER_ID}"
 
     def test_case10_avatar_failure_alert_continues(self):
         """Test 10: فشل الصورة → التنبيه + الاسم + الزر كلهم يستمرون."""
@@ -671,11 +681,18 @@ class TestLogging:
                    for m in sender_logs.lines)
 
     def test_log_no_phone_leak(self, sender_logs):
-        """لا بيانات حساسة (هاتف) في اللوج — spec #22."""
+        """لا بيانات حساسة (أرقام هاتف E.164) في اللوج — spec #22 المحدّث.
+
+        أسماء الحقول التشخيصية (phone_target=UNAVAILABLE) ليست تسريباً —
+        الفحص الفعلي: لا رقم هاتف فعلي (+9665...) ولا نمط E.164 في السجل.
+        """
+        import re as _re
+
         t = resolve_contact_target(sender_id=SENDER_ID, username="iesk1")
         log_sender_resolution(t, message_id=1)
         all_logs = "\n".join(sender_logs.lines)
-        assert "+9665" not in all_logs and "phone" not in all_logs
+        assert "+9665" not in all_logs
+        assert _re.search(r"\+\d{7,15}", all_logs) is None, "رقم هاتف فعلي في السجل"
 
 
 class TestMetrics:
@@ -689,9 +706,11 @@ class TestMetrics:
             assert key in snap, key
 
     def test_counters_increment(self):
-        before = get_contact_metrics_snapshot()["user_id_fallback"]
+        """v14.6.0: بلا username → openmessage_fallback هو العدّاد الفعلي
+        (v14.5.2 جعل openmessage قبل user_id في سلسلة الاختيار)."""
+        before = get_contact_metrics_snapshot()["openmessage_fallback"]
         resolve_contact_target(sender_id=SENDER_ID)  # بلا username → fallback
-        after = get_contact_metrics_snapshot()["user_id_fallback"]
+        after = get_contact_metrics_snapshot()["openmessage_fallback"]
         assert after == before + 1
 
     def test_metric_inc_never_raises(self):
@@ -731,7 +750,8 @@ class TestFinalTemplate:
         assert text == ("B_Bot\nالمرسل: <a href=\"tg://user?id=5601276336\">نواف محمد</a>\n\n"
                         "نص الرسالة:\n\nالنص")
         # v13: نفس اللوحة لكل المسارات (مراسلة ← عرض من هدف ContactTarget)
+        # v14.5.2: زر مراسلة = openmessage (بلا روابط وهمية)
         assert buttons == [[
-            {"text": "مراسلة", "url": f"tg://user?id={SENDER_ID}"},
+            {"text": "مراسلة", "url": f"tg://openmessage?user_id={SENDER_ID}"},
             {"text": "عرض الرسالة", "url": f"https://t.me/c/111222333/{MSG_ID}"},
         ]]
