@@ -117,7 +117,7 @@ except Exception:  # pragma: no cover — extremely old Telethon fallback
     GetUsersRequest = None  # type: ignore[assignment]
 
 from config import CFG
-from task_util import spawn_bg  # v11.8.1 (F-17): مرجع محفوظ لمهام background
+from task_util import spawn_bg, TELEGRAM_USERNAME_RE  # v11.8.1 (F-17) + v14.8.0 (F-27)
 
 __version__ = "14.5.1"
 
@@ -125,7 +125,8 @@ __version__ = "14.5.1"
 # 32). كان {3,31} (يقبل 4-32) في v11.8.2 — Telegram يرفض أقل من 5، فقد
 # يُبنى رابط ميت t.me/abcd إذا مرّ حدث/سجل تاريخي باسم قصير.
 # {4,31} = 1 حرف بادئة + 4 إلى 31 حرفاً إضافياً = 5-32 إجمالاً.
-_USERNAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{4,31}$")
+# v14.8.0 (F-27): الثابت موحّد في task_util.TELEGRAM_USERNAME_RE (يُستورد أعلاه).
+_USERNAME_RE = TELEGRAM_USERNAME_RE
 
 
 # =============================================================================

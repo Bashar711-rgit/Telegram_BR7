@@ -39,13 +39,21 @@ from __future__ import annotations
 """
 
 import asyncio
+import re
 from typing import Any, Coroutine, Optional, Set
 
 from loguru import logger
 
-__version__ = "14.5.1"
+__version__ = "14.8.0"
 
 _tasks: Set[asyncio.Task] = set()
+
+# v14.8.0 (F-27): regex اسم المستخدم الموحّد — كان مكرراً بنفس النمط حرفياً في
+# message_context.py وnav_resolver.py وsender_resolver.py، وأي تعديل مستقبلي
+# على قواعد أسماء تيليجرام كان يجب أن يمرّ على ثلاث نقاط. الثابت الوحيد هنا
+# يستورده الثلاثة (task_util stdlib+loguru فقط — بلا دورات استيراد ممكنة).
+# القاعدة: 5-32 حرفاً، يبدأ بحرف، يليه حروف/أرقام/شرطة سفلية.
+TELEGRAM_USERNAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{4,31}$")
 
 
 def _on_task_done(task: asyncio.Task) -> None:

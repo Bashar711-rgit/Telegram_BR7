@@ -54,6 +54,11 @@ import re
 import time
 from typing import Any, Dict, List, Optional
 
+# v14.8.0 (F-27): regex اسم المستخدم الموحّد — الثابت الوحيد في task_util؛
+# كان النمط مكرراً حرفياً في ثلاث وحدات (message_context/nav_resolver/
+# sender_resolver) وأي تعديل مستقبلي يتطلب تعديل ثلاث نقاط.
+from task_util import TELEGRAM_USERNAME_RE as _USERNAME_RE
+
 logger = logging.getLogger(__name__)
 
 # ══ ثوابت تمثيل حالات البيانات (§3.4) ══════════════════════════════════
@@ -200,7 +205,7 @@ def _safe_call(fn: Any, what: str) -> Any:
 # v14.5.1: {4,31} = 5-32 chars — يطابق nav_resolver v14.5.1 /
 # sender_resolver v14.5.1. كان {3,31} (4-32) في fallback فقط، فيختلف عن
 # المسار الأساسي (nav_resolver) الذي يرفض 4-char usernames.
-_USERNAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{4,31}$")
+# (v14.8.0 F-27: التعريف انتقل إلى الاستيراد الموحّد أعلاه من task_util)
 
 
 def is_valid_username(value: Any) -> bool:

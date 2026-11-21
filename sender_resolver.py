@@ -65,6 +65,7 @@ from telethon.errors import (
 from telethon.tl.types import InputPeerUser
 
 from config import CFG
+from task_util import TELEGRAM_USERNAME_RE  # v14.8.0 (F-27): regex موحّد
 
 __version__ = "14.5.2"
 
@@ -137,7 +138,9 @@ def _status_label(status: Any) -> Optional[str]:
     return label
 
 
-_USERNAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{4,31}$")
+# v14.8.0 (F-27): الثابت الموحّد من task_util — كان التعريف مكرراً حرفياً
+# في ثلاث وحدات (message_context/nav_resolver/sender_resolver).
+_USERNAME_RE = TELEGRAM_USERNAME_RE
 
 
 def _clean_username(value: Any) -> Optional[str]:
