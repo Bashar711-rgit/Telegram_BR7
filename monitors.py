@@ -3104,8 +3104,15 @@ class EnhancedAccountMonitor:
                                     self._account_name_for_client(c) or "", sender_id,
                                     int(getattr(input_user, "access_hash")),
                                 )
-                                asyncio.create_task(
-                                    self._persist_account_hash(sender_id, int(getattr(input_user, "access_hash")))
+                                # v14.9.0 (F-17): spawn_bg بدل create_task عارٍ —
+                                # Python لا يضمن بقاء Task بدون مرجع (GC قد يجمعها
+                                # قبل اكتمالها)، وspawn_bg يضيف done_callback يسترجع
+                                # الاستثناء ويوّثقه بدل تحذير asyncio الصامت.
+                                spawn_bg(
+                                    self._persist_account_hash(
+                                        sender_id, int(getattr(input_user, "access_hash"))
+                                    ),
+                                    name=f"persist_account_hash_{sender_id}",
                                 )
                             verified, why = _verify_mention_entity(sent_msg, sender_id)
                             _sticky(c)
