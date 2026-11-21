@@ -327,9 +327,9 @@ class TestSendLadder:
         ok, method, reason = await bot.send(_data(sender_username="user1"))
         assert ok is True and method == "text_only"
         assert len(fake.sent) == 1
-        # الأزرار وصلت للعميل نفسها (بنية build_alert_buttons — ترتيب v13)
+        # الأزرار وصلت للعميل نفسها (بنية build_alert_buttons — v14.9.2)
         row = fake.sent[0][1][0]
-        assert [b["text"] for b in row] == ["مراسلة", "عرض الرسالة"]
+        assert [b["text"] for b in row] == ["@user1", "جروب"]
 
     @pytest.mark.asyncio
     async def test_bot_api_failure_client_fallback_success(self):

@@ -509,9 +509,9 @@ class TestUnifiedCardCompleteness:
         built = self._built()
         row = built["buttons"][0]
         by_text = {b["text"]: b for b in row}
-        assert set(by_text) == {"عرض الرسالة", "مراسلة"}
-        assert by_text["عرض الرسالة"]["url"] == "https://t.me/src/531011"
-        assert by_text["مراسلة"]["url"] == "https://t.me/Lara507"
+        assert set(by_text) == {"جروب", "@Lara507"}  # v14.9.2
+        assert by_text["جروب"]["url"] == "https://t.me/src"
+        assert by_text["@Lara507"]["url"] == "https://t.me/Lara507"
 
     def test_no_username_still_reachable_and_complete(self):
         """بلا username: الاسم رابط tg://user وزر مراسلة موجود — لا بيانات مختلقة."""
@@ -521,7 +521,7 @@ class TestUnifiedCardCompleteness:
         assert "— @" not in t.split("\n\n")[0]  # لا @username مُختلق
         row = built["buttons"][0]
         by_text = {b["text"]: b for b in row}
-        assert by_text["مراسلة"]["url"] == f"tg://user?id={SENDER_ID}"  # v14.7.0
+        assert by_text["مراسلة"]["url"] == f"tg://user?id={SENDER_ID}"  # v14.7.0: بلا username
 
     def test_long_text_truncated_with_marker_not_silently(self):
         """نص طويل جداً: يُقص مع علامة … وسجل تحذير — لا حذف صامت كامل."""

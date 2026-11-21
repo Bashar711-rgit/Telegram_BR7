@@ -8,7 +8,7 @@
 
     {النص الأصلي كاملاً}
 
-مع لوحة أزرار فعلية [ عرض الرسالة ][ مراسلة ] مرتبطة بالتنبيه —
+مع لوحة أزرار فعلية [ @username ][ جروب ] مرتبطة بالتنبيه (v14.9.2) —
 بلا رموز 👤/💬، بلا blockquote/اقتباس، وبلا وسوم خام ظاهرة.
 
 لكل حالة: صحة النص وترتيبه، عدم ظهور وسوم خام، الرابط الصحيح على الاسم،
@@ -139,7 +139,7 @@ class TestSenderIdentityCases:
                                   name="محمد العمري", body=ORIG)
         assert 'href="https://t.me/mohammed_99"' in built["text"]
         assert built["contact_method"] == "username"
-        contact = next(b for b in _row(built) if b["text"] == "مراسلة")
+        contact = next(b for b in _row(built) if b["text"] == "@mohammed_99")  # v14.9.2
         assert contact["url"] == "https://t.me/mohammed_99"
 
     def test_case2_no_username_with_id(self):
@@ -176,16 +176,19 @@ class TestSenderIdentityCases:
 
 class TestChatKindCases:
     def test_case4_public_group(self):
-        """حالة 4: مجموعة عامة → زر عرض يقود t.me/{u}/{id} بالرسالة نفسها."""
+        """حالة 4: مجموعة عامة → زر «جروب» يقود t.me/{u} (المجموعة المصدر)."""
         built = build_alert_html(_data(chat_username="mygroup"))
-        view = next(b for b in _row(built) if b["text"] == "عرض الرسالة")
-        assert view["url"] == f"https://t.me/mygroup/{MSG_ID}"
+        group_btn = next(b for b in _row(built) if b["text"] == "جروب")  # v14.9.2
+        assert group_btn["url"] == "https://t.me/mygroup"
+        # ورابط الرسالة الكامل يبقى أفضل وسيلة عرض عند غياب القروب فقط
+        sender_btn = next(b for b in _row(built) if b["text"] == "مراسلة")
+        assert sender_btn["url"] == "tg://user?id=6079171409"
 
     def test_case5_private_group(self):
-        """حالة 5: مجموعة خاصة → صيغة t.me/c/{inner}/{id} (تفتح للأعضاء)."""
+        """حالة 5: مجموعة خاصة → زر «جروب» بصيغة t.me/c/{inner} (تفتح للأعضاء)."""
         built = build_alert_html(_data())  # chat_id=-100... بلا username
-        view = next(b for b in _row(built) if b["text"] == "عرض الرسالة")
-        assert view["url"] == f"https://t.me/c/{INNER}/{MSG_ID}"
+        group_btn = next(b for b in _row(built) if b["text"] == "جروب")  # v14.9.2
+        assert group_btn["url"] == f"https://t.me/c/{INNER}"
 
     def test_case6_channel_post(self):
         """حالة 6: رسالة قناة → هوية القناة ≠ شخص قابل لمراسلة: بلا
@@ -197,9 +200,9 @@ class TestChatKindCases:
         assert "tg://user" not in built["text"].replace('href="', 'href=') or \
             'href="tg://user' not in built["text"]
         assert all(b["text"] != "مراسلة" for b in _row(built))
-        # رابط الرسالة (هوية القناة/النشر) مستقل عن رابط المرسل
-        view = next((b for b in _row(built) if b["text"] == "عرض الرسالة"), None)
-        assert view is not None and "/c/" in view["url"]
+        # رابط القروب (هوية القناة/النشر) مستقل عن رابط المرسل (v14.9.2)
+        group_btn = next((b for b in _row(built) if b["text"] == "جروب"), None)
+        assert group_btn is not None and "/c/" in group_btn["url"]
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -266,11 +269,11 @@ class TestMissingLinkCase:
         assert contact is not None  # مراسلة مستقلة عن رابط الرسالة
 
     def test_view_falls_back_to_group_link_not_fake(self):
-        """بلا رابط رسالة لكن مع رابط قروب → عرض يفتح أفضل آلية متاحة."""
+        """بلا رابط رسالة لكن مع رابط قروب → زر «جروب» يفتح المجموعة المصدر."""
         built = build_alert_html(_data(message_id=None), msg_link=None,
                                  group_link="https://t.me/g_only")
-        view = next(b for b in _row(built) if b["text"] == "عرض الرسالة")
-        assert view["url"] == "https://t.me/g_only"
+        group_btn = next(b for b in _row(built) if b["text"] == "جروب")  # v14.9.2
+        assert group_btn["url"] == "https://t.me/g_only"
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -291,7 +294,7 @@ class TestFailureAndRetryCases:
         assert len(bot.calls) == 2
         for call in bot.calls:
             kb = call["payload"]["reply_markup"]["inline_keyboard"]
-            assert kb and [b["text"] for b in kb[0]] == ["مراسلة", "عرض الرسالة"]
+            assert kb and [b["text"] for b in kb[0]] == ["@user1", "جروب"]  # v14.9.2
             assert call["payload"]["parse_mode"] == "HTML"
 
     @pytest.mark.asyncio
@@ -314,7 +317,7 @@ class TestFailureAndRetryCases:
         assert ok is True and len(bot.calls) == 2
         kb2 = bot.calls[1]["payload"]["reply_markup"]["inline_keyboard"][0]
         assert all(b["text"] != "مراسلة" for b in kb2)
-        assert any(b["text"] == "عرض الرسالة" for b in kb2)
+        assert any(b["text"] == "جروب" for b in kb2)  # v14.9.2: زر القروب باقٍ
         # رابط الاسم باقٍ في النص بعد الإعادة
         assert 'tg://user?id=6079171409' in bot.calls[1]["payload"]["text"]
 
@@ -383,10 +386,10 @@ class TestAllSendPathsCase:
         """الدالة المركزية وحدها تبني اللوحة — لا بناء يدوي في أي مسار."""
         kb = build_alert_buttons(sender_id=SENDER_ID, sender_username="user1",
                                  msg_link="https://t.me/g/9", group_link="https://t.me/g")
-        assert [b["text"] for b in kb[0]] == ["مراسلة", "عرض الرسالة"]
+        assert [b["text"] for b in kb[0]] == ["@user1", "جروب"]  # v14.9.2
         # بلا بيانات → لوحة فارغة بصدق
         assert build_alert_buttons(sender_id=0) == []
-        # include_user_button=False بعد رفض الخصوصية → عرض فقط
+        # include_user_button=False بعد رفض الخصوصية + بلا قروب → عرض الرسالة فقط
         kb2 = build_alert_buttons(sender_id=SENDER_ID, msg_link="https://t.me/g/9",
                                   include_user_button=False)
         assert [b["text"] for b in kb2[0]] == ["عرض الرسالة"]
@@ -419,9 +422,9 @@ class TestAllSendPathsCase:
         assert p["link_preview_options"] == {"is_disabled": True}
         kb = p["reply_markup"]["inline_keyboard"]
         assert kb == [[
-            {"text": "مراسلة", "url": "https://t.me/user1"},
-            {"text": "عرض الرسالة", "url": f"https://t.me/mygroup/{MSG_ID}"},
-        ]]
+            {"text": "@user1", "url": "https://t.me/user1"},
+            {"text": "جروب", "url": "https://t.me/mygroup"},
+        ]]  # v14.9.2
         _assert_template_contract(p["text"], username="user1",
                                   name="محمد العمري", body=ORIG)
 
@@ -441,6 +444,6 @@ class TestAllSendPathsCase:
         _assert_template_contract(text, username="user1",
                                   name="محمد العمري", body=ORIG)
         assert buttons == [[
-            {"text": "مراسلة", "url": "https://t.me/user1"},
-            {"text": "عرض الرسالة", "url": f"https://t.me/mygroup/{MSG_ID}"},
-        ]]
+            {"text": "@user1", "url": "https://t.me/user1"},
+            {"text": "جروب", "url": "https://t.me/mygroup"},
+        ]]  # v14.9.2

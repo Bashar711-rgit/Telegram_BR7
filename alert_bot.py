@@ -1,6 +1,22 @@
 #!/usr/bin/env python3
 """
-alert_bot.py - v14.5.1 Alert Bot - نظام مراسلة المرسل + واجهة التنبيهات الموحدة.
+alert_bot.py - v14.9.2 Alert Bot - نظام مراسلة المرسل + واجهة التنبيهات الموحدة.
+
+v14.9.2 — التخطيط المرجعي للمستخدم (لقطة القناة الهدف 21-11):
+  * لوحة الأزرار صارت بالتسمية المرجعية:
+
+        [ @username ] [ جروب ]
+
+    - زر المرسل: مع username يُسمّى «@username» ويفتح الملف/المحادثة عبر
+      https://t.me/{username} — زر URL عالمي يعمل على كل العملاء (لا
+      tg:// قابلة للرفض). بلا username يبقى زر «مراسلة» بأفضل وسيلة
+      وصول (contact_url ← tg://user?id) كما كان — لا اختلاق روابط.
+    - زر القروب: يُسمّى «جروب» ويفتح المجموعة المصدر (دعوة ← t.me/{u} ←
+      t.me/c/{inner}). بلا رابط قروب يبقى زر «عرض الرسالة» برابط
+      الرسالة إن وجد — بلا روابط وهمية أبداً.
+  * _emit_alert_log: تصنيف contact من الزر الأول المطابق (@…/مراسلة)
+  * الأزرار تصل فقط عبر Bot API (بوت عضو في قناة الهدف) — حسابات
+    المستخدمين لا ترفق أزراراً (قيد منصة)؛ انظر v14.9.1 Buttons Heal.
 
 v14.5.1 — correction pass:
   * _fill_from_context treats `0` as "missing" for numeric fields
@@ -18,7 +34,7 @@ v14.5.1 — correction pass:
     immediately on the first timeout, so the suffix suggested a retry
     that did not exist).
   * Header button-order comment aligned with the actual output
-    [ مراسلة ] [ عرض الرسالة ] (the code and docstrings already used
+    [ مراسلة ] [ عرض الرسالة ] (the v14.5.1 code and docstrings used
     this order; only the header said the opposite).
 
 v11.2 (طلب المستخدم — نظام مراسلة المرسل): ContactTarget هو المصدر الوحيد
@@ -28,7 +44,7 @@ v11.2 (طلب المستخدم — نظام مراسلة المرسل): ContactT
 (MTProto) تمرر الكيانات جاهزة عبر formatting_entities فيبقى الاسم قابلًا
 للنقر بعد أن كان تيليثون يحذف tg://user?id صامتاً عند الـparse.
 
-القالب (مواصفة المستخدم v11.6 — القالب الحرفي):
+القالب (مواصفة المستخدم v11.6 — القالب الحرفي، الأزرار v14.9.2):
 
     المرسل: {اسم المرسل قابل للنقر}{ — @username}
     (سطر فارغ)
@@ -36,7 +52,7 @@ v11.2 (طلب المستخدم — نظام مراسلة المرسل): ContactT
     (سطر فارغ)
     {النص الأصلي كاملاً - بلا حذف أجزاء وبلا إطار/اقتباس}
 
-    [ مراسلة ] [ عرض الرسالة ]   ← لوحة Inline فعلية أسفل التنبيه
+    [ @username ] [ جروب ]   ← لوحة Inline فعلية أسفل التنبيه (v14.9.2)
 
   * بلا رموز 👤/💬 وبلا <blockquote> — النص الأصلي يظهر كما ورد (الأسطر
     واللغة والرموز التعبيرية والروابط)، مهرباً HTML فقط كي تُعرض وسوم
@@ -56,9 +72,9 @@ v11.2 (طلب المستخدم — نظام مراسلة المرسل): ContactT
 الأزرار - Inline Keyboard في صف واحد (الدالة المركزية build_alert_buttons -
 لا يُبنى أي زر يدوياً في أي مكان آخر):
 
-    [ مراسلة ] [ عرض الرسالة ]
+    [ @username ] [ جروب ]
 
-  * مراسلة: فتح محادثة المستخدم فعلياً - username -> https://t.me/U؛
+  * @username/مراسلة: فتح محادثة المستخدم فعلياً - username -> https://t.me/U؛
     بدونه أفضل رابط مباشر متاح (tg://user?id=ID). يُحذف الزر إن لم يوجد
     أي منهما.
   * عرض الرسالة: رابط الرسالة الحقيقي (t.me/{u}/{id} للعام،
@@ -153,10 +169,12 @@ TELEGRAM_MAX_TEXT_LEN = 4096
 # داخل blockquote — الاسم نفسه رابط داخلي، والنسخ بالضغط على النص.
 MSG_LINK_UNAVAILABLE = "غير متاح"  # محتفظ به للتوافق الخلفي (لم يعد في النص)
 
-# نصوص الزرين (v11.6) — صف واحد بالترتيب الحرفي للمواصفة:
-#     [ مراسلة ] [ عرض الرسالة ]
-BTN_CONTACT = "مراسلة"
-BTN_VIEW = "عرض الرسالة"
+# نصوص أزرار اللوحة — صف واحد بالترتيب الحرفي للمواصفة:
+#     v11.6:  [ مراسلة ] [ عرض الرسالة ]
+#     v14.9.2 (مواصفة الصورة المرجعية): [ @username ] [ جروب ]
+BTN_CONTACT = "مراسلة"   # بلا username فقط (زر tg:// أو وسيلة وصول بديلة)
+BTN_VIEW = "عرض الرسالة"  # بلا رابط قروب فقط — بديل القروب الصادق
+BTN_GROUP = "جروب"        # زر المجموعة المصدر (القيمة المرجعية للمستخدم)
 
 # أخطاء زر tg://user — يُعاد الإرسال بدون زر «مراسلة» فقط (بقية الأزرار
 # تبقى، ورابط الاسم يبقى في النص).
@@ -250,20 +268,25 @@ def build_alert_buttons(
     contact_url: Optional[str] = None,
     sender_type: Optional[str] = None,
 ) -> List[List[Dict[str, Any]]]:
-    """══ الدالة المركزية الوحيدة لبناء أزرار التنبيه (v11.6 → v13.0) ══
+    """══ الدالة المركزية الوحيدة لبناء أزرار التنبيه (v11.6 → v14.9.2) ══
 
-    صف واحد بترتيب مواصفة v13.0 (تخطيط الأزرار المعتمد حرفياً):
+    صف واحد بالتخطيط المرجعي (لقطة المستخدم للقناة الهدف — v14.9.2):
 
-        [ مراسلة ] [ عرض الرسالة ]
+        [ @username ] [ جروب ]
 
     * الزر الذي تنعدم بياناته يُحذف كلياً (لا أزرار معطلة ولا روابط وهمية).
-    * v11.2 (spec #16): contact_url من ContactTarget.selected_url — الاسم
-      والزر يشتركان في نفس الهدف المختار (username ← user_id). تمريره
-      يتفوق على بناء الرابط من sender_id/username مباشرة.
-    * v11.2 (spec #18): sender_type ∈ (channel, deleted) يمنع زر
-      tg://user?id — لا اختلاق وسيلة وصول لغير المستخدمين.
+    * زر المرسل: مع username يُسمّى «@username» ويفتح https://t.me/{u} —
+      زر URL عالمي لا يُرفض من تيليجرام ولا يعتمد على خصوصية المرسل
+      (نفس صيغة اللقطة المرجعية: @Phaedra01). بلا username يبقى زر
+      «مراسلة» بأفضل وسيلة وصول: contact_url من ContactTarget.selected_url
+      (spec #16) ثم tg://user?id (spec #15) — والقنوات/المحذوفون بلا
+      زر مختلق (spec #18).
+    * زر القروب: يُسمّى «جروب» ويفتح المجموعة المصدر — دعوة متاحة ثم
+      t.me/{u} ثم t.me/c/{inner} (build_group_link — لا روابط وهمية).
+      بلا رابط قروب: زر «عرض الرسالة» برابط الرسالة إن وجد (البديل
+      الصادق)، وبلا أي رابط يُحذف.
     * include_user_button=False بعد رفض tg://user (خصوصية) — يُسقط زر
-      «مراسلة» فقط ويبقى زر العرض.
+      المرسل فقط ويبقى زر القروب.
     * copy_text: معامل محفوظ للتوافق الخلفي (v10.9.1) — مُتجاهَل منذ v11.1.
     * كل تنبيه جديد مستقبلاً يستخدم هذه الدالة تلقائياً — لا تُبنى أزرار
       يدوياً في أي مسار آخر.
@@ -275,30 +298,35 @@ def build_alert_buttons(
     except Exception:
         sid = 0
 
-    # 1) مراسلة — فتح محادثة المستخدم مباشرة (الزر الأول حسب مواصفة v13).
-    #    الزر لا يعتمد على username: بلا username يُستخدم tg://user?id
-    #    (spec #15) أو الهدف الذي اختاره ContactTarget إن مرّر (spec #16).
+    # 1) زر المرسل — v14.9.2: التسمية @username (زر URL عالمي، نفس هدف
+    #    ContactTarget). بلا username: «مراسلة» بوسيلة الوصول البديلة كما
+    #    كانت — لا تغيير في سلوك التسليم.
     if include_user_button:
         url: Optional[str] = None
-        if contact_url:
-            url = str(contact_url)
-        elif username:
+        if username:
             url = f"{_TG_URL}{username}"
+        elif contact_url:
+            url = str(contact_url)
         elif sid and str(sender_type or "").strip().lower() not in _NO_USER_BUTTON_TYPES:
             # أفضل رابط مباشر ممكن لمن لا يملك username
             url = f"tg://user?id={sid}"
         if url:
-            row.append({"text": BTN_CONTACT, "url": url})
+            row.append({"text": f"@{username}" if username else BTN_CONTACT, "url": url})
 
-    # 2) عرض الرسالة — الرسالة نفسها لا الصفحة الرئيسية؛ بدون رابط مباشر
-    #    نستخدم أفضل آلية متاحة (رابط القروب) بدل رابط وهمي.
-    view_url = str(msg_link or "").strip()
-    if view_url in ("", "#"):
-        view_url = str(group_link or "").strip()
-    if view_url in ("", "#"):
-        view_url = ""
-    if view_url:
-        row.append({"text": BTN_VIEW, "url": view_url})
+    # 2) زر القروب — v14.9.2: «جروب» يفتح المجموعة المصدر مباشرة (نفس
+    #    صيغة اللقطة المرجعية). بلا رابط قروب: «عرض الرسالة» برابط الرسالة
+    #    إن وجد — بلا روابط وهمية أبداً.
+    group = str(group_link or "").strip()
+    if group in ("", "#"):
+        group = ""
+    if group:
+        row.append({"text": BTN_GROUP, "url": group})
+    else:
+        view_url = str(msg_link or "").strip()
+        if view_url in ("", "#"):
+            view_url = ""
+        if view_url:
+            row.append({"text": BTN_VIEW, "url": view_url})
 
     return [row] if row else []
 
@@ -393,7 +421,7 @@ def _emit_alert_log(
             أو tg://openmessage — ديسكتوب فقط) | B4 بلا زر مراسلة —
             المسار عبر رابط الرسالة المصدر (الاسم مُصلَّح له) | none.
       view: V1 t.me/<u>/<id> | V2 t.me/c/... | V4 group/alert | none.
-      buttons: «n/2» — الزران الهدفان مراسلة+عرض.
+      buttons: «n/2» — الزران الهدفان (@username/مراسلة)+جروب.
     """
     try:
         tgt = built.get("contact_target")
@@ -415,14 +443,16 @@ def _emit_alert_log(
             tier = "T1"
 
         msg_link = str(built.get("msg_link") or "").strip()
-        # ══ v14.7.0: التصنيف من رابط زر «مراسلة» المرفق فعلياً ══
-        # سابقاً كان التصنيف من method فقط — فبُلعت أزرار openmessage/phone
-        # تحت B4 (مضلل). الآن: الزر المرفق هو الحقيقة.
+        # ══ v14.7.0 → v14.9.2: التصنيف من زر المرسل المرفق فعلياً ══
+        # الزر الأول المطابق (نصه يبدأ بـ«@» أو يساوي «مراسلة») هو زر
+        # المرسل — التصنيف من رابطه المرفق هو الحقيقة (سابقاً كان من
+        # method فقط فبُلعت أزرار openmessage/phone تحت B4 مضللة).
         _btn_url: Optional[str] = None
         try:
             for _row in (built.get("buttons") or []):
                 for _b in (_row or []):
-                    if str((_b or {}).get("text") or "") == BTN_CONTACT:
+                    _t = str((_b or {}).get("text") or "")
+                    if _t == BTN_CONTACT or _t.startswith("@"):
                         _btn_url = str((_b or {}).get("url") or "").strip() or None
                         break
                 if _btn_url:
@@ -969,9 +999,9 @@ class AlertBot:
         sanitize_tg: bool = False,
     ) -> Dict[str, Any]:
         """حمولة sendMessage — الدالة المركزية build_alert_buttons تبني
-        صف الأزرار الموحد [ مراسلة ][ عرض الرسالة ] (v11.6).
+        صف الأزرار الموحد [ @username ][ جروب ] (v14.9.2).
         الزر بلا بيانات لا يُعرض إطلاقاً؛ include_user_button=False بعد
-        رفض tg://user (يسقط زر «مراسلة» فقط)؛ sanitize_tg=True بعد رفض
+        رفض tg://user (يسقط زر المرسل فقط)؛ sanitize_tg=True بعد رفض
         عام للوحة (يحذف أزرار tg:// ويبقي t.me الصالحة عالمياً)."""
         kwargs = dict(built.get("button_kwargs") or {})
         kb = build_alert_buttons(include_user_button=include_user_button, **kwargs)
@@ -1010,9 +1040,9 @@ class AlertBot:
 
         يعيد (ok, contact_method, reason):
           ok=True  → contact_method = username | mention_button | text_only
-                     (username: زر مراسلة t.me؛ mention_button: زر
+                     (username: زر @username برابط t.me؛ mention_button: زر
                       tg://user مُقبل؛ text_only: أُعيد الإرسال بدون زر
-                      «مراسلة» بسبب الخصوصية أو لا يوجد مرسل قابل للزر)
+                      المرسل بسبب الخصوصية أو لا يوجد مرسل قابل للزر)
           ok=False → reason = سبب الفشل (المستدعي يعود لمسار حسابات
                      المستخدمين بنفس القالب بدون أزرار ويُسجل السبب).
         """

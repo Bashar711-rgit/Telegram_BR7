@@ -431,11 +431,11 @@ class TestAlertShapeViaContext:
         )
         assert ok is True and method == "username"
         kb = _buttons_of(bot.calls[0]["payload"])
-        assert [b["text"] for b in kb] == ["مراسلة", "عرض الرسالة"]  # ترتيب v13
+        assert [b["text"] for b in kb] == ["@Lara507", "جروب"]  # v14.9.2
 
     @pytest.mark.asyncio
     async def test_single_button_when_one_target(self):
-        """بلا username وبلا tg:// (ذاكرة رفض) → زر «عرض الرسالة» وحده."""
+        """بلا username وبلا tg:// (ذاكرة رفض) → زر «جروب» وحده (v14.9.2)."""
         mark_tg_user_blocked(SID)
         bot = _FakeAlertBot([(200, {"ok": True})])
         ok, _, _ = await bot.send(
@@ -445,7 +445,7 @@ class TestAlertShapeViaContext:
         )
         assert ok is True
         kb = _buttons_of(bot.calls[0]["payload"])
-        assert [b["text"] for b in kb] == ["عرض الرسالة"]
+        assert [b["text"] for b in kb] == ["جروب"]
 
     @pytest.mark.asyncio
     async def test_text_only_when_no_targets(self):
