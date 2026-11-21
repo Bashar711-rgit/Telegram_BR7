@@ -402,6 +402,7 @@ class EnhancedDatabase:
             await self._create_tables()
             await self._migrate_bigint_ids()
             await self._migrate_sender_intel()
+            await self._migrate_sources_extra()
             await self._migrate_sender_account_hashes()
             await self._migrate_sender_access()
             await self._migrate_intel_entities()
@@ -837,6 +838,16 @@ class EnhancedDatabase:
                 value TEXT NOT NULL,
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
             );
+            -- v14.8.0 (P6.2): تاريخ أسماء المستخدمين — صف واحد لكل اسم مختلف.
+            -- PG: user_id INTEGER NOT NULL → BIGINT NOT NULL (سلسلة الترجمة
+            -- في _create_tables تعتني بذلك) وDATETIME → TIMESTAMP.
+            CREATE TABLE IF NOT EXISTS telegram_usernames_history (
+                user_id INTEGER NOT NULL,
+                username TEXT NOT NULL,
+                changed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                source_account TEXT,
+                PRIMARY KEY (user_id, changed_at)
+            );
         """
         for stmt in stmts.split(";"):
             s = stmt.strip()
@@ -1008,6 +1019,52 @@ class EnhancedDatabase:
         if added:
             logger.info(f"Database migration v9.3: sender_contacts enriched (+{added} columns)")
 
+    _SOURCES_EXTRA_COLUMNS = [
+        # v14.8.0 (P6.3): أعمدة sources الإضافية — تُطبق عبر آلية الترحيل
+        # الإضافي الموجودة (لا ALTER خاماً — SQLite لا يدعم IF NOT EXISTS).
+        # الأنواع صالحة على المحركين كما هي (TEXT/INTEGER/TIMESTAMP).
+        ("chat_type", "TEXT"),
+        ("member_count", "INTEGER"),
+        ("last_seen_at", "TIMESTAMP"),
+    ]
+
+    async def _migrate_sources_extra(self) -> None:
+        """v14.8.0 (P6.3): إثراء جدول sources بالأعمدة الجديدة idempotent."""
+        table = "sources"
+        existing: set = set()
+        if self.db_type == "postgresql":
+            rows = await self._fetchall(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name = ?",
+                (table,),
+            )
+            existing = {r["column_name"] for r in rows}
+        else:
+            rows = await self._fetchall(f"PRAGMA table_info({table})", ())
+            existing = {r["name"] for r in rows}
+        added = 0
+        for name, decl in self._SOURCES_EXTRA_COLUMNS:
+            if name in existing:
+                continue
+            try:
+                if self.db_type == "postgresql":
+                    await self._execute(
+                        f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {name} {decl}"
+                    )
+                else:
+                    await self._execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+                added += 1
+            except Exception as e:
+                logger.warning(
+                    f"sources migration: {table}.{name} skipped: "
+                    f"{type(e).__name__}: {str(e)[:120]}"
+                )
+        await self._commit()
+        if added:
+            logger.info(
+                f"Database migration v14.8.0: sources enriched (+{added} columns)"
+            )
+
     async def _create_indexes(self) -> None:
         indexes = [
             "CREATE INDEX IF NOT EXISTS idx_msg_hash     ON messages(message_hash)",
@@ -1035,6 +1092,7 @@ class EnhancedDatabase:
             "CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_logs(action)",
             "CREATE INDEX IF NOT EXISTS idx_audit_actor  ON audit_logs(actor)",
             "CREATE INDEX IF NOT EXISTS idx_sources_enabled ON sources(enabled)",
+            "CREATE INDEX IF NOT EXISTS idx_tuh_username ON telegram_usernames_history(username)",
             "CREATE INDEX IF NOT EXISTS idx_rules_eval ON rules(enabled, priority, id)",
             "CREATE INDEX IF NOT EXISTS idx_allowed_lookup ON allowed_entities(entity_type, entity_id)",
             "CREATE INDEX IF NOT EXISTS idx_notif_unread_time ON notifications(is_read, created_at DESC)",
@@ -1854,8 +1912,57 @@ class EnhancedDatabase:
                     ),
                     *p,
                 )
+            # v14.8.0 (P6.2): تسجيل تغيّر اسم المستخدم بعد الحل الناجح —
+            # يُستدعى هنا (نقطة استمرارية المرسل الفعلية) بدل sender_resolver
+            # لأن الأخير محلّي خالص لا يلمس DB في المعمارية الحالية.
+            try:
+                _uname = str(data.get("username") or "").strip()
+                _uid = int(data.get("sender_id") or 0)
+                if _uname and _uid > 0:
+                    await self.record_username_change(
+                        _uid, _uname, str(data.get("owner_account") or "")
+                    )
+            except Exception as _uh_err:
+                logger.debug(
+                    f"username-history hook skipped: "
+                    f"{type(_uh_err).__name__}: {str(_uh_err)[:120]}"
+                )
         except Exception as e:
             logger.error(f"upsert_sender_contact error: {e}")
+
+    async def record_username_change(
+        self, user_id: int, username: str, source_account: str = ""
+    ) -> None:
+        """v14.8.0 (P6.2): سجل تاريخ أسماء المستخدمين — صف لكل اسم مختلف.
+
+        يُدرج فقط إذا اختلف الاسم عن آخر قيمة محفوظة للمستخدم نفسه —
+        الاستدعاء المتكرر بنفس الاسم لا يكتب شيئاً (بلا تضخم للجدول).
+        fail-safe بالكامل: أي خطأ يُسجل debug ولا يُعطّل مسار التنبيه.
+        يعمل على المحركين (placeholders ? تُترجم عبر _pg للـPostgreSQL).
+        """
+        try:
+            uid = int(user_id)
+            uname = str(username or "").strip()
+            if uid <= 0 or not uname:
+                return
+            row = await self._fetchone(
+                "SELECT username FROM telegram_usernames_history "
+                "WHERE user_id = ? ORDER BY changed_at DESC LIMIT 1",
+                (uid,),
+            )
+            last = str((row or {}).get("username") or "")
+            if last == uname:
+                return
+            await self._execute(
+                "INSERT INTO telegram_usernames_history "
+                "(user_id, username, source_account) VALUES (?, ?, ?)",
+                (uid, uname, str(source_account or "")),
+            )
+            await self._commit()
+        except Exception as e:
+            logger.debug(
+                f"record_username_change error: {type(e).__name__}: {str(e)[:120]}"
+            )
 
     async def get_sender_contact(self, sender_id: int) -> Optional[Dict[str, Any]]:
         try:
