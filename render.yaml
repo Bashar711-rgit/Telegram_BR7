@@ -115,10 +115,11 @@ services:
       # ── الإعداد الافتراضي (ephemeral — للاختبار فقط) ────────────
       # إذا لم تُضبط DATABASE_URL ولم تُفعّل Persistent Disk،
       # يعمل البوت بـ SQLite مؤقتة مع تحذير واضح عند كل بدء تشغيل.
-      - key: DB_TYPE
-        value: sqlite
-      - key: DB_FILE
-        value: telegram_bot.db
+      # v14.8.0 (P3): حُذف DB_TYPE=sqlite/DB_FILE المكتوبة هنا — الكود يفترض
+      # sqlite افتراضياً عند غيابهما (config.py SecretManager default) وينقلب
+      # إلى postgresql تلقائياً عند وجود DATABASE_URL؛ بقاؤها كان يوثّق قيمة
+      # لا تلائم الإنتاج الفعلي (Supabase PG) ويمكن أن تُربك إعادة تطبيق
+      # Blueprint في المستقبل.
 
       # DB Pool (PostgreSQL فقط — يُتجاهل مع SQLite)
       - key: DB_POOL_MIN
