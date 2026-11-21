@@ -465,6 +465,57 @@ class EnhancedFilter:
         "ما ابي", "ما ابغى", "ما اريد", "ما احتاج",
         "ما عاد ابي", "ما عاد اريد",
     )
+
+    # ═══ v14.9.0 (F-01): العروض التجارية على شكل طلب ═══
+    # نمط «فريق يقدّم خدمات» ينتحل شكل الطلب («نحل واجبات، تواصل واتس»). الدرجات:
+    # فعل عرض + اسم أكاديمي خلال 1-4 كلمات بعده = +2، كل CTA مبيعات = +1.
+    # offer>=2 → تجاهل صارم (تجاهل عرض تجاري) بغض النظر عن الثقة المحسوبة.
+    # الصيغ هنا مُطبّعة مسبقاً (ا بدون أ/إ، ه بدون ة) لتطابق مخرجات _clean().
+    _OFFER_VERBS: Final[Tuple[str, ...]] = (
+        "نقدم", "نوفر", "نسوي", "نحل", "نكتب",
+    )
+    _OFFER_CTA: Final[Tuple[str, ...]] = (
+        "تواصل", "للتواصل", "خاص", "واتس", "واتساب", "اسعار", "سعر",
+    )
+    # مطابقة الفعلي: عندنا/لدينا غير موجودة في قوائم الإعلانات في keywords.json
+    # لأنها صفة جماعية للطلاب ("عندنا واجب ما عرفناه" طلب حقيقي) — لذا تُحتسب
+    # فقط مع أسماء "الحلول" (عندنا حلول جاهزة) لا أسماء "الواجبات".
+    _OFFER_SOLUTION_ONLY_VERBS: Final[Tuple[str, ...]] = ("عندنا", "لدينا")
+    _OFFER_SOLUTION_NOUNS: Final[Tuple[str, ...]] = (
+        "حل", "حلول", "بحوث", "بحث", "تقارير", "تلخيص", "ملخصات",
+    )
+    _OFFER_ALL_NOUNS: Final[Tuple[str, ...]] = (
+        "حل", "حلول", "واجب", "واجبات", "بحوث", "بحث", "تقارير",
+        "مشاريع", "تلخيص", "ملخصات",
+    )
+    # حارس النافي: نافٍ مباشرة قبل فعل العرض ("ما نحل واجبات هنا" طالب يرفض) يلغيه.
+    _OFFER_NEGATOR_TOKENS: Final[Tuple[str, ...]] = (
+        "ما", "مو", "مش", "مب", "لا", "لم", "لن",
+    )
+    # حارس الجماعة الاحتياجية: "نحتاج نسوي بحث تخرج" مجموعة طلاب تخطط — الفعل
+    # بعدها وصف لخطة الجماعة لا عرض خدمات ("نسوي بحث لكم" هو الإعلان).
+    _COLLECTIVE_NEED_TOKENS: Final[Tuple[str, ...]] = (
+        "نحتاج", "نبي", "نريد", "نبغي", "نحس", "نبحث",
+    )
+    # حارس سياق الطلب الشخصي: "نسوي بحث واحتاج مساعدة في التنسيق" طالب يوصف
+    # وضعه بصيغة الجماعة — الأفعال هنا وصف لا عرض؛ الإعلان المقنّع بهذا
+    # السياق يحمل CTA دائماً، والCTA يظل محتسباً.
+    _PERSONAL_REQUEST_TOKENS: Final[Tuple[str, ...]] = (
+        "ابغى", "ابي", "احتاج", "اريد", "محتاج",
+    )
+    _HELP_SEEK_TOKENS: Final[Tuple[str, ...]] = (
+        "مساعده", "يساعدني", "تساعدني", "يسعفني", "فزعه", "فزعتكم",
+        "ساعدوني", "ساعدني", "يحل", "يحلها", "يسويلي", "يكتبلي",
+    )
+
+    # ═══ v14.9.0 (F-04): علامات طلب غير مباشر + أفعال مساعدة على مستوى كلمة ═══
+    # لرفع الرسائل القصيرة (3-6 كلمات) مثل «احد يقدر يساعدني بالحل» إلى review.
+    _REQUEST_MARKERS: Final[Tuple[str, ...]] = (
+        "احد", "من", "مين", "فيه", "تكفون", "تكفى",
+    )
+    _HELP_VERB_TOKENS: Final[Tuple[str, ...]] = (
+        "يساعدني", "تساعدني", "يسعفني", "يحل", "يحلها", "يسويلي", "يكتبلي",
+    )
     FILTER_MIN_MESSAGE_CHARS: Final[int] = 3
 
     _PATTERNS: Dict[str, re.Pattern] = {
@@ -741,6 +792,43 @@ class EnhancedFilter:
             if "payment_methods" in ps and "terms" in ps["payment_methods"]:
                 if isinstance(ps["payment_methods"]["terms"], list):
                     ps["payment_methods"]["terms"] = _norm_list(ps["payment_methods"]["terms"])
+
+        # ═══ v14.9.0 (F-15): مطابقة إشارات الإعلان بحدود كلمات ═══
+        # substring الخام (signal in text) يلتقط «بحث» داخل «بحثت» و«تواصل»
+        # داخل «التواصل» — كل قائمة تُجمَّع الآن في regex واحد بحدود \w
+        # (يدعم العربية لأن \w يطابق حروف العربية في Python). البدائل
+        # الأطول أولاً حتى تفوز «حلول دراسيه» على أي تقاطع جزئي.
+        def _signal_boundary_re(terms: Any) -> Optional["re.Pattern[str]"]:
+            alts: List[str] = []
+            if isinstance(terms, list):
+                for _t in terms:
+                    if isinstance(_t, str) and _t.strip():
+                        alts.append(re.escape(_t))
+            if not alts:
+                return None
+            alts.sort(key=len, reverse=True)
+            try:
+                # v14.9.0: Arabic conjunction prefixes attach to the first word
+                # ("w-nihal"/"w-nusawi"/"al-tawasul") — optional prefixes before the term
+                # with word boundaries before and after.
+                prefix = r"(?:وال|فال|بال|كال|لل|ال|و|ف|ك|ل|ب)?"
+                return re.compile(
+                    r"(?<!\w)" + prefix + "(?:" + "|".join(alts) + r")(?!\w)"
+                )
+            except re.error:
+                return None
+
+        self._ad_hard_re = _signal_boundary_re(self._ad_signals.get("hard_signals"))
+        self._ad_medium_re = _signal_boundary_re(self._ad_signals.get("medium_signals"))
+        self._ad_cta_re = _signal_boundary_re(self._ad_signals.get("cta_signals"))
+        self._ad_institution_re = _signal_boundary_re(self._ad_signals.get("institution_terms"))
+        _prov_re = self._ad_signals.get("provider_profile", {})
+        self._ad_strong_re = _signal_boundary_re(
+            (_prov_re.get("strong_provider") or []) + (_prov_re.get("individual_provider") or [])
+        )
+        self._ad_weak_re = _signal_boundary_re(_prov_re.get("weak_provider"))
+        _pm_re = self._ad_signals.get("price_signals", {}).get("payment_methods", {})
+        self._ad_payment_re = _signal_boundary_re(_pm_re.get("terms"))
 
         # Spam categories
         self._spam_categories: Dict[str, List[str]] = kw.get("spam_categories", {})
@@ -1206,86 +1294,155 @@ class EnhancedFilter:
             score += 0.15
         return min(score, 1.0)
 
-    def _detect_advertisement(self, text: str) -> Tuple[float, List[str]]:
+    @staticmethod
+    def _strip_conj_token(t: str) -> str:
+        """v14.9.0: إزالة بادئة العطف (و/ف) من الكلمة —
+        "ونسوي"/"واحتاج" → "نسوي"/"احتاج". الو/الف فقط والتوكن أطول من
+        حرفين؛ فحص الصيغتين (خام + مجردة) معاً يحمي الكلمات الأصلية
+        مثل "واجبات" من أي تأثير جانبي."""
+        return t[1:] if len(t) > 2 and t[0] in "وف" else t
+
+    def commercial_offer_score(self, norm_text: str) -> int:
+        """v14.9.0 (F-01): درجة العرض التجاري على شكل طلب.
+
+        يقيس «فريق يقدّم خدمات» («نحل واجبات وتقارير، تواصل واتس») — نمط
+        ينتحل شكل الطلب لكنه إعلان. المطابقة على مستوى كلمة (token) بعد
+        التطبيع، لا substring، حتى لا يلتقط «بحث» داخل «بحثت»:
+          * فعل عرض (_OFFER_VERBS) يليه خلال 1-4 كلمات اسم أكاديمي
+            (_OFFER_NOUNS) → +2
+          * كل كلمة CTA مبيعات (_OFFER_CTA) → +1
+        عتبة التجاهل الصارم: offer_score >= 2 (تطبَّق في classify()).
+        """
+        if not norm_text:
+            return 0
+        # v14.9.0: تطبيع دفاعي — العقد أن norm_text مُطبّع من _clean()، لكن
+        # المسار الدفاعي يضمن ة→ه وأ→ا لأي مستدعٍ مستقبلي يمرر نصاً خاماً.
+        norm_text = self._normalize_arabic(norm_text.lower())
+        tokens = norm_text.split()
+        if not tokens:
+            return 0
+        # حارس سياق الطلب الشخصي الصادق: مزيج "ابغى/احتاج… + مساعدة/يساعدني…"
+        # = طالب يوصف وضعه بصيغة الجماعة — الأفعال الجماعية وصف لا عرض.
+        personal_frame = (
+            any(t in self._PERSONAL_REQUEST_TOKENS for t in tokens)
+            and any(t in self._HELP_SEEK_TOKENS for t in tokens)
+        )
+        # البادئات العربية للعطف (w/f) تلحق بأول كلمة: "w-ahtaj" = و+احتاج،
+        # لكن "واجبات" كلمة أصلية تبدأ بو — نفحص الصيغتين (خام + مجردة) معاً.
+        forms = [(t, self._strip_conj_token(t)) for t in tokens]
+
+        def _any_in(terms) -> bool:
+            return any((t in terms) or (b in terms) for t, b in forms)
+
+        personal_frame = (
+            _any_in(self._PERSONAL_REQUEST_TOKENS)
+            and _any_in(self._HELP_SEEK_TOKENS)
+        )
+        score = 0
+        for i, (tok, bare) in enumerate(forms):
+            if tok in self._OFFER_CTA or bare in self._OFFER_CTA:
+                score += 1
+                continue
+            is_solution_only = (
+                tok in self._OFFER_SOLUTION_ONLY_VERBS
+                or bare in self._OFFER_SOLUTION_ONLY_VERBS
+            )
+            is_verb = (
+                tok in self._OFFER_VERBS
+                or bare in self._OFFER_VERBS
+                or is_solution_only
+            )
+            if not is_verb:
+                continue
+            # حارس النافي: "ما نحل واجبات هنا" — نافٍ مباشرة قبل الفعل يلغيه
+            # (نفحص الصيغتين للكلمة السابقة: "وما" → "ما").
+            prev_tok, prev_bare = forms[i - 1]
+            if i > 0 and (
+                prev_tok in self._OFFER_NEGATOR_TOKENS
+                or prev_bare in self._OFFER_NEGATOR_TOKENS
+                or prev_tok in self._COLLECTIVE_NEED_TOKENS
+                or prev_bare in self._COLLECTIVE_NEED_TOKENS
+            ):
+                continue
+            if personal_frame:
+                continue
+            window = forms[i + 1:i + 5]
+            nouns = (
+                self._OFFER_SOLUTION_NOUNS if is_solution_only
+                else self._OFFER_ALL_NOUNS
+            )
+            if any((w in nouns) or (wb in nouns) for w, wb in window):
+                score += 2
+        return score
+
+    def _detect_advertisement(
+        self, text: str, offer_score: Optional[int] = None
+    ) -> Tuple[float, List[str]]:
         if not getattr(CFG, "AD_DETECTION_ENABLED", True):
             return (0.0, [])
         ad_score = 0.0
         reasons = []
 
-        hard_signals = self._ad_signals.get("hard_signals", [])
-        if isinstance(hard_signals, list):
-            for signal in hard_signals:
-                if signal in text:
-                    ad_score += 0.4
-                    reasons.append(f"hard_ad_signal: {signal}")
+        # v14.9.0 (F-15): مطابقة بحدود كلمات عبر regex مجمّعة لكل قائمة
+        if self._ad_hard_re is not None:
+            for m in self._ad_hard_re.finditer(text):
+                ad_score += 0.4
+                reasons.append(f"hard_ad_signal: {m.group(0)}")
 
-        medium_signals = self._ad_signals.get("medium_signals", [])
-        if isinstance(medium_signals, list):
-            for signal in medium_signals:
-                if signal in text:
-                    ad_score += 0.2
-                    reasons.append(f"medium_ad_signal: {signal}")
+        if self._ad_medium_re is not None:
+            for m in self._ad_medium_re.finditer(text):
+                ad_score += 0.2
+                reasons.append(f"medium_ad_signal: {m.group(0)}")
 
-        provider_data = self._ad_signals.get("provider_profile", {})
-        strong_providers = provider_data.get("strong_provider", [])
-        weak_providers = provider_data.get("weak_provider", [])
-        individual_providers = provider_data.get("individual_provider", [])
+        strong_hits: List[str] = (
+            [m.group(0) for m in self._ad_strong_re.finditer(text)]
+            if self._ad_strong_re is not None else []
+        )
+        weak_hits: List[str] = (
+            [m.group(0) for m in self._ad_weak_re.finditer(text)]
+            if self._ad_weak_re is not None else []
+        )
+        strong_count = len(strong_hits)
+        weak_count = len(weak_hits)
 
-        strong_count = sum(1 for p in strong_providers if p in text)
-        weak_count = sum(1 for p in weak_providers if p in text)
-        individual_count = sum(1 for p in individual_providers if p in text)
-
-        if strong_count > 0 or individual_count > 0:
+        if strong_count > 0:
             ad_score += 0.3
             reasons.append("provider_detected")
         elif weak_count >= _cfg("AD_WEAK_PROVIDER_THRESHOLD", 2):
             ad_score += 0.25
             reasons.append("weak_provider_multiple")
 
-        cta_signals = self._ad_signals.get("cta_signals", [])
-        if isinstance(cta_signals, list):
-            for signal in cta_signals:
-                if signal in text:
-                    ad_score += 0.1
-                    reasons.append(f"cta_signal: {signal}")
+        if self._ad_cta_re is not None:
+            for m in self._ad_cta_re.finditer(text):
+                ad_score += 0.1
+                reasons.append(f"cta_signal: {m.group(0)}")
 
-        price_signals = self._ad_signals.get("price_signals", {})
-        if isinstance(price_signals, dict):
-            payment_methods = price_signals.get("payment_methods", {})
-            if isinstance(payment_methods, dict):
-                terms = payment_methods.get("terms", [])
-                if isinstance(terms, list) and (strong_count > 0 or individual_count > 0):
-                    for term in terms:
-                        if term in text:
-                            ad_score += 0.1
-                            reasons.append(f"payment_signal: {term}")
+        if self._ad_payment_re is not None and strong_count > 0:
+            for m in self._ad_payment_re.finditer(text):
+                ad_score += 0.1
+                reasons.append(f"payment_signal: {m.group(0)}")
 
-        institution_terms = self._ad_signals.get("institution_terms", [])
-        if isinstance(institution_terms, list):
-            for term in institution_terms:
-                if term in text:
-                    ad_score += 0.15
-                    reasons.append(f"institution_term: {term}")
+        if self._ad_institution_re is not None:
+            for m in self._ad_institution_re.finditer(text):
+                ad_score += 0.15
+                reasons.append(f"institution_term: {m.group(0)}")
 
-        if weak_count > 0 and strong_count == 0 and individual_count == 0:
+        if weak_count > 0 and strong_count == 0:
             commercial_context = any(
                 r.startswith(("medium_ad_signal", "cta_signal", "payment_signal",
                               "institution_term", "url_signal"))
                 for r in reasons
             )
             if commercial_context:
-                _wp_terms = [p for p in weak_providers if p in text]
-                _word_bounded = any(
-                    re.search(rf"(^|\s){re.escape(p)}(\s|$|\d)", text)
-                    for p in _wp_terms
-                )
+                # v14.9.0: weak_hits مأخوذة أصلاً من regex بحدود كلمات —
+                # فحص الحدود اليدوي السابق أصبح مضمّناً في المطابقة نفسها.
                 _collective_guard = any(
                     g in text for g in (
                         "نحتاج", "مع بعض", "مع بعضنا", "مشروعنا", "واجبنا",
                         "بحثنا", "قروبنا", "مجموعتنا",
                     )
                 )
-                if _word_bounded and not _collective_guard:
+                if weak_hits and not _collective_guard:
                     ad_score += 0.4
                     reasons.append("commercial_prefix")
 
@@ -1298,6 +1455,16 @@ class EnhancedFilter:
         if ad_emoji_count >= _cfg("AD_EMOJI_THRESHOLD", 3):
             ad_score += 0.2
             reasons.append(f"ad_emoji_count: {ad_emoji_count}")
+
+        # ═══ v14.9.0 (F-01): دمج درجة العرض التجاري في كشف الإعلان ═══
+        if offer_score is None:
+            offer_score = self.commercial_offer_score(text)
+        if offer_score >= 2:
+            ad_score += 0.45
+            reasons.append(f"commercial_offer: {offer_score}")
+        elif offer_score == 1:
+            ad_score += 0.2
+            reasons.append("commercial_offer: 1")
 
         return min(ad_score, 1.0), reasons
 
@@ -1681,6 +1848,37 @@ class EnhancedFilter:
                 is_implicit = True
                 help_anchored = True
             else:
+                # ═══ v14.9.0 (F-04): rescue of short indirect requests ═══
+                # Messages like "can anyone help me with the solution" die at no_keyword
+                # before reaching any review floor — the rescue here: request marker +
+                # help verb + 3-6 words + no commercial offer → review (0.42).
+                _tokens = cleaned.split()
+                _tok_forms = set(_tokens)
+                _tok_forms |= {self._strip_conj_token(t) for t in _tokens}
+                if (
+                    3 <= len(_tokens) <= 6
+                    and (_tok_forms & set(self._REQUEST_MARKERS))
+                    and (_tok_forms & set(self._HELP_VERB_TOKENS))
+                    and self.commercial_offer_score(cleaned) == 0
+                ):
+                    # v14.9.0: بلا _convert_result — هو يجبر decision على
+                    # ignore/accept فقط (عقد المسارات المبكرة binary)، والمراجعة
+                    # تحتاج decision="review" مع valid=False كالمسار الكامل.
+                    _res = self._result(
+                        "review", 0.42, ["f04: short_request_floor"],
+                        original_text=original_text,
+                    )
+                    _res["language"] = "ar" if is_arabic else "unknown"
+                    _res["lang_conf"] = arabic_ratio
+                    _res["spam_score"] = 0.0
+                    _res["analysis_time_ms"] = round(
+                        (time.perf_counter() - start) * 1000, 2
+                    )
+                    return (
+                        _res,
+                        self._mark_rejected(stats_inc, "review"),
+                        None, None,
+                    )
                 result.valid = False
                 result.reason = "no_keyword"
                 return (
@@ -1713,7 +1911,9 @@ class EnhancedFilter:
                 None, None,
             )
 
-        ad_score, ad_reasons = self._detect_advertisement(cleaned)
+        # v14.9.0 (F-01): تُحسب مرة واحدة وتُمرَّر لكل نقاط الدمج
+        offer_score = self.commercial_offer_score(cleaned)
+        ad_score, ad_reasons = self._detect_advertisement(cleaned, offer_score=offer_score)
         if ad_score > 0.6:
             return (
                 self._convert_result(
@@ -1843,7 +2043,8 @@ class EnhancedFilter:
         result.confidence *= (1 - ad_score * 1.1)
 
         boost = 0.0
-        _ad_evidence = ad_score >= 0.2 or any(
+        # v14.9.0 (F-01): أي عرض تجاري (حتى offer=1) يلغي الـboost
+        _ad_evidence = offer_score > 0 or ad_score >= 0.2 or any(
             r.startswith(("commercial_prefix", "provider_detected",
                           "weak_provider_multiple"))
             for r in ad_reasons
@@ -1869,6 +2070,7 @@ class EnhancedFilter:
             "boost": round(boost, 3),
             "negation_score": round(neg_score, 3),
             "ad_score": round(ad_score, 3),
+            "offer_score": offer_score,  # v14.9.0 (F-01)
         }
 
         if result.confidence >= CFG.CONFIDENCE_ACCEPT_THRESHOLD:
@@ -1889,6 +2091,26 @@ class EnhancedFilter:
         ):
             result.confidence = max(result.confidence, _cfg("CONFIDENCE_REVIEW_THRESHOLD", 0.40) + 0.05)
             result.decision = "review"
+        # ═══ v14.9.0 (F-04): أرضية مراجعة للطلبات غير المباشرة القصيرة ═══
+        # «احد يقدر يساعدني بالحل» (4 كلمات) كان يسقط في ignore — الآن:
+        # علامة طلب + فعل مساعدة + 3-6 كلمات + لا عرض تجاري → review (0.42).
+        if (
+            offer_score == 0
+            and result.decision != "accept"
+            and 3 <= token_count <= 6
+            and (
+                implicit_match is not None
+                or indirect_match is not None
+                or any(_mk in cleaned.split() for _mk in self._REQUEST_MARKERS)
+            )
+            and (
+                help_match is not None
+                or any(_hv in cleaned.split() for _hv in self._HELP_VERB_TOKENS)
+            )
+        ):
+            result.confidence = max(result.confidence, 0.42)
+            result.decision = "review"
+            result.reasons.append("f04: short_request_floor")
         if (
             result.decision == "accept"
             and academic_word in getattr(self, "_expert_words", set())
@@ -1923,6 +2145,14 @@ class EnhancedFilter:
                         result.reasons.append(
                             "capped: rescore_respects_resolution_ceiling"
                         )
+
+        # ═══ v14.9.0 (F-01): القاعدة الصارمة — عرض تجاري صريح يتجاوز الثقة ═══
+        # تُطبّق بعد كل مسارات الرفع (review floor + clause_rescore) حتى لا
+        # يعيد أي مسار رفع decision=accept لرسالة عرض تجاري (offer>=2).
+        if offer_score >= 2 and result.decision != "ignore":
+            result.decision = "ignore"
+            result.reasons.append("capped: commercial_offer")
+            result.score_details["commercial_offer_override"] = True
 
         result.valid = (result.decision == "accept")
 
