@@ -222,7 +222,7 @@ class TestReplyFixQuotaRace:
         ترى hourly_cap فوراً (كانت تمر بالحصة وترسل ردّاً ثانياً)."""
         from reply_fix import ReplyFixer
 
-        fixer = ReplyFixer(hourly_per_user=1, jitter_min=0.02, jitter_max=0.03)
+        fixer = ReplyFixer(enabled=True, hourly_per_user=1, jitter_min=0.02, jitter_max=0.03)
         client = _FakeClient(entities=[MessageEntityMentionName()])
 
         task1 = asyncio.create_task(fixer.run(
@@ -248,7 +248,7 @@ class TestReplyFixQuotaRace:
         فيقفل المرسل ساعة كاملة حتى بلا ردّ)."""
         from reply_fix import ReplyFixer
 
-        fixer = ReplyFixer(hourly_per_user=1, jitter_min=0, jitter_max=0)
+        fixer = ReplyFixer(enabled=True, hourly_per_user=1, jitter_min=0, jitter_max=0)
         client = _FakeClient(error=RuntimeError("boom"))
         ladder = [("username", _InputUserStub(UID, HASH)),
                   ("account_hash", _InputUserStub(UID, HASH + 1))]

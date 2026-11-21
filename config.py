@@ -829,7 +829,11 @@ class Config:
             # ========== التنبيهات ==========
             ALERT_WITH_BUTTONS=SecretManager.get_bool("ALERT_WITH_BUTTONS", True),
             ALERT_BUTTONS_ENABLED=SecretManager.get_bool("ALERT_BUTTONS_ENABLED", False),
-            ALERT_FORWARD_FALLBACK=SecretManager.get_bool("ALERT_FORWARD_FALLBACK", True),
+            # v14.9.3: إعادة تحويل الرسالة الأصلية للقناة أُلغيت نهائياً
+            # (طلب المالك 21-11: «دون تكرار او اعاده تحويل او اعاده توجيه»)
+            # — كل تنبيه رسالة واحدة بالصيغة المرجعية. القيمة الافتراضية
+            # False والمسار محذوف من monitors أصلاً.
+            ALERT_FORWARD_FALLBACK=SecretManager.get_bool("ALERT_FORWARD_FALLBACK", False),
             TARGET_MEMBERSHIP_CHECK=SecretManager.get_bool("TARGET_MEMBERSHIP_CHECK", True),
             # ══ v10.8 Alert Bot ══
             ALERT_BOT_TOKEN=SecretManager.get("ALERT_BOT_TOKEN", None, required=False),
@@ -840,7 +844,9 @@ class Config:
             ALERT_MAX_TEXT_LEN=SecretManager.get_int("ALERT_MAX_TEXT_LEN", 350, required=False),
             ALERT_WITH_COPY_BUTTON=SecretManager.get_bool("ALERT_WITH_COPY_BUTTON", True),
             ALERT_WITH_CONTACT_BUTTON=SecretManager.get_bool("ALERT_WITH_CONTACT_BUTTON", True),
-            REPLY_FIX_ENABLED=SecretManager.get_bool("REPLY_FIX_ENABLED", True),
+            # v14.9.3: الرد التعويضي «👤» المنفصل أُلغي — الاسم داخل البطاقة
+            # نفسها بالصيغة المرجعية، ورسالة ردّ إضافية = تكرار رفضه المالك.
+            REPLY_FIX_ENABLED=SecretManager.get_bool("REPLY_FIX_ENABLED", False),
             REPLY_FIX_HOURLY_PER_USER=SecretManager.get_int("REPLY_FIX_HOURLY_PER_USER", 1, required=False),
             REPLY_FIX_DAILY_CAP=SecretManager.get_int("REPLY_FIX_DAILY_CAP", 100, required=False),
             REPLY_FIX_JITTER_MIN=SecretManager.get_float("REPLY_FIX_JITTER_MIN", 2.0, required=False),
@@ -1073,7 +1079,7 @@ class Config:
 # لقطة المستخدم للقناة الهدف: زر المرسل يُسمّى @username (زر URL عالمي
 # t.me — لا tg:// قابلة للرفض) وزر القروب يُسمّى «جروب» ويفتح المجموعة
 # المصدر؛ البدائل الصادقة بلا username/رابط قروب: مراسلة/عرض الرسالة.
-BOT_VERSION: Final = "14.9.2"
+BOT_VERSION: Final = "14.9.3"
 BOT_CODENAME: Final = "Reference Button Layout"
 
 # =============================================================================

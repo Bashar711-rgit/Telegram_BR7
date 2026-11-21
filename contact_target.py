@@ -64,23 +64,32 @@ __version__ = "14.5.2"
 
 _TG_URL = "https://t.me/"
 
-# شكل التنبيه الفعال (v14.6.0 — B_Bot مستعاد في رأس البطاقة):
-# B_Bot\nالمرسل: الاسم — @username
-# v14.6.0: المواصفة الحالية للمالك (§ثالثاً) تطلب صراحة «إظهار اسم B_Bot في
-# رأس التنبيه» — توقيع v13 أعيد. كل إزاحات الكيانات المشتقة (name_off/
-# uname_off في contact_target + alert_bot + alert_ui) تُحسب من
-# utf16_len(SENDER_LABEL) فتصح تلقائياً — نفس حل v13 المدعومة باختبارات
-# القالب الذهبي. echo guard في monitors يطابق هذا التوقيع أصلاً
-# (_is_current_card_header: 'B_Bot\nالمرسل: ').
-#     المرسل: [اسم المرسل قابل للنقر] — @username
-#     (سطر فارغ)
-#     نص الرسالة:
-#     (سطر فارغ)
+# ═══════════════════════════════════════════════════════════════════════
+# v14.9.3 — الصيغة المرجعية الموحدة (لقطة المالك للقناة الهدف 21-11):
+#
+#     👤 {@username | الاسم}
+#     المرسل : ID {sender_id}
+#     نص الرساله :
 #     [النص الأصلي كاملاً]
-BOT_NAME_LINE = "B_Bot"  # مطلوب في monitors.py لفحص البطاقات
-SENDER_LABEL = "B_Bot\nالمرسل: "  # v14.6.0: B_Bot مستعاد (مواصفة §ثالثاً)
-MSG_TEXT_LABEL = "نص الرسالة:"
-SENDER_DASH = " — "
+#     رابط الرساله : {رابط حقيقي فقط — بلا روابط مختلقة}
+#
+#     [ زر المرسل (@username|الاسم) ] [ جروب ]
+#
+# * B_Bot مُخفى من نص البطاقة نهائياً (طلب المالك — هوية القناة تأتي
+#   من تيليجرام نفسه عند الإرسال بهوية القناة، لا من نص البطاقة).
+# * CARD_NAME_PREFIX هو قاعدة إزاحة كيان اسم المرسل (utf16_len = 3:
+#   👤 وحدتا UTF-16 + مسافة واحدة) — كل الإزاحات المشتقة تُحسب منه.
+# * التوقيعات القديمة (B_Bot/المرسل:) تبقى مقبولة في echo guard
+#   (monitors) للبطاقات التاريخية الموجودة في القناة فقط.
+# ═══════════════════════════════════════════════════════════════════════
+BOT_NAME_LINE = "B_Bot"  # توقيع تاريخي — echo guard فقط (ليس في البطاقات الجديدة)
+CARD_NAME_PREFIX = "👤 "          # v14.9.3: السطر الأول للبطاقة
+SENDER_LABEL = CARD_NAME_PREFIX   # قاعدة إزاحة كيان الاسم (توافق المُستدعين)
+SENDER_ID_LABEL = "المرسل : "     # سطر معرف المرسل (صيغة الصورة المرجعية)
+MSG_TEXT_LABEL = "نص الرساله :"   # صيغة الصورة المرجعية حرفياً
+MSG_LINK_LABEL = "رابط الرساله : "  # سطر رابط الرسالة (حقيقي فقط)
+SENDER_DASH = " — "               # توقيع تاريخي — اختبارات/توافق فقط
+ID_UNKNOWN_TEXT = "غير معروف"     # بلا معرف حقيقي — لا اختلاق
 
 
 def build_username_suffix(username: Any = None) -> str:
@@ -422,22 +431,50 @@ def build_alert_entity_pack(
     rule_tag: Optional[str] = None,
     plain_budget: int = 3800,
     name_url_override: Optional[str] = None,
+    sender_id: Any = 0,
+    msg_link: Optional[str] = None,
 ) -> Dict[str, Any]:
+    """يبني نص البطاقة (نظيف) + كيانات الاسم — الصيغة المرجعية الموحدة v14.9.3:
+
+        👤 {الاسم}
+        المرسل : ID {sender_id}
+        نص الرساله :
+        {النص الأصلي}
+        رابط الرساله : {رابط حقيقي فقط — يُحذف السطر إن لم يوجد}
+
+    * name_text: المرسل بلا username يظهر باسمه، ومع username يُعرض
+      «@username» (نفس الصيغة المرجعية) — والرابط من target دائماً.
+    * بلا معرف حقيقي → «المرسل : غير معروف» — لا اختلاق معرفات.
+    """
     display = str(display_name or "").strip() or "مستخدم"
     raw = str(message_text or "")
     if len(raw) > max(64, int(plain_budget)):
         raw = raw[: max(64, int(plain_budget)) - 1].rstrip() + "…"
 
     uname = getattr(target, "username", None) if target is not None else None
+    _u = str(uname or "").strip().lstrip("@")
+    name_text = f"@{_u}" if (_u and _is_valid_username(_u)) else display
+
+    try:
+        uid = int(sender_id or 0)
+    except Exception:
+        uid = 0
+    id_value = f"ID {uid}" if uid > 0 else ID_UNKNOWN_TEXT
+
     plain_text = (
-        f"{SENDER_LABEL}{display}{build_username_suffix(uname)}"
-        f"\n\n{MSG_TEXT_LABEL}\n\n{raw}"
+        f"{CARD_NAME_PREFIX}{name_text}"
+        f"\n{SENDER_ID_LABEL}{id_value}"
+        f"\n{MSG_TEXT_LABEL}\n{raw}"
     )
+    link_clean = str(msg_link or "").strip()
+    if link_clean and link_clean != "#":
+        plain_text += f"\n{MSG_LINK_LABEL}{link_clean}"
+
     entities: List[Any] = []
 
     try:
-        name_off = utf16_len(SENDER_LABEL)
-        name_len = utf16_len(display)
+        name_off = utf16_len(CARD_NAME_PREFIX)
+        name_len = utf16_len(name_text)
         name_url = (str(name_url_override).strip() if name_url_override else None) or (
             target.selected_url if target is not None else None
         )
@@ -448,23 +485,6 @@ def build_alert_entity_pack(
     except Exception as e:
         logger.debug(f"contact_target entity pack failed: {type(e).__name__}: {e}")
         entities = []
-
-    try:
-        uname = getattr(target, "username", None) if target is not None else None
-        uname_url = (str(name_url_override).strip() if name_url_override else None) or (
-            target.selected_url if target is not None else None
-        )
-        _u = str(uname or "").strip().lstrip("@")
-        if _u and uname_url and _is_valid_username(_u) and MessageEntityTextUrl is not None:
-            uname_off = (
-                utf16_len(SENDER_LABEL) + utf16_len(display) + utf16_len(SENDER_DASH)
-            )
-            uname_len = utf16_len(f"@{_u}")
-            entities.append(
-                MessageEntityTextUrl(offset=uname_off, length=uname_len, url=uname_url)
-            )
-    except Exception as e:
-        logger.debug(f"contact_target username entity failed: {type(e).__name__}: {e}")
 
     suffix = ""
     if rule_tag:

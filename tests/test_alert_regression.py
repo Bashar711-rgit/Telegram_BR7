@@ -4,29 +4,30 @@
 deploys. These tests pin the EXACT expected text/buttons produced by
 the current code.
 
-⚠️ v11.5 (2026-10) — GOLDEN UPDATED BY EXPLICIT USER SPEC §7 (سطر «💬:» مستعاد):
+⚠️ v14.9.3 (2026-11) — GOLDEN UPDATED BY OWNER DECISION «الصيغة المرجعية الموحدة»:
 نمط واجهة موحد لكل التنبيهات دون استثناء (parse_mode=HTML):
 
-    سطر 1:  👤: {SENDER}
-    (سطر فارغ)
-    💬:
-    <blockquote>{النص الأصلي كاملاً — نسخ بالضغط (Copy Text)}</blockquote>
+    سطر 1:  👤 {@username | الاسم}   — الاسم نفسه رابط
+    سطر 2:  المرسل : ID {sender_id}  — بلا معرف حقيقي → «المرسل : غير معروف»
+    سطر 3:  نص الرساله :
+    {النص الأصلي كاملاً}
+    رابط الرساله : {رابط حقيقي فقط — بلا رابط يُحذف السطر كلياً}
 
-    [ @username ] [ جروب ]   ← التخطيط المرجعي v14.9.2 (لقطة المستخدم)
+    [ @username | الاسم ] [ جروب ]   ← التخطيط المرجعي (v14.9.2/v14.9.3)
 
 SENDER:
-  - username:  <a href="https://t.me/U">الاسم</a>
-  - بدونه:     <a href="tg://user?id=ID">الاسم الكامل</a>
+  - username:  الاسم الظاهر = @username برابط https://t.me/{u}
+  - بدونه:     الاسم الظاهر = الاسم برابط tg://user?id=ID
     (إن أُسقط الكيان من الخادم يُصلح تلقائياً برابط الرسالة المصدر —
      v11.3 self-heal، انظر test_bot_api_heals_dropped_name_entity).
 
-الأزرار (v14.9.2 — لقطة المستخدم المرجعية): Inline Keyboard صف واحد أسفل
-كل تنبيه مباشرة:
+الأزرار (التخطيط المرجعي): Inline Keyboard صف واحد أسفل كل تنبيه مباشرة:
 
     [ @username ] [ جروب ]
 
   - زر المرسل مع username: نصه «@username» ورابطه t.me/{u} — زر URL
-    عالمي. بلا username: «مراسلة» بأفضل وسيلة وصول (tg://user?id).
+    عالمي. بلا username: نصه اسم الظاهر (مثل «سارة») بنفس وسيلة الوصول
+    (tg://user?id)؛ «مراسلة» آخر احتياط بلا اسم إطلاقاً (v14.9.3).
   - زر «جروب»: يفتح المجموعة المصدر (دعوة ← t.me/{u} ← t.me/c/{inner}).
     بلا رابط قروب: زر «عرض الرسالة» برابط الرسالة إن وجد.
 
@@ -54,15 +55,17 @@ from alert_bot import build_alert_html  # noqa: E402
 import pytest  # noqa: E402
 
 
-# ── GOLDEN OUTPUT (v14.9.2 — بطاقة باسم البوت + أزرار [@username][جروب]) ──
+# ── GOLDEN OUTPUT (الصيغة المرجعية الموحدة v14.9.3 + أزرار [@username][جروب]) ──
 GOLDEN = {
     "S1_username_chat": {
         "alert": (
-            'B_Bot\nالمرسل: <a href="https://t.me/ahmed_99">أحمد محمد</a> — <a href="https://t.me/ahmed_99">@ahmed_99</a>'
-            '\n\nنص الرسالة:\n\n'
+            '👤 <a href="https://t.me/ahmed_99">@ahmed_99</a>'
+            '\nالمرسل : ID 555000111'
+            '\nنص الرساله :\n'
             'أبي مساعدة في واجب الاحصاء ضروري'
+            '\nرابط الرساله : https://t.me/mygroup/123'
         ),
-        # أزرار بوت التنبيهات: صف واحد بالتخطيط المرجعي v14.9.2
+        # أزرار بوت التنبيهات: صف واحد بالتخطيط المرجعي
         "bot_buttons": [
             {"text": "@ahmed_99", "url": "https://t.me/ahmed_99"},
             {"text": "جروب", "url": "https://t.me/mygroup"},
@@ -70,31 +73,37 @@ GOLDEN = {
     },
     "S2_private_chat": {
         "alert": (
-            'B_Bot\nالمرسل: <a href="tg://user?id=777000222">سارة</a>'
-            '\n\nنص الرسالة:\n\n'
+            '👤 <a href="tg://user?id=777000222">سارة</a>'
+            '\nالمرسل : ID 777000222'
+            '\nنص الرساله :\n'
             'أبي مساعدة في واجب الاحصاء ضروري'
+            '\nرابط الرساله : https://t.me/c/1234567890/456'
         ),
         "bot_buttons": [
-            {"text": "مراسلة", "url": "tg://user?id=777000222"},  # بلا username: وسيلة الوصول البديلة
+            # بلا username: زر المرسل باسم الظاهر بنفس وسيلة الوصول (v14.9.3)
+            {"text": "سارة", "url": "tg://user?id=777000222"},
             {"text": "جروب", "url": "https://t.me/c/1234567890"},
         ],
     },
     "S3_no_username_hash": {
         "alert": (
-            'B_Bot\nالمرسل: <a href="tg://user?id=888000333">خالد</a>'
-            '\n\nنص الرسالة:\n\n'
+            '👤 <a href="tg://user?id=888000333">خالد</a>'
+            '\nالمرسل : ID 888000333'
+            '\nنص الرساله :\n'
             'أبي مساعدة في واجب الاحصاء ضروري'
         ),
-        # بلا روابط → تُحذف أزرار التنقل بصدق (لا روابط وهمية)
+        # بلا روابط → تُحذف أزرار التنقل بصدق (لا روابط وهمية) — ولا سطر رابط
         "bot_buttons": [
-            {"text": "مراسلة", "url": "tg://user?id=888000333"},  # بلا username: وسيلة الوصول البديلة
+            {"text": "خالد", "url": "tg://user?id=888000333"},  # بلا username: اسم الظاهر (v14.9.3)
         ],
     },
     "S4_unknown_title": {
         "alert": (
-            'B_Bot\nالمرسل: <a href="https://t.me/user_x">مستخدم</a> — <a href="https://t.me/user_x">@user_x</a>'
-            '\n\nنص الرسالة:\n\n'
+            '👤 <a href="https://t.me/user_x">@user_x</a>'
+            '\nالمرسل : ID 999000444'
+            '\nنص الرساله :\n'
             'أبي مساعدة في واجب الاحصاء ضروري'
+            '\nرابط الرساله : https://t.me/eng_group/789'
         ),
         "bot_buttons": [
             {"text": "@user_x", "url": "https://t.me/user_x"},
@@ -308,13 +317,14 @@ class TestAlertRegression:
         methods = [m for m, _ in bot.methods]
         assert "editMessageText" in methods
         edit_payload = next(p for m, p in bot.methods if m == "editMessageText")
-        # نفس النص لكن رابط الاسم صار رابط الرسالة المصدر (قالب v11.6)
-        assert edit_payload["text"].startswith('B_Bot\nالمرسل: <a href="https://t.me/c/1234567890/456">سارة</a>')
-        assert "نص الرسالة:" in edit_payload["text"]
+        # نفس النص لكن رابط الاسم صار رابط الرسالة المصدر (v14.9.3 — الاسم الظاهر لا يتغير)
+        assert edit_payload["text"].startswith('👤 <a href="https://t.me/c/1234567890/456">سارة</a>\nالمرسل : ID')
+        assert "نص الرساله :" in edit_payload["text"]
         assert "<blockquote>" not in edit_payload["text"]
-        # نفس الأزرار بقيت على الرسالة المعدّلة — زر المرسل ثم زر جروب
+        # نفس الأزرار بقيت على الرسالة المعدّلة — زر المرسل (اسم الظاهر) ثم زر جروب
         row = edit_payload["reply_markup"]["inline_keyboard"][0]
-        assert row[0]["url"] == "tg://user?id=777000222"  # بلا username: وسيلة الوصول البديلة
+        assert row[0]["url"] == "tg://user?id=777000222"  # بلا username: وسيلة الوصول البديلة (v14.9.3)
+        assert row[0]["text"] == "سارة"
         # زر جروب يفتح المجموعة المصدر (رابط القروب — لا رابط الرسالة)
         assert "https://t.me/c/1234567890" in [b["url"] for b in row]
         assert row[1]["text"] == "جروب"

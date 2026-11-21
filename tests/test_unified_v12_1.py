@@ -232,7 +232,7 @@ class TestAlertReceipt:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# D. صيغة الصورة المرجعية — كلا الاسمين رابطان
+# D. الصيغة المرجعية الموحدة v14.9.3 — الاسم الظاهر هو @username وهو رابط
 # ═══════════════════════════════════════════════════════════════════════
 
 class TestCardBothAnchorsLinked:
@@ -250,31 +250,34 @@ class TestCardBothAnchorsLinked:
             None,
         )
 
-    def test_username_suffix_is_linked_too(self):
+    def test_username_header_is_linked(self):
+        """v14.9.3 (الصيغة المرجعية الموحدة): الاسم الظاهر = @username وهو رابط
+        واحد في سطر الترويسة — بلا تكرار الاسم ولا لاحقة «— @username»."""
         built = self._build()
-        header = built["text"].split("\n")[1]  # v13: السطر 0 هو اسم البوت
-        # رابطان في سطر الترويسة: الاسم + @username
-        assert header.count('<a href="https://t.me/l8i18l">') == 2
-        assert ">@l8i18l</a>" in header
-        assert "نص الرسالة:" in built["text"]
-        assert built["text"].split("\n")[0] == "B_Bot"
+        header = built["text"].split("\n")[0]  # v14.9.3: السطر 0 هو سطر الاسم
+        # رابط واحد للاسم الظاهر (@username)
+        assert header.count('<a href="https://t.me/l8i18l">') == 1
+        assert header == '👤 <a href="https://t.me/l8i18l">@l8i18l</a>'
+        assert "نص الرساله :" in built["text"]
 
-    def test_plain_text_layout_unchanged(self):
-        # البنية الحرفية v13: B_Bot (فارغ) المرسل: {display} — @user (فارغ) نص الرسالة:
+    def test_plain_text_layout_v14_9_3(self):
+        # البنية الحرفية v14.9.3: 👤 ← المرسل : ID ← نص الرساله : ← النص ← رابط الرساله :
         built = self._build()
         import re
         plain = re.sub(r"<[^>]+>", "", built["text"])
         lines = plain.split("\n")
-        assert lines[0] == "B_Bot"
-        assert lines[1].startswith("المرسل: ")
-        assert "— @l8i18l" in lines[1]
-        assert lines[2] == "" and lines[3] == "نص الرسالة:" and lines[4] == ""
+        assert lines[0] == "👤 @l8i18l"
+        assert lines[1] == "المرسل : ID 555000111"
+        assert lines[2] == "نص الرساله :"
+        assert lines[3] == "ابي اذاكار اللي يجبي مقالي وشو it232"
+        assert lines[4] == "رابط الرساله : https://t.me/c/1234567890/42"
 
     def test_no_username_keeps_plain_suffix(self):
         built = self._build(sender_username=None)
-        header = built["text"].split("\n")[1]  # v13: السطر 0 هو اسم البوت
-        # بلا username: لا ذيل @ — لا اختلاق (عقد v11.6 §3.6)
-        assert "— @" not in header
+        header = built["text"].split("\n")[0]  # v14.9.3: السطر 0 هو سطر الاسم
+        # بلا username: الاسم الظاهر «N+» برابط tg://user — لا ذيل @ — لا اختلاق
+        assert header == '👤 <a href="tg://user?id=555000111">N+</a>'
+        assert "— @" not in built["text"]
 
     def test_linked_suffix_helper_rejects_bad_urls(self):
         from contact_target import build_username_suffix_linked
@@ -283,8 +286,10 @@ class TestCardBothAnchorsLinked:
         assert build_username_suffix_linked(None, "https://t.me/x") == ""
         assert build_username_suffix_linked("", "https://t.me/x") == ""
 
-    def test_mtpacto_entity_pack_has_second_entity(self):
-        from contact_target import build_alert_entity_pack, resolve_contact_target
+    def test_mtpacto_entity_pack_single_name_entity(self):
+        """v14.9.3: كيان واحد للاسم الظاهر (@username) — الكيان الثاني القديم
+        (اللاحقة « — @username») أُزيل نهائياً من الحزمة."""
+        from contact_target import build_alert_entity_pack, resolve_contact_target, utf16_len, CARD_NAME_PREFIX
         target = resolve_contact_target(
             sender_id=555000111, username="l8i18l", display="N+",
         )
@@ -295,11 +300,13 @@ class TestCardBothAnchorsLinked:
         )
         ents = pack.get("formatting_entities") or []
         text_urls = [e for e in ents if type(e).__name__ == "MessageEntityTextUrl"]
-        assert len(text_urls) >= 2  # الاسم + @username
-        # كيان @username ملتصق بموضعه الصحيح في النص الخام
-        assert any(
-            e.offset > 0 and e.length == len("@l8i18l") for e in text_urls
-        )
+        assert len(text_urls) == 1  # كيان واحد — بلا كيان ثانٍ للاسم البديل
+        ent = text_urls[0]
+        # كيان الاسم ملتصق بموضعه الصحيح في النص الخام (بعد «👤 » مباشرة)
+        assert ent.offset == utf16_len(CARD_NAME_PREFIX) == 3
+        assert ent.length == utf16_len("@l8i18l")
+        assert ent.url == "https://t.me/l8i18l"
+        assert pack["clickable"] is True
 
 
 # ═══════════════════════════════════════════════════════════════════════

@@ -1,6 +1,30 @@
 #!/usr/bin/env python3
 """
-alert_bot.py - v14.9.2 Alert Bot - نظام مراسلة المرسل + واجهة التنبيهات الموحدة.
+alert_bot.py - v14.9.3 Alert Bot - نظام مراسلة المرسل + واجهة التنبيهات الموحدة.
+
+v14.9.3 — الصيغة المرجعية الموحدة (طلب المالك 21-11: «كامل التنبيهات بهذا
+الشكل ودون تكرار او اعاده تحويل او اعاده توجيه»):
+  * نص البطاقة صار حرفياً بالصيغة المرجعية:
+
+        👤 {@username | الاسم}
+        المرسل : ID {sender_id}
+        نص الرساله :
+        {النص الأصلي كاملاً}
+        رابط الرساله : {رابط حقيقي فقط — بلا رابط يُحذف السطر}
+
+    - B_Bot مُخفى نهائياً من نص البطاقة (طلب المالك) — هوية المرسِل تأتي
+      من تيليجرام عند النشر بهوية القناة الهدف.
+    - الاسم الظاهر = @username عند توفره وإلا اسم المرسل (نفس اللقطة:
+      👤 @qiiwuii / 👤 F) — والاسم نفسه يبقى رابطاً قابلاً للنقر.
+    - سطر المعرف «المرسل : ID …» بمعرف المرسل الحقيقي؛ بلا معرف →
+      «غير معروف» — لا اختلاق.
+    - سطر «رابط الرساله :» يظهر فقط برابط رسالة حقيقي (عام t.me/{u}/{id}
+      أو خاص t.me/c/{inner}/{id}) — بلا روابط مختلقة أبداً.
+  * زر المرسل في اللوحة: «@username» ثم إن لم يوجد username اسم المرسل
+    الظاهر (مثل «F») بنفس وسيلة الوصول — «مراسلة» آخر احتياط بلا اسم.
+  * لا تكرار ولا إعادة تحويل: تُلغي هذه النسخة أي مسار يرسل الرسالة
+    الأصلية (forward supplement) أو رسالة ردّ زائدة (reply_fix «👤»
+    المنفصلة) — كل تنبيه = رسالة واحدة فقط بالصيغة أعلاه.
 
 v14.9.2 — التخطيط المرجعي للمستخدم (لقطة القناة الهدف 21-11):
   * لوحة الأزرار صارت بالتسمية المرجعية:
@@ -44,21 +68,18 @@ v11.2 (طلب المستخدم — نظام مراسلة المرسل): ContactT
 (MTProto) تمرر الكيانات جاهزة عبر formatting_entities فيبقى الاسم قابلًا
 للنقر بعد أن كان تيليثون يحذف tg://user?id صامتاً عند الـparse.
 
-القالب (مواصفة المستخدم v11.6 — القالب الحرفي، الأزرار v14.9.2):
+القالب (v14.9.3 — الصيغة المرجعية الموحدة من لقطة المالك، الأزرار المرجعية):
 
-    المرسل: {اسم المرسل قابل للنقر}{ — @username}
-    (سطر فارغ)
-    نص الرسالة:
-    (سطر فارغ)
+    👤 {@username | اسم المرسل قابل للنقر}
+    المرسل : ID {sender_id}
+    نص الرساله :
     {النص الأصلي كاملاً - بلا حذف أجزاء وبلا إطار/اقتباس}
+    رابط الرساله : {رابط حقيقي فقط}
 
-    [ @username ] [ جروب ]   ← لوحة Inline فعلية أسفل التنبيه (v14.9.2)
+    [ @username | الاسم ] [ جروب ]   ← لوحة Inline فعلية أسفل التنبيه
 
-  * بلا رموز 👤/💬 وبلا <blockquote> — النص الأصلي يظهر كما ورد (الأسطر
-    واللغة والرموز التعبيرية والروابط)، مهرباً HTML فقط كي تُعرض وسوم
-    المستخدم كنص عادي ولا تتلف بنية التنبيه.
-  * «— @username» نص مستقل بجانب الاسم يظهر فقط عند توفر username صالح —
-    لا يُختلق أبداً؛ والاسم وحده هو الرابط (ليس السطر كله ولا نص الرسالة).
+  * النص الأصلي يظهر كما ورد (الأسطر واللغة والرموز التعبيرية والروابط)،
+    مهرباً HTML فقط كي تُعرض وسوم المستخدم كنص عادي ولا تتلف بنية التنبيه.
   * النص الأصلي يُحفظ كاملاً (لا truncate(400)) - التقصير الوحيد المسموح
     هو حاجز حد تيليجرام 4096 حرفاً للرسالة كلها (مع "…" وتحذير في اللوج).
   * SENDER: username -> <a href="https://t.me/U">الاسم</a>؛ بدونه
@@ -136,7 +157,11 @@ from unified_alerts.card import validate_and_repair_card  # noqa: E402
 # لا يُبنى رابط مرسل يدوياً في هذا الملف ولا في أي ملف آخر — ContactTarget
 # يقرر (username ← user_id ← لا شيء) ويستخدم الاسم والزر نفس selected_url.
 from contact_target import (  # noqa: E402
+    CARD_NAME_PREFIX,
+    ID_UNKNOWN_TEXT,
+    MSG_LINK_LABEL,
     MSG_TEXT_LABEL,
+    SENDER_ID_LABEL,
     ContactTarget,
     SENDER_LABEL,
     build_alert_entity_pack,
@@ -275,12 +300,11 @@ def build_alert_buttons(
         [ @username ] [ جروب ]
 
     * الزر الذي تنعدم بياناته يُحذف كلياً (لا أزرار معطلة ولا روابط وهمية).
-    * زر المرسل: مع username يُسمّى «@username» ويفتح https://t.me/{u} —
-      زر URL عالمي لا يُرفض من تيليجرام ولا يعتمد على خصوصية المرسل
-      (نفس صيغة اللقطة المرجعية: @Phaedra01). بلا username يبقى زر
-      «مراسلة» بأفضل وسيلة وصول: contact_url من ContactTarget.selected_url
-      (spec #16) ثم tg://user?id (spec #15) — والقنوات/المحذوفون بلا
-      زر مختلق (spec #18).
+    * زر المرسل — v14.9.3 (صيغة الصورة المرجعية): مع username يُسمّى
+      «@username» ويفتح https://t.me/{u}؛ بلا username يُسمّى باسم المرسل
+      الظاهر في البطاقة (مثل «F» في اللقطة) بنفس وسيلة الوصول (contact_url
+      ← tg://user?id)؛ بلا اسم إطلاقاً يبقى «مراسلة». القنوات/المحذوفون
+      بلا زر مختلق (spec #18).
     * زر القروب: يُسمّى «جروب» ويفتح المجموعة المصدر — دعوة متاحة ثم
       t.me/{u} ثم t.me/c/{inner} (build_group_link — لا روابط وهمية).
       بلا رابط قروب: زر «عرض الرسالة» برابط الرسالة إن وجد (البديل
@@ -298,9 +322,9 @@ def build_alert_buttons(
     except Exception:
         sid = 0
 
-    # 1) زر المرسل — v14.9.2: التسمية @username (زر URL عالمي، نفس هدف
-    #    ContactTarget). بلا username: «مراسلة» بوسيلة الوصول البديلة كما
-    #    كانت — لا تغيير في سلوك التسليم.
+    # 1) زر المرسل — v14.9.3: التسمية المرجعية للصورة:
+    #    مع username → «@username»؛ بلا username → اسم المرسل الظاهر؛
+    #    بلا اسم إطلاقاً → «مراسلة» بوسيلة الوصول البديلة — لا اختلاق روابط.
     if include_user_button:
         url: Optional[str] = None
         if username:
@@ -311,7 +335,11 @@ def build_alert_buttons(
             # أفضل رابط مباشر ممكن لمن لا يملك username
             url = f"tg://user?id={sid}"
         if url:
-            row.append({"text": f"@{username}" if username else BTN_CONTACT, "url": url})
+            if username:
+                _label = f"@{username}"
+            else:
+                _label = str(sender_name or "").strip() or BTN_CONTACT
+            row.append({"text": _label[:64], "url": url})
 
     # 2) زر القروب — v14.9.2: «جروب» يفتح المجموعة المصدر مباشرة (نفس
     #    صيغة اللقطة المرجعية). بلا رابط قروب: «عرض الرسالة» برابط الرسالة
@@ -443,16 +471,17 @@ def _emit_alert_log(
             tier = "T1"
 
         msg_link = str(built.get("msg_link") or "").strip()
-        # ══ v14.7.0 → v14.9.2: التصنيف من زر المرسل المرفق فعلياً ══
-        # الزر الأول المطابق (نصه يبدأ بـ«@» أو يساوي «مراسلة») هو زر
-        # المرسل — التصنيف من رابطه المرفق هو الحقيقة (سابقاً كان من
-        # method فقط فبُلعت أزرار openmessage/phone تحت B4 مضللة).
+        # ══ v14.9.3: التصنيف من زر المرسل المرفق فعلياً ══
+        # الزر الأول في الصف هو زر المرسل دائماً (يبنيه build_alert_buttons
+        # أولاً): نصه «@username» أو اسم المرسل الظاهر أو «مراسلة» — نطابق
+        # النص الثلاثي لتجنب تصنيف زر جروب/عرض عند إسقاط زر المرسل.
         _btn_url: Optional[str] = None
         try:
+            _disp = str(built.get("display") or "").strip()
             for _row in (built.get("buttons") or []):
                 for _b in (_row or []):
                     _t = str((_b or {}).get("text") or "")
-                    if _t == BTN_CONTACT or _t.startswith("@"):
+                    if _t == BTN_CONTACT or _t.startswith("@") or (_disp and _t == _disp):
                         _btn_url = str((_b or {}).get("url") or "").strip() or None
                         break
                 if _btn_url:
@@ -629,8 +658,10 @@ def build_alert_html(
     # ── الاسم المعروض (سقف 128 حرفاً — حماية حد 4096) ──
     # ── الاسم المعروض (spec #17) — الأولوية: display ← أول+أخير ←
     #    username ← fallback؛ سقف 128 حرفاً حمايةً لحد 4096 ──
-    # v11.7.1: لا معرفات رقمية ظاهرة في البطاقة (المهمة §5.1) —
-    # «مستخدم (id)» أُزيل؛ المعرف يبقى داخل السياق حصراً.
+    # v14.9.3 (الصيغة المرجعية الموحدة): الاسم الظاهر في البطاقة = 
+    # «@username» عند توفره وإلا اسم المرسل — مطابق للقناة المرجعية
+    # (👤 @qiiwuii / 👤 F). B_Bot مُخفى نهائياً من نص البطاقة — هوية
+    # المرسِل تأتي من تيليجرام نفسه عند النشر بهوية القناة الهدف.
     display = (
         str(data.get("sender_display") or "").strip()
         or (target.display_name or "").strip()
@@ -638,33 +669,25 @@ def build_alert_html(
     )
     if len(display) > 128:
         display = display[:127] + "…"
+    header_name = f"@{username}" if username else display
 
-    # ── سطر المرسل (v11.6): «المرسل: {اسم قابل للنقر}{ — @username}» ──
-    # النص الظاهر ≠ الرابط (spec #14): لا يظهر للمستخدم أي https://t.me
-    # أو tg:// — الرابط يُحمل كوسم anchor داخل الاسم حصراً (ليس السطر كله
-    # ولا نص الرسالة)، و«@username» نص مستقل بجانب الاسم لا يُختلق عند
-    # غيابه (مواصفة v11.6 §3.6/#3.7).
+    # ── سطرا البطاقة (v14.9.3 — الصيغة المرجعية حرفياً) ──
+    #     👤 {الاسم الظاهر}          ← الاسم نفسه رابط (username ← tg://user)
+    #     المرسل : ID {sender_id}   ← المعرف الحقيقي؛ بلا معرف → «غير معروف»
+    #     نص الرساله :
+    #     {النص الأصلي كاملاً}
+    #     رابط الرساله : {رابط حقيقي فقط — بلا رابط يُحذف السطر كلياً}
     if target.username_url:
-        sender_html = f'<a href="{target.username_url}">{InputSanitizer.escape_html(display)}</a>'
+        sender_html = f'<a href="{target.username_url}">{InputSanitizer.escape_html(header_name)}</a>'
         contact_method = "username"
     elif target.user_id_url:
-        sender_html = f'<a href="{target.user_id_url}">{InputSanitizer.escape_html(display)}</a>'
+        sender_html = f'<a href="{target.user_id_url}">{InputSanitizer.escape_html(header_name)}</a>'
         contact_method = "mention_button"
     else:
-        sender_html = InputSanitizer.escape_html(display)
+        sender_html = InputSanitizer.escape_html(header_name)
         contact_method = "text_only"
-    uname_suffix_html = build_username_suffix(target.username)
-    # ══ v12.1.0 — صيغة الصورة المرجعية من المستخدم ══
-    # «المرسل: {الاسم رابط} — {@username رابط}» — كلاهما أزرق (اللقطة
-    # المرجعية: N+ أزرق و @l8i18l أزرق). الرابط نفسه username_url المختار
-    # من ContactTarget — بلا رابط صالح يبقى الذيل النصي العادي (لا
-    # اختلاق روابط — عقد v11.6 §3.6 كما هو).
-    try:
-        _linked_suffix = build_username_suffix_linked(target.username, target.username_url)
-        if _linked_suffix:
-            uname_suffix_html = _linked_suffix
-    except Exception:
-        pass  # فشل-آمن: الذيل النصي العادي كما هو
+    id_value = f"ID {sender_id}" if sender_id > 0 else ID_UNKNOWN_TEXT
+    id_line = f"\n{SENDER_ID_LABEL}{id_value}"
 
     # ── سطر «🏷 قاعدة» (ميزة محرك القواعد) — عند وجوده فقط ──
     rule_tag = (analysis or {}).get("rule_tag") if isinstance(analysis, dict) else None
@@ -672,18 +695,25 @@ def build_alert_html(
     if rule_tag:
         rule_part = f"\n\n🏷 قاعدة: {InputSanitizer.escape_html(str(rule_tag))}"
 
-    # ── قسم نص الرسالة (v11.6 — القالب الحرفي): بلا رموز 👤/💬 وبلا
-    # blockquote/اقتباس/إطار — النص الأصلي كما ورد (الأسطر واللغة والرموز
+    # ── روابط الرسالة/القروب الحقيقية (قيم المحلّل أولاً ثم البناء) ──
+    # v14.9.3: تُحسب قبل تركيب النص — سطر «رابط الرساله» يظهر فقط برابط حقيقي.
+    link = str(msg_link or "").strip()
+    if link in ("", "#"):
+        link = build_message_link(data, chat_username) or ""
+    glink = str(group_link or "").strip()
+    if glink in ("", "#"):
+        glink = build_group_link(data, chat_username) or ""
+
+    # ── قسم نص الرسالة — النص الأصلي كما ورد (الأسطر واللغة والرموز
     # والروابط)، مهرباً HTML فقط كي لا تُفسد وسوم المستخدم الشكل. الحاجز
     # الوحيد: حد تيليجرام 4096 للرسالة كلها (قص مع "…" وتحذير لوج).
-    # ══ v14.6.0: عقد القالب الذهبي أعيد — بلا <b> وبسطر فارغ قبل النص
-    # (صيغة الصورة المرجعية v13: B_Bot ← المرسل ← (فارغ) ← نص الرسالة:
-    # ← (فارغ) ← النص). "[تعديل مطلوب]" الوسيط كسر 60 اختباراً ذهبياً
-    # والمواصفة الحالية §ثالثاً تعيد تثبيت صيغة الصورة المرجعية. ══
-    header = f"{SENDER_LABEL}{sender_html}{uname_suffix_html}"
-    msg_label = f"\n\n{MSG_TEXT_LABEL}\n\n"
-    
-    overhead = len(header) + len(msg_label) + len(rule_part) + 16
+    header = f"{CARD_NAME_PREFIX}{sender_html}{id_line}"
+    msg_label = f"\n{MSG_TEXT_LABEL}\n"
+    link_line = f"\n{MSG_LINK_LABEL}{InputSanitizer.escape_html(link)}" if link else ""
+
+    overhead = (
+        len(header) + len(msg_label) + len(rule_part) + len(link_line) + 16
+    )
     budget = max(TELEGRAM_MAX_TEXT_LEN - overhead, 256)
     safe_text = InputSanitizer.escape_html(str(data.get("text") or ""))
     if len(safe_text) > budget:
@@ -694,15 +724,7 @@ def build_alert_html(
             f"⚠️ alert text truncated to Telegram 4096 limit "
             f"(escaped_len={len(safe_text)} budget={budget})"
         )
-    text = f"{header}{msg_label}{safe_text}{rule_part}"
-
-    # ── روابط الرسالة/القروب الحقيقية (قيم المحلّل أولاً ثم البناء) ──
-    link = str(msg_link or "").strip()
-    if link in ("", "#"):
-        link = build_message_link(data, chat_username) or ""
-    glink = str(group_link or "").strip()
-    if glink in ("", "#"):
-        glink = build_group_link(data, chat_username) or ""
+    text = f"{header}{msg_label}{safe_text}{link_line}{rule_part}"
 
     button_kwargs: Dict[str, Any] = {
         "sender_id": sender_id,
@@ -1293,11 +1315,16 @@ class AlertBot:
                     # الطبقة الاحتياطية أيضاً (spec #14).
                     _tgt = built.get("contact_target")
                     _rule = (analysis or {}).get("rule_tag") if isinstance(analysis, dict) else None
+                    # v14.9.3: البطاقة النظيفة بنفس الصيغة المرجعية — المعرف
+                    # ورابط الرسالة يمرران ليبنا سطرا «المرسل : ID» و
+                    # «رابط الرساله» في مسار MTProto الاحتياطي أيضاً.
                     _pack = build_alert_entity_pack(
                         built.get("display") or "",
                         str(data.get("text") or ""),
                         _tgt,
                         rule_tag=_rule,
+                        sender_id=((built.get("button_kwargs") or {}).get("sender_id") or 0),
+                        msg_link=built.get("msg_link"),
                     )
                     # v11.3: حزمة الإصلاح الذاتي — إن أُسقط كيان tg://user
                     # من الخادم (البوت لا يعرف المرسل) يُعدَّل التنبيه
@@ -1311,6 +1338,8 @@ class AlertBot:
                             _tgt,
                             rule_tag=_rule,
                             name_url_override=_heal_url,
+                            sender_id=((built.get("button_kwargs") or {}).get("sender_id") or 0),
+                            msg_link=built.get("msg_link"),
                         )
                         _heal_pack = (_hpack["plain_text"], _hpack.get("formatting_entities"))
                     if await self._client.send_buttons(
