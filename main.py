@@ -1045,6 +1045,16 @@ class EnhancedTelegramBot:
             # من اللقطة بدل استنتاج من كود HTTP.
             "db_down": bool(db_down),
         }
+        # ═══ v14.8.0 (P7): db_latency_ms — زمن SELECT 1 الفعلي ═══
+        # يُقاس هنا (حلقة اللقطة كل 10s على الحلقة الرئيسية) لا في مسار الطلب —
+        # عقد v14.6.1: خيط خادم الصحة لا يلمس DB إطلاقاً. None = فشل القياس
+        # أو الاتصال (يُقرأ مع db_healthy/db_down للتفسير).
+        try:
+            _t0 = time.perf_counter()
+            await self.db._ping()
+            payload["db_latency_ms"] = round((time.perf_counter() - _t0) * 1000, 2)
+        except Exception:
+            payload["db_latency_ms"] = None
         # ═══ v14.5.5-diag: تشخيصات الاستقرار الذاتي — كل قسم فشل-آمن ═══
         try:
             import psutil as _psu
