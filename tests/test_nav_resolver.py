@@ -426,10 +426,10 @@ class TestFrozenBuilderIntegration:
         # v12.1.0 صيغة الصورة المرجعية: الاسم و@username كلاهما رابط
         assert '— <a href="https://t.me/ahmed_99">@ahmed_99</a>' in alert
         assert "رابط الرسالة" not in alert  # الروابط في الأزرار الآن
-        # v13: نفس اللوحة لكل المسارات — [ مراسلة ][ عرض الرسالة ]
+        # v14.9.2: نفس اللوحة لكل المسارات — [ @ahmed_99 ][ جروب ]
         assert buttons == [[
-            {"text": "مراسلة", "url": "https://t.me/ahmed_99"},
-            {"text": "عرض الرسالة", "url": "https://t.me/mygroup/789"},
+            {"text": "@ahmed_99", "url": "https://t.me/ahmed_99"},
+            {"text": "جروب", "url": "https://t.me/mygroup"},
         ]]
 
     async def test_no_username_uses_recovered_db_username(self, monitor):

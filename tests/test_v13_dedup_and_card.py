@@ -405,22 +405,22 @@ class TestCardV13:
         assert built["buttons"], "اللوحة مطلوبة"
         row = built["buttons"][0]
         texts = [b["text"] for b in row]
-        assert texts == ["مراسلة", "عرض الرسالة"]
+        assert texts == ["@layan_l9", "جروب"]  # v14.9.2 (التخطيط المرجعي)
 
     def test_7_contact_button_linked_to_correct_sender(self):
         built = build_alert_html(_data(sender_username="layan_l9"))
-        contact = next(b for b in built["buttons"][0] if b["text"] == "مراسلة")
+        contact = next(b for b in built["buttons"][0] if b["text"] == "@layan_l9")  # v14.9.2
         assert contact["url"] == "https://t.me/layan_l9"
 
     def test_8_view_button_linked_to_correct_source_public(self):
         built = build_alert_html(_data(chat_username="mygroup"))
-        view = next(b for b in built["buttons"][0] if b["text"] == "عرض الرسالة")
-        assert view["url"] == f"https://t.me/mygroup/{MSG_ID}"
+        group_btn = next(b for b in built["buttons"][0] if b["text"] == "جروب")  # v14.9.2
+        assert group_btn["url"] == "https://t.me/mygroup"
 
     def test_8b_view_button_private_group(self):
         built = build_alert_html(_data(chat_username=None))
-        view = next(b for b in built["buttons"][0] if b["text"] == "عرض الرسالة")
-        assert view["url"] == f"https://t.me/c/{INNER}/{MSG_ID}"
+        group_btn = next(b for b in built["buttons"][0] if b["text"] == "جروب")  # v14.9.2
+        assert group_btn["url"] == f"https://t.me/c/{INNER}"
 
     def test_9_no_fake_links_channel_sender(self):
         """قناة (sender_type=channel) → لا زر tg://user مُختلق."""

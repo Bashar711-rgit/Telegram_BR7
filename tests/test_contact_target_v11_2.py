@@ -290,7 +290,7 @@ class TestContactButton:
     def test_button_with_username(self):
         built = build_alert_html(_data(sender_username="@iesk1"))
         row = built["buttons"][0]
-        assert {"text": "مراسلة", "url": "https://t.me/iesk1"} in row
+        assert {"text": "@iesk1", "url": "https://t.me/iesk1"} in row  # v14.9.2
 
     def test_channel_gets_no_contact_button(self):
         """spec #18: قناة بلا username → لا زر مراسلة (لا روابط وهمية)."""
@@ -576,7 +576,7 @@ class TestSpecTenCases:
         """Test 1: username=@iesk1 + user_id → اسم clickable + زر موجود."""
         built = build_alert_html(_data(sender_id=123456789, sender_username="@iesk1"))
         assert 'href="https://t.me/iesk1"' in built["text"]
-        assert {"text": "مراسلة", "url": "https://t.me/iesk1"} in built["buttons"][0]
+        assert {"text": "@iesk1", "url": "https://t.me/iesk1"} in built["buttons"][0]  # v14.9.2
         # v13: الاسم و@username كلاهما رابط (صيغة الصورة المرجعية) باسم البوت
         assert built["text"].startswith("B_Bot\nالمرسل: <a href=\"https://t.me/iesk1\">نواف محمد</a> — <a href=\"https://t.me/iesk1\">@iesk1</a>\n")
 
@@ -752,7 +752,7 @@ class TestFinalTemplate:
                          "\n\nنص الرسالة:\n\nنص الرسالة الأصلي")
         assert built["text"] == expected_head
         assert [[b["text"] for b in row] for row in built["buttons"]] == [
-            ["مراسلة", "عرض الرسالة"]
+            ["مراسلة", "جروب"]  # v14.9.2
         ]
 
     def test_monitor_build_alert_uses_same_target(self):
@@ -771,9 +771,9 @@ class TestFinalTemplate:
                                        contact_target=target)
         assert text == ("B_Bot\nالمرسل: <a href=\"tg://user?id=5601276336\">نواف محمد</a>\n\n"
                         "نص الرسالة:\n\nالنص")
-        # v13: نفس اللوحة لكل المسارات (مراسلة ← عرض من هدف ContactTarget)
+        # v14.9.2: نفس اللوحة لكل المسارات (مراسلة ← جروب من هدف ContactTarget)
         # v14.7.0: زر مراسلة = tg://user?id (بدل openmessage الديسكتوب-فقط)
         assert buttons == [[
             {"text": "مراسلة", "url": f"tg://user?id={SENDER_ID}"},
-            {"text": "عرض الرسالة", "url": f"https://t.me/c/111222333/{MSG_ID}"},
+            {"text": "جروب", "url": "https://t.me/c/111222333"},
         ]]

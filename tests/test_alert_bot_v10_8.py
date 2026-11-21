@@ -104,10 +104,10 @@ class TestBuildAlertHtml:
         assert "<blockquote>" not in built["text"]
         # الروابط في الأزرار لا في النص
         assert "رابط الرسالة" not in built["text"]
-        # ترتيب مواصفة v13 الحرفي: [ مراسلة ] [ عرض الرسالة ]
+        # التخطيط المرجعي v14.9.2: [ @Lara507 ] [ جروب ]
         assert built["buttons"] == [[
-            {"text": "مراسلة", "url": "https://t.me/Lara507"},
-            {"text": "عرض الرسالة", "url": "https://t.me/sultanu1999/531011"},
+            {"text": "@Lara507", "url": "https://t.me/Lara507"},
+            {"text": "جروب", "url": "https://t.me/sultanu1999"},
         ]]
 
     def test_acceptance_2_no_username_name_button(self):
@@ -123,18 +123,18 @@ class TestBuildAlertHtml:
         # _data() لديه chat_id=-100111222333 وmessage_id=4242 → روابط خاصة صالحة
         assert built["buttons"] == [[
             {"text": "مراسلة", "url": f"tg://user?id={SENDER_ID}"},
-            {"text": "عرض الرسالة", "url": f"https://t.me/c/{INNER}/{MSG_ID}"},
+            {"text": "جروب", "url": f"https://t.me/c/{INNER}"},  # v14.9.2
         ]]
 
     def test_acceptance_3_private_group_message_link(self):
         """قروب خاص (id يبدأ -100): زر عرض بصيغة t.me/c/{inner}/{id}."""
         built = build_alert_html(_data())  # بلا username للقروب، بلا overrides
         assert built["msg_link"] == f"https://t.me/c/{INNER}/{MSG_ID}"
-        assert {"text": "عرض الرسالة", "url": f"https://t.me/c/{INNER}/{MSG_ID}"} in _row_of(built)
+        assert {"text": "جروب", "url": f"https://t.me/c/{INNER}"} in _row_of(built)  # v14.9.2
         
     def test_public_group_message_link(self):
         built = build_alert_html(_data(chat_username="mygroup", message_id=789))
-        assert {"text": "عرض الرسالة", "url": "https://t.me/mygroup/789"} in _row_of(built)
+        assert {"text": "جروب", "url": "https://t.me/mygroup"} in _row_of(built)  # v14.9.2
         
     def test_acceptance_4_no_link_unavailable_no_group_button(self):
         """قروب بلا رابط: يختفي زرا «عرض» و«القروب» بصدق
@@ -142,20 +142,19 @@ class TestBuildAlertHtml:
         built = build_alert_html(_data(chat_id=-987654321))  # مجموعة عادية
         row = _row_of(built)
         assert {"text": "مراسلة", "url": f"tg://user?id={SENDER_ID}"} in row
-        assert all(b["text"] not in ("عرض الرسالة", "القروب") for b in row)
+        assert all(b["text"] not in ("عرض الرسالة", "القروب", "جروب") for b in row)
         assert built["msg_link"] is None
         assert "\n\nنص الرسالة:\n\n" in built["text"]
         assert "<blockquote>" not in built["text"]
 
     def test_view_button_falls_back_to_group_link(self):
-        """بدون رابط رسالة مباشر → عرض يستخدم أفضل آلية متاحة
-        (رابط القروب) بدل رابط وهمي."""
+        """بدون رابط قروب ومع رابط قروب متاح → زر «جروب» يفتح المجموعة (v14.9.2)."""
         built = build_alert_html(
             _data(message_id=None, chat_id=-987654321),
             msg_link=None, group_link="https://t.me/g_only",
         )
         row = _row_of(built)
-        assert {"text": "عرض الرسالة", "url": "https://t.me/g_only"} in row
+        assert {"text": "جروب", "url": "https://t.me/g_only"} in row
 
     def test_full_text_no_400_truncate(self):
         """v10.9→v11.6: النص الأصلي كاملاً بعد «نص الرسالة:» — لا truncate(400)."""
@@ -186,13 +185,13 @@ class TestBuildAlertHtml:
         ru = SimpleNamespace(username="fallback_u", active=True)
         built = build_alert_html(_data(sender_usernames=[ru]))
         assert built["contact_method"] == "username"
-        assert {"text": "مراسلة", "url": "https://t.me/fallback_u"} in _row_of(built)
+        assert {"text": "@fallback_u", "url": "https://t.me/fallback_u"} in _row_of(built)  # v14.9.2
 
     def test_multiple_active_usernames(self):
         ru1 = SimpleNamespace(username="main_u", active=True)
         ru2 = SimpleNamespace(username="second_u", active=True)
         built = build_alert_html(_data(sender_username="main_u", sender_usernames=[ru1, ru2]))
-        assert {"text": "مراسلة", "url": "https://t.me/main_u"} in _row_of(built)
+        assert {"text": "@main_u", "url": "https://t.me/main_u"} in _row_of(built)  # v14.9.2
 
     def test_rule_tag_feature_preserved(self):
         built = build_alert_html(_data(), {"rule_tag": "قاعدة تجريبية"})
@@ -213,15 +212,15 @@ class TestBuildAlertHtml:
 
 class TestBuildAlertButtons:
     def test_full_row_order_v13(self):
-        """الترتيب الحرفي لمواصفة v13: [ مراسلة ] [ عرض الرسالة ]."""
+        """التخطيط المرجعي v14.9.2: [ @u7 ] [ جروب ]."""
         from alert_bot import build_alert_buttons
         kb = build_alert_buttons(
             sender_id=777, sender_username="u7",
             msg_link="https://t.me/g/9", group_link="https://t.me/g",
         )
         assert kb == [[
-            {"text": "مراسلة", "url": "https://t.me/u7"},
-            {"text": "عرض الرسالة", "url": "https://t.me/g/9"},
+            {"text": "@u7", "url": "https://t.me/u7"},
+            {"text": "جروب", "url": "https://t.me/g"},
         ]]
 
     def test_contact_only_without_username(self):
@@ -233,14 +232,14 @@ class TestBuildAlertButtons:
         ]]
 
     def test_include_user_button_false_drops_only_contact(self):
-        """بعد رفض tg://user (خصوصية): يُسقط زر «مراسلة» فقط."""
+        """بعد رفض tg://user (خصوصية): يُسقط زر المرسل فقط ويبقى «جروب»."""
         from alert_bot import build_alert_buttons
         kb = build_alert_buttons(
             sender_id=777, msg_link="https://t.me/g/9",
             group_link="https://t.me/g", include_user_button=False,
         )
         assert kb == [[
-            {"text": "عرض الرسالة", "url": "https://t.me/g/9"},
+            {"text": "جروب", "url": "https://t.me/g"},
         ]]
 
     def test_empty_when_no_data(self):
@@ -302,9 +301,9 @@ class TestAlertBotSend:
         assert p["link_preview_options"] == {"is_disabled": True}
         kb = _buttons_of(p)
         assert kb == [
-            {"text": "مراسلة", "url": "https://t.me/Lara507"},
-            {"text": "عرض الرسالة", "url": "https://t.me/sultanu1999/531011"},
-        ]
+            {"text": "@Lara507", "url": "https://t.me/Lara507"},
+            {"text": "جروب", "url": "https://t.me/sultanu1999"},
+        ]  # v14.9.2
         assert bot.calls[0]["method"] == "sendMessage"
 
     @pytest.mark.asyncio
@@ -353,11 +352,11 @@ class TestAlertBotSend:
         first_kb = _buttons_of(bot.calls[0]["payload"])
         assert first_kb == [
             {"text": "مراسلة", "url": f"tg://user?id={SENDER_ID}"},
-            {"text": "عرض الرسالة", "url": "https://t.me/g1/9"},
+            {"text": "جروب", "url": "https://t.me/g1"},  # v14.9.2
         ]
         second_kb = _buttons_of(bot.calls[1]["payload"])
         assert second_kb == [
-            {"text": "عرض الرسالة", "url": "https://t.me/g1/9"},
+            {"text": "جروب", "url": "https://t.me/g1"},
         ]
         # رابط الاسم يبقى في النص حرفياً
         assert 'tg://user?id=6079171409' in bot.calls[1]["payload"]["text"]
@@ -583,7 +582,7 @@ class TestMonitorIntegration:
         # v11.6: اللوحة تُحاول فعلاً في المسار الاحتياطي — الزران الهدفان
         assert call.get("buttons"), "لوحة الأزرار يجب أن تُحاول في المسار الاحتياطي"
         kb0 = (call.get("buttons") or [[]])[0]
-        assert [b.get("text") for b in kb0] == ["مراسلة", "عرض الرسالة"]
+        assert [b.get("text") for b in kb0] == ["مراسلة", "جروب"]  # v14.9.2
         # القالب الموحد v11.6 (بعد تحليل HTML لمسار mention — بلا وسوم ظاهرة)
         assert "المرسل: " in call["text"] and "نص الرسالة:" in call["text"]
         assert "👤" not in call["text"] and "💬" not in call["text"]

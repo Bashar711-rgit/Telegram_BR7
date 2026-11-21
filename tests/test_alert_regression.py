@@ -12,7 +12,7 @@ the current code.
     💬:
     <blockquote>{النص الأصلي كاملاً — نسخ بالضغط (Copy Text)}</blockquote>
 
-    [ مراسلة ]   [ عرض الرسالة ]
+    [ @username ] [ جروب ]   ← التخطيط المرجعي v14.9.2 (لقطة المستخدم)
 
 SENDER:
   - username:  <a href="https://t.me/U">الاسم</a>
@@ -20,15 +20,19 @@ SENDER:
     (إن أُسقط الكيان من الخادم يُصلح تلقائياً برابط الرسالة المصدر —
      v11.3 self-heal، انظر test_bot_api_heals_dropped_name_entity).
 
-الأزرار (v10.9.1): Inline Keyboard صف واحد أسفل كل تنبيه مباشرة، ترتيب
-RTL («مراسلة» في أقصى اليمين كما في الصورة المرجعية) — نصوص مصغّرة
-(تيليجرام يحسب حجم الزر من طول نصه حصراً — لا تحكم API في الخط/الحاشية):
+الأزرار (v14.9.2 — لقطة المستخدم المرجعية): Inline Keyboard صف واحد أسفل
+كل تنبيه مباشرة:
 
-    [ مراسلة ] [ عرض الرسالة ]
+    [ @username ] [ جروب ]
+
+  - زر المرسل مع username: نصه «@username» ورابطه t.me/{u} — زر URL
+    عالمي. بلا username: «مراسلة» بأفضل وسيلة وصول (tg://user?id).
+  - زر «جروب»: يفتح المجموعة المصدر (دعوة ← t.me/{u} ← t.me/c/{inner}).
+    بلا رابط قروب: زر «عرض الرسالة» برابط الرسالة إن وجد.
 
 تُبنى حصراً عبر الدالة المركزية alert_bot.build_alert_buttons وترسل عبر
 بوت التنبيهات (Bot API). حسابات المستخدمين لا ترسل أزراراً — _build_alert
-يعيد buttons=None دائماً. النسخ بالضغط على نص الرسالة (quote → Copy Text).
+يعيد buttons=None دائماً. النسخ بالضغط على نص الرسالة.
 الزر الذي تنعدم بياناته يُحذف (لا روابط وهمية ولا أزرار معطلة).
 
 If ANY of these tests fail, the alert format changed and the release
@@ -50,7 +54,7 @@ from alert_bot import build_alert_html  # noqa: E402
 import pytest  # noqa: E402
 
 
-# ── GOLDEN OUTPUT (v13.0 — بطاقة باسم البوت + أزرار [مراسلة][عرض الرسالة]) ──
+# ── GOLDEN OUTPUT (v14.9.2 — بطاقة باسم البوت + أزرار [@username][جروب]) ──
 GOLDEN = {
     "S1_username_chat": {
         "alert": (
@@ -58,10 +62,10 @@ GOLDEN = {
             '\n\nنص الرسالة:\n\n'
             'أبي مساعدة في واجب الاحصاء ضروري'
         ),
-        # أزرار بوت التنبيهات: صف واحد بترتيب مواصفة v13
+        # أزرار بوت التنبيهات: صف واحد بالتخطيط المرجعي v14.9.2
         "bot_buttons": [
-            {"text": "مراسلة", "url": "https://t.me/ahmed_99"},
-            {"text": "عرض الرسالة", "url": "https://t.me/mygroup/123"},
+            {"text": "@ahmed_99", "url": "https://t.me/ahmed_99"},
+            {"text": "جروب", "url": "https://t.me/mygroup"},
         ],
     },
     "S2_private_chat": {
@@ -71,8 +75,8 @@ GOLDEN = {
             'أبي مساعدة في واجب الاحصاء ضروري'
         ),
         "bot_buttons": [
-            {"text": "مراسلة", "url": "tg://user?id=777000222"},  # v14.7.0: مخطط موثّق لكل العملاء
-            {"text": "عرض الرسالة", "url": "https://t.me/c/1234567890/456"},
+            {"text": "مراسلة", "url": "tg://user?id=777000222"},  # بلا username: وسيلة الوصول البديلة
+            {"text": "جروب", "url": "https://t.me/c/1234567890"},
         ],
     },
     "S3_no_username_hash": {
@@ -81,9 +85,9 @@ GOLDEN = {
             '\n\nنص الرسالة:\n\n'
             'أبي مساعدة في واجب الاحصاء ضروري'
         ),
-        # بلا روابط → يختفي زر «عرض الرسالة» بصدق (لا روابط وهمية)
+        # بلا روابط → تُحذف أزرار التنقل بصدق (لا روابط وهمية)
         "bot_buttons": [
-            {"text": "مراسلة", "url": "tg://user?id=888000333"},  # v14.7.0: مخطط موثّق لكل العملاء
+            {"text": "مراسلة", "url": "tg://user?id=888000333"},  # بلا username: وسيلة الوصول البديلة
         ],
     },
     "S4_unknown_title": {
@@ -93,8 +97,8 @@ GOLDEN = {
             'أبي مساعدة في واجب الاحصاء ضروري'
         ),
         "bot_buttons": [
-            {"text": "مراسلة", "url": "https://t.me/user_x"},
-            {"text": "عرض الرسالة", "url": "https://t.me/eng_group/789"},
+            {"text": "@user_x", "url": "https://t.me/user_x"},
+            {"text": "جروب", "url": "https://t.me/eng_group"},
         ],
     },
 }
@@ -236,7 +240,7 @@ class TestAlertRegression:
     @pytest.mark.asyncio
     async def test_bot_api_payload_shape(self, monitor):
         """حمولة Bot API: parse_mode=HTML + link_preview_options disabled
-        + صف أزرار واحد [مراسلة][عرض الرسالة]
+        + صف أزرار واحد [@username][جروب]
         (طريقة الإرسال المطلوبة حرفياً).
 
         v11.3: الاستجابة تحمل كيانات الرسالة الفعلية — عند وجود text_link
@@ -308,10 +312,12 @@ class TestAlertRegression:
         assert edit_payload["text"].startswith('B_Bot\nالمرسل: <a href="https://t.me/c/1234567890/456">سارة</a>')
         assert "نص الرسالة:" in edit_payload["text"]
         assert "<blockquote>" not in edit_payload["text"]
-        # نفس الأزرار بقيت على الرسالة المعدّلة — الزران (مراسلة ثم عرض — ترتيب v13)
+        # نفس الأزرار بقيت على الرسالة المعدّلة — زر المرسل ثم زر جروب
         row = edit_payload["reply_markup"]["inline_keyboard"][0]
-        assert row[0]["url"] == "tg://user?id=777000222"  # v14.7.0
-        assert "https://t.me/c/1234567890/456" in [b["url"] for b in row]
+        assert row[0]["url"] == "tg://user?id=777000222"  # بلا username: وسيلة الوصول البديلة
+        # زر جروب يفتح المجموعة المصدر (رابط القروب — لا رابط الرسالة)
+        assert "https://t.me/c/1234567890" in [b["url"] for b in row]
+        assert row[1]["text"] == "جروب"
 
     @pytest.mark.asyncio
     async def test_bot_api_no_edit_when_name_entity_present(self, monitor):
