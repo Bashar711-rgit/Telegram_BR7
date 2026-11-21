@@ -107,6 +107,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
@@ -737,6 +738,18 @@ class AlertBot:
         # v14.5.1: قفل إنشاء الجلسة — استدعاءان متزامنان على جلسة باردة
         # كانا يُنشئان جلستين ويُسرّبان واحدة.
         self._session_lock = asyncio.Lock()
+        # ══ v14.9.1: حالة عضوية البوت في قناة الهدف — مصدر حالة الأزرار ══
+        # زرا «مراسلة» و«عرض الرسالة» يُرفقان عبر Bot API حصراً؛ حسابات
+        # المستخدمين تُسقط الأزرار (قيد منصة موثق — silent_drop).
+        # None=لم يُفحص بعد | True=عضو (الأزرار تعمل) | False=غير عضو
+        # (تنبيهات Bot API ستفشل 403 وتُسلّم بلا أزرار عبر fallback).
+        self.membership_ok: Optional[bool] = None
+        self.membership_status: str = ""
+        self.membership_error: str = ""
+        self._membership_last_check_ts: float = 0.0
+        # إشارة طلب إصلاح ذاتي — يرفعها send() عند 403 not-member ويلتقطها
+        # حلقة المراقبة في main (alertbot_membership watchdog).
+        self._heal_requested: bool = False
 
     async def _get_session(self) -> Any:
         """جلسة مشتركة معاد استخدامها (F-24) — يُعاد إنشاؤها إن أُغلقت.
@@ -771,6 +784,37 @@ class AlertBot:
         """v11.0: ربط عميل البوت الحي (AlertBotClient) كطبقة إرسال احتياطية
         بالأزرار — يُستدعى من main.initialize بعد start() الناجح فقط."""
         self._client = client
+
+    # ── v14.9.1: حالة العضوية (أزرار التنبيهات) ──
+    def _note_membership(
+        self, ok: bool, status: str = "", error: str = ""
+    ) -> None:
+        """تحديث حالة العضوية — القيم تُعرض في /health/full عبر status_snapshot."""
+        self.membership_ok = bool(ok)
+        self.membership_status = str(status or "")[:40]
+        self.membership_error = str(error or "")[:160]
+        self._membership_last_check_ts = time.time()
+
+    def status_snapshot(self) -> Dict[str, Any]:
+        """لقطة حالة أزرار التنبيهات (عضوية البوت) — تُعرض في /health/full.
+
+        مفاتيح ثابتة وبلا أسرار إطلاقاً (اسم البوت وحالة العضوية فقط).
+        فشل-آمن: أي خلل يعيد لقطة صادقة بدل استثناء."""
+        try:
+            age: Optional[float] = None
+            if self._membership_last_check_ts:
+                age = round(time.time() - self._membership_last_check_ts, 1)
+            return {
+                "enabled": bool(self.enabled),
+                "bot_username": self.bot_username,
+                "membership_ok": self.membership_ok,
+                "membership_status": self.membership_status or None,
+                "membership_error": self.membership_error or None,
+                "membership_last_check_age_s": age,
+                "heal_requested": bool(self._heal_requested),
+            }
+        except Exception:
+            return {"enabled": bool(self.enabled), "membership_ok": None}
 
     # ── Bot API primitives ──
     async def _post(self, method: str, payload: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
@@ -880,11 +924,13 @@ class AlertBot:
             if status == 200 and body.get("ok"):
                 st = str((body.get("result") or {}).get("status") or "")
                 if st in ("member", "administrator", "creator"):
+                    self._note_membership(True, st, "")
                     logger.info(
                         f"✅ alert-bot membership ok: @{self.bot_username} عضو في "
                         f"قناة الهدف (status={st})"
                     )
                 else:
+                    self._note_membership(False, st, f"status={st or 'unknown'}")
                     logger.warning(
                         f"⚠️ بوت التنبيهات @{self.bot_username} ليس عضواً في "
                         f"TARGET_GROUP_ID ({self.chat_id}) — status={st or 'unknown'}. "
@@ -892,13 +938,27 @@ class AlertBot:
                         "تنبيهاته وسيُستخدم مسار حسابات المستخدمين بدون أزرار."
                     )
                 return st or None
+            desc = str(body.get("description") or "")[:120]
+            if "not a member" in desc.lower():
+                # ══ v14.9.1: رفض حقيقي من تيليجرام — البوت غير عضو ══
+                self._note_membership(False, "", f"http_{status}:{desc}")
+            elif self.membership_ok is None:
+                # لم يتحقق أي فحص سابق ناجح — نعلم الحالة بصدق
+                self._note_membership(False, "", f"http_{status}:{desc}")
+            else:
+                # فشل عابر (شبكة/مهلة) بعد تحقق ناجح سابق — نحفظ السبب
+                # دون قلب آخر حالة مثبتة.
+                self.membership_error = f"http_{status}:{desc}"
+                self._membership_last_check_ts = time.time()
             logger.warning(
                 f"⚠️ alert-bot membership check failed: HTTP {status} "
-                f"{str(body.get('description') or '')[:120]} — تأكد أن البوت "
+                f"{desc} — تأكد أن البوت "
                 "عضو في TARGET_GROUP_ID (يفضل أدمن)"
             )
         except Exception as e:
             logger.warning(f"⚠️ alert-bot membership check error: {type(e).__name__}: {e}")
+            if self.membership_ok is None:
+                self._note_membership(False, "", f"error:{type(e).__name__}")
         return None
 
     # ── الإرسال ──
@@ -1103,6 +1163,9 @@ class AlertBot:
                     else "contact_button_failure"
                 )
                 # v11.5 (spec §16): سجل [ALERT] الموحد — يصنّف السلالم فعلياً
+                # v14.9.1: نجاح الإرسال إلى قناة الهدف يثبت العضوية فعلياً
+                if self.membership_ok is not True:
+                    self._note_membership(True, "verified_by_send", "")
                 self.last_tier = ("T3" if buttons_dropped else "T2" if sender_dropped else "T1")
                 _emit_alert_log(
                     built, method,
@@ -1182,6 +1245,13 @@ class AlertBot:
                 buttons_dropped = True  # t.me فقط رُفضت أيضاً → فشل مؤكد أدناه
 
             self.last_error = f"bot_api_{status}:{desc[:120]}"
+            # ══ v14.9.1: 403 not-member = البوت ليس عضواً في قناة الهدف ══
+            # كل محاولات Bot API ستفشل وتصل التنبيهات بلا أزرار عبر حسابات
+            # المستخدمين. نحدّث الحالة (تظهر في /health/full) ونطلب إصلاحاً
+            # ذاتياً من حلقة المراقبة في main.
+            if "not a member" in desc.lower():
+                self._note_membership(False, "", self.last_error)
+                self._heal_requested = True
             # ── v11.0: طبقة الإرسال الاحتياطية بالأزرار — عميل البوت الحي
             # (Telethon) بنفس النص والأزرار قبل الاستسلام لحسابات المستخدمين.
             if self._client is not None:

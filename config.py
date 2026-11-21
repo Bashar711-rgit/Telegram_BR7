@@ -1065,8 +1065,12 @@ class Config:
 # commercial_offer_score + قاعدة تجاهل صارمة عند >=2)، أرضية مراجعة
 # للطلبات غير المباشرة القصيرة (F-04)، مطابقة إشارات الإعلان بحدود
 # كلمات بدل substring (F-15)، وspawn_bg لمهمة persist_account_hash (F-17).
-BOT_VERSION: Final = "14.9.0"
-BOT_CODENAME: Final = "Filter Precision"
+# v14.9.1: Buttons Heal — حالة عضوية بوت التنبيهات (membership_ok) في
+# /health/full، إصلاح ذاتي (إعادة إضافة البوت لقناة الهدف بصلاحية نشر
+# الرسائل فقط عبر حساب مشرف) + حلقة مراقبة + تحذير إداري بخطوات يدوية
+# عند تعذر الإصلاح (حادثة: تنبيهات بلا أزرار بسبب 403 not-member).
+BOT_VERSION: Final = "14.9.1"
+BOT_CODENAME: Final = "Buttons Heal"
 
 # =============================================================================
 # Pre-built config instance

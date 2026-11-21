@@ -470,6 +470,10 @@ class MemoryMonitor:
 # =============================================================================
 # Main Bot Class v14.5.1 (hardened)
 # =============================================================================
+# v14.9.1: دورة حلقة مراقبة عضوية بوت التنبيهات — ثابت وحدة لقابلية الاختبار
+_ALERTBOT_WATCHDOG_CYCLE_S: float = 60.0
+
+
 class EnhancedTelegramBot:
     def __init__(self) -> None:
         self.db = EnhancedDatabase()
@@ -541,6 +545,13 @@ class EnhancedTelegramBot:
         # (hibernate-wake-error 503). بعد الاكتمال يعود العقد الأصلي
         # (503 عند سقوط DB) بلا تغيير.
         self._boot_complete: bool = False
+        # ══ v14.9.1: Buttons Availability Heal (عضوية بوت التنبيهات) ══
+        # زرا «مراسلة» و«عرض الرسالة» يعملان عبر Bot API حصراً — فقدان
+        # عضوية البوت في قناة الهدف = تنبيهات بلا أزرار (حادثة 21-11-2026).
+        self._alertbot_heal_last_ts: float = 0.0
+        self._alertbot_heal_attempts: int = 0
+        self._alertbot_warn_last_ts: float = 0.0
+        self._alertbot_membership_task: Optional[asyncio.Task] = None
 
         # ── Main-client failover (M-10 / M-11) ──────────────────────────
         self._main_client_lock = asyncio.Lock()
@@ -1041,6 +1052,11 @@ class EnhancedTelegramBot:
             "dedup": get_dedup_snapshot(),
             "unified_gate": unified_snapshot(),  # v12.0 unified_alerts
             "antispam": get_antispam_snapshot(),
+            # ══ v14.9.1: حالة أزرار التنبيهات (عضوية بوت التنبيهات) ══
+            "alert_bot": (
+                self.alert_bot.status_snapshot()
+                if getattr(self, "alert_bot", None) is not None else None
+            ),
             # v14.6.1: حقل db_down صريح — المستهلكون (لوحات/سكربتات) يقرؤونه
             # من اللقطة بدل استنتاج من كود HTTP.
             "db_down": bool(db_down),
@@ -2205,8 +2221,262 @@ class EnhancedTelegramBot:
             # v11.5.2: هوية البوت من هويّاتنا — رسائله في مجموعة الهدف لا تُراقب
             register_self_sender(self.alert_bot.bot_id)
             await self.alert_bot.check_membership()
+            # ══ v14.9.1: الأزرار عبر Bot API حصراً — بوت غير عضو = تنبيهات
+            # بلا أزرار. محاولة إصلاح ذاتي فورية + حلقة مراقبة تحدّث الحالة
+            # وتعيد المحاولة بعد cooldown، وتكشف الاستعادة اليدوية سريعاً.
+            if self.alert_bot.membership_ok is False:
+                self._track_task(
+                    self._heal_alertbot_membership(trigger="boot"),
+                    "alertbot_heal_boot",
+                )
+            self._alertbot_membership_task = self._track_task(
+                self._alertbot_membership_watchdog(), "alertbot_membership"
+            )
         except Exception as e:
             logger.debug(f"alert_bot boot check skipped: {type(e).__name__}: {e}")
+
+    # ═══════════════ v14.9.1: Buttons Availability Heal ═══════════════
+    # تيليجرام يرفض إرفاق أزرار inline من حسابات المستخدمين (قيد منصة
+    # موثق — silent_drop_no_reply_markup). المسار الوحيد القادر على
+    # إرفاق [مراسلة][عرض الرسالة] هو Bot API بوت عضو في قناة الهدف.
+    # الإصلاح الذاتي: الحسابات المشرفة تملك صلاحية الإضافة — نحاول
+    # إعادة إضافة البوت وترقيته بصلاحية «نشر الرسائل» فقط (أقل صلاحية
+    # ممكنة، وهي الدور نفسه قبل الفقدان). العملية قابلة للعكس ولا
+    # تلمس أي إعداد آخر، ولا تُرقّي بوتاً مشرفاً أصلاً (حماية من
+    # إسقاط صلاحياته الحالية — EditAdminRequest يستبدل الصلاحيات).
+
+    def _alertbot_heal_clients(self) -> List[TelegramClient]:
+        """مرشّحو الإصلاح: المرسل اللاصق (ناشر مثبت للقناة الهدف) ثم
+        main_client ثم عملاء المراقبين الأحياء — بلا تكرار."""
+        cands: List[TelegramClient] = []
+        sc = getattr(self, "alert_sender_client", None)
+        if sc is not None and sc.is_connected():
+            cands.append(sc)
+        mc = getattr(self, "main_client", None)
+        if mc is not None and mc.is_connected() and all(mc is not c for c in cands):
+            cands.append(mc)
+        for m in self.monitors:
+            c = getattr(m, "client", None)
+            if (
+                c is not None
+                and c.is_connected()
+                and all(c is not x for x in cands)
+            ):
+                cands.append(c)
+        return cands
+
+    def _alertbot_heal_cooldown_ok(self) -> bool:
+        cd = max(300, int(getattr(CFG, "ALERT_BOT_HEAL_COOLDOWN_SECONDS", 1800) or 1800))
+        return (time.time() - self._alertbot_heal_last_ts) >= cd
+
+    async def _heal_alertbot_membership(
+        self,
+        trigger: str = "boot",
+        clients: Optional[List[TelegramClient]] = None,
+    ) -> bool:
+        """إعادة إضافة بوت التنبيهات لقناة الهدف وترقيته (نشر الرسائل فقط).
+
+        v14.9.1 — التسلسل لكل مرشّح:
+          1) حلّ الكيانين (القناة الهدف + البوت باسمه العام).
+          2) دعوة البوت (تُتسامح حالة الوجود المسبق).
+          3) فحص العضوية: مشرف أصلاً → انتهاء ناجح بلا ترقية (حماية
+             صلاحياته الحالية)؛ عضو عادي → ترقية post_messages فقط.
+          4) تحقق نهائي عبر check_membership (مصدر الحقيقة).
+        لا يرفع استثناءات إطلاقاً — كل فشل يُسجل ويُحوّل تحذيراً إدارياً.
+        """
+        bot = getattr(self, "alert_bot", None)
+        if bot is None or not bot.enabled or not bot.bot_username:
+            return False
+        if not bool(getattr(CFG, "ALERT_BOT_AUTO_ADD", True)):
+            logger.info("[ALERTBOT-HEAL] skipped (ALERT_BOT_AUTO_ADD=false)")
+            return False
+        cands = clients if clients is not None else self._alertbot_heal_clients()
+        if not cands:
+            logger.warning("[ALERTBOT-HEAL] no connected client available for heal")
+            await self._alertbot_admin_warn(trigger=trigger, reason="no_connected_client")
+            return False
+        try:
+            from telethon.tl.functions.channels import (
+                EditAdminRequest,
+                InviteToChannelRequest,
+            )
+            from telethon.tl.types import ChatAdminRights
+        except Exception as e:
+            logger.warning(f"[ALERTBOT-HEAL] telethon imports failed: {type(e).__name__}")
+            return False
+        self._alertbot_heal_last_ts = time.time()
+        self._alertbot_heal_attempts += 1
+        _attempt = self._alertbot_heal_attempts
+        logger.warning(
+            f"[ALERTBOT-HEAL] attempt=#{_attempt} trigger={trigger} "
+            f"candidates={len(cands)} — restoring @{bot.bot_username} membership "
+            "in target channel (post_messages only)"
+        )
+        for c in cands:
+            try:
+                target = await c.get_input_entity(int(CFG.TARGET_GROUP_ID))
+            except Exception as e:
+                logger.debug(f"[ALERTBOT-HEAL] candidate target resolve failed: {type(e).__name__}")
+                continue
+            try:
+                bot_ent = await c.get_input_entity(f"@{bot.bot_username}")
+            except Exception as e:
+                logger.debug(f"[ALERTBOT-HEAL] candidate bot resolve failed: {type(e).__name__}")
+                continue
+            # 1) الدعوة (وجود مسبق/قيد تواصل = مسموح الاستمرار للفحص)
+            try:
+                await c(InviteToChannelRequest(target, [bot_ent]))
+                await asyncio.sleep(1.5)
+            except Exception as e:
+                s = str(e).upper()
+                if "ALREADY_PARTICIPANT" in s or "USER_NOT_MUTUAL" in s:
+                    logger.info(f"[ALERTBOT-HEAL] invite tolerated: {type(e).__name__}")
+                else:
+                    logger.info(f"[ALERTBOT-HEAL] invite failed [{type(e).__name__}] — next candidate")
+                    continue
+            # 2) فحص العضوية قبل أي ترقية — مشرف أصلاً لا يُلمس إطلاقاً
+            try:
+                await bot.check_membership()
+            except Exception:
+                pass
+            if bot.membership_ok is True and bot.membership_status in (
+                "administrator", "creator"
+            ):
+                logger.warning(
+                    f"[ALERTBOT-HEAL] SUCCESS (already-admin, rights untouched) — "
+                    f"@{bot.bot_username} عضو مشرف في قناة الهدف"
+                )
+                await self._alertbot_admin_notify(
+                    "✅ تم استعادة أزرار التنبيهات: بوت التنبيهات "
+                    f"@{bot.bot_username} عضو مشرف في قناة الهدف ولم يُعدّل "
+                    "أي صلاحية. زرا «مراسلة» و«عرض الرسالة» سيعملان في "
+                    "التنبيه التالي."
+                )
+                return True
+            if bot.membership_ok is not True:
+                # الدعوة لم تُثبت العضوية بعد (قد تؤخرها تيليجرام) — نحاول
+                # الترقية على أي حال؛ رفضها يعني الانتقال للمرشّح التالي.
+                logger.info(
+                    "[ALERTBOT-HEAL] membership unverified after invite — "
+                    "trying promote anyway"
+                )
+            # 3) الترقية بصلاحية نشر الرسائل فقط (عضو عادي بلا صلاحيات
+            #    تُستبدل — لا خطر على مشرف قائم)
+            try:
+                rights = ChatAdminRights(
+                    change_info=False,
+                    post_messages=True,
+                    edit_messages=False,
+                    delete_messages=False,
+                    ban_users=False,
+                    invite_users=False,
+                    pin_messages=False,
+                    add_admins=False,
+                )
+                await c(EditAdminRequest(target, bot_ent, rights, "alerts"))
+                logger.info("[ALERTBOT-HEAL] promote request sent (post_messages only)")
+            except Exception as e:
+                logger.info(f"[ALERTBOT-HEAL] promote failed [{type(e).__name__}] — next candidate")
+                continue
+            # 4) التحقق النهائي
+            try:
+                await asyncio.sleep(1.0)
+                await bot.check_membership()
+            except Exception:
+                pass
+            if bot.membership_ok is True:
+                logger.warning(
+                    "[ALERTBOT-HEAL] SUCCESS — "
+                    f"@{bot.bot_username} re-added as channel admin "
+                    "(post_messages only) — أزرار التنبيهات مستعادة"
+                )
+                await self._alertbot_admin_notify(
+                    "✅ تم استعادة أزرار التنبيهات تلقائياً: أعيدت إضافة بوت "
+                    f"التنبيهات @{bot.bot_username} إلى قناة الهدف بصلاحية "
+                    "«نشر الرسائل» فقط. زرا «مراسلة» و«عرض الرسالة» سيعملان "
+                    "في التنبيه التالي (بلا إعادة تشغيل)."
+                )
+                return True
+        logger.warning(
+            "[ALERTBOT-HEAL] all candidates exhausted — لا حساب يملك صلاحية "
+            "الإضافة/الترقية؛ سيُرسل تحذير إداري بخطوات الإضافة اليدوية"
+        )
+        await self._alertbot_admin_warn(trigger=trigger, reason="no_admin_rights")
+        return False
+
+    async def _alertbot_admin_notify(self, text: str) -> None:
+        """رسالة إدارية مباشرة عبر Bot API إلى ADMIN_CHAT_ID (فشل-آمن)."""
+        bot = getattr(self, "alert_bot", None)
+        admin = int(getattr(CFG, "ADMIN_CHAT_ID", 0) or 0)
+        if bot is None or not bot.enabled or not admin:
+            return
+        try:
+            ok, _ = await bot.send_plain(text, chat_id=admin, silent=False)
+            logger.info(f"[ALERTBOT-HEAL] admin notify sent ok={ok}")
+        except Exception as e:
+            logger.debug(f"[ALERTBOT-HEAL] admin notify failed: {type(e).__name__}")
+
+    async def _alertbot_admin_warn(self, trigger: str, reason: str) -> None:
+        """تحذير إداري (cooldown افتراضي 6 ساعات) بخطوات الإضافة اليدوية.
+
+        رسالة DM عبر Bot API تعمل حتى بغير عضوية قناة الهدف (المراسلة
+        الخاصة لا تتطلب عضوية). الفشل مسجل فقط — لا استثناءات."""
+        cd = max(600, int(getattr(CFG, "ALERT_BOT_WARN_COOLDOWN_SECONDS", 21600) or 21600))
+        now = time.time()
+        if (now - self._alertbot_warn_last_ts) < cd:
+            return
+        self._alertbot_warn_last_ts = now
+        bot = getattr(self, "alert_bot", None)
+        _bot_name = f"@{bot.bot_username}" if bot and bot.bot_username else "بوت التنبيهات"
+        await self._alertbot_admin_notify(
+            "⚠️ أزرار التنبيهات («مراسلة» و«عرض الرسالة») معطّلة: بوت التنبيهات "
+            "ليس عضواً في قناة الهدف، وتيليجرام يرفض إرفاق الأزرار من حسابات "
+            f"المستخدمين.\n\nجرّبت الإضافة التلقائية ({trigger}) ولم تنجح "
+            f"({reason}).\n\nالحل اليدوي (30 ثانية):\n"
+            "1) افتح قناة الهدف ← إدارة القناة ← المشرفون.\n"
+            f"2) إضافة مشرف ← ابحث عن: {_bot_name}\n"
+            "3) فعّل صلاحية «نشر الرسائل» فقط ثم احفظ.\n\n"
+            "بعد الإضافة تُستعاد الأزرار تلقائياً في التنبيه التالي — لا حاجة "
+            "لإعادة تشغيل الخدمة."
+        )
+
+    async def _alertbot_membership_watchdog(self) -> None:
+        """حلقة مراقبة عضوية بوت التنبيهات (دورة 60s، فحص كامل دوري).
+
+        * طلب إصلاح فوري من send() (403 not-member) → محاولة إصلاح.
+        * فحص كامل دوري (ALERT_BOT_MEMBERSHIP_RECHECK_SECONDS افتراضي 900s)
+          يحدّث الحالة ويكشف الاستعادة اليدوية بسرعة.
+        * الحلقة تنتظر _shutdown_event (إيقاف نظيف فوري بلا نوم متبق).
+        لا ترفع استثناءات إطلاقاً (فشل-آمن)."""
+        check_every = max(
+            1,
+            int(getattr(CFG, "ALERT_BOT_MEMBERSHIP_RECHECK_SECONDS", 900) or 900) // 60,
+        )
+        cycle = 0
+        while not self._shutdown_event.is_set():
+            try:
+                await asyncio.wait_for(
+                    self._shutdown_event.wait(),
+                    timeout=_ALERTBOT_WATCHDOG_CYCLE_S,
+                )
+                break  # الإيقاف مفعّل → إنهاء نظيف
+            except asyncio.TimeoutError:
+                pass
+            try:
+                bot = getattr(self, "alert_bot", None)
+                if bot is None or not bot.enabled:
+                    continue
+                if bot._heal_requested:
+                    bot._heal_requested = False
+                    if self._alertbot_heal_cooldown_ok():
+                        await self._heal_alertbot_membership(trigger="send_403")
+                cycle += 1
+                if cycle % check_every == 0 or bot.membership_ok is None:
+                    await bot.check_membership()
+                    if bot.membership_ok is False and self._alertbot_heal_cooldown_ok():
+                        await self._heal_alertbot_membership(trigger="periodic")
+            except Exception as e:
+                logger.debug(f"[ALERTBOT-HEAL] watchdog cycle error: {type(e).__name__}")
 
     async def _warmup_chat_caches(self) -> None:
         """v10.4: prefetch the entities of recently-seen source chats into

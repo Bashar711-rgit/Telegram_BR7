@@ -512,3 +512,52 @@ Stage Summary:
 - القرار: تأجيل الملف فقط — أُزيل من main مؤقتاً وينتظر إعادة التطبيق بعد
   تدوير التوكن؛ النسخة الكاملة محفوظة في فرع feature/v14.8.0-audit-closure
   (6ee5b12). كل إصلاحات الكود الأخرى دُفعت ونُشرت.
+
+---
+
+Task ID: v14.9.1 (Buttons Heal — استعادة أزرار التنبيهات [مراسلة][عرض الرسالة])
+Agent: Z.ai Code (main orchestrator)
+Task: بلاغ المالك «التنبيهات تعمل بلا أزرار» — تشخيص إنتاجي وإصلاح ذاتي كامل
+
+Work Log:
+- **التشخيص من الإنتاج (سجلات Render الحية + Bot API مباشرة)**: بوت التنبيهات
+  @alzariqi711r_bot ليس عضواً في قناة الهدف TARGET_GROUP_ID — كل إرسال AlertBot
+  يفشل `bot_api_403:Forbidden: bot is not a member of the channel chat` فيسقط
+  الإرسال لمسار حسابات المستخدمين، وتيليجرام يرفض إرفاق inline buttons من حساب
+  مستخدم (`silent_drop_no_reply_markup` — قيد منصة موثق منذ v14.7). النتيجة:
+  تنبيهات تصل نصاً بروابط ترويسة فقط وبلا زرَي «مراسلة» و«عرض الرسالة».
+  الإعدادات سليمة (ALERT_WITH_BUTTONS=true / ALERT_BOT_ENABLED=true) — المشكلة
+  عضوية حصراً، والسجلات تؤكد فشل كل تسليم AlertBot منذ إقلاع النسخة الحالية.
+- **الإصلاح (v14.9.1 Buttons Heal) — أربع طبقات**:
+  * alert_bot.py: حالة عضوية رسمية (membership_ok/status/error + طابع زمني) —
+    check_membership يحدّثها من رد تيليجرام (403 not-member = False بصدق، فشل
+    عابر بعد تحقق ناجح يحفظ السبب دون قلب الحالة)، send() الناجح يثبت العضوية
+    (verified_by_send)، send() الفاشل بـ403 not-member يقلبها ويرفع
+    _heal_requested، وstatus_snapshot() لقطة ثابتة المفاتيح بلا أسرار.
+  * main.py — الإصلاح الذاتي (ALERT_BOT_AUTO_ADD=true افتراضياً):
+    _heal_alertbot_membership يمر على مرشّحين (المرسل اللاصق للقناة ← main ←
+    المراقبون الأحياء) ويحاول دعوة البوت لقناة الهدف ثم ترقيته بصلاحية «نشر
+    الرسائل» فقط. **حماية الصلاحيات**: بوت مشرف أصلاً لا يُرقّى إطلاقاً
+    (EditAdminRequest يستبدل الصلاحيات — الترقية الأعمى كانت ستسقط
+    edit/delete/pin إن وُجدت). تحقق نهائي عبر check_membership بعد كل خطوة.
+    فشل كل المرشحين → تحذير إداري مباشر DM بخطوات الإضافة اليدوية (cooldown
+    6 ساعات؛ notify عند النجاح).
+  * main.py — حلقة مراقبة `_alertbot_membership_watchdog` (دورة 60s عبر
+    _ALERTBOT_WATCHDOG_CYCLE_S، فحص كامل كل 15 دقيقة، إصلاح فوري عند
+    _heal_requested بعد cooldown 30 دقيقة، إيقاف نظيف عبر _shutdown_event).
+  * /health/full يعرض قسماً جديداً `alert_bot` (enabled/bot_username/
+    membership_ok/status/error/age/heal_requested) — حالة الأزرار مرئية
+    للمراقبة الخارجية لأول مرة.
+- الاختبارات: tests/test_alertbot_membership_state.py — 19 اختباراً حتمياً
+  (حالات العضوية الأربع + قلب الحالة عند الإرسال + لقطة بلا أسرار + مسارات
+  heal: مشرف أصلاً/ترقية post_messages فقط/already-participant/فشل شامل +
+  cooldown التحذير + مفتاح الإيقاف + cooldown الإصلاح + حلقة المراقبة).
+- BOT_VERSION → 14.9.1 («Buttons Heal»).
+
+Stage Summary:
+- المجموعة الكاملة: **1094/1094 PASS** (EXIT=0) — py_compile/compileall PASS.
+- التعافي التلقائي: بمجرد عودة العضوية (تلقائياً أو يدوياً) ينجح التنبيه
+  التالي عبر AlertBot بالأزرار — بلا إعادة تشغيل.
+- خارج الكود: إن تعذر الإصلاح الذاتي (لا حساب يملك صلاحية الإضافة) يصل المالك
+  DM بخطوات الإضافة اليدوية: قناة الهدف ← إدارة ← المشرفون ← إضافة مشرف ←
+  بوت التنبيهات ← «نشر الرسائل» فقط.
