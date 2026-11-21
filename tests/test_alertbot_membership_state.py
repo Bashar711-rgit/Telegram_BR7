@@ -12,9 +12,11 @@ tests/test_alertbot_membership_state.py — v14.9.1 Buttons Heal
   2) send() الناجح يثبت العضوية؛ فشل 403 not-member يقلبها ويطلب إصلاحاً
      ذاتياً (_heal_requested) — بلا أي استثناء خروج.
   3) status_snapshot لقطة ثابتة المفاتيح بلا أسرار إطلاقاً.
-  4) الإصلاح الذاتي (heal): بوت مشرف أصلاً لا يُرقّى (حماية صلاحياته من
-     الاستبدال)، عضو عادي يُرقّى post_messages فقط، فشل كل المرشحين →
-     تحذير إداري مباشر، ومفتاح ALERT_BOT_AUTO_ADD=false يعطّل المسار.
+  4) الإصلاح الذاتي (heal) بسلّم القنوات الرسمي: بوت مشرف أصلاً لا
+     يُلمس؛ EditAdminRequest مباشرة (add-as-admin) قبل أي دعوة؛
+     USER_NOT_PARTICIPANT → دعوة ثم إضافة-كمشرف؛ صلاحية post_messages
+     فقط؛ فشل كل المرشحين → تحذير إداري مباشر؛ ALERT_BOT_AUTO_ADD=false
+     يعطّل المسار.
   5) حلقة المراقبة تُنهى نفسها فوراً عند الإيقاف (إيقاف نظيف).
 
 كل الاختبارات محاكاة بالكامل (لا شبكة، لا تيليجرام إنتاجي).
@@ -287,9 +289,8 @@ class TestHeal:
         monkeypatch.setattr(asyncio, "sleep", _zero_sleep)
         ok = await BotApp._heal_alertbot_membership(app, trigger="test", clients=[client])
         assert ok is True
-        names = [n for n, _ in client.requests]
-        assert "InviteToChannelRequest" in names
-        assert "EditAdminRequest" not in names
+        # بلا أي طلب تيليجرام إطلاقاً — الفحص يسبق كل عملية (حماية الصلاحيات)
+        assert client.requests == []
         assert bot.membership_ok is True
 
     @pytest.mark.asyncio
@@ -311,16 +312,65 @@ class TestHeal:
         assert bot.membership_ok is True
 
     @pytest.mark.asyncio
-    async def test_invite_already_participant_tolerated(self, monkeypatch):
-        class _Already(Exception):
-            pass
-
-        bot = _member_status_bot(monkeypatch, ["administrator"])
-        client = _FakeClient(invite_error=_Already("USER_ALREADY_PARTICIPANT"))
+    async def test_direct_add_as_admin_first_no_invite(self, monkeypatch):
+        """المسار الرسمي للقنوات: EditAdminRequest مباشرة بلا دعوة مسبقة."""
+        bot = _member_status_bot(monkeypatch, ["left", "administrator"])
+        client = _FakeClient()
         app = _StubApp(bot)
         monkeypatch.setattr(asyncio, "sleep", _zero_sleep)
         ok = await BotApp._heal_alertbot_membership(app, trigger="test", clients=[client])
         assert ok is True
+        names = [n for n, _ in client.requests]
+        # لا دعوة إطلاقاً — الإضافة-كمشرف المباشرة نجحت
+        assert "InviteToChannelRequest" not in names
+        assert names.count("EditAdminRequest") == 1
+
+    @pytest.mark.asyncio
+    async def test_invite_fallback_on_not_participant_then_tolerate(self, monkeypatch):
+        """USER_NOT_PARTICIPANT من الإضافة المباشرة → دعوة (وجود مسبق
+        متسامح) → إضافة-كمشرف → تحقق."""
+        class _NotParticipant(Exception):
+            pass
+
+        class _Already(Exception):
+            pass
+
+        bot = _member_status_bot(monkeypatch, ["left", "administrator"])
+        client = _FakeClient(
+            invite_error=_Already("USER_ALREADY_PARTICIPANT"),
+            promote_error=None,
+        )
+        app = _StubApp(bot)
+        monkeypatch.setattr(asyncio, "sleep", _zero_sleep)
+
+        # أول EditAdminRequest يرفع USER_NOT_PARTICIPANT، ثانيها ينجح
+        original_call = client.__class__.__call__
+
+        async def scripted_call(self_, req):
+            name = type(req).__name__
+            self_.requests.append((name, req))
+            if name == "EditAdminRequest":
+                if self_.promote_error is not None:
+                    err = self_.promote_error
+                    self_.promote_error = None  # مرة واحدة فقط
+                    raise err
+                return SimpleNamespace(updates=[])
+            if name == "InviteToChannelRequest":
+                if self_.invite_error is not None:
+                    err = self_.invite_error
+                    self_.invite_error = None
+                    raise err
+                return SimpleNamespace(updates=[])
+            return SimpleNamespace(updates=[])
+
+        client.promote_error = _NotParticipant("USER_NOT_PARTICIPANT")
+        monkeypatch.setattr(client.__class__, "__call__", scripted_call)
+        ok = await BotApp._heal_alertbot_membership(app, trigger="test", clients=[client])
+        assert ok is True
+        names = [n for n, _ in client.requests]
+        assert names == ["EditAdminRequest", "InviteToChannelRequest", "EditAdminRequest"]
+        rights_ok = client.requests[0][1].admin_rights.post_messages is True
+        assert rights_ok
 
     @pytest.mark.asyncio
     async def test_all_candidates_fail_sends_admin_warn(self, monkeypatch):
@@ -328,7 +378,8 @@ class TestHeal:
         bot = AlertBot(token="123:fake", chat_id=TARGET)
         bot.bot_id = 8433129002
         bot.bot_username = BOT_UNAME
-        client = _FakeClient(invite_error=Exception("CHAT_ADMIN_REQUIRED"))
+        bot = _member_status_bot(monkeypatch, ["left"])
+        client = _FakeClient(promote_error=Exception("CHAT_ADMIN_REQUIRED"))
 
         app = _StubApp(bot)
         sent: List[str] = []
@@ -349,10 +400,9 @@ class TestHeal:
     @pytest.mark.asyncio
     async def test_warn_cooldown_suppresses_repeat(self, monkeypatch):
         """ثانية متتالية بلا صلاحيات لا تكرر الرسالة (cooldown 6 ساعات)."""
-        bot = AlertBot(token="123:fake", chat_id=TARGET)
-        bot.bot_id = 8433129002
-        bot.bot_username = BOT_UNAME
-        client = _FakeClient(invite_error=Exception("CHAT_ADMIN_REQUIRED"))
+        # _member_status_bot = بلا أي اتصال شبكة حقيقي (عزل الاختبارات)
+        bot = _member_status_bot(monkeypatch, ["left"])
+        client = _FakeClient(promote_error=Exception("CHAT_ADMIN_REQUIRED"))
         app = _StubApp(bot)
         sent: List[str] = []
 

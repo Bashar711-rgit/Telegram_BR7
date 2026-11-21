@@ -2323,18 +2323,9 @@ class EnhancedTelegramBot:
             except Exception as e:
                 logger.debug(f"[ALERTBOT-HEAL] candidate bot resolve failed: {type(e).__name__}")
                 continue
-            # 1) الدعوة (وجود مسبق/قيد تواصل = مسموح الاستمرار للفحص)
-            try:
-                await c(InviteToChannelRequest(target, [bot_ent]))
-                await asyncio.sleep(1.5)
-            except Exception as e:
-                s = str(e).upper()
-                if "ALREADY_PARTICIPANT" in s or "USER_NOT_MUTUAL" in s:
-                    logger.info(f"[ALERTBOT-HEAL] invite tolerated: {type(e).__name__}")
-                else:
-                    logger.info(f"[ALERTBOT-HEAL] invite failed [{type(e).__name__}] — next candidate")
-                    continue
-            # 2) فحص العضوية قبل أي ترقية — مشرف أصلاً لا يُلمس إطلاقاً
+            # ══ فحص العضوية الحالية أولاً — مشرف أصلاً لا يُلمس إطلاقاً ══
+            # (EditAdminRequest يستبدل الصلاحيات — الترقية الأعمى كانت ستسقط
+            # صلاحيات قائمة مثل edit/delete/pin إن وُجدت).
             try:
                 await bot.check_membership()
             except Exception:
@@ -2353,32 +2344,65 @@ class EnhancedTelegramBot:
                     "التنبيه التالي."
                 )
                 return True
-            if bot.membership_ok is not True:
-                # الدعوة لم تُثبت العضوية بعد (قد تؤخرها تيليجرام) — نحاول
-                # الترقية على أي حال؛ رفضها يعني الانتقال للمرشّح التالي.
-                logger.info(
-                    "[ALERTBOT-HEAL] membership unverified after invite — "
-                    "trying promote anyway"
-                )
-            # 3) الترقية بصلاحية نشر الرسائل فقط (عضو عادي بلا صلاحيات
-            #    تُستبدل — لا خطر على مشرف قائم)
+            # ══ المسار الرسمي للقنوات: إضافة-كمشرف مباشرة ══
+            # القنوات ترفض دعوة البوتات كأعضاء عاديين (InviteToChannelRequest
+            # → UserBotError حادثة الإقلاع 21-11). Telegram الرسمي يضيف
+            # البوت للقناة عبر EditAdminRequest مباشرة — تعمل حتى لغير
+            # العضو (add-as-admin في خطوة واحدة)، وصلاحية نشر الرسائل فقط.
+            rights = ChatAdminRights(
+                change_info=False,
+                post_messages=True,
+                edit_messages=False,
+                delete_messages=False,
+                ban_users=False,
+                invite_users=False,
+                pin_messages=False,
+                add_admins=False,
+            )
+            promoted = False
             try:
-                rights = ChatAdminRights(
-                    change_info=False,
-                    post_messages=True,
-                    edit_messages=False,
-                    delete_messages=False,
-                    ban_users=False,
-                    invite_users=False,
-                    pin_messages=False,
-                    add_admins=False,
-                )
                 await c(EditAdminRequest(target, bot_ent, rights, "alerts"))
-                logger.info("[ALERTBOT-HEAL] promote request sent (post_messages only)")
+                promoted = True
+                logger.info(
+                    "[ALERTBOT-HEAL] direct add-as-admin sent "
+                    "(EditAdminRequest, post_messages only)"
+                )
             except Exception as e:
-                logger.info(f"[ALERTBOT-HEAL] promote failed [{type(e).__name__}] — next candidate")
+                s = str(e).upper()
+                if "NOT_PARTICIPANT" in s or "PARTICIPANT_MISSING" in s:
+                    # بعض الخوادم تشترط العضوية أولاً → دعوة ثم إضافة-كمشرف
+                    try:
+                        await c(InviteToChannelRequest(target, [bot_ent]))
+                        await asyncio.sleep(1.5)
+                    except Exception as e2:
+                        s2 = str(e2).upper()
+                        if "ALREADY_PARTICIPANT" in s2 or "USER_NOT_MUTUAL" in s2:
+                            logger.info(f"[ALERTBOT-HEAL] invite tolerated: {type(e2).__name__}")
+                        else:
+                            logger.info(
+                                f"[ALERTBOT-HEAL] invite fallback failed "
+                                f"[{type(e2).__name__}] — next candidate"
+                            )
+                            continue
+                    try:
+                        await c(EditAdminRequest(target, bot_ent, rights, "alerts"))
+                        promoted = True
+                        logger.info("[ALERTBOT-HEAL] add-as-admin sent after invite")
+                    except Exception as e3:
+                        logger.info(
+                            f"[ALERTBOT-HEAL] promote failed after invite "
+                            f"[{type(e3).__name__}] — next candidate"
+                        )
+                        continue
+                else:
+                    logger.info(
+                        f"[ALERTBOT-HEAL] direct add-as-admin rejected "
+                        f"[{type(e).__name__}] — next candidate"
+                    )
+                    continue
+            if not promoted:
                 continue
-            # 4) التحقق النهائي
+            # ══ التحقق النهائي (مصدر الحقيقة: getChatMember من Bot API) ══
             try:
                 await asyncio.sleep(1.0)
                 await bot.check_membership()
@@ -2397,6 +2421,10 @@ class EnhancedTelegramBot:
                     "في التنبيه التالي (بلا إعادة تشغيل)."
                 )
                 return True
+            logger.info(
+                "[ALERTBOT-HEAL] promote sent but membership unverified — "
+                "next candidate"
+            )
         logger.warning(
             "[ALERTBOT-HEAL] all candidates exhausted — لا حساب يملك صلاحية "
             "الإضافة/الترقية؛ سيُرسل تحذير إداري بخطوات الإضافة اليدوية"
