@@ -84,7 +84,7 @@ class _FakeClient:
 def fast_fixer():
     """F بفاصل اختباري صغير (0.001–0.002) كي لا تُبطئ الاختبارات —
     حدود الـjitter الافتراضية (2–5) تُختبر في اختبار مستقل."""
-    return ReplyFixer(jitter_min=0.001, jitter_max=0.002)
+    return ReplyFixer(enabled=True, jitter_min=0.001, jitter_max=0.002)
 
 
 @pytest.fixture()
@@ -98,7 +98,7 @@ def patch_telethon(monkeypatch):
 
 class TestCaps:
     def test_hourly_cap_blocks_second_attempt(self):
-        f = ReplyFixer(hourly_per_user=1, jitter_min=0, jitter_max=0)
+        f = ReplyFixer(enabled=True, hourly_per_user=1, jitter_min=0, jitter_max=0)
         ok, why = f.allowed(UID)
         assert ok is True
         f._record_attempt(UID)
@@ -106,7 +106,7 @@ class TestCaps:
         assert ok is False and why == "hourly_cap"
 
     def test_daily_cap(self):
-        f = ReplyFixer(daily_cap=2, jitter_min=0, jitter_max=0)
+        f = ReplyFixer(enabled=True, daily_cap=2, jitter_min=0, jitter_max=0)
         f._record_attempt(1)
         f._record_attempt(1)
         ok, why = f.allowed(2)  # الحد اليومي كلي — ليس لكل مستخدم
@@ -118,7 +118,7 @@ class TestCaps:
         assert ok is False and why == "disabled"
 
     def test_broadcast_disable(self):
-        f = ReplyFixer(jitter_min=0, jitter_max=0)
+        f = ReplyFixer(enabled=True, jitter_min=0, jitter_max=0)
         f.disable_for_broadcast("target is broadcast channel")
         ok, why = f.allowed(UID)
         assert ok is False and why == "broadcast_target"
@@ -251,7 +251,7 @@ class TestJitterBounds:
             captured.append(sec)
 
         monkeypatch.setattr(rf.asyncio, "sleep", _fake_sleep)
-        f = ReplyFixer()  # الافتراضي 2–5
+        f = ReplyFixer(enabled=True)  # الافتراضي 2–5 (v14.9.3: التشغيل الإنتاجي من config)
         client = _FakeClient(entities=[MessageEntityMentionName()])
         await f.run(client, chat_id=CHAT, reply_to_msg_id=ALERT_MSG_ID,
                     user_id=UID, access_hash=HASH)

@@ -490,9 +490,10 @@ async def test_acceptance_4_owner_outside_target_moves_to_next_account(db):
 
 
 @pytest.mark.asyncio
-async def test_acceptance_5_channel_sender_uses_forward_and_link(db):
+async def test_acceptance_5_channel_sender_uses_link_only_no_forward(db):
     """5) مرسل قناة/أدمن مجهول → لا Text Mention إطلاقاً؛ التنبيه يخرج
-    برابط الرسالة + forward يُظهر اسم المرسل أعلى النسخة."""
+    برابط الرسالة داخل البطاقة. v14.9.3: لا forward نهائياً — رسالة
+    واحدة لكل تنبيه (طلب المالك: دون اعاده تحويل/توجيه)."""
     client = FakeClient("Account 1")
     m = _monitor(db, "Account 1", client)
     _wire(db, m, (m, client))
@@ -500,9 +501,8 @@ async def test_acceptance_5_channel_sender_uses_forward_and_link(db):
     await m._send_alert(data, "واجب", data["text"], "acc5-hash", {"rule_tag": None})
     sends = [c for c in client.calls if c["kind"] == "message"]
     assert sends and all(not c.get("formatting_entities") for c in sends)
-    assert len(client.forward_calls) == 1
-    fc = client.forward_calls[0]
-    assert fc["to"] == TARGET and fc["msg_id"] == MSG_ID and fc["from_peer"] == CHAT_ID
+    assert len(sends) == 1, "رسالة واحدة فقط (v14.9.3)"
+    assert client.forward_calls == [], "لا إعادة تحويل نهائياً (v14.9.3)"
 
 
 @pytest.mark.asyncio
@@ -539,7 +539,8 @@ async def test_acceptance_7_contact_method_recorded_for_every_alert(db):
     m2 = _monitor(db, "Account 1", c2)
     _wire(db, m2, (m2, c2))
     await m2._send_alert(_alert_data(), "واجب", "نص الثاني", "cm-mention", {"rule_tag": None})
-    # (ج) forward (قناة) — المرسل مختلف أيضاً (sender_id يدخل البصمة)
+    # (ج) قناة — المرسل مختلف أيضاً (sender_id يدخل البصمة)
+    # v14.9.3: لا forward — مرسل القناة يخرج برابط الرسالة (contact_method=link)
     c3 = FakeClient("Account 1")
     m3 = _monitor(db, "Account 1", c3)
     _wire(db, m3, (m3, c3))
@@ -552,15 +553,16 @@ async def test_acceptance_7_contact_method_recorded_for_every_alert(db):
 
     assert await _method("cm-username") == "username"
     assert await _method("cm-mention") == "mention"
-    assert await _method("cm-forward") == "forward"
+    assert await _method("cm-forward") == "link"
 
 
 # ═════════════════ §4 تصعيد: كيان مفقود بعد الإرسال → forward ═════════════════
 
 @pytest.mark.asyncio
-async def test_unverified_mention_escalates_to_forward(db):
+async def test_unverified_mention_single_card_no_forward(db):
     """أُرسل التنبيه بmention لكن الرد بلا كيان (حالة نادرة) → تسجيل السبب
-    + forward supplement (بلا إعادة إرسال التنبيه — لا تكرار)."""
+    فقط. v14.9.3: لا forward supplement — رسالة واحدة، الإصلاح الذاتي
+    (alert_ui heal) يتكفل بقابلية النقر بلا رسائل إضافية."""
     client = FakeClient("Account 1", drop_entities=True)
     m = _monitor(db, "Account 1", client)
     _wire(db, m, (m, client))
@@ -568,10 +570,10 @@ async def test_unverified_mention_escalates_to_forward(db):
     await m._send_alert(data, "واجب", data["text"], "uv-hash", {"rule_tag": None})
     sends = [c for c in client.calls if c["kind"] == "message"]
     assert len(sends) == 1, "التنبيه لا يُعاد إرساله (لا تكرار)"
-    assert len(client.forward_calls) == 1, "التصعيد تم عبر forward"
+    assert client.forward_calls == [], "لا إعادة تحويل نهائياً (v14.9.3)"
     await db._flush()
     row = await db._fetchone("SELECT contact_method FROM alerts WHERE message_hash = ?", ("uv-hash",))
-    assert row["contact_method"] == "forward"
+    assert row["contact_method"] == "link"
 
 
 @pytest.mark.asyncio

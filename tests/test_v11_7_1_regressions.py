@@ -256,6 +256,7 @@ class TestReplyFixLadder:
         from reply_fix import reset_reply_fixer, get_reply_fixer
         reset_reply_fixer()
         fixer = get_reply_fixer()
+        fixer.enabled = True  # v14.9.3: اختبار الميكانيكا — الافتراضي الإنتاجي من config
         fixer.jitter_min = 0.0
         fixer.jitter_max = 0.0
 
@@ -283,6 +284,7 @@ class TestReplyFixLadder:
         from reply_fix import reset_reply_fixer, get_reply_fixer
         reset_reply_fixer()
         fixer = get_reply_fixer()
+        fixer.enabled = True  # v14.9.3: اختبار الميكانيكا — الافتراضي الإنتاجي من config
         fixer.jitter_min = 0.0
         fixer.jitter_max = 0.0
         client = _FakeClient(failures=["ErrOne", "ErrTwo"])
@@ -305,6 +307,7 @@ class TestReplyFixLadder:
         from reply_fix import reset_reply_fixer, get_reply_fixer
         reset_reply_fixer()
         fixer = get_reply_fixer()
+        fixer.enabled = True  # v14.9.3: اختبار الميكانيكا — الافتراضي الإنتاجي من config
         res = await fixer.run(
             _FakeClient([]), chat_id=-100777, reply_to_msg_id=42,
             user_id=SENDER_ID, access_hash=None, owner_account="t",

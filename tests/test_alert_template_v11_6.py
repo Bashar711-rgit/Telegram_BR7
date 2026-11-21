@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 """اختبارات القالب الموحد v11.6 — مصفوفة الحالات الـ14 الإلزامية (مواصفة المهلة).
 
-القالب الحرفي المطلوب:
-    المرسل: {اسم المرسل قابل للنقر}{ — @username}
+القالب الحرفي المطلوب — الصيغة المرجعية الموحدة v14.9.3 (تحديث بقرار المالك
+حلّ محل قالب v13 «المرسل: … — @username»):
 
-    نص الرسالة:
-
+    👤 {@username | الاسم}
+    المرسل : ID {sender_id}      (بلا معرف حقيقي → «المرسل : غير معروف»)
+    نص الرساله :
     {النص الأصلي كاملاً}
+    رابط الرساله : {رابط حقيقي فقط — بلا رابط يُحذف السطر كلياً}
 
-مع لوحة أزرار فعلية [ @username ][ جروب ] مرتبطة بالتنبيه (v14.9.2) —
-بلا رموز 👤/💬، بلا blockquote/اقتباس، وبلا وسوم خام ظاهرة.
+مع لوحة أزرار فعلية [ @username | الاسم | مراسلة ][ جروب ] مرتبطة بالتنبيه —
+بلا B_Bot ولا لاحقة «— @username»، وبلا blockquote/اقتباس، وبلا وسوم خام
+ظاهرة خارج وسط الاسم وسطر الرابط الشرعي.
 
 لكل حالة: صحة النص وترتيبه، عدم ظهور وسوم خام، الرابط الصحيح على الاسم،
 وجود الزرين ووجهة كل زر، وسلوك إعادة المحاولة/التكرار دون فقدان الأزرار.
@@ -73,34 +76,36 @@ def _visible(text: str) -> str:
 
 
 def _assert_template_contract(text: str, *, username: str = None,
-                              name: str = None, body: str = None) -> None:
-    """العقد الحرفي v13 — مشترك بين كل الحالات.
+                              name: str = None, body: str = None,
+                              sender_id: Any = None) -> None:
+    """العقد الحرفي — الصيغة المرجعية الموحدة v14.9.3 — مشترك بين كل الحالات.
 
-    البطاقة تبدأ بسطر اسم البوت (B_Bot) ثم سطر المرسل ثم قسم نص
-    الرسالة ثم النص الأصلي (مواصفة v13 §9: اسم البوت ← المرسل ←
-    «نص الرسالة:» ← المحتوى)."""
-    from contact_target import BOT_NAME_LINE as _BNL
+    البطاقة تبدأ بسطر «👤 {الاسم}» ثم «المرسل : ID …» ثم «نص الرساله :»
+    ثم النص الأصلي (سطر واحد بعد التسمية) ثم سطر «رابط الرساله :»."""
     visible = _visible(text)
-    # 1) الترتيب: اسم البوت ← سطر المرسل ← (فارغ) ← نص الرسالة: ← (فارغ) ← النص
     lines = visible.split("\n")
-    assert lines[0] == _BNL, f"سطر اسم البوت مفقود: {lines[0]!r}"
-    assert lines[1].startswith("المرسل: "), f"سطر المرسل مفقود: {lines[1]!r}"
-    assert "\n\nنص الرسالة:\n\n" in visible, "قسم «نص الرسالة:» بترتيبه مطلوب"
-    # 2) بلا رموز قديمة وبلا اقتباس
-    assert "👤" not in text and "💬" not in text
+    # 1) الترتيب: 👤 ← المرسل : ID ← نص الرساله : ← النص ← رابط الرساله :
+    assert lines[0].startswith("👤 "), f"سطر الاسم مفقود: {lines[0]!r}"
+    if username:
+        assert lines[0] == f"👤 @{username}", f"سطر الاسم لا يطابق: {lines[0]!r}"
+    elif name:
+        assert lines[0] == f"👤 {name}", f"سطر الاسم لا يطابق: {lines[0]!r}"
+    assert lines[1].startswith("المرسل : "), f"سطر المعرف مفقود: {lines[1]!r}"
+    if sender_id is not None:
+        if sender_id and int(sender_id) > 0:
+            assert lines[1] == f"المرسل : ID {sender_id}", f"سطر المعرف لا يطابق: {lines[1]!r}"
+        else:
+            assert lines[1] == "المرسل : غير معروف", f"بلا معرف → غير معروف: {lines[1]!r}"
+    assert "\nنص الرساله :\n" in visible, "قسم «نص الرساله :» بترتيبه مطلوب"
+    # 2) بلا رموز قديمة وبلا اقتباس (👤 مطلوب الآن — رأس البطاقة v14.9.3)
+    assert "💬" not in text
     assert "<blockquote>" not in text and "</blockquote>" not in text
     assert "<b>" not in text and "<i>" not in text
-    # 3) @username نص مستقل عند توفره فقط — لا يُختلق
-    if username:
-        assert f"— @{username}" in visible
-    else:
-        assert "— @" not in visible
-    # 4) الاسم في موضع الاسم (بعد الترويسة مباشرة)
-    if name:
-        assert f"المرسل: {name}" in visible
-    # 5) النص الأصلي كاملاً بعد التسمية (أسطره كما وردت)
+    # 3) الاسم الظاهر = @username عند توفره — ولا لاحقة «— @» مُختلقة أبداً
+    assert "— @" not in visible
+    # 4) النص الأصلي كاملاً بعد التسمية مباشرة (أسطره كما وردت)
     if body:
-        body_section = visible.split("\n\nنص الرسالة:\n\n", 1)[1]
+        body_section = visible.split("\nنص الرساله :\n", 1)[1]
         assert body_section.startswith(body), f"النص الأصلي مفقود/مقطوع: {body_section[:60]!r}"
 
 
@@ -133,33 +138,35 @@ class _FakeAlertBot(AlertBot):
 
 class TestSenderIdentityCases:
     def test_case1_valid_username(self):
-        """حالة 1: username صالح → رابط t.me على الاسم + « — @username» نصاً."""
+        """حالة 1: username صالح → الاسم الظاهر «@username» برابط t.me + زر
+        «@username» (الصيغة المرجعية الموحدة v14.9.3)."""
         built = build_alert_html(_data(sender_username="mohammed_99"))
         _assert_template_contract(built["text"], username="mohammed_99",
-                                  name="محمد العمري", body=ORIG)
+                                  body=ORIG, sender_id=SENDER_ID)
         assert 'href="https://t.me/mohammed_99"' in built["text"]
         assert built["contact_method"] == "username"
         contact = next(b for b in _row(built) if b["text"] == "@mohammed_99")  # v14.9.2
         assert contact["url"] == "https://t.me/mohammed_99"
 
     def test_case2_no_username_with_id(self):
-        """حالة 2: بلا username مع user_id → tg://user?id على الاسم بلا @."""
+        """حالة 2: بلا username مع user_id → tg://user?id على الاسم، وزر
+        المرسل باسم الظاهر بنفس الوسيلة (v14.9.3 — «مراسلة» بقي لبلا اسم)."""
         built = build_alert_html(_data())
         _assert_template_contract(built["text"], username=None,
-                                  name="محمد العمري", body=ORIG)
+                                  name="محمد العمري", body=ORIG, sender_id=SENDER_ID)
         assert 'href="tg://user?id=6079171409"' in built["text"]
-        contact = next(b for b in _row(built) if b["text"] == "مراسلة")
+        contact = next(b for b in _row(built) if b["text"] == "محمد العمري")
         assert contact["url"] == "tg://user?id=6079171409"  # v14.7.0: مخطط موثّق لكل العملاء
 
     def test_case3_insufficient_data(self):
         """حالة 3: لا هوية إطلاقاً → اسم آمن، بلا رابط مُختلق وبلا زر وهمي."""
         built = build_alert_html(_data(sender_id=0, sender_type="none",
                                        sender_first_name=None, sender_last_name=None))
-        _assert_template_contract(built["text"], username=None, body=ORIG)
+        _assert_template_contract(built["text"], username=None, body=ORIG, sender_id=0)
         assert "<a " not in built["text"]  # لا مرساة مختلقة
         assert built["contact_method"] == "text_only"
-        # لا زر مراسلة بلا هدف (لا https://t.me/None)
-        assert all(b["text"] != "مراسلة" for b in _row(built))
+        # لا زر مرسل بلا هدف (لا https://t.me/None ولا «مراسلة» بلا اسم)
+        assert [b["text"] for b in _row(built)] == ["جروب"]
 
     def test_username_suffix_helper(self):
         """« — @username» فقط عند صلاحية الشكل — لا لاحقة لمُدخلات فاسدة."""
@@ -181,7 +188,7 @@ class TestChatKindCases:
         group_btn = next(b for b in _row(built) if b["text"] == "جروب")  # v14.9.2
         assert group_btn["url"] == "https://t.me/mygroup"
         # ورابط الرسالة الكامل يبقى أفضل وسيلة عرض عند غياب القروب فقط
-        sender_btn = next(b for b in _row(built) if b["text"] == "مراسلة")
+        sender_btn = next(b for b in _row(built) if b["text"] == "محمد العمري")
         assert sender_btn["url"] == "tg://user?id=6079171409"
 
     def test_case5_private_group(self):
@@ -192,14 +199,15 @@ class TestChatKindCases:
 
     def test_case6_channel_post(self):
         """حالة 6: رسالة قناة → هوية القناة ≠ شخص قابل لمراسلة: بلا
-        tg://user مختلق وبلا زر مراسلة؛ اسم القناة يظهر فقط."""
+        tg://user مختلق وبلا زر مرسل؛ اسم القناة يظهر فقط (v14.9.3)."""
         built = build_alert_html(_data(sender_id=555, sender_type="channel",
                                        sender_first_name="قناة الأخبار",
                                        sender_last_name=None))
-        _assert_template_contract(built["text"], username=None, body=ORIG)
-        assert "tg://user" not in built["text"].replace('href="', 'href=') or \
-            'href="tg://user' not in built["text"]
-        assert all(b["text"] != "مراسلة" for b in _row(built))
+        _assert_template_contract(built["text"], username=None, name="قناة الأخبار",
+                                  body=ORIG, sender_id=555)
+        assert 'href="tg://user' not in built["text"]
+        # القنوات/المحذوفون بلا زر مرسل مختلق — زر القروب فقط (v14.9.3)
+        assert [b["text"] for b in _row(built)] == ["جروب"]
         # رابط القروب (هوية القناة/النشر) مستقل عن رابط المرسل (v14.9.2)
         group_btn = next((b for b in _row(built) if b["text"] == "جروب"), None)
         assert group_btn is not None and "/c/" in group_btn["url"]
@@ -211,10 +219,14 @@ class TestChatKindCases:
 
 class TestContentCases:
     def test_case7_arabic_multiline(self):
-        """حالة 7: عربي متعدد الأسطر — الأسطر والترتيب كما وردت حرفياً."""
+        """حالة 7: عربي متعدد الأسطر — الأسطر والترتيب كما وردت حرفياً
+        بعد «نص الرساله :» مباشرة (سطر واحد — v14.9.3)."""
         multi = "سطر أول\nسطر ثاني\n\nسطر رابع بعد فاصل"
         built = build_alert_html(_data(text=multi))
-        body = _visible(built["text"]).split("\n\nنص الرسالة:\n\n", 1)[1]
+        visible = _visible(built["text"])
+        lines = visible.split("\n")
+        link_idx = next(i for i, l in enumerate(lines) if l.startswith("رابط الرساله :"))
+        body = "\n".join(lines[3:link_idx])  # بعد: 👤 / المرسل : ID / نص الرساله :
         assert body == multi
 
     def test_case8_html_marks_and_quotes(self):
@@ -237,18 +249,18 @@ class TestContentCases:
         assert "🔥" in built["text"] and "✅" in built["text"]
 
     def test_case10_empty_text_with_media(self):
-        """حالة 10: نص فارغ مع وسائط → القالب سليم، القسم فارغ بصدق،
-        الأزرار باقية (الوسائط تصل عبر forward supplement)."""
+        """حالة 10: نص فارغ مع وسائط → القالب سليم، القسم فارغ بصدق، والأزرار باقية."""
         built = build_alert_html(_data(text=""))
         visible = _visible(built["text"])
-        assert visible.endswith("نص الرسالة:") or visible.rstrip("\n").endswith("نص الرسالة:")
+        # بعد «نص الرساله :» يليه سطر الرابط الشرعي مباشرة — بلا نص مُختلق
+        assert "نص الرساله :\n\nرابط الرساله :" in visible
         assert "<blockquote>" not in built["text"]
         assert len(_row(built)) >= 1
-        # حزمة الكيانات للمسار الاحتياطي بنفس القالب (v13: باسم البوت)
+        # حزمة الكيانات للمسار الاحتياطي بنفس القالب (v14.9.3)
         t = resolve_contact_target(sender_id=SENDER_ID)
         pack = build_alert_entity_pack("محمد العمري", "", t)
         assert pack["plain_text"].startswith(
-            f"{BOT_NAME_LINE}\nالمرسل: محمد العمري\n\nنص الرسالة:")
+            "👤 محمد العمري\nالمرسل : غير معروف\nنص الرساله :\n")
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -257,16 +269,17 @@ class TestContentCases:
 
 class TestMissingLinkCase:
     def test_case11_no_message_link(self):
-        """حالة 11: بلا رابط رسالة → زر عرض يختفي بصدق (لا روابط وهمية)،
-        وزر مراسلة يبقى؛ لا t.me/None أبداً."""
+        """حالة 11: بلا رابط رسالة → سطر «رابط الرساله :» يُحذف كلياً بصدق
+        (لا روابط وهمية)، وزر المرسل يبقى؛ لا t.me/None أبداً (v14.9.3)."""
         built = build_alert_html(_data(chat_id=-987654321, message_id=None,
                                        group_link=None, msg_link=None))
         row = _row(built)
         assert all(b["text"] != "عرض الرسالة" for b in row)
         assert all("None" not in str(b.get("url")) for b in row)
         assert all(b["text"] != "#" for b in row)
-        contact = next((b for b in row if b["text"] == "مراسلة"), None)
-        assert contact is not None  # مراسلة مستقلة عن رابط الرسالة
+        assert "رابط الرساله :" not in _visible(built["text"])  # بلا رابط → لا سطر
+        contact = next((b for b in row if b["text"] == "محمد العمري"), None)
+        assert contact is not None  # زر المرسل مستقل عن رابط الرسالة
 
     def test_view_falls_back_to_group_link_not_fake(self):
         """بلا رابط رسالة لكن مع رابط قروب → زر «جروب» يفتح المجموعة المصدر."""
@@ -395,16 +408,18 @@ class TestAllSendPathsCase:
         assert [b["text"] for b in kb2[0]] == ["عرض الرسالة"]
 
     def test_case14_entity_pack_matches_html_template(self):
-        """مسار MTProto الاحتياطي: نفس الشكل المرئي حرفياً عبر كيانات جاهزة."""
+        """مسار MTProto الاحتياطي: نفس الشكل المرئي حرفياً عبر كيانات جاهزة
+        (الصيغة المرجعية الموحدة v14.9.3 — كيان واحد للاسم)."""
         t = resolve_contact_target(sender_id=SENDER_ID, username="user1",
                                    first_name="محمد", last_name="العمري")
         pack = build_alert_entity_pack("محمد العمري", ORIG, t)
-        expected = (f"{BOT_NAME_LINE}\nالمرسل: محمد العمري — @user1\n\nنص الرسالة:\n\n" + ORIG)
+        expected = ("👤 @user1\nالمرسل : غير معروف\nنص الرساله :\n" + ORIG)
         assert pack["plain_text"] == expected
         ents = pack["formatting_entities"]
+        assert len(ents) == 1  # كيان واحد للاسم — بلا كيان ثانٍ للاسم البديل
         name_ent = next(e for e in ents if type(e).__name__ == "MessageEntityTextUrl")
-        assert name_ent.offset == utf16_len(SENDER_LABEL)
-        assert name_ent.length == utf16_len("محمد العمري")
+        assert name_ent.offset == utf16_len(SENDER_LABEL)  # بعد «👤 » (=3)
+        assert name_ent.length == utf16_len("@user1")
         assert name_ent.url == "https://t.me/user1"
         # لا كيان blockquote في أي حزمة (v11.6)
         assert all(type(e).__name__ != "MessageEntityBlockquote" for e in ents)
@@ -426,7 +441,7 @@ class TestAllSendPathsCase:
             {"text": "جروب", "url": "https://t.me/mygroup"},
         ]]  # v14.9.2
         _assert_template_contract(p["text"], username="user1",
-                                  name="محمد العمري", body=ORIG)
+                                  body=ORIG, sender_id=SENDER_ID)
 
     def test_case14_user_account_path_carries_buttons(self):
         """مسار حسابات المستخدمين (monitors._build_alert) يعيد اللوحة نفسها."""
@@ -442,7 +457,7 @@ class TestAllSendPathsCase:
                 "msg_link": f"https://t.me/mygroup/{MSG_ID}"}
         text, buttons = m._build_alert(sender, chat, "واجب", ORIG, {})
         _assert_template_contract(text, username="user1",
-                                  name="محمد العمري", body=ORIG)
+                                  body=ORIG, sender_id=SENDER_ID)
         assert buttons == [[
             {"text": "@user1", "url": "https://t.me/user1"},
             {"text": "جروب", "url": "https://t.me/mygroup"},

@@ -252,7 +252,7 @@ async def test_f18_reply_fix_limits_survive_restart(db):
     import negative_memory as nm
     from reply_fix import ReplyFixer
 
-    f1 = ReplyFixer()
+    f1 = ReplyFixer(enabled=True)
     nm.register_store("reply_fix", f1.snapshot_state, f1.restore_state)
     f1._record_attempt(555000111)
 
@@ -267,7 +267,7 @@ async def test_f18_reply_fix_limits_survive_restart(db):
     assert snap["v"] == 1 and "555000111" in snap["users"]
 
     # مثيل جديد (محاكاة إعادة تشغيل) — قبل الترطيب الحد غير معروف
-    f2 = ReplyFixer()
+    f2 = ReplyFixer(enabled=True)
     ok_before, _ = f2.allowed(555000111)
     assert ok_before is True
     f2.restore_state(snap)
@@ -280,7 +280,7 @@ async def test_f18_reply_fix_limits_survive_restart(db):
 def test_f18_reply_fix_snapshot_drops_stale_entries():
     from reply_fix import ReplyFixer
     import time as _t
-    f = ReplyFixer()
+    f = ReplyFixer(enabled=True)
     old = _t.monotonic() - 7200.0  # قبل ساعتين — خارج نافذة الساعة
     f._hour_history[42] = __import__("collections").deque([old], maxlen=8)
     snap = f.snapshot_state()

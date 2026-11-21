@@ -392,7 +392,7 @@ class _FakeAlertUI:
 
 
 def _card_plain_text() -> str:
-    """البطاقة كما يراها تيليجرام نصاً خاماً (بلا وسوم) — صيغة v12.1.0."""
+    """البطاقة كما يراها تيليجرام نصاً خاماً (بلا وسوم) — الصيغة المرجعية الموحدة v14.9.3."""
     data = {
         "sender_id": SENDER_ID, "sender_username": "Lara507",
         "sender_first_name": "هناء", "sender_last_name": "العنزي",
@@ -453,15 +453,17 @@ class TestDeliveryVerifierFixed:
 
     @pytest.mark.asyncio
     async def test_bbot_header_signature_recognized(self, db: EnhancedDatabase):
-        """RC-4: بطاقات v12.1.0+ تبدأ بسطر «B_Bot» — المُحقّق يتعرف عليها
-        (كان يرفضها لأنها لا تبدأ بـ«المرسل:») وحاجز الصدى يكتشفها."""
+        """RC-4 (v14.9.3 — الصيغة المرجعية الموحدة): البطاقة الحالية تبدأ بسطر
+        «👤 …» — المُحقّق يتعرف عليها وحاجز الصدى يكتشفها؛ التوقيعات التاريخية
+        (B_Bot/المرسل:) تبقى مقبولة للبطاقات القديمة الموجودة في القناة."""
         plain = _card_plain_text()
-        assert plain.lstrip().startswith("B_Bot")
+        assert plain.lstrip().startswith("👤 ")
         assert mon._is_current_card_header(plain.lstrip()) is True
         assert mon.is_alert_card_echo(plain) is True
-        # الصيغ الأقدم (بلا سطر الاسم) تبقى معترفاً بها
-        older = plain.split("\n", 1)[1]
-        assert mon.is_alert_card_echo(older) is True
+        # التوقيعات التاريخية تبقى معترفاً بها (بطاقات القناة القديمة)
+        legacy = "B_Bot\nالمرسل: هناء العنزي\n\nنص الرسالة:\n\nنص"
+        assert mon._is_current_card_header(legacy) is True
+        assert mon.is_alert_card_echo(legacy) is True
         # رسالة مستخدم عادية ليست بطاقة أبداً
         assert mon.is_alert_card_echo("المرسل: عندك حل؟") is False
 
@@ -498,11 +500,14 @@ class TestUnifiedCardCompleteness:
                                 group_link="https://t.me/src")
 
     def test_card_has_bot_name_sender_and_label(self):
+        """البطاقة الكاملة — الصيغة المرجعية الموحدة v14.9.3:
+        👤 ← المرسل : ID ← نص الرساله : ← النص ← رابط الرساله :"""
         built = self._built()
         t = built["text"]
-        assert t.startswith("B_Bot\n")
-        assert "المرسل: " in t.split("\n\n")[0]
-        assert "نص الرسالة:" in t
+        assert t.startswith('👤 <a href="https://t.me/Lara507">@Lara507</a>\n')
+        assert "\nالمرسل : ID 6079171409\n" in t
+        assert "\nنص الرساله :\n" in t
+        assert "\nرابط الرساله : https://t.me/src/531011" in t
         assert TEXT in t
 
     def test_card_has_both_buttons_with_correct_targets(self):
@@ -514,19 +519,23 @@ class TestUnifiedCardCompleteness:
         assert by_text["@Lara507"]["url"] == "https://t.me/Lara507"
 
     def test_no_username_still_reachable_and_complete(self):
-        """بلا username: الاسم رابط tg://user وزر مراسلة موجود — لا بيانات مختلقة."""
+        """بلا username: الاسم الظاهر رابط tg://user وزر المرسل باسم الظاهر موجود —
+        لا بيانات مختلقة (v14.9.3)."""
         built = self._built(sender_username=None)
         t = built["text"]
-        assert t.startswith("B_Bot\nالمرسل: <a href=\"tg://user?id=6079171409\">")
-        assert "— @" not in t.split("\n\n")[0]  # لا @username مُختلق
+        assert t.startswith('👤 <a href="tg://user?id=6079171409">هناء العنزي</a>\nالمرسل : ID')
+        assert "— @" not in t  # لا @username مُختلق
         row = built["buttons"][0]
         by_text = {b["text"]: b for b in row}
-        assert by_text["مراسلة"]["url"] == f"tg://user?id={SENDER_ID}"  # v14.7.0: بلا username
+        # v14.9.3: زر المرسل باسم الظاهر بنفس وسيلة الوصول
+        assert by_text["هناء العنزي"]["url"] == f"tg://user?id={SENDER_ID}"
 
     def test_long_text_truncated_with_marker_not_silently(self):
-        """نص طويل جداً: يُقص مع علامة … وسجل تحذير — لا حذف صامت كامل."""
+        """نص طويل جداً: يُقص مع علامة … وسجل تحذير — لا حذف صامت كامل
+        (القسم النصي قبل سطر الرابط الشرعي هو ما ينتهي بـ«…»)."""
         built = self._built(text="ا" * 5000)
-        assert built["text"].rstrip().endswith("…")
+        body = built["text"].rsplit("\nرابط الرساله :", 1)[0]
+        assert body.rstrip().endswith("…")
 
     def test_arabic_content_preserved_verbatim(self):
         """النص العربي يصل كما ورد (بعد فك الترميز) — بلا تحريف المعنى."""

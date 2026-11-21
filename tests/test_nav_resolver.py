@@ -409,23 +409,20 @@ class TestEntryPoint:
 # ═══════════════════════════════════════════════════════════════════════════
 class TestFrozenBuilderIntegration:
     async def test_alert_from_enriched_chat_info(self, monitor):
-        """التنبيه النهائي من بيانات مُحلّى: رابط المرسل + بطاقة «نص
-        الرسالة:» الموحدة (v10.9) — والأزرار من بوت التنبيهات فقط.
-
-        v10.9: الروابط انتقلت من سطر «رابط الرسالة :» إلى زر «عرض
-        الرسالة»؛ النص بطاقة موحدة (blockquote) لكل التنبيهات."""
+        """التنبيه النهائي من بيانات مُحلّى — الصيغة المرجعية الموحدة v14.9.3:
+        «👤 {الاسم}» + «المرسل : ID» + «نص الرساله :» + سطر «رابط الرساله :»
+        — والأزرار من بوت التنبيهات فقط."""
         sender = {"id": 777000111, "display": "أحمد", "username": "ahmed_99", "access_hash": None}
         chat = {"entity": None, "title": "مجموعة الطلاب", "id": -1001234567890,
                 "message_id": 789, "username": "mygroup",
                 "group_link": "https://t.me/mygroup", "msg_link": "https://t.me/mygroup/789"}
         alert, buttons = monitor._build_alert(sender, chat, "واجب", "نص التنبيه", {"msg_hash": "h1"})
-        assert '<a href="https://t.me/ahmed_99">أحمد</a>' in alert
-        # القالب الموحد v11.6: الاسم ← (فارغ) ← «نص الرسالة:» ← النص كاملاً بلا إطار
-        assert '\n\nنص الرسالة:\n\nنص التنبيه' in alert
-        assert '<blockquote>' not in alert and '💬' not in alert and '👤' not in alert
-        # v12.1.0 صيغة الصورة المرجعية: الاسم و@username كلاهما رابط
-        assert '— <a href="https://t.me/ahmed_99">@ahmed_99</a>' in alert
-        assert "رابط الرسالة" not in alert  # الروابط في الأزرار الآن
+        # v14.9.3: الاسم الظاهر = @username وهو رابط
+        assert alert.startswith('👤 <a href="https://t.me/ahmed_99">@ahmed_99</a>\nالمرسل : ID 777000111\n')
+        assert '\nنص الرساله :\nنص التنبيه' in alert
+        assert '💬' not in alert and '<blockquote>' not in alert
+        # سطر الرابط الشرعي (رابط رسالة حقيقي من المحلّل)
+        assert '\nرابط الرساله : https://t.me/mygroup/789' in alert
         # v14.9.2: نفس اللوحة لكل المسارات — [ @ahmed_99 ][ جروب ]
         assert buttons == [[
             {"text": "@ahmed_99", "url": "https://t.me/ahmed_99"},
@@ -433,14 +430,16 @@ class TestFrozenBuilderIntegration:
         ]]
 
     async def test_no_username_uses_recovered_db_username(self, monitor):
-        """مرسل بلا username في الحدث لكن له اسم محفوظ → الرابط t.me بدل
-        مرساة tg:// الميتة (الإجراء #1 يعمل فعلياً)."""
+        """مرسل بلا username في الحدث لكن له اسم محفوظ → الاسم الظاهر
+        «@recovered_user» برابط t.me العالمي بدل مرساة tg:// الميتة
+        (الإجراء #1 يعمل فعلياً — الصيغة المرجعية الموحدة v14.9.3)."""
         sender = {"id": 777000111, "display": "سارة", "username": "recovered_user", "access_hash": None}
         chat = {"entity": None, "title": None, "id": -1001234567890,
                 "message_id": 456, "username": None,
                 "group_link": "https://t.me/c/1234567890", "msg_link": "https://t.me/c/1234567890/456"}
         alert, _ = monitor._build_alert(sender, chat, "ك", "نص", {"msg_hash": "h2"})
-        assert '<a href="https://t.me/recovered_user">سارة</a>' in alert
+        assert alert.startswith('👤 <a href="https://t.me/recovered_user">@recovered_user</a>\n')
+        assert "— @" not in alert  # بلا لاحقة مختلقة
 
 
 # ═══════════════════════════════════════════════════════════════════════════

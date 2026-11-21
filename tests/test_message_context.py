@@ -477,7 +477,9 @@ class TestAlertShapeViaContext:
 
     @pytest.mark.asyncio
     async def test_template_frozen_shape(self):
-        """القالب المجمد v11.6 حرفياً: «المرسل:» + «نص الرسالة:» بلا معرفات."""
+        """القالب المرجعي — «الصيغة المرجعية الموحدة v14.9.3» (تحديث رسمي
+        للقالب المجمد v11.6 بقرار المالك): «👤 {الاسم}» رابط + سطر المعرف
+        «المرسل : ID …» + تسمية «نص الرساله :» + سطر الرابط الشرعي."""
         bot = _FakeAlertBot([(200, {"ok": True})])
         ok, _, _ = await bot.send(
             _data(sender_username=None, chat_username="sultanu1999"),
@@ -486,26 +488,29 @@ class TestAlertShapeViaContext:
         )
         assert ok is True
         txt = bot.calls[0]["payload"]["text"]
-        assert txt.startswith("B_Bot\nالمرسل: ")  # قالب v13 باسم البوت
-        assert "نص الرسالة:" in txt
-        # لا معرفات رقمية في النص الظاهر (روابط tg:// تحمل المعرف داخل
-        # href — غير مرئية للمستلم؛ الفحص بعد إزالة الوسوم)
+        # v14.9.3: الاسم الظاهر رابط + سطر المعرف الحقيقي + تسمية «نص الرساله :»
+        assert txt.startswith('👤 <a href="tg://user?id=6079171409">نورة الشمري</a>\n')
+        assert "\nالمرسل : ID 6079171409\n" in txt
+        assert "\nنص الرساله :\n" in txt
+        assert "\nرابط الرساله : https://t.me/sultanu1999/531011" in txt
+        # لا صيغة «مستخدم (id)» القديمة — المعرف في سطره المخصص فقط
         import re as _re
         visible = _re.sub(r"<[^>]+>", "", txt)
-        assert str(SID) not in visible
         assert "مستخدم (" not in visible
 
     @pytest.mark.asyncio
     async def test_no_name_shows_unspecified_sender(self):
-        """بلا أي اسم: «مرسل غير محدد» — لا «مستخدم (id)» ولا رقم."""
+        """بلا أي اسم: «مرسل غير محدد» في سطر الاسم — لا «مستخدم (id)»؛
+        المعرف الحقيقي يظهر في سطره المخصص «المرسل : ID» حصراً (v14.9.3)."""
         built = ab.build_alert_html(_data(
             sender_id=SID, sender_first_name=None, sender_last_name=None,
             sender_username=None, chat_username="sultanu1999",
         ), msg_link="https://t.me/sultanu1999/531011")
         import re as _re
         visible = _re.sub(r"<[^>]+>", "", built["text"])
-        assert "مرسل غير محدد" in visible
-        assert str(SID) not in visible
+        assert visible.split("\n")[0] == "👤 مرسل غير محدد"
+        assert "مستخدم (" not in visible
+        assert f"\nالمرسل : ID {SID}" in visible
 
     @pytest.mark.asyncio
     async def test_arabic_emoji_utf16_offsets(self):
@@ -521,8 +526,8 @@ class TestAlertShapeViaContext:
         ents = [{"type": "text_mention", "offset": utf16_len(SENDER_LABEL),
                  "length": 4, "user": {"id": SID}}]
         assert ab._name_entity_missing(ents) is False
-        # إيموجي داخل الاسم لا يكسر فحص الموضع (v13: السطر 1 بعد اسم البوت)
-        header = built["text"].split("\n")[1]
+        # إيموجي داخل الاسم لا يكسر فحص الموضع (v14.9.3: الاسم في السطر 0 بعد «👤 »)
+        header = built["text"].split("\n")[0]
         assert "نورة" in header
 
     @pytest.mark.asyncio

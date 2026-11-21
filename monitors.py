@@ -219,18 +219,19 @@ def is_self_sender(sender_id) -> bool:
 
 _ALERT_CARD_HEADER = "المرسل:"
 _ALERT_CARD_NAME_LINE = _CARD_BOT_NAME_LINE
-_ALERT_CARD_MSG_LABEL = "نص الرسالة:"
+_ALERT_CARD_MSG_LABEL = "نص الرساله :"      # v14.9.3 (صيغة الصورة المرجعية)
+_LEGACY_MSG_LABELS = ("نص الرسالة:", "نص الرساله :")  # توقيعات تاريخية + جديدة
 _ECHO_SCAN_WINDOW = 300
 _LEGACY_CARD_HEADER = "👤:"
 _LEGACY_CARD_MSG_LABEL = "💬:"
 
 
 def _is_current_card_header(t: str) -> bool:
-    """v14.5.2: أربع توقيعات تاريخية مقبولة:
-      * v14.5.1+      : "المرسل: ..."          ← SENDER_LABEL الحالي (B_Bot مخفي)
-      * v14.5.1      : "B_Bot\\n\\nالمرسل: "    ← قديم قبل إخفاء B_Bot
-      * v11.2-14.5.0 : "B_Bot\\nالمرسل: "      ← توقيع سابق
-      * pre-v12      : "المرسل: "              ← أقدم (بلا B_Bot)
+    """v14.9.3: توقيعات مقبولة (جديدة + تاريخية لبطاقات القناة القديمة):
+      * v14.9.3+      : "👤 ..."                ← الصيغة المرجعية الموحدة
+      * v14.5.1-14.9.2: "B_Bot\\nالمرسل: "      ← توقيع سابق
+      * v14.5.0       : "B_Bot\\n\\nالمرسل: "    ← قديم قبل ضم السطرين
+      * pre-v12       : "المرسل: "              ← أقدم (بلا B_Bot)
     """
     if not t:
         return False
@@ -248,7 +249,8 @@ def is_alert_card_echo(text) -> bool:
         return False
     t = str(text).lstrip()
     if _is_current_card_header(t):
-        return _ALERT_CARD_MSG_LABEL in t[:_ECHO_SCAN_WINDOW]
+        window = t[:_ECHO_SCAN_WINDOW]
+        return any(lbl in window for lbl in _LEGACY_MSG_LABELS)
     if t.startswith(_LEGACY_CARD_HEADER):
         return _LEGACY_CARD_MSG_LABEL in t[:64]
     return False
@@ -2894,34 +2896,6 @@ class EnhancedAccountMonitor:
                     pass
             self._note_post_capable(c)
 
-        async def _forward_supplement(preferred: Optional[TelegramClient]) -> bool:
-            if not getattr(CFG, "ALERT_FORWARD_FALLBACK", True):
-                return False
-            if not chat_id or not message_id:
-                return False
-            tried: List[TelegramClient] = []
-            if preferred is not None and self._is_client_alive(preferred):
-                tried.append(preferred)
-            cap_client = self._capturing_client(data)
-            if cap_client is not None and all(cap_client is not c for c in tried):
-                tried.append(cap_client)
-            for c in tried[:2]:
-                try:
-                    await c.forward_messages(CFG.TARGET_GROUP_ID, message_id, from_peer=int(chat_id))
-                    logger.info(
-                        f"📤 forward supplement sent [{account_name}] (sender={sender_id}) — "
-                        "original message forwarded to target so the sender profile is reachable"
-                    )
-                    return True
-                except (FloodWaitError, CircuitBreakerOpen) as fw:
-                    logger.warning(f"forward supplement throttled [{account_name}]: {type(fw).__name__}: {fw}")
-                    return False
-                except Exception as fe:
-                    logger.debug(
-                        f"forward supplement failed [{account_name}]: {type(fe).__name__}: {str(fe)[:120]}"
-                    )
-            return False
-
         alert_bot = getattr(self._bot_ref, "alert_bot", None) if self._bot_ref is not None else None
         if alert_bot is not None and getattr(alert_bot, "enabled", False):
             try:
@@ -2940,22 +2914,9 @@ class EnhancedAccountMonitor:
                         f"sender={sender_id} | contact_method={_method} | "
                         f"tier={getattr(alert_bot, 'last_tier', None)}"
                     )
-                    try:
-                        self._schedule_reply_fix(
-                            data=data, sender=sender, account_name=account_name,
-                            target_chat_id=getattr(alert_bot, "chat_id", 0),
-                            alert_msg_id=(
-                                data.get("_alert_message_id")
-                                or getattr(alert_bot, "last_alert_message_id", None)
-                            ),
-                        )
-                    except Exception as _rf_sched_err:
-                        logger.debug(
-                            f"reply_fix schedule skipped: "
-                            f"{type(_rf_sched_err).__name__}: {_rf_sched_err}"
-                        )
-                    if user_media is not None:
-                        await _forward_supplement(None)
+                    # v14.9.3: الرد التعويضي «👤» المنفصل أُلغي — الاسم ومعه
+                    # وسيلة الوصول داخل البطاقة نفسها (صيغة الصورة المرجعية)،
+                    # ورسالة ردّ إضافية في القناة = تكرار رفضه المالك صراحة.
                     _bmsg_v11 = chat_info.get("msg_link")
                     _bmsg_v11 = _bmsg_v11 if _bmsg_v11 and _bmsg_v11 != "#" else None
                     _busr_v11 = sender_target.selected_url or None
@@ -3072,7 +3033,6 @@ class EnhancedAccountMonitor:
                         )
                 raise last_exc if last_exc else RuntimeError("no send candidate succeeded")
             escalate_msg: Any = None
-            escalate_via: Optional[TelegramClient] = None
             if mention_allowed and CFG.SENDER_MENTION_FIX_ENABLED:
                 escalate = False
                 for idx, c in enumerate(send_clients):
@@ -3126,11 +3086,11 @@ class EnhancedAccountMonitor:
                             outcome["verify_fail_reason"] = f"{tier_name}:{why}"
                             outcome["method"] = "link"
                             escalate_msg = sent_msg
-                            escalate_via = c
                             escalate = True
                             logger.warning(
                                 f"⚠️ mention entity NOT verified after send [{account_name}] "
-                                f"tier={tier_name} sender={sender_id}: {why} — escalating to forward supplement"
+                                f"tier={tier_name} sender={sender_id}: {why} — "
+                                "بطاقة واحدة فقط (v14.9.3: لا forward supplement)"
                             )
                             break
                     except (FloodWaitError, CircuitBreakerOpen):
@@ -3141,10 +3101,11 @@ class EnhancedAccountMonitor:
                             f"Send candidate #{idx + 1} failed [{account_name}]: "
                             f"{type(e).__name__}: {str(e)[:120]} — trying next client"
                         )
-                if escalate:
-                    if await _forward_supplement(escalate_via):
-                        outcome["method"] = "forward"
-                        outcome["forward_done"] = True
+                # v14.9.3: لا إعادة تحويل — البطاقة المرسلة هي الوحيدة التي
+                # تصل القناة الهدف (mention غير موثّق يعالجه الإصلاح الذاتي
+                # في alert_ui بلا رسائل إضافية). بلا إرسال mention إطلاقاً
+                # نكمل مسار الإرسال HTML الطبيعي كما كان.
+                if escalate_msg is not None:
                     return escalate_msg
             sent_msg: Any = None
             sent_via: Optional[TelegramClient] = None
@@ -3168,9 +3129,8 @@ class EnhancedAccountMonitor:
                     )
             if sent_msg is None:
                 raise html_exc if html_exc else RuntimeError("no send candidate succeeded")
-            if await _forward_supplement(sent_via):
-                outcome["method"] = "forward"
-                outcome["forward_done"] = True
+            # v14.9.3: لا forward supplement — رسالة واحدة لكل تنبيه (طلب
+            # المالك: «دون تكرار او اعاده تحويل او اعاده توجيه»).
             if idx > 0:
                 logger.info(
                     f"✅ Alert send succeeded with candidate #{idx + 1} "

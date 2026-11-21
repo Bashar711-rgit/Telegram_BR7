@@ -13,7 +13,9 @@
   T9  اختلاف المرفقات ← هوية محتوى مختلفة
   T10 الرسائل القديمة المؤكدة ← لا إعادة تنبيه
 
-وعقد البطاقة v13: B_Bot ← المرسل ← نص الرسالة ← المحتوى ← [مراسلة][عرض الرسالة]
+وعقد البطاقة — الصيغة المرجعية الموحدة v14.9.3:
+  👤 {@username | الاسم} ← المرسل : ID ← نص الرساله : ← المحتوى ← رابط الرساله : ← [زر المرسل][جروب]
+  (B_Bot حُذف من البطاقات نهائياً — توقيع echo-guard فقط للبطاقات التاريخية)
 """
 
 import asyncio
@@ -370,35 +372,40 @@ class TestT10_OldEvents:
 # ═══════════════════════════════════════════════════════════════════════
 
 class TestCardV13:
-    def test_1_bot_name_first_line(self):
+    def test_1_card_name_first_line(self):
+        """السطر الأول للبطاقة — الصيغة المرجعية الموحدة v14.9.3:
+        «👤 {الاسم الظاهر}» (@username عند توفره) — B_Bot حُذف نهائياً
+        من نص البطاقات بقرار المالك (بقي توقيع echo-guard للتاريخية)."""
         built = build_alert_html(_data())
         visible = _visible(built["text"])
-        assert visible.split("\n")[0] == BOT_NAME_LINE == "B_Bot"
+        assert visible.split("\n")[0] == "👤 @layan_l9"
 
     def test_2_sender_line_present(self):
+        """v14.9.3: سطر المعرف «المرسل : ID …» بصيغة الصورة المرجعية حرفياً."""
         built = build_alert_html(_data())
         visible = _visible(built["text"])
         lines = visible.split("\n")
-        assert lines[1].startswith("المرسل: ")
-        assert "ليان" in lines[1]
-        assert "— @layan_l9" in lines[1]
+        assert lines[1] == "المرسل : ID 6079171409"
 
     def test_3_message_label_present(self):
         built = build_alert_html(_data())
-        assert "\n\nنص الرسالة:\n\n" in _visible(built["text"])
-        assert MSG_TEXT_LABEL == "نص الرسالة:"
+        assert "\nنص الرساله :\n" in _visible(built["text"])
+        # الصيغة المرجعية v14.9.3 حرفياً (هاء لا ة — مسافة قبل النقطتين)
+        assert MSG_TEXT_LABEL == "نص الرساله :"
 
     def test_4_arabic_content_preserved(self):
         orig = "أَبِي حل الواجب — اللغة العربية 📚\nوالسطر الثاني"
         built = build_alert_html(_data(text=orig))
-        body = _visible(built["text"]).split("\n\nنص الرسالة:\n\n", 1)[1]
+        body = _visible(built["text"]).split("\nنص الرساله :\n", 1)[1]
         assert body.startswith(orig)
 
     def test_5_long_text_truncated_within_limit(self):
         long_text = "ط" * 6000
         built = build_alert_html(_data(text=long_text))
         assert utf16_len(built["text"]) <= 4096
-        assert built["text"].rstrip().endswith("…")
+        # القسم النصي (قبل سطر الرابط الشرعي) ينتهي بـ«…» عند التجاوز
+        body = built["text"].rsplit("\nرابط الرساله :", 1)[0]
+        assert body.rstrip().endswith("…")
 
     def test_6_buttons_present_in_one_row_v13_order(self):
         built = build_alert_html(_data())
@@ -438,18 +445,22 @@ class TestCardV13:
         assert all(b["text"] != "مراسلة" for b in row)
         assert "<a " not in built["text"]
 
-    def test_10_name_entity_offset_with_bot_prefix(self):
-        """إزاحة كيان الاسم = utf16_len(SENDER_LABEL) بعد سطر B_Bot."""
+    def test_10_name_entity_offset_with_card_prefix(self):
+        """إزاحة كيان الاسم = utf16_len(SENDER_LABEL) بعد «👤 » (=3، v14.9.3) —
+        وكيان واحد فقط للاسم (لا كيان ثانٍ للاسم البديل)."""
         target = resolve_contact_target(sender_id=SENDER_ID, username="layan_l9",
                                         first_name="ليان")
         pack = build_alert_entity_pack(
             display_name="ليان", message_text=ORIG, target=target)
         ents = pack["formatting_entities"] or []
         assert ents, "كيان الاسم مطلوب"
+        assert len(ents) == 1  # كيان واحد — بلا كيان ثانٍ للاسم البديل
         first = ents[0]
         assert int(getattr(first, "offset", -1)) == utf16_len(SENDER_LABEL)
-        # النص العادي يطابق قالب HTML مرئياً
-        assert pack["plain_text"].startswith(f"{BOT_NAME_LINE}\nالمرسل: ")
+        assert int(getattr(first, "length", -1)) == utf16_len("@layan_l9")
+        assert getattr(first, "url", "") == "https://t.me/layan_l9"
+        # النص العادي يطابق قالب HTML مرئياً (الصيغة المرجعية الموحدة v14.9.3)
+        assert pack["plain_text"].startswith("👤 @layan_l9\nالمرسل : ")
 
     def test_11_echo_guard_recognizes_v13_card(self):
         built = build_alert_html(_data())
@@ -479,20 +490,22 @@ class TestCardV13:
 
     def test_13_media_message_caption_handled(self):
         built = build_alert_html(_data(text="شرح الواجب في الصورة", media_type="photo"))
-        body = _visible(built["text"]).split("\n\nنص الرسالة:\n\n", 1)[1]
+        visible = _visible(built["text"])
+        body = visible.split("\nنص الرساله :\n", 1)[1]
         assert body.startswith("شرح الواجب في الصورة")
-        # بطاقة الوسائط تحمل نفس العقد
-        assert _visible(built["text"]).split("\n")[0] == "B_Bot"
+        # بطاقة الوسائط تحمل نفس العقد (v14.9.3)
+        assert visible.split("\n")[0] == "👤 @layan_l9"
 
     def test_14_no_text_message_safe_card(self):
         """رسالة بلا نص (وسائط فقط) — بطاقة صالحة بلا نص مُختلق."""
         built = build_alert_html(_data(text="", media_type="photo"))
-        assert "\n\nنص الرسالة:\n\n" in built["text"] or built["text"]
-        assert _visible(built["text"]).split("\n")[0] == "B_Bot"
+        assert built["text"]
+        assert _visible(built["text"]).split("\n")[0] == "👤 @layan_l9"
 
     def test_15_empty_media_label_not_fabricated(self):
         """لا يُعرض نص بديل يوهم بأنه النص الأصلي — قسم نص الرسالة فارغ بصدق."""
         built = build_alert_html(_data(text=""))
         visible = _visible(built["text"])
-        body = visible.split("\n\nنص الرسالة:\n\n", 1)[1]
-        assert body.strip() == ""
+        # بعد «نص الرساله :» يليه سطر الرابط الشرعي مباشرة — بلا نص مُختلق
+        body = visible.split("\nنص الرساله :\n", 1)[1]
+        assert body == f"\nرابط الرساله : https://t.me/c/{INNER}/{MSG_ID}"

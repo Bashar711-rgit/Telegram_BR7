@@ -1,22 +1,22 @@
-"""Alert Bot — اختبارات القبول والوحدات (v10.9 النمط الموحد).
+"""Alert Bot — اختبارات القبول والوحدات (النمط الموحد — الصيغة المرجعية v14.9.3).
 
-المواصفة v10.9 — نمط واجهة موحد لكل التنبيهات (parse_mode=HTML):
-      سطر 1: 👤 {SENDER}    — username: <a href="https://t.me/U">@U</a>
-                              بدونه: <a href="tg://user?id=ID">الاسم</a>
-      سطر 2: <b>المرسل :</b> ID {id}
-      (فارغ) <b>نص الرسالة:</b>
-      💬:
-      <blockquote>{النص الأصلي كاملاً — لا truncate(400)}
-  * أزرار Inline في صف واحد (ترتيب RTL: «مراسلة» أقصى اليمين):
-      [ مراسلة ] [ عرض ] [ نسخ ] [ القروب ]   (v10.9.1 نصوص مصغّرة)
+المواصفة v14.9.3 — الصيغة المرجعية الموحدة (parse_mode=HTML):
+      سطر 1: 👤 {@username | الاسم}   — الاسم نفسه رابط (username ← tg://user)
+      سطر 2: المرسل : ID {id}        — بلا معرف → «المرسل : غير معروف»
+      سطر 3: نص الرساله :
+      {النص الأصلي كاملاً — لا truncate(400)}
+      رابط الرساله : {رابط حقيقي فقط — بلا رابط يُحذف السطر كلياً}
+  * أزرار Inline في صف واحد (التخطيط المرجعي v14.9.2/v14.9.3):
+      [ @username | الاسم | مراسلة ] [ جروب | عرض الرسالة ]
     تُبنى حصراً عبر الدالة المركزية build_alert_buttons — الزر الذي
-    تنعدم بياناته يُحذف. نسخ زر copy_text فعلي (@username أو ID).
+    تنعدم بياناته يُحذف (لا روابط وهمية أبداً).
   * الإرسال عبر Bot API sendMessage بـ aiohttp + link_preview_options
     disabled؛ 429 → retry_after (≤3)؛ BUTTON_USER_INVALID /
-    BUTTON_USER_PRIVACY_RESTRICTED → إعادة بدون زر «مراسلة» فقط؛ أي
+    BUTTON_USER_PRIVACY_RESTRICTED → إعادة بدون زر المرسل فقط؛ أي
     فشل/غياب ALERT_BOT_TOKEN → fallback لحسابات المستخدمين بنفس القالب
     بدون أزرار.
   * contact_method = username | mention_button | text_only.
+  * v14.9.3: لا forward supplement ولا reply_fix — كل تنبيه رسالة واحدة.
 
 كل تفاعلات الشبكة مُزيفة — لا نداءات حقيقية إطلاقاً.
 """
@@ -87,23 +87,23 @@ def _row_of(built):
 
 class TestBuildAlertHtml:
     def test_acceptance_1_username_sender(self):
-        """v11.6: مرسل بـ username — «المرسل: الاسم — @user» + لوحة أزرار فعلية."""
+        """v14.9.3: مرسل بـ username — الاسم الظاهر «@username» رابط + زر @username."""
         built = build_alert_html(
             _data(sender_username="Lara507", chat_username="sultanu1999"),
             msg_link="https://t.me/sultanu1999/531011",
             group_link="https://t.me/sultanu1999",
         )
         assert built["contact_method"] == "username"
-        # v13 صيغة الصورة المرجعية باسم البوت: الاسم رابط + « — @username» رابط أيضاً
+        # v14.9.3 (الصيغة المرجعية الموحدة): 👤 ← الاسم رابط ← المرسل : ID ← نص الرساله :
         assert built["text"].startswith(
-            'B_Bot\nالمرسل: <a href="https://t.me/Lara507">هناء العنزي</a> — <a href="https://t.me/Lara507">@Lara507</a>\n\n'
+            '👤 <a href="https://t.me/Lara507">@Lara507</a>\nالمرسل : ID 6079171409\n'
         )
-        assert "\n\nنص الرسالة:\n\n" in built["text"]
-        # v11.6: بلا رموز 👤/💬 وبلا blockquote/اقتباس
-        assert "👤" not in built["text"] and "💬" not in built["text"]
+        assert "\nنص الرساله :\n" in built["text"]
+        # بلا رموز قديمة وبلا blockquote/اقتباس (👤 رأس البطاقة v14.9.3)
+        assert "💬" not in built["text"]
         assert "<blockquote>" not in built["text"]
-        # الروابط في الأزرار لا في النص
-        assert "رابط الرسالة" not in built["text"]
+        # سطر الرابط الشرعي بنصه الكامل
+        assert "\nرابط الرساله : https://t.me/sultanu1999/531011" in built["text"]
         # التخطيط المرجعي v14.9.2: [ @Lara507 ] [ جروب ]
         assert built["buttons"] == [[
             {"text": "@Lara507", "url": "https://t.me/Lara507"},
@@ -111,18 +111,18 @@ class TestBuildAlertHtml:
         ]]
 
     def test_acceptance_2_no_username_name_button(self):
-        """v11.6: مرسل بلا username — الاسم رابط tg://user، بلا @username
-        مُختلق، وزر مراسلة tg://user (الأزرار من بيانات التنبيه نفسه)."""
+        """v14.9.3: مرسل بلا username — الاسم الظاهر رابط tg://user، بلا
+        @username مُختلق، وزر المرسل باسم الظاهر (الأزرار من بيانات التنبيه نفسه)."""
         built = build_alert_html(_data(), msg_link=None, group_link=None)
         assert built["contact_method"] == "mention_button"
-        # بلا username → لا لاحقة « — @...» في السطر (قالب v13 باسم البوت)
+        # بلا username → الاسم الظاهر برابط tg://user (v14.9.3)
         assert built["text"].startswith(
-            'B_Bot\nالمرسل: <a href="tg://user?id=6079171409">هناء العنزي</a>\n\n'
+            '👤 <a href="tg://user?id=6079171409">هناء العنزي</a>\nالمرسل : ID 6079171409\n'
         )
         assert "— @" not in built["text"]
         # _data() لديه chat_id=-100111222333 وmessage_id=4242 → روابط خاصة صالحة
         assert built["buttons"] == [[
-            {"text": "مراسلة", "url": f"tg://user?id={SENDER_ID}"},
+            {"text": "هناء العنزي", "url": f"tg://user?id={SENDER_ID}"},
             {"text": "جروب", "url": f"https://t.me/c/{INNER}"},  # v14.9.2
         ]]
 
@@ -141,10 +141,12 @@ class TestBuildAlertHtml:
         (لا روابط وهمية) وتبقى أزرار المرسل فعّالة."""
         built = build_alert_html(_data(chat_id=-987654321))  # مجموعة عادية
         row = _row_of(built)
-        assert {"text": "مراسلة", "url": f"tg://user?id={SENDER_ID}"} in row
+        assert {"text": "هناء العنزي", "url": f"tg://user?id={SENDER_ID}"} in row
         assert all(b["text"] not in ("عرض الرسالة", "القروب", "جروب") for b in row)
         assert built["msg_link"] is None
-        assert "\n\nنص الرسالة:\n\n" in built["text"]
+        # بلا رابط → سطر «رابط الرساله :» يُحذف كلياً (لا روابط وهمية)
+        assert "رابط الرساله :" not in built["text"]
+        assert "\nنص الرساله :\n" in built["text"]
         assert "<blockquote>" not in built["text"]
 
     def test_view_button_falls_back_to_group_link(self):
@@ -157,11 +159,11 @@ class TestBuildAlertHtml:
         assert {"text": "جروب", "url": "https://t.me/g_only"} in row
 
     def test_full_text_no_400_truncate(self):
-        """v10.9→v11.6: النص الأصلي كاملاً بعد «نص الرسالة:» — لا truncate(400)."""
+        """v10.9→v14.9.3: النص الأصلي كاملاً بعد «نص الرساله :» — لا truncate(400)."""
         long_text = "ع" * 600
         built = build_alert_html(_data(text=long_text))
-        body = built["text"].split("\n\nنص الرسالة:\n\n", 1)[1]
-        assert body == long_text
+        body = built["text"].split("\nنص الرساله :\n", 1)[1]
+        assert body == long_text + f"\nرابط الرساله : https://t.me/c/{INNER}/{MSG_ID}"
         esc = build_alert_html(_data(text="<b>خط & إهمال</b>"))
         assert "&lt;b&gt;خط &amp; إهمال&lt;/b&gt;" in esc["text"]
         # وسوم المستخدم تظهر نصاً عادياً — لا تُفسد بنية التنبيه
@@ -169,16 +171,18 @@ class TestBuildAlertHtml:
 
     def test_telegram_4096_guard(self):
         """الحاجز الوحيد المسموح: حد تيليجرام 4096 — يُقص فقط عند التجاوز
-        مع «…» (ولا يُقطع كيان HTML نصف مكتمل)."""
+        مع «…» في القسم النصي (سطر الرابط الشرعي يبقى آخر السطر)."""
         built = build_alert_html(_data(text="ع" * 6000))
         assert len(built["text"]) <= 4096
-        assert built["text"].endswith("…")
+        # القسم النصي (قبل سطر الرابط الشرعي) ينتهي بـ«…» عند التجاوز
+        body = built["text"].rsplit("\nرابط الرساله :", 1)[0]
+        assert body.endswith("…")
 
     def test_html_escaping_in_display_name(self):
         built = build_alert_html(_data(sender_first_name="<سك>rip", sender_last_name=None))
         assert '<a href="tg://user?id=6079171409">&lt;سك&gt;rip</a>' in built["text"]
-        # نصوص الأزرار ثابتة (عقد الواجهة) — البيانات في الروابط/النسخ فقط
-        assert {"text": "مراسلة", "url": f"tg://user?id={SENDER_ID}"} in _row_of(built)
+        # v14.9.3: زر المرسل يأخذ اسم الظاهر نفسه (مهرباً في HTML فقط)
+        assert {"text": "<سك>rip", "url": f"tg://user?id={SENDER_ID}"} in _row_of(built)
 
     def test_sender_usernames_fallback(self):
         """بلا username أساسي → أول usernames النشطة يُستخدم."""
@@ -203,7 +207,9 @@ class TestBuildAlertHtml:
 
     def test_never_raises_on_garbage(self):
         built = build_alert_html({"sender_id": "x", "chat_id": None, "message_id": None, "text": None})
-        assert "المرسل: " in built["text"] and "نص الرسالة:" in built["text"]
+        # v14.9.3: بلا معرف صالح → «المرسل : غير معروف» وبلا سطر رابط
+        assert "المرسل : غير معروف" in built["text"] and "نص الرساله :" in built["text"]
+        assert "رابط الرساله :" not in built["text"]
         # لا مرسل ولا روابط → كل الأزرار تُحذف بصدق (لا أزرار معطلة)
         assert built["buttons"] == []
 
@@ -336,7 +342,7 @@ class TestAlertBotSend:
 
     @pytest.mark.asyncio
     async def test_acceptance_5_button_user_invalid_resends_without_sender_button(self):
-        """خصوصية المرسل تمنع زر tg://user → يُعاد الإرسال بدون زر «مراسلة»
+        """خصوصية المرسل تمنع زر tg://user → يُعاد الإرسال بدون زر المرسل
         فقط (رابط الاسم يبقى في النص وتبقى بقية الأزرار) ولا تضيع الرسالة."""
         bot = _FakeAlertBot([
             (400, {"ok": False, "description": "Bad Request: BUTTON_USER_INVALID"}),
@@ -351,7 +357,7 @@ class TestAlertBotSend:
         assert len(bot.calls) == 2
         first_kb = _buttons_of(bot.calls[0]["payload"])
         assert first_kb == [
-            {"text": "مراسلة", "url": f"tg://user?id={SENDER_ID}"},
+            {"text": "هناء العنزي", "url": f"tg://user?id={SENDER_ID}"},  # v14.9.3
             {"text": "جروب", "url": "https://t.me/g1"},  # v14.9.2
         ]
         second_kb = _buttons_of(bot.calls[1]["payload"])
@@ -582,10 +588,10 @@ class TestMonitorIntegration:
         # v11.6: اللوحة تُحاول فعلاً في المسار الاحتياطي — الزران الهدفان
         assert call.get("buttons"), "لوحة الأزرار يجب أن تُحاول في المسار الاحتياطي"
         kb0 = (call.get("buttons") or [[]])[0]
-        assert [b.get("text") for b in kb0] == ["مراسلة", "جروب"]  # v14.9.2
-        # القالب الموحد v11.6 (بعد تحليل HTML لمسار mention — بلا وسوم ظاهرة)
-        assert "المرسل: " in call["text"] and "نص الرسالة:" in call["text"]
-        assert "👤" not in call["text"] and "💬" not in call["text"]
+        assert [b.get("text") for b in kb0] == ["هناء العنزي", "جروب"]  # v14.9.3
+        # القالب الموحد v14.9.3 (نفس نص HTML لمسار Bot API)
+        assert "المرسل : ID" in call["text"] and "نص الرساله :" in call["text"]
+        assert "💬" not in call["text"]
         await db._flush()  # add_alert دفعي — الصف يظهر بعد flush
         row = await db._fetchone(
             "SELECT contact_method FROM alerts WHERE message_hash = 'h_v109_fb'"
@@ -604,8 +610,9 @@ class TestMonitorIntegration:
         assert len(m.client.calls) >= 1
 
     @pytest.mark.asyncio
-    async def test_bot_success_with_media_triggers_forward(self, db):
-        """تنبيه بوسائط عبر البوت → forward supplement يحمل الوسائط."""
+    async def test_bot_success_with_media_no_forward_no_duplicate(self, db):
+        """تنبيه بوسائط عبر البوت → رسالة واحدة فقط (v14.9.3: forward
+        supplement حُذف — لا إعادة توجيه ولا تكرار؛ الوسائط تبقى مع التنبيه)."""
         m = _monitor(db, "Account 1", _FakeClient("Account 1"))
         stub = _StubAlertBot((True, "username", ""))
         _wire(db, m, m.client, alert_bot=stub)
@@ -615,7 +622,8 @@ class TestMonitorIntegration:
             msg_hash="h_v109_media", analysis={"valid": True, "decision": "accept"},
         )
         assert len(stub.calls) == 1
-        assert len(m.client.forward_calls) == 1  # الوسائط وصلت عبر forward
+        # v14.9.3: بلا إعادة توجيه إطلاقاً — كل تنبيه رسالة واحدة
+        assert m.client.forward_calls == []
         assert m.client.calls == []
 
     @pytest.mark.asyncio

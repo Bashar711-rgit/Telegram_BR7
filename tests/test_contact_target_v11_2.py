@@ -193,15 +193,19 @@ class TestContactTargetCore:
 
 class TestClickableName:
     def test_html_name_clickable_no_raw_url_visible(self):
-        """spec #3/#14: المستخدم يرى «المرسل: نواف» فقط — الرابط داخل href."""
+        """spec #3/#14: المستخدم يرى «👤 نواف محمد» فقط — الرابط داخل href
+        (الصيغة المرجعية الموحدة v14.9.3)."""
         built = build_alert_html(_data())
-        # السطر الظاهر: اسم البوت ثم الاسم بين وسوم الرابط (قالب v13)
-        assert built["text"].startswith("B_Bot\nالمرسل: <a href=\"tg://user?id=5601276336\">نواف محمد</a>\n")
-        # لا رابط خام خارج الوسوم: بعد إزالة قيم href لا يبقى أي tg:// أو t.me
+        # السطر الظاهر: 👤 ثم الاسم بين وسوم الرابط ثم سطر المعرف (v14.9.3)
+        assert built["text"].startswith("👤 <a href=\"tg://user?id=5601276336\">نواف محمد</a>\nالمرسل : ID 5601276336\n")
+        # لا رابط خام خارج الوسوم: بعد إزالة قيم href لا يبقى أي tg:// (رابط
+        # المرسل داخل href دائماً) — ولا أي t.me خارج سطر «رابط الرساله :»
+        # الشرعي (v14.9.3 يُظهر رابط الرسالة الحقيقي نصاً في سطره المخصص).
         import re as _re
         visible = _re.sub(r'href="[^"]*"', "", built["text"])
         assert "tg://" not in visible
-        assert "https://t.me" not in visible
+        visible_without_link_line = visible.split("\nرابط الرساله :", 1)[0]
+        assert "https://t.me" not in visible_without_link_line
 
     def test_both_targets_share_selected_url(self):
         """v14.7.0: الزر واسم البطاقة كلاهما من user_id_url (selected_url
@@ -210,14 +214,16 @@ class TestClickableName:
         built = build_alert_html(_data())
         t = built["contact_target"]
         name_url = built["text"].split('href="')[1].split('"')[0]
+        # v14.9.3: زر المرسل بلا username يُسمّى باسم الظاهر في البطاقة
         button_url = next(
-            b["url"] for b in built["buttons"][0] if b["text"] == "مراسلة"
+            b["url"] for b in built["buttons"][0] if b["text"] == "نواف محمد"
         )
         assert name_url == t.user_id_url
         assert button_url == t.selected_url == t.user_id_url
 
     def test_entity_pack_utf16_offsets(self):
-        """الكيانات تحسب offset/length بوحدات UTF-16 (عربي + إيموجي)."""
+        """الكيانات تحسب offset/length بوحدات UTF-16 (عربي + إيموجي) —
+        الصيغة المرجعية الموحدة v14.9.3."""
         t = resolve_contact_target(sender_id=SENDER_ID)
         pack = build_alert_entity_pack("نواف محمد", "نص الرسالة", t)
         assert pack["clickable"] is True
@@ -225,15 +231,16 @@ class TestClickableName:
         kinds = {type(e).__name__: e for e in ents}
         name_ent = kinds["MessageEntityTextUrl"]
         from contact_target import SENDER_LABEL as _SL
-        assert name_ent.offset == utf16_len(_SL)  # v13: بعد سطر B_Bot\n (=14)
+        assert name_ent.offset == utf16_len(_SL)  # v14.9.3: بعد «👤 » (=3)
         assert name_ent.length == utf16_len("نواف محمد")
         # v14.7.0: رابط الكيان = selected_url (tg://user?id — مخطط موثّق
         # لكل العملاء؛ يُصلَّح ذاتياً لرابط الرسالة عند رفض الخادم)
         assert name_ent.url == f"tg://user?id={SENDER_ID}"
-        # القالب نفسه (v13): اسم البوت ← الاسم ← (فارغ) ← نص الرسالة: ← النص
+        # القالب نفسه (v14.9.3): 👤 ← الاسم ← المرسل : ID ← نص الرساله : ← النص
         assert pack["plain_text"].startswith(
-            f"{BOT_NAME_LINE}\nالمرسل: نواف محمد\n\nنص الرسالة:\n\nنص الرسالة")
-        assert "👤" not in pack["plain_text"] and "💬" not in pack["plain_text"]
+            "👤 نواف محمد\nالمرسل : غير معروف\nنص الرساله :\nنص الرسالة")
+        # كيان واحد فقط للاسم — بلا كيان ثانٍ للاسم البديل (v14.9.3)
+        assert len(ents) == 1
 
     def test_entity_pack_without_target_plain(self):
         """بلا هدف → نص عادي بلا كيان رابط (فشل-آمن)."""
@@ -258,8 +265,9 @@ class TestClickableName:
         assert name_ents[0].url == "https://t.me/c/1234567890/77"
         from contact_target import SENDER_LABEL as _SL
         assert name_ents[0].offset == utf16_len(_SL)
-        # النص الظاهر لا يتغير إطلاقاً — الرابط الداخلي فقط (قالب v13 باسم البوت)
-        assert pack["plain_text"] == f"{BOT_NAME_LINE}\nالمرسل: نواف محمد\n\nنص الرسالة:\n\nنص الرسالة"
+        # النص الظاهر لا يتغير إطلاقاً — الرابط الداخلي فقط (v14.9.3، بلا
+        # sender_id ممرَّر → «المرسل : غير معروف» وبلا سطر رابط)
+        assert pack["plain_text"] == "👤 نواف محمد\nالمرسل : غير معروف\nنص الرساله :\nنص الرسالة"
 
     def test_entity_pack_rule_tag_appended(self):
         pack = build_alert_entity_pack("نواف", "نص",
@@ -281,11 +289,12 @@ class TestClickableName:
 
 class TestContactButton:
     def test_button_without_username_via_user_id(self):
-        """spec #15 المحدّد (v14.7.0): username=None لكن user_id → زر مراسلة
-        tg://user?id (مخطط موثّق — بدل openmessage الديسكتوب-فقط)."""
+        """spec #15 المحدّد (v14.9.3): username=None لكن user_id → زر المرسل
+        باسم الظاهر «نواف محمد» برابط tg://user?id (مخطط موثّق — بدل
+        openmessage الديسكتوب-فقط). «مراسلة» بقي فقط لبلا اسم إطلاقاً."""
         built = build_alert_html(_data())
         row = built["buttons"][0]
-        assert {"text": "مراسلة", "url": f"tg://user?id={SENDER_ID}"} in row
+        assert {"text": "نواف محمد", "url": f"tg://user?id={SENDER_ID}"} in row
 
     def test_button_with_username(self):
         built = build_alert_html(_data(sender_username="@iesk1"))
@@ -356,17 +365,18 @@ class TestAlertBotSend:
         assert ok is True and method == "username" and reason == ""
         sent = bot.calls[0]["payload"]
         assert sent["parse_mode"] == "HTML"
-        # لا رابط خام في النص الظاهر (داخل href فقط) — قالب v13 مع @username
-        assert sent["text"].startswith("B_Bot\nالمرسل: <a href=\"https://t.me/iesk1\">نواف محمد</a> — <a href=\"https://t.me/iesk1\">@iesk1</a>\n")
+        # لا رابط خام في النص الظاهر (داخل href فقط) — v14.9.3 مع @username
+        assert sent["text"].startswith("👤 <a href=\"https://t.me/iesk1\">@iesk1</a>\nالمرسل : ID 5601276336\n")
 
     @pytest.mark.asyncio
     async def test_send_user_id_button_without_username(self):
-        """spec #15: بلا username → زر مراسلة tg://user مُقبل + method=mention_button."""
+        """spec #15: بلا username → زر المرسل (اسم الظاهر) برابط tg://user
+        مُقبل + method=mention_button (v14.9.3)."""
         bot = _FakeAlertBot([])
         ok, method, _ = await bot.send(_data())
         assert ok is True and method == "mention_button"
         row = bot.calls[0]["payload"]["reply_markup"]["inline_keyboard"][0]
-        assert {"text": "مراسلة", "url": f"tg://user?id={SENDER_ID}"} in row
+        assert {"text": "نواف محمد", "url": f"tg://user?id={SENDER_ID}"} in row
 
     @pytest.mark.asyncio
     async def test_privacy_rejection_retries_without_contact_only(self):
@@ -406,8 +416,8 @@ class TestAlertBotSend:
             for e in ents
         )
         # النص الظاهر في الطبقة الاحتياطية يطابق القالب (بلا وسوم HTML)
-        # v13: اسم البوت ثم الاسم ثم «نص الرسالة:» ثم النص مباشرة
-        assert call["text"].startswith(f"{BOT_NAME_LINE}\nالمرسل: نواف محمد\n\nنص الرسالة:\n\n")
+        # v14.9.3: 👤 ثم الاسم ثم «المرسل : ID» ثم «نص الرساله :» ثم النص
+        assert call["text"].startswith("👤 نواف محمد\nالمرسل : ID 5601276336\nنص الرساله :\n")
 
     @pytest.mark.asyncio
     async def test_no_token_safe_fallback(self):
@@ -420,8 +430,8 @@ class TestAlertBotSend:
     async def test_alert_never_lost_on_avatar_failure(self):
         """spec #21: الصورة optional — فشلها لا يمنع الاسم ولا الزر."""
         built = build_alert_html(_data(sender_photo_available=False))
-        assert built["text"].startswith("B_Bot\nالمرسل: <a href=\"tg://user?id=5601276336\">نواف محمد</a>")
-        assert "مراسلة" in [b["text"] for b in built["buttons"][0]]
+        assert built["text"].startswith("👤 <a href=\"tg://user?id=5601276336\">نواف محمد</a>\nالمرسل : ID")
+        assert "نواف محمد" in [b["text"] for b in built["buttons"][0]]
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -577,8 +587,8 @@ class TestSpecTenCases:
         built = build_alert_html(_data(sender_id=123456789, sender_username="@iesk1"))
         assert 'href="https://t.me/iesk1"' in built["text"]
         assert {"text": "@iesk1", "url": "https://t.me/iesk1"} in built["buttons"][0]  # v14.9.2
-        # v13: الاسم و@username كلاهما رابط (صيغة الصورة المرجعية) باسم البوت
-        assert built["text"].startswith("B_Bot\nالمرسل: <a href=\"https://t.me/iesk1\">نواف محمد</a> — <a href=\"https://t.me/iesk1\">@iesk1</a>\n")
+        # v14.9.3: الاسم الظاهر = @username وهو رابط (الصيغة المرجعية الموحدة)
+        assert built["text"].startswith("👤 <a href=\"https://t.me/iesk1\">@iesk1</a>\nالمرسل : ID 123456789\n")
 
     def test_case2_no_username_uid_5601276336(self):
         """Test 2: username=None + user_id=5601276336 → clickable عبر user_id."""
@@ -631,7 +641,7 @@ class TestSpecTenCases:
         built = build_alert_html(_data(sender_photo_available=False,
                                        sender_is_deleted=False))
         assert built["contact_method"] == "mention_button"
-        assert "مراسلة" in [b["text"] for b in built["buttons"][0]]
+        assert "نواف محمد" in [b["text"] for b in built["buttons"][0]]
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -746,13 +756,16 @@ class TestMetrics:
 
 class TestFinalTemplate:
     def test_exact_shape(self):
-        """الشكل النهائي الفعّال (v13): B_Bot ← المرسل: الاسم ← (فارغ) ← نص الرسالة: ← النص ← [مراسلة][عرض]."""
+        """الشكل النهائي الفعّال — الصيغة المرجعية الموحدة v14.9.3:
+        👤 ← المرسل : ID ← نص الرساله : ← النص ← رابط الرساله : ←
+        [زر المرسل (الاسم الظاهر)][جروب]."""
         built = build_alert_html(_data())
-        expected_head = ("B_Bot\nالمرسل: <a href=\"tg://user?id=5601276336\">نواف محمد</a>"
-                         "\n\nنص الرسالة:\n\nنص الرسالة الأصلي")
+        expected_head = ("👤 <a href=\"tg://user?id=5601276336\">نواف محمد</a>"
+                         "\nالمرسل : ID 5601276336\nنص الرساله :\nنص الرسالة الأصلي"
+                         "\nرابط الرساله : https://t.me/c/111222333/4242")
         assert built["text"] == expected_head
         assert [[b["text"] for b in row] for row in built["buttons"]] == [
-            ["مراسلة", "جروب"]  # v14.9.2
+            ["نواف محمد", "جروب"]  # v14.9.3: زر المرسل باسمه الظاهر
         ]
 
     def test_monitor_build_alert_uses_same_target(self):
@@ -769,11 +782,11 @@ class TestFinalTemplate:
                                         last_name="محمد")
         text, buttons = m._build_alert(sender, chat, "واجب", "النص", {},
                                        contact_target=target)
-        assert text == ("B_Bot\nالمرسل: <a href=\"tg://user?id=5601276336\">نواف محمد</a>\n\n"
-                        "نص الرسالة:\n\nالنص")
-        # v14.9.2: نفس اللوحة لكل المسارات (مراسلة ← جروب من هدف ContactTarget)
-        # v14.7.0: زر مراسلة = tg://user?id (بدل openmessage الديسكتوب-فقط)
+        assert text == ("👤 <a href=\"tg://user?id=5601276336\">نواف محمد</a>\n"
+                        "المرسل : ID 5601276336\nنص الرساله :\nالنص"
+                        "\nرابط الرساله : https://t.me/c/111222333/4242")
+        # v14.9.3: نفس اللوحة لكل المسارات (زر المرسل باسمه الظاهر ← جروب)
         assert buttons == [[
-            {"text": "مراسلة", "url": f"tg://user?id={SENDER_ID}"},
+            {"text": "نواف محمد", "url": f"tg://user?id={SENDER_ID}"},
             {"text": "جروب", "url": "https://t.me/c/111222333"},
         ]]
