@@ -382,9 +382,12 @@ class ResolveResult:
 class SenderResolver:
     _LATENCY_WINDOW = 2000
 
-    # v14.5.2: temporary link cache configuration
-    _TEMP_LINK_CACHE_MAXSIZE = 5000
-    _TEMP_LINK_CACHE_TTL_S = 6 * 3600  # 6h << Telegram server expiry (~7d)
+    # v14.7.0: temporary-link cache REMOVED — contacts.exportContactToken
+    # (Telethon 1.45) takes zero parameters, so the v14.5.2 call raised
+    # TypeError on every attempt (77/77 failures in production). Even a
+    # successful call returns a temporary link for the CALLING monitor
+    # account, not the sender — an account-exposure bug. The strategy is
+    # unimplementable as designed and was removed from the ladder.
 
     def __init__(
         self,
@@ -404,16 +407,6 @@ class SenderResolver:
         self._metrics: Dict[str, int] = defaultdict(int)
         self._latencies: Deque[float] = deque(maxlen=self._LATENCY_WINDOW)
         self._flood_wait_until: float = 0.0
-
-        # v14.5.2: temporary-link cache. The generated URL is a UNIVERSAL
-        # link (any account can open it once created), so the key is just
-        # the sender_id — NOT the account that generated it. Cross-account
-        # sharing is safe because Telegram's server validates the token,
-        # not the account that made it.
-        self._temp_link_cache: "TTLCache[int, str]" = TTLCache(
-            maxsize=self._TEMP_LINK_CACHE_MAXSIZE,
-            ttl=self._TEMP_LINK_CACHE_TTL_S,
-        )
 
     extract = staticmethod(extract_sender)
     extract_flat = staticmethod(extract_flat)
@@ -502,15 +495,14 @@ class SenderResolver:
             "entity_cache_hit": 0, "entity_cache_miss": 0,
             "telegram_retry_count": 0, "flood_wait_count": 0,
             "inflight_dedup": 0,
+            # v14.7.0: temporary_link counters kept at zero for honest
+            # history — the strategy was removed (see class docstring).
             "temporary_link_success": 0, "temporary_link_failure": 0,
             "temporary_link_cache_hit": 0, "temporary_link_cache_miss": 0,
         }
         return {
             "enabled": bool(getattr(CFG, "SENDER_INTEL_ENABLED", True)),
             "cache_size": len(self._entity_cache),
-            "temp_link_cache_size": len(self._temp_link_cache),
-            "temp_link_cache_maxsize": self._TEMP_LINK_CACHE_MAXSIZE,
-            "temp_link_cache_ttl_s": self._TEMP_LINK_CACHE_TTL_S,
             "flood_wait_remaining": round(max(0.0, self._flood_wait_until - time.time()), 1),
             "average_resolve_latency": round(self._avg_latency(), 2),
             **{**base, **self._metrics},
@@ -537,87 +529,8 @@ class SenderResolver:
             await asyncio.sleep(seconds)
 
     # ═══════════════════════════════════════════════════════════════════
-    # v14.5.2: export_temporary_link — HTTPS link with in-memory cache
+    # v14.7.0: export_temporary_link REMOVED.
     # ═══════════════════════════════════════════════════════════════════
-    async def export_temporary_link(
-        self,
-        client: TelegramClient,
-        sender_id: Any,
-        access_hash: Any,
-        *,
-        timeout: float = 3.0,
-        force_refresh: bool = False,
-    ) -> Optional[str]:
-        """v14.5.2: fetch (or return cached) a temporary profile link.
-
-        Produces https://t.me/+<token> that opens the user's profile EVEN
-        when they have no username — a Telegram-official mechanism
-        (core.telegram.org/api/links, "Temporary profile links"). The
-        link expires server-side (~7 days); we cache it for 6 hours so
-        the cache never returns a dead URL.
-
-        The generated URL is UNIVERSAL: any account can serve it to any
-        recipient. So the cache key is just sender_id — a second account
-        asking for the same sender hits the cache from the first
-        account's generation.
-
-        force_refresh=True bypasses the cache (for debugging / manual
-        retries). Never raises. Returns None on any failure.
-        """
-        try:
-            sid = int(sender_id or 0)
-            ah = int(access_hash) if access_hash is not None else 0
-        except (TypeError, ValueError):
-            return None
-        if not sid or not ah:
-            return None
-
-        # v14.5.2: cache lookup first — eliminates 95%+ of API calls
-        # across alerts and across accounts.
-        if not force_refresh:
-            cached = self._temp_link_cache.get(sid)
-            if cached:
-                self._inc("temporary_link_cache_hit")
-                return cached
-
-        self._inc("temporary_link_cache_miss")
-
-        if self._in_flood_cooldown():
-            self._inc("temporary_link_failure")
-            return None
-
-        try:
-            from telethon.tl.functions.contacts import ExportContactTokenRequest
-            from telethon.tl.types import InputUser as _InputUser
-        except Exception:
-            self._inc("temporary_link_failure")
-            return None
-
-        try:
-            result = await asyncio.wait_for(
-                client(ExportContactTokenRequest(
-                    _InputUser(user_id=sid, access_hash=ah)
-                )),
-                timeout=float(timeout),
-            )
-            url = getattr(result, "url", None)
-            if isinstance(url, str) and url.startswith("https://t.me/"):
-                self._temp_link_cache[sid] = url
-                self._inc("temporary_link_success")
-                logger.debug(f"export_temporary_link OK [{sid}]: {url[:40]}… (cached)")
-                return url
-            self._inc("temporary_link_failure")
-            return None
-        except FloodWaitError as e:
-            self._record_flood(getattr(e, "seconds", 0) or 0, "export_contact_token")
-            self._inc("temporary_link_failure")
-            return None
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            logger.debug(f"export_temporary_link failed [{sid}]: {type(e).__name__}: {e}")
-            self._inc("temporary_link_failure")
-            return None
 
     async def resolve_entity(
         self,
@@ -1063,8 +976,7 @@ sender_intel = SenderResolver(
 )
 logger.info(
     f"Sender Intelligence initialized | enabled={getattr(CFG, 'SENDER_INTEL_ENABLED', True)} | "
-    f"cache={getattr(CFG, 'SENDER_ENTITY_CACHE_SIZE', 2000)} | ttl={getattr(CFG, 'SENDER_ENTITY_CACHE_TTL', 900)}s | "
-    f"temp_link_cache={SenderResolver._TEMP_LINK_CACHE_MAXSIZE}@{SenderResolver._TEMP_LINK_CACHE_TTL_S}s"
+    f"cache={getattr(CFG, 'SENDER_ENTITY_CACHE_SIZE', 2000)} | ttl={getattr(CFG, 'SENDER_ENTITY_CACHE_TTL', 900)}s"
 )
 
 

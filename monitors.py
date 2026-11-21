@@ -934,7 +934,10 @@ class ReconnectionManager:
                         self._mon._connect_flood_until = 0.0
                     last_error = self._mon._last_connect_error or ""
                     _UNRECOVERABLE_CONNECT_ERRORS = (
-                        "AuthKeyDuplicatedError",
+                        # v14.7.0: كانت "AuthKeyDuplicatedError" ولا تطابق
+                        # القيمة المخزنة فعلياً ("AuthKeyDuplicated") — الحالة
+                        # النهائية ظلت ميتة و230+ محاولة فاشلة في الإنتاج.
+                        "AuthKeyDuplicated",
                         "SessionPasswordNeededError",
                         "Session expired",
                         "AuthKeyUnregistered",
@@ -944,20 +947,31 @@ class ReconnectionManager:
                         # v14.6.0: توثيق آخر AuthKeyDuplicated (لـ /health/full)
                         if "AuthKeyDuplicated" in last_error:
                             self.last_authkey_dup_ts = now_ts
-                        logger.error(f"Unrecoverable error for {self._mon.account['name']}, suspending retries")
+                        # ══ v14.7.0: حالة نهائية حقيقية ══
+                        # وسم نهائي + إشعار واحد + إنهاء المشرف نهائياً
+                        # (سابقاً: sleep(3600)+continue بلا نهاية).
+                        self._mon._terminal_error = str(last_error)[:120]
+                        logger.error(
+                            f"Unrecoverable error for {self._mon.account['name']} "
+                            f"({self._mon._terminal_error}) — supervisor stopped, "
+                            f"manual re-login required (needs_relogin=true)"
+                        )
                         self._mon._last_connect_error = f"Unrecoverable: {last_error[:100]}"
-                        try:
-                            await self._mon.db.record_notification(
-                                ntype="account_needs_relogin",
-                                title=f"الحساب {self._mon.account['name']} يحتاج إعادة دخول",
-                                body=f"توقفت محاولات إعادة الاتصال تلقائياً ({str(last_error)[:120]}). أعد تسجيل الدخول من صفحة الحسابات.",
-                                severity="warn",
-                                object_type="account",
-                                object_id=str(self._mon.account.get("name", "")),
-                            )
-                        except Exception:
-                            pass
-                        await asyncio.sleep(3600); continue
+                        if not self._mon._relogin_notified:
+                            self._mon._relogin_notified = True
+                            try:
+                                await self._mon.db.record_notification(
+                                    ntype="account_needs_relogin",
+                                    title=f"الحساب {self._mon.account['name']} يحتاج إعادة دخول",
+                                    body=f"توقفت محاولات إعادة الاتصال تلقائياً ({str(last_error)[:120]}). أعد تسجيل الدخول من صفحة الحسابات.",
+                                    severity="warn",
+                                    object_type="account",
+                                    object_id=str(self._mon.account.get("name", "")),
+                                )
+                            except Exception:
+                                pass
+                        self._running = False
+                        return
                     self._consecutive_failures += 1
                     # v14.5.5-fix: إشعار واحد للإدارة عند تكرار الجلسة
                     # (AuthKeyDuplicated المستمر = المفتاح ملغى من تيليجرام
@@ -1035,6 +1049,12 @@ class EnhancedAccountMonitor:
         self.last_event_sender_id: int = 0
         self.events_received: int = 0
         self.last_connect_success_ts: float = 0.0
+        # ══ v14.7.0: الحالة النهائية للاتصال ══
+        # _terminal_error يُضبط مرة واحدة عند خطأ غير قابل للاسترداد
+        # (AuthKeyDuplicated/2FA/...). المراقب بهذا الوسم لا يُسلّح له
+        # مشرف إعادة اتصال جديد (watchdog/boot) — إعادة الدخول يدوية.
+        self._terminal_error: Optional[str] = None
+        self._relogin_notified: bool = False
         self._connect_lock = asyncio.Lock(); self._reconnect = ReconnectionManager(self)
         self._send_cb = CircuitBreaker(f"send_{account['name']}", failure_threshold=5, recovery_timeout=60.0)
         self._entity_cb = CircuitBreaker(f"entity_{account['name']}", failure_threshold=3, recovery_timeout=30.0)
@@ -1449,15 +1469,20 @@ class EnhancedAccountMonitor:
             logger.error(f"Unhandled media task exception [{self.account['name']}]: {exc}")
 
     async def _event_to_dict(self, event: events.NewMessage.Event) -> Dict[str, Any]:
+        # v14.7.0: مهلتي جلب المرسل 1.2s/0.75s → 0.6s/0.35s — الجلب البارد
+        # كان يضاف كاملاً إلى receive_lag داخل معالج الأحداث (ويعطل استقبال
+        # أحداث الحسابات الأخرى). عند انتهاء المهلة يضبط الإثراء اللاحق
+        # (_enrich_sender_via_resolver + DB) الهوية في مسار العامل بدلاً
+        # من المسار الحرج للالتقاط — بلا فقدان هوية.
         sender = event.sender
         if sender is None and bool(getattr(event, "sender_id", None)):
             try:
-                sender = await asyncio.wait_for(event.get_sender(), timeout=1.2)
+                sender = await asyncio.wait_for(event.get_sender(), timeout=0.6)
             except Exception:
                 sender = event.sender
         _inp = None
         try:
-            _inp = await asyncio.wait_for(event.get_input_sender(), timeout=0.75)
+            _inp = await asyncio.wait_for(event.get_input_sender(), timeout=0.35)
         except Exception:
             _inp = None
         _inp_hash: Optional[int] = None
@@ -2011,9 +2036,19 @@ class EnhancedAccountMonitor:
     async def _analyze_and_alert(self, data: Dict[str, Any], msg_hash: str, validated_text: Optional[str]):
         sender_id = data.get("sender_id", 0); has_media = bool(data.get("media_object"))
         start_time = time.perf_counter()
+        # ══ v14.7.0: لقطة الذكاء على الخلفية ══
+        # 4 كتابات DB متسلسلة (~0.4-1.2s على Supabase) كانت تحجب تحليل
+        # كل رسالة — الآن تنطلق خلفياً (spawn_bg) ومتوازية (gather داخلها)
+        # — لا تعتمدية read-your-writes في مسار التنبيه الحالي، ورفع الحدث
+        # التالي نفسه يستفيد من الكتابات المكتملة في الإثراء من DB.
         try:
-            await self._record_intel_snapshot(
-                data, msg_hash, validated_text if validated_text is not None else (data.get("text") or None))
+            from task_util import spawn_bg as _spawn_bg
+            _spawn_bg(
+                self._record_intel_snapshot(
+                    data, msg_hash,
+                    validated_text if validated_text is not None else (data.get("text") or None)),
+                name=f"intel_{self.account['name']}_{data.get('chat_id')}_{data.get('message_id')}",
+            )
         except Exception as _ie_err:
             logger.debug(f"intel snapshot skipped [{self.account['name']}]: {type(_ie_err).__name__}")
         if validated_text:
@@ -2191,67 +2226,78 @@ class EnhancedAccountMonitor:
 
     async def _record_intel_snapshot(self, data: Dict[str, Any], msg_hash: str,
                                      text: Optional[str]) -> None:
+        # ══ v14.7.0: الكتابات الأربع متوازية (gather) بدل التسلسل ══
+        # مستقلة تماماً (upserts بلا تبعية ترتيب) — زمن اللقطة الكلي
+        # = أبطأ كتابة بدلاً من مجموع الأربع (~0.4-1.2s → ~0.1-0.3s).
         db = self.db
         sender_id = data.get("sender_id") or 0
         chat_id = data.get("chat_id") or 0
         ts = data.get("timestamp") or time.time()
         message_id = data.get("message_id")
-        try:
-            if sender_id:
-                await db.upsert_tg_user({
-                    "user_id": int(sender_id),
-                    "access_hash": data.get("sender_access_hash"),
-                    "first_name": data.get("sender_first_name"),
-                    "last_name": data.get("sender_last_name"),
-                    "username": data.get("sender_username"),
-                    "phone": data.get("sender_phone"),
-                    "is_bot": data.get("sender_is_bot"),
-                    "is_verified": data.get("sender_is_verified"),
-                    "is_premium": data.get("sender_is_premium"),
-                    "is_scam": data.get("sender_is_scam"),
-                    "is_fake": data.get("sender_is_fake"),
-                    "is_deleted": data.get("sender_is_deleted"),
-                    "status": data.get("sender_status"),
-                })
-        except Exception as e:
-            logger.debug(f"intel users skipped: {type(e).__name__}")
-        try:
-            if chat_id and sender_id:
-                await db.upsert_group_membership({
-                    "chat_id": int(chat_id), "user_id": int(sender_id),
-                    "chat_title": data.get("chat_title"),
-                    "chat_username": data.get("chat_username"),
-                    "chat_type": data.get("chat_type"),
-                    "is_member": True,
-                })
-        except Exception as e:
-            logger.debug(f"intel membership skipped: {type(e).__name__}")
-        try:
-            if chat_id and message_id:
-                artifacts = self._extract_text_artifacts(text)
-                await db.record_group_message({
-                    "chat_id": int(chat_id), "message_id": int(message_id),
-                    "user_id": int(sender_id) if sender_id else None,
-                    "message_text": text,
-                    "message_date": ts,
-                    "message_link": build_telegram_links(
-                        chat_id, message_id, username=data.get("chat_username")
-                    ).get("message"),
-                    "reply_to_message_id": data.get("reply_to_message_id"),
-                    "is_reply": bool(data.get("reply_to_message_id")),
-                    "is_forward": bool(data.get("is_forward")),
-                    "media_type": data.get("media_type"),
-                    "msg_hash": msg_hash,
-                    **artifacts,
-                })
-        except Exception as e:
-            logger.debug(f"intel message skipped: {type(e).__name__}")
-        try:
-            if chat_id and sender_id:
-                await db.record_user_activity(int(sender_id), int(chat_id),
-                                              message_id, ts)
-        except Exception as e:
-            logger.debug(f"intel activity skipped: {type(e).__name__}")
+
+        async def _w_users() -> None:
+            if not sender_id:
+                return
+            await db.upsert_tg_user({
+                "user_id": int(sender_id),
+                "access_hash": data.get("sender_access_hash"),
+                "first_name": data.get("sender_first_name"),
+                "last_name": data.get("sender_last_name"),
+                "username": data.get("sender_username"),
+                "phone": data.get("sender_phone"),
+                "is_bot": data.get("sender_is_bot"),
+                "is_verified": data.get("sender_is_verified"),
+                "is_premium": data.get("sender_is_premium"),
+                "is_scam": data.get("sender_is_scam"),
+                "is_fake": data.get("sender_is_fake"),
+                "is_deleted": data.get("sender_is_deleted"),
+                "status": data.get("sender_status"),
+            })
+
+        async def _w_membership() -> None:
+            if not (chat_id and sender_id):
+                return
+            await db.upsert_group_membership({
+                "chat_id": int(chat_id), "user_id": int(sender_id),
+                "chat_title": data.get("chat_title"),
+                "chat_username": data.get("chat_username"),
+                "chat_type": data.get("chat_type"),
+                "is_member": True,
+            })
+
+        async def _w_message() -> None:
+            if not (chat_id and message_id):
+                return
+            artifacts = self._extract_text_artifacts(text)
+            await db.record_group_message({
+                "chat_id": int(chat_id), "message_id": int(message_id),
+                "user_id": int(sender_id) if sender_id else None,
+                "message_text": text,
+                "message_date": ts,
+                "message_link": build_telegram_links(
+                    chat_id, message_id, username=data.get("chat_username")
+                ).get("message"),
+                "reply_to_message_id": data.get("reply_to_message_id"),
+                "is_reply": bool(data.get("reply_to_message_id")),
+                "is_forward": bool(data.get("is_forward")),
+                "media_type": data.get("media_type"),
+                "msg_hash": msg_hash,
+                **artifacts,
+            })
+
+        async def _w_activity() -> None:
+            if not (chat_id and sender_id):
+                return
+            await db.record_user_activity(int(sender_id), int(chat_id),
+                                          message_id, ts)
+
+        results = await asyncio.gather(
+            _w_users(), _w_membership(), _w_message(), _w_activity(),
+            return_exceptions=True,
+        )
+        for _r in results:
+            if isinstance(_r, Exception) and not isinstance(_r, asyncio.CancelledError):
+                logger.debug(f"intel snapshot write skipped: {type(_r).__name__}")
 
     def _account_name_for_client(self, client: Optional[TelegramClient]) -> Optional[str]:
         if client is None:
@@ -2583,9 +2629,43 @@ class EnhancedAccountMonitor:
                 f"sender={sender_id} | fp={dedup_fp[:12]} (cross-account/re-send dedup)"
             )
             return False
-        if not await self._bot_ref.rate_limiter.can_proceed(account_name):
+        # ══ v14.7.0: حارس المعدل لا يُسقط التنبيه صامتاً ══
+        # سابقاً: نفاد التوكن كان يُسقط التنبيه نهائياً (فقدان إشعار).
+        # الآن: انتظار محدود لتوكن متاح (wait_for_token)، وعند استنفاد
+        # الميزانية يُعاد التنبيه عبر DLQ (سلّم إعادة محاولة مؤكد) بدل
+        # الإسقاط الصامت — «لا تنبيه مفقود بسبب throttle داخلي».
+        _rl = getattr(self._bot_ref, "rate_limiter", None)
+        _rate_ok = False
+        if _rl is not None:
+            try:
+                _rate_ok = bool(await _rl.can_proceed(account_name))
+            except Exception:
+                _rate_ok = False
+            if not _rate_ok:
+                _wait_fn = getattr(_rl, "wait_for_token", None)
+                if _wait_fn is not None:
+                    try:
+                        _rate_ok = bool(await _wait_fn(account_name))
+                    except Exception:
+                        _rate_ok = False
+        if not _rate_ok:
             await self._inc_stat("rate_limited")
             await get_deduplicator().release(dedup_fp)
+            try:
+                await self._dlq.push(
+                    data,
+                    RuntimeError("rate_limit_budget_exhausted"),
+                    retry_count=0,
+                )
+                logger.warning(
+                    f"Rate budget exhausted [{account_name}] | msg_hash={msg_hash} "
+                    f"— re-scheduled via DLQ (no silent drop)"
+                )
+            except Exception as _dlq_err:
+                logger.warning(
+                    f"Rate budget exhausted [{account_name}] | DLQ push failed: "
+                    f"{type(_dlq_err).__name__} — alert re-claimable on next pipeline pass"
+                )
             return False
         _sim_hit = get_similarity_gate().check_and_record(sender_id, text)
         if _sim_hit is not None:
@@ -2615,22 +2695,12 @@ class EnhancedAccountMonitor:
             except Exception:
                 pass
 
-        # ══ v14.5.2: جلب رابط المرسل المؤقت عند غياب username ══
-        # https://t.me/+<token> يعمل بلا username (موثق في تيليجرام).
-        # الفشل-آمن: None عند أي خطأ → سلّم contact_target يستمر.
-        _temp_link: Optional[str] = None
-        if not (nav_sender_username or sender_username or data.get("sender_username")):
-            try:
-                _temp_link = await sender_intel.export_temporary_link(
-                    send_client, sender_id, sender_access_hash,
-                )
-            except Exception as _tl_err:
-                logger.debug(
-                    f"export_temporary_link skipped [{account_name}]: "
-                    f"{type(_tl_err).__name__}"
-                )
-                _temp_link = None
-
+        # ══ v14.7.0: طبقة temporary_link حُذفت نهائياً ══
+        # contacts.exportContactToken لا يقبل وسيطاً في Telethon 1.45
+        # (TypeError دائماً — 77/77 فشل)، والرابط الناتج (لو نجح) يعود
+        # لحساب المراقب لا للمرسل. الحذف يوفر أيضاً حتى 3 ثوانٍ من
+        # الانتظار الداخلي لكل تنبيه بلا username (مهلة 3.0s كانت تُدفع
+        # في المسار الحرج للإرسال).
         sender_target = _resolve_contact_target(
             sender_id=sender_id,
             username=nav_sender_username or sender_username or data.get("sender_username"),
@@ -2640,7 +2710,6 @@ class EnhancedAccountMonitor:
             is_bot=data.get("sender_is_bot"),
             is_deleted=data.get("sender_is_deleted"),
             phone=data.get("sender_phone"),                # v14.5.2
-            temporary_link_url=_temp_link,                  # v14.5.2
         )
         if not display_name:
             display_name = sender_target.display_name or "مرسل غير محدد"

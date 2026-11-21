@@ -1,3 +1,22 @@
+---
+Task ID: v14.7.0 (instant-delivery: buttons repair + latency + terminal states)
+Agent: Z.ai Code (main orchestrator)
+Task: تحسين الروبوت الحالي بلا إعادة بناء — سرعة المراقبة، زرا الإشعار، حالة الحسابات — مع الحفاظ على كل ميزة عاملة
+
+Work Log:
+- [زر مراسلة — عطل جذري مُثبت]: contacts.exportContactToken في Telethon 1.45 طلب بلا وسائط؛ الاستدعاء القديم كان يرفع TypeError عند كل محاولة (temporary_link_failure=77/77 في الإنتاج — مطابقة تامة لعدد المرسلين بلا username). حتى لو نجح لكان الرابط يعود لحساب المراقب لا للمرسل (تسريب حساب). أزيلت الطبقة نهائياً: sender_resolver.export_temporary_link + الكاش + مفاتيح snapshot (بقيت العدادات صفرية لتاريخ صادق)، ومنع الاختيار في contact_target.
+- [زر مراسلة — سلّم صادق]: الترتيب كان يختار tg://openmessage (ديسكتوب فقط — أزرار ميتة على الجوال 74/84) قبل tg://user?id (توصل نفس الشرط فلم يُختار أبداً — user_id_fallback=0 بنيوياً). الجديد: username > phone > user_id > openmessage. رفض Bot API لخصوصية tg://user?id مُعالَج أصلاً بسلامة (إعادة بلا زر مراسلة + ذاكرة سلبية 6h + رابط اسم يتحول لرابط الرسالة المصدر).
+- [مقاييس صادقة]: _emit_alert_log يصنف contact من رابط زر «مراسلة» المرفق فعلياً: B1 t.me/{u} | B2 tg://user?id | B3 مباشر محدود (t.me/+phone أو openmessage) | B4 بلا زر مراسلة (الاسم عبر رابط الرسالة). سابقاً بُلعت openmessage/phone تحت B4.
+- [حالة نهائية AuthKeyDuplicated]: الحارس كان يقارن "AuthKeyDuplicatedError" مع المخزن "AuthKeyDuplicated" فلم تشتغل الحالة النهائية إطلاقاً — 204 محاولة فاشلة كل 300s (Account 1). الآن: مطابقة صحيحة + _terminal_error على المراقب + إشعار واحد (حارس _relogin_notified) + إنهاء حلقة المشرف نهائياً + منع إعادة التسليح من watchdog/الإقلاع + needs_relogin/terminal_error على /health/full.
+- [لا إسقاط صامت لحارس المعدل]: نفاد التوكن كان يُسقط التنبيه نهائياً؛ الآن wait_for_token (انتظار محدود 35s، استقصاء 0.75s بلا أقفال) ثم DLQ بدل الإسقاط — توافق خلفي عبر getattr للمرسلات الاختبارية.
+- [زمن الاستجابة]: (1) حذف SELECT الاستباقي من add_to_queue داخل القفل العام — الفهرس الفريد الجزئي + مسار استرداد السباق يعطيان النتيجة نفسها بRTT واحد فقط عند التكرار الفعلي بدل كل رسالة؛ (2) لقطة الذكاء (4 كتابات متسلسلة) تنطلق خلفياً ومتوازية (spawn_bg + gather) — حاجب التحليل ~0.4-1.2s صفر الآن؛ (3) مهلتي جلب المرسل في معالج الأحداث 1.2s/0.75s → 0.6s/0.35s (الإثراء اللاحق في مسار العامل يعوض).
+- [ذاكرة/استقرار]: tracemalloc يعمل فقط عند MEMORY_TRACEMALLOC=1 (كان بلا شرط — بصمة RSS ثابتة تحت حد 480MB)، _clear_caches يمسح كاشات الفلتر (_text_cache 5000 + _hash_cache 10000 — كانت لاصقة عبر 294 إعادة ناعمة)، FAST_CAPTURE_ENABLED الافتراضي true (كان false وenv الإنتاج بلا المتغير).
+- الاختبارات: العدّة كاملة PASS (EXIT=0) — عُدّلت عقود السلّم في 6 ملفات اختبار (test_contact_target_v11_2 + golden S2/S3 في test_alert_regression + alert_bot_v10_8 + alert_template_v11_6 + v11_7_1 + v12_4) وأُضيفت حالات سلّم phone/temporary_link ضمن الاختبارات المحدّثة نفسها.
+
+Stage Summary:
+- الإنتاج يعمل 2/3 حسابات (Account 1 جلسة ملغاة AuthKeyDuplicated — يحتاج توليد SESSION_STRING جديد يدوياً؛ الحسابات 2/5/6 بلا متغيرات بيئة أصلاً). الكود يدعم حتى 21 حساباً بلا أي سقف — التفعيل الكامل للستة يتطلب بيانات دخول المالك فقط.
+- على المالك: (1) توليد جلسة جديدة لـ Account 1 عبر generate_session.py وتحديث متغير البيئة؛ (2) إضافة ACCOUNT_2/5/6_* env إذا أراد ستة حسابات فعلاً؛ (3) التحقق من FAST_CAPTURE_ENABLED=true في لوحة Render (الأصبح الافتراضي ON بالكود).
+
 
 ---
 Task ID: v14.1.1 (audit-tail: last dead dashboard code + stale comments)

@@ -197,6 +197,10 @@ class ContactTarget:
     openmessage_url: Optional[str] = None
     # v14.5.2: مسارات HTTPS إضافية تعمل حتى بلا username
     phone_url: Optional[str] = None
+    # v14.7.0: temporary_link_url أُوقفت — contacts.exportContactToken لا
+    # يقبل أي وسيط في Telethon 1.45 (TypeError دائماً — 77/77 فشل في
+    # الإنتاج)، وحتى لو نجح فالرابط يعود لحساب المراقب نفسه لا للمرسل
+    # (تسريب حساب). الحقل محفوظ للتوافق الخلفي فقط — لا يُختار أبداً.
     temporary_link_url: Optional[str] = None
     selected_url: Optional[str] = None
     target_type: str = "none"
@@ -294,7 +298,10 @@ def resolve_contact_target(
     # ── المسارات المتاحة ──
     username_url = f"{_TG_URL}{uname}" if uname else None
 
-    # v14.5.2: temporary link من exportContactToken (HTTPS، يعمل بلا username).
+    # v14.7.0: طبقة temporary_link أزيلت من المسار — الطلب نفسه يرفع
+    # TypeError في Telethon 1.45 (requests بلا وسائط) والرابط الناتج
+    # (لو نجح) يعود لحساب المراقب لا للمرسل. الحقل يبقى للتوافق الخلفي
+    # ويُحفظ كما هو إن مُرّر لكنه لا يدخل سلسلة الاختيار أبداً.
     temp_url: Optional[str] = None
     if temporary_link_url:
         _t = str(temporary_link_url).strip()
@@ -316,17 +323,21 @@ def resolve_contact_target(
         else None
     )
 
-    # ── الاختيار: username > temporary_link > phone > openmessage > user_id ──
+    # ── الاختيار (v14.7.0): username > phone > user_id > openmessage ──
+    # تغيير v14.7.0: tg://user?id={sid} يُختار قبل tg://openmessage —
+    # openmessage مخطط تيليجرام-ديسكتوب فقط (ميت على Android/iOS —
+    # 74 زراً ميتاً في الإنتاج)، بينما tg://user?id مخطط موثّق تدعمه
+    # كل العملاء حين تعرف هوية المرسل؛ ورفض Bot API له (خصوصية)
+    # مُعالَج بسلامة كاملة (إعادة إرسال بلا زر مراسلة + ذاكرة سلبية
+    # + رابط اسم يتحول لرابط الرسالة المصدر).
     if username_url:
         selected_url, target_type = username_url, "username"
-    elif temp_url:
-        selected_url, target_type = temp_url, "temporary_link"
     elif phone_url:
         selected_url, target_type = phone_url, "phone"
-    elif openmessage_url:
-        selected_url, target_type = openmessage_url, "openmessage"
     elif user_id_url:
         selected_url, target_type = user_id_url, "user_id"
+    elif openmessage_url:
+        selected_url, target_type = openmessage_url, "openmessage"
     else:
         selected_url, target_type = None, "none"
 

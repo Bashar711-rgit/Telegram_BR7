@@ -386,7 +386,11 @@ def _emit_alert_log(
             الأزرار كافة | T5 عبر العميل الحي (فشل Bot API).
       name: N1 username | N2 tg://user (Bot API anchor) | N4 openmessage
             | N5 نص عادي.
-      contact: B1 t.me | B2 tg://user | B4 رابط الرسالة | none.
+      contact (v14.7.0 — من زر «مراسلة» المرفق فعلياً):
+            B1 t.me/{username} | B2 tg://user?id (زر مباشر متوافق مع كل
+            العملاء حين تُعرف الهوية) | B3 مخطط مباشر محدود (t.me/+phone
+            أو tg://openmessage — ديسكتوب فقط) | B4 بلا زر مراسلة —
+            المسار عبر رابط الرسالة المصدر (الاسم مُصلَّح له) | none.
       view: V1 t.me/<u>/<id> | V2 t.me/c/... | V4 group/alert | none.
       buttons: «n/2» — الزران الهدفان مراسلة+عرض.
     """
@@ -410,7 +414,28 @@ def _emit_alert_log(
             tier = "T1"
 
         msg_link = str(built.get("msg_link") or "").strip()
-        if method == "username":
+        # ══ v14.7.0: التصنيف من رابط زر «مراسلة» المرفق فعلياً ══
+        # سابقاً كان التصنيف من method فقط — فبُلعت أزرار openmessage/phone
+        # تحت B4 (مضلل). الآن: الزر المرفق هو الحقيقة.
+        _btn_url: Optional[str] = None
+        try:
+            for _row in (built.get("buttons") or []):
+                for _b in (_row or []):
+                    if str((_b or {}).get("text") or "") == BTN_CONTACT:
+                        _btn_url = str((_b or {}).get("url") or "").strip() or None
+                        break
+                if _btn_url:
+                    break
+        except Exception:
+            _btn_url = None
+        if _btn_url and _btn_url.startswith("https://t.me/") and not _btn_url.startswith("https://t.me/+"):
+            contact = "B1"
+        elif _btn_url and _btn_url.startswith("tg://user?id="):
+            contact = "B2"
+        elif _btn_url:
+            # tg://openmessage أو https://t.me/+<phone> — مباشر بمخطط محدود
+            contact = "B3"
+        elif method == "username":
             contact = "B1"
         elif method == "mention_button":
             contact = "B2"

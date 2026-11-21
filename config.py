@@ -877,7 +877,11 @@ class Config:
             CONNECTION_TIMEOUT=SecretManager.get_int("CONNECTION_TIMEOUT", 30, required=False),
             SESSION_REFRESH_INTERVAL=SecretManager.get_int("SESSION_REFRESH_INTERVAL", 43200, required=False),
             # ========== Fast Capture ==========
-            FAST_CAPTURE_ENABLED=SecretManager.get_bool("FAST_CAPTURE_ENABLED", False),
+            # v14.7.0: الافتراضي true — الالتقاط السريع مخزن ذاكرة فقط
+            # (صفر تكلفة زمن) وينقذ نص الرسالة المحذوفة أثناء التجميع.
+            # كان false افتراضياً والقيمة true في render.yaml لم تصل env
+            # الإنتاج — حماية افتراضية الآن بلا اعتماد على env.
+            FAST_CAPTURE_ENABLED=SecretManager.get_bool("FAST_CAPTURE_ENABLED", True),
             CAPTURE_BUFFER_SIZE=SecretManager.get_int("CAPTURE_BUFFER_SIZE", 1000, required=False),
             CAPTURE_TTL_SECONDS=SecretManager.get_int("CAPTURE_TTL_SECONDS", 30, required=False),
             # ========== Dedup ==========
@@ -1048,8 +1052,13 @@ class Config:
 # v14.6.0: Activity Maintenance System — رسالة النشاط الدورية + حارس الخدمة.
 # v14.6.1: Liveness Decoupling — خادم الصحة في thread مستقل + لقطة مخبأة
 # (كسر حلقة انهيار SIGTERM: فشل فحص Render تحت تشبع event loop).
-BOT_VERSION: Final = "14.6.1"
-BOT_CODENAME: Final = "Liveness Decoupled"
+# v14.7.0: Instant Delivery & Buttons Repair — إزالة طبقة temporary_link
+# المكسورة (TypeError 77/77)، سلّم مراسلة صادق (user_id قبل openmessage)،
+# حالة نهائية حقيقية لـ AuthKeyDuplicated (needs_relogin)، لا إسقاط صامت
+# لحارس المعدل، مسار طابور أخف (بلا SELECT استباقي)، لقطة ذكاء على
+# الخلفية، tracemalloc اختياري، fast_capture افتراضياً ON.
+BOT_VERSION: Final = "14.7.0"
+BOT_CODENAME: Final = "Instant Delivery"
 
 # =============================================================================
 # Pre-built config instance

@@ -1081,21 +1081,15 @@ class EnhancedDatabase:
                         logger.debug(f"queue mirror reconcile failed: {e}")
                 current_size = self._queue_size_mirror
 
-                # ══ v14.2.0-dedup: حارس التكرار — الصف النشط نفسه يكفي ══
-                if dedup_key:
-                    try:
-                        dup = await self._fetchone(
-                            "SELECT id FROM processing_queue WHERE dedup_key = ? "
-                            "AND (status IS NULL OR status IN ('pending', 'in_flight')) LIMIT 1",
-                            (dedup_key,),
-                        )
-                        if dup is not None:
-                            async with self._stats_lock:
-                                self.stats["queue_dedup_hits"] = self.stats.get("queue_dedup_hits", 0) + 1
-                            self._notify_queue_wakeup()
-                            return int(dup["id"])
-                    except Exception as e:
-                        logger.debug(f"queue dedup pre-check failed: {e}")
+                # ══ v14.7.0: حارس التكرار الانتقالي حُذف من المسار الحرج ══
+                # الـSELECT الاستباقي (dedup_key=?) كان RTT كامل داخل القفل
+                # العام على كل رسالة (0.1-0.3s Supabase — عبره المرسل
+                # التالي ينتظر). الفهرس الفريد الجزئي uq_queue_active_dedup
+                # + مسار استرداد السباق أدناه يعطيان النتيجة نفسها بدقة:
+                # الخاسر في السباق يستلم id الصف الموجود — بلا ازدواج
+                # وبلا فقدان، و1 RTT يُدفع فقط عند التكرار الفعلي (نادر)
+                # بدل كل رسالة. عداد queue_dedup_hits يزيد في مسار
+                # الاسترداد — لذا القياس يبقى صادقاً.
 
                 if self.db_type == "sqlite":
                     if current_size >= CFG.MESSAGE_QUEUE_SIZE:

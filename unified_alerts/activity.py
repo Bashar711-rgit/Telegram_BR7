@@ -245,6 +245,13 @@ class ActivityWatchdog:
             for m in monitors:
                 if getattr(m, "is_connected", False):
                     continue
+                # v14.7.0: المراقب بحالة نهائية (AuthKeyDuplicated/2FA/...)
+                # لا يُعاد تسليحه — الحلقة ستمر بالحالة النهائية وتموت
+                # فوراً؛ التسليح الدوري هنا كان يعيد تشغيل حلقة ميتة كل
+                # دورة (محاولات بلا جدوى + عدادات مضللة). إعادة الدخول
+                # يدوية — انظر needs_relogin على /health/full.
+                if getattr(m, "_terminal_error", None) is not None:
+                    continue
                 rm = getattr(m, "_reconnect", None)
                 if rm is not None and not getattr(rm, "_running", False):
                     try:

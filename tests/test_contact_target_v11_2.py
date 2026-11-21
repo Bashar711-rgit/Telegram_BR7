@@ -6,7 +6,8 @@
 المبادئ المُختبرة هنا (أرقام المواصفة):
   #4  username → https://t.me/{u} (بلا @)
   #5  user_id → tg://user?id={id} — fallback أساسي (username ليس شرطاً)
-  #6  openmessage يُحتفظ به داخليًا فقط — لا يُختار أبدًا
+  #6  openmessage يُحتفظ به داخليًا فقط — يُختار أخيراً بعد user_id (ديسكتوب فقط)
+  #6b v14.7.0: temporary_link أُزيل من السلّم نهائياً (TypeError دائم)
   #7  ContactTarget — التجريد الوحيد
   #8  Resolver مركزي واحد (resolve_contact_target) — بلا منطق روابط في ملفات أخرى
   #10/#11 الكيان كاش — CACHE HIT بلا API request / MISS → resolve → كاش
@@ -86,25 +87,45 @@ class TestContactTargetCore:
         assert t.resolution_status == "resolved"
 
     def test_user_id_fallback_primary(self):
-        """v14.6.0 spec #8 (عدم روابط وهمية): بلا username → openmessage هو
-        الـfallback المختار؛ tg://user?id يبقى محفوظاً داخلياً (رابط اسم
-        البطاقة عبر TextMention — يعمل حين يعرف البوت المرسل فقط)."""
+        """v14.7.0 spec #8: بلا username → tg://user?id هو الـfallback المختار
+        (مخطط موثّق تدعمه كل العملاء حين تعرف الهوية — بدل openmessage
+        الديسكتوب-فقط الذي كان ميتاً على الجوال). رفض Bot API لخصوصية
+        مُعالَج بسلامة (إعادة بلا زر مراسلة + ذاكرة سلبية + رابط اسم
+        يتحول لرابط الرسالة المصدر)."""
         t = resolve_contact_target(sender_id=SENDER_ID)
         assert t.username is None
         assert t.user_id_url == f"tg://user?id={SENDER_ID}"
         assert t.openmessage_url == f"tg://openmessage?user_id={SENDER_ID}"
-        assert t.selected_url == f"tg://openmessage?user_id={SENDER_ID}"
-        assert t.target_type == "openmessage"
+        assert t.selected_url == f"tg://user?id={SENDER_ID}"
+        assert t.target_type == "user_id"
         assert t.reachable is True
 
-    def test_openmessage_selected_user_id_kept_internal(self):
-        """v14.5.2 spec #8 المحدّث: openmessage يُختار قبل tg://user —
-        (tg://user?id بلا access_hash يُرفض بكثرة = رابط وهمي)."""
+    def test_openmessage_kept_internal_after_user_id(self):
+        """v14.7.0: user_id يُختار قبل openmessage — openmessage يبقى
+        محفوظاً داخلياً (احتياط أخير — ديسكتوب فقط)."""
         t = resolve_contact_target(sender_id=SENDER_ID)
-        assert t.openmessage_url  # محفوظ + مختار
-        assert t.target_type == "openmessage"
-        assert t.selected_url == t.openmessage_url
-        assert t.user_id_url  # يبقى داخلياً لرابط الاسم
+        assert t.openmessage_url  # محفوظ داخلياً (لا يُختار هنا)
+        assert t.target_type == "user_id"
+        assert t.selected_url == t.user_id_url
+
+    def test_phone_url_wins_over_user_id(self):
+        """v14.7.0: phone (HTTPS) يُختار قبل tg://user?id عند توفره."""
+        t = resolve_contact_target(sender_id=SENDER_ID, phone="+966500000000")
+        assert t.phone_url == "https://t.me/+966500000000"
+        assert t.selected_url == "https://t.me/+966500000000"
+        assert t.target_type == "phone"
+
+    def test_temporary_link_never_selected(self):
+        """v14.7.0: temporary_link لا يدخل سلسلة الاختيار أبداً — الطلب
+        كان يرفع TypeError في Telethon 1.45 (77/77 فشل) والرابط الناتج
+        (لو نجح) يعود لحساب المراقب لا للمرسل."""
+        t = resolve_contact_target(
+            sender_id=SENDER_ID,
+            temporary_link_url="https://t.me/+fakeToken",
+        )
+        assert t.temporary_link_url == "https://t.me/+fakeToken"  # محفوظ للتوافق
+        assert t.selected_url == f"tg://user?id={SENDER_ID}"
+        assert t.target_type == "user_id"
 
     def test_sender_type_none_with_sid_is_assumed_user(self):
         """الحالة الحرجة: كيان غائب (sender_type=none) مع sender_id موجودة
@@ -183,9 +204,9 @@ class TestClickableName:
         assert "https://t.me" not in visible
 
     def test_both_targets_share_selected_url(self):
-        """v14.5.2 المحدّث: الزر من selected_url (openmessage — بلا روابط
-        وهمية) واسم البطاقة من user_id_url (TextMention للمرسل المعروف).
-        كلاهما من نفس ContactTarget — لا روابط مُختلقة خارج الهدف."""
+        """v14.7.0: الزر واسم البطاقة كلاهما من user_id_url (selected_url
+        = tg://user?id). كلاهما من نفس ContactTarget — لا روابط مُختلقة
+        خارج الهدف."""
         built = build_alert_html(_data())
         t = built["contact_target"]
         name_url = built["text"].split('href="')[1].split('"')[0]
@@ -193,7 +214,7 @@ class TestClickableName:
             b["url"] for b in built["buttons"][0] if b["text"] == "مراسلة"
         )
         assert name_url == t.user_id_url
-        assert button_url == t.selected_url == t.openmessage_url
+        assert button_url == t.selected_url == t.user_id_url
 
     def test_entity_pack_utf16_offsets(self):
         """الكيانات تحسب offset/length بوحدات UTF-16 (عربي + إيموجي)."""
@@ -206,8 +227,9 @@ class TestClickableName:
         from contact_target import SENDER_LABEL as _SL
         assert name_ent.offset == utf16_len(_SL)  # v13: بعد سطر B_Bot\n (=14)
         assert name_ent.length == utf16_len("نواف محمد")
-        # v14.5.2: رابط الكيان = selected_url (openmessage) — بلا روابط وهمية
-        assert name_ent.url == f"tg://openmessage?user_id={SENDER_ID}"
+        # v14.7.0: رابط الكيان = selected_url (tg://user?id — مخطط موثّق
+        # لكل العملاء؛ يُصلَّح ذاتياً لرابط الرسالة عند رفض الخادم)
+        assert name_ent.url == f"tg://user?id={SENDER_ID}"
         # القالب نفسه (v13): اسم البوت ← الاسم ← (فارغ) ← نص الرسالة: ← النص
         assert pack["plain_text"].startswith(
             f"{BOT_NAME_LINE}\nالمرسل: نواف محمد\n\nنص الرسالة:\n\nنص الرسالة")
@@ -259,11 +281,11 @@ class TestClickableName:
 
 class TestContactButton:
     def test_button_without_username_via_user_id(self):
-        """spec #15 المحدّد (v14.5.2): username=None لكن user_id → زر مراسلة
-        tg://openmessage (بلا روابط وهمية)."""
+        """spec #15 المحدّد (v14.7.0): username=None لكن user_id → زر مراسلة
+        tg://user?id (مخطط موثّق — بدل openmessage الديسكتوب-فقط)."""
         built = build_alert_html(_data())
         row = built["buttons"][0]
-        assert {"text": "مراسلة", "url": f"tg://openmessage?user_id={SENDER_ID}"} in row
+        assert {"text": "مراسلة", "url": f"tg://user?id={SENDER_ID}"} in row
 
     def test_button_with_username(self):
         built = build_alert_html(_data(sender_username="@iesk1"))
@@ -344,7 +366,7 @@ class TestAlertBotSend:
         ok, method, _ = await bot.send(_data())
         assert ok is True and method == "mention_button"
         row = bot.calls[0]["payload"]["reply_markup"]["inline_keyboard"][0]
-        assert {"text": "مراسلة", "url": f"tg://openmessage?user_id={SENDER_ID}"} in row
+        assert {"text": "مراسلة", "url": f"tg://user?id={SENDER_ID}"} in row
 
     @pytest.mark.asyncio
     async def test_privacy_rejection_retries_without_contact_only(self):
@@ -380,7 +402,7 @@ class TestAlertBotSend:
         assert ents, "الكيانات مطلوبة في المسار الاحتياطي"
         assert any(
             type(e).__name__ == "MessageEntityTextUrl"
-            and getattr(e, "url", "") == f"tg://openmessage?user_id={SENDER_ID}"
+            and getattr(e, "url", "") == f"tg://user?id={SENDER_ID}"
             for e in ents
         )
         # النص الظاهر في الطبقة الاحتياطية يطابق القالب (بلا وسوم HTML)
@@ -563,7 +585,7 @@ class TestSpecTenCases:
         built = build_alert_html(_data(sender_id=5601276336, sender_first_name="نواف",
                                        sender_last_name=None))
         assert 'href="tg://user?id=5601276336"' in built["text"]
-        assert "tg://openmessage?user_id=5601276336" in [b["url"] for b in built["buttons"][0]]
+        assert "tg://user?id=5601276336" in [b["url"] for b in built["buttons"][0]]
         assert "— @" not in built["text"]  # بلا username → لا لاحقة مُختلقّة
 
     def test_case3_no_username_uid_1630216165(self):
@@ -571,7 +593,7 @@ class TestSpecTenCases:
         built = build_alert_html(_data(sender_id=1630216165, sender_first_name="أحمد",
                                        sender_last_name=None))
         assert 'href="tg://user?id=1630216165"' in built["text"]
-        assert "tg://openmessage?user_id=1630216165" in [b["url"] for b in built["buttons"][0]]
+        assert "tg://user?id=1630216165" in [b["url"] for b in built["buttons"][0]]
 
     def test_case4_cached_user_no_api(self):
         """Test 4: cached → لا API request — مغطى في TestEntityCache.test_cache_hit_no_api_request."""
@@ -602,7 +624,7 @@ class TestSpecTenCases:
         t = resolve_contact_target(sender_id=SENDER_ID, first_name="نواف")
         # حتى لو حملت data حقول مصدر توجيه، لا تؤثر على الهدف
         assert t.user_id == SENDER_ID
-        assert t.selected_url == f"tg://openmessage?user_id={SENDER_ID}"
+        assert t.selected_url == f"tg://user?id={SENDER_ID}"
 
     def test_case10_avatar_failure_alert_continues(self):
         """Test 10: فشل الصورة → التنبيه + الاسم + الزر كلهم يستمرون."""
@@ -706,11 +728,11 @@ class TestMetrics:
             assert key in snap, key
 
     def test_counters_increment(self):
-        """v14.6.0: بلا username → openmessage_fallback هو العدّاد الفعلي
-        (v14.5.2 جعل openmessage قبل user_id في سلسلة الاختيار)."""
-        before = get_contact_metrics_snapshot()["openmessage_fallback"]
+        """v14.7.0: بلا username → user_id_fallback هو العدّاد الفعلي
+        (v14.7.0 جعل tg://user?id قبل openmessage في سلسلة الاختيار)."""
+        before = get_contact_metrics_snapshot()["user_id_fallback"]
         resolve_contact_target(sender_id=SENDER_ID)  # بلا username → fallback
-        after = get_contact_metrics_snapshot()["openmessage_fallback"]
+        after = get_contact_metrics_snapshot()["user_id_fallback"]
         assert after == before + 1
 
     def test_metric_inc_never_raises(self):
@@ -750,8 +772,8 @@ class TestFinalTemplate:
         assert text == ("B_Bot\nالمرسل: <a href=\"tg://user?id=5601276336\">نواف محمد</a>\n\n"
                         "نص الرسالة:\n\nالنص")
         # v13: نفس اللوحة لكل المسارات (مراسلة ← عرض من هدف ContactTarget)
-        # v14.5.2: زر مراسلة = openmessage (بلا روابط وهمية)
+        # v14.7.0: زر مراسلة = tg://user?id (بدل openmessage الديسكتوب-فقط)
         assert buttons == [[
-            {"text": "مراسلة", "url": f"tg://openmessage?user_id={SENDER_ID}"},
+            {"text": "مراسلة", "url": f"tg://user?id={SENDER_ID}"},
             {"text": "عرض الرسالة", "url": f"https://t.me/c/111222333/{MSG_ID}"},
         ]]

@@ -306,6 +306,26 @@ class MemoryGuard:
                 cache.clear()
             except Exception:
                 pass
+        # v14.7.0: كاشات محرك الفلترة (_text_cache 5000 + _hash_cache
+        # 10000) كانت لاصقة — لا تنظيفها في 294 إعادة ناعمة كان يرفع
+        # أرضية RSS باستمرار. كل المراقبين يتشاركون نفس نسخة الفلتر —
+        # التنظيف مرة واحدة عبر أول مراقب.
+        try:
+            _flt_seen: List[int] = []
+            for mon in monitors:
+                flt = getattr(mon, "filter", None)
+                if flt is None or id(flt) in _flt_seen:
+                    continue
+                _flt_seen.append(id(flt))
+                for fattr in ("_text_cache", "_hash_cache"):
+                    try:
+                        fcache = getattr(flt, fattr, None)
+                        if fcache is not None and hasattr(fcache, "clear"):
+                            fcache.clear()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
     # ── Hard Reset (95%) — عملية جديدة عبر إعادة تشغيل Render ──────────
     async def _hard_reset(self, reason: str) -> None:

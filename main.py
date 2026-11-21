@@ -325,6 +325,27 @@ class AdaptiveRateLimiter:
             "burst": self._burst,
         }
 
+    async def wait_for_token(
+        self, account_name: str = "default", max_wait_s: float = 35.0,
+    ) -> bool:
+        """v14.7.0: انتظار توكن متاح بدل الرفض الفوري.
+
+        الرفض الفوري (can_proceed=False) كان يُسقط التنبيه صامتاً في
+        المسار الأعلى — الآن يستدعي مسار الإرسال هذا الانتظار المحدود
+        قبل التسليم لسلّم DLQ. الاستقصاء كل 0.75s يستهلك بلا أقفال
+        (can_proceed نفسه هو البوابة الذرية). يعيد True عند حصول توكن.
+        """
+        deadline = time.monotonic() + max(0.0, float(max_wait_s))
+        while True:
+            try:
+                if await self.can_proceed(account_name):
+                    return True
+            except Exception:
+                return False
+            if time.monotonic() >= deadline:
+                return False
+            await asyncio.sleep(0.75)
+
 
 # =============================================================================
 # Memory Monitor — v2 (hardened, see module docstring M-01/02/03/13/14/15)
@@ -361,12 +382,22 @@ class MemoryMonitor:
         self._last_snapshot = None  # type: ignore[assignment]
 
     def start(self) -> None:
-        try:
-            tracemalloc.start()
-            self._tracemalloc_enabled = True
-            self._last_snapshot = tracemalloc.take_snapshot()
-        except Exception as e:
-            logger.warning(f"tracemalloc unavailable, leak diagnostics limited: {e}")
+        # v14.7.0: tracemalloc يعمل فقط عند الطلب الصريح (MEMORY_TRACEMALLOC=1).
+        # تتبع كل تخصيصة يضيف بصمة RSS ثابتة وتكلفة CPU — وكان يعمل بلا
+        # شرط في الإنتاج بينما الحد 480MB يُحاصر الخدمة. التشخيص يبقى
+        # متاحاً بتشغيل المتغير ثم إعادة التشغيل.
+        _tm_requested = os.getenv("MEMORY_TRACEMALLOC", "").strip().lower() in (
+            "1", "true", "yes", "on",
+        )
+        if _tm_requested:
+            try:
+                tracemalloc.start()
+                self._tracemalloc_enabled = True
+                self._last_snapshot = tracemalloc.take_snapshot()
+            except Exception as e:
+                logger.warning(f"tracemalloc unavailable, leak diagnostics limited: {e}")
+                self._tracemalloc_enabled = False
+        else:
             self._tracemalloc_enabled = False
         self._baseline = self._current_rss()
         self._peak = self._baseline
@@ -1072,6 +1103,13 @@ class EnhancedTelegramBot:
                     "last_connect_success_age_s": (
                         round(time.time() - float(getattr(m, "last_connect_success_ts", 0) or 0), 1)
                         if getattr(m, "last_connect_success_ts", 0) else None
+                    ),
+                    # v14.7.0: تمييز «يُعاد المحاولة» عن «حالة نهائية تتطلب
+                    # إعادة دخول يدوية» — الحساب الميت بجلسة ملغاة لم يعد
+                    # يبدو وكأنه في حلقة إعادة اتصال عادية.
+                    "needs_relogin": bool(getattr(m, "_terminal_error", None) is not None),
+                    "terminal_error": (
+                        str(getattr(m, "_terminal_error", None) or "")[:120] or None
                     ),
                     "reconnect": rm_snap,
                 })
@@ -1987,6 +2025,16 @@ class EnhancedTelegramBot:
         # اختفاء التعارض أو زوال السبب العابر.
         for m in self.monitors:
             if not m.is_connected:
+                # v14.7.0: المراقب بحالة نهائية (AuthKeyDuplicated/2FA/...)
+                # لا يُسلّح له مشرف — إعادة المحاولة بلا جدوى حتى إعادة
+                # الدخول اليدوية (needs_relogin=true على /health/full).
+                if getattr(m, "_terminal_error", None) is not None:
+                    logger.error(
+                        f"{m.account['name']} has terminal error "
+                        f"({m._terminal_error}) — NOT arming reconnect supervisor "
+                        f"(manual re-login required)"
+                    )
+                    continue
                 try:
                     rm = getattr(m, "_reconnect", None)
                     if rm is not None and not getattr(rm, "_running", False):

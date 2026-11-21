@@ -521,7 +521,7 @@ class TestUnifiedCardCompleteness:
         assert "— @" not in t.split("\n\n")[0]  # لا @username مُختلق
         row = built["buttons"][0]
         by_text = {b["text"]: b for b in row}
-        assert by_text["مراسلة"]["url"] == f"tg://openmessage?user_id={SENDER_ID}"  # v14.5.2
+        assert by_text["مراسلة"]["url"] == f"tg://user?id={SENDER_ID}"  # v14.7.0
 
     def test_long_text_truncated_with_marker_not_silently(self):
         """نص طويل جداً: يُقص مع علامة … وسجل تحذير — لا حذف صامت كامل."""
