@@ -1057,8 +1057,12 @@ class Config:
 # حالة نهائية حقيقية لـ AuthKeyDuplicated (needs_relogin)، لا إسقاط صامت
 # لحارس المعدل، مسار طابور أخف (بلا SELECT استباقي)، لقطة ذكاء على
 # الخلفية، tracemalloc اختياري، fast_capture افتراضياً ON.
-BOT_VERSION: Final = "14.7.0"
-BOT_CODENAME: Final = "Instant Delivery"
+# v14.8.0: Audit Closure — إغلاق بقايا دليل الترقية (تدقيق 27 أكتوبر على
+# v11.7.1): سجل أسماء المستخدمين (P6.2) + أعمدة sources (P6.3) +
+# db_latency_ms في /health/full (P7) + توحيد regex المستخدم (F-27) +
+# تنظيف render.yaml (P3) + اختبار دخان PG (P2.3) + CI (P8.4).
+BOT_VERSION: Final = "14.8.0"
+BOT_CODENAME: Final = "Audit Closure"
 
 # =============================================================================
 # Pre-built config instance

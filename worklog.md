@@ -461,3 +461,27 @@ Work Log:
 Stage Summary:
 - المجموعة الكاملة: **1032/1032 PASS** (EXIT=0) — py_compile PASS.
 - الأثر المتوقع: توقف حلقة SIGTERM فوراً (الفحص يُجاب من thread مستقل حتى تحت تشبع كامل)، الاحتياطي يتصرف بلا مقاطعات، أزمنة التنبيه تعود إلى الثواني بعد التصريف.
+
+---
+
+Task ID: v14.8.0 (Audit Closure — إغلاق بقايا دليل الترقية على v11.7.1)
+Agent: Z.ai Code (main orchestrator)
+Task: دليل تنفيذ المالك (مرجع: تدقيق 27 أكتوبر 2026 على v11.7.1/3a8c52b) — تدقيق كل بند مقابل الكود الحي (v14.7.0) وتنفيذ ما تبقى فقط مع الحفاظ على المعمارية القائمة
+
+Work Log:
+- **خط الأساس**: HEAD v14.7.0 متزامن مع origin/main؛ شجرة نظيفة (بعد استبعاد ضجيج mode-bits بـ core.fileMode=false). تدقيق بند-ببند أثبت أن غالبية بنود الدليل مغلقة منذ v11.8→v14.7 بعلامات مرجعية واختبارات: F-01/F-03(6..65 موثق مقصود)/F-04/F-05/F-06/F-13/F-14/F-15/F-29 (filter+keywords.json) · F-07 (get_sender_access_hash بمالك الحساب) · F-08 (إبطال last_alert_message_id عند كل تنبيه) · F-10 (_prune_blocked_cache) · F-12 (unknown_send_result_policy موحدة) · F-16 (TTL 7d) · F-17 (task_util.spawn_bg) · F-19 (OrderedDict مقيد) · F-20/F-22 (عدادات incl. length_rejected) · F-21/F-28 (_pick_alertui_account لم يعد موجوداً) · F-23 (HealthMonitor يستخدم _ping) · F-24 (جلسة aiohttp دائمة) · F-25 (fallback بلا أزرار بالتصميم) · F-26 (حارس هوية المحادثة) · F-30 (إخلاء الأقفال غير المحتجزة فقط) · P2.2 (statement_cache_size=0 عبر DB_STATEMENT_CACHE_SIZE) · P3 أطوال 6/65 + DATABASE_URL sync:false + pool 2/5 · P6.4 (scripts/supabase_rls.sql v11.8.1 br7_app+FORCE) · عشرة أمثلة النوايا تمر 10/10 على المحرك الحي.
+- **الفجوات المنفذة فعلياً**:
+  * P6.2: جدول telegram_usernames_history (ترجمة PG تلقائية عبر سلسلة _create_tables) + idx_tuh_username + record_username_change (يُدرج فقط عند اختلاف الاسم عن آخر قيمة) + خطاف في upsert_sender_contact (نقطة الاستمرارية الفعلية؛ sender_resolver محلّي خالص بلا DB في المعمارية الحالية). **إصلاحان أثناء الاختبار**: changed_at بدقة ms صراحةً (بدقة الثانية في SQLite كان التصادم الممكن)، ثم تسلسل صارم لكل مستخدم (آخر+1ms) يمنع تصادم PK المركب المتتالي ويجعل الترتيب حتمياً.
+  * P6.3: أعمدة sources (chat_type TEXT, member_count INTEGER, last_seen_at TIMESTAMP) عبر آلية الترحيل الإضافي الموجودة (_migrate_sources_extra على نمط _migrate_sender_intel) — بلا ALTER خام.
+  * P7: db_latency_ms في /health/full — يقاس في حلقة اللقطة (كل 10s) التزاماً بعقد v14.6.1 (خيط الصحة لا يلمس DB). /health نفسه بقى liveness صرف (عقد أحدث من الدليل — اللوحة حُذفت أصلاً في v14.0).
+  * F-27: توحيد regex اسم المستخدم في task_util.TELEGRAM_USERNAME_RE (كان مكرراً حرفياً في message_context/nav_resolver/sender_resolver) — aliases محلية تحفظ كل مواضع الاستدعاء.
+  * P3: حذف DB_TYPE=sqlite/DB_FILE النشطة من render.yaml (الكود يفترض sqlite غياباً وينقلب postgresql مع DATABASE_URL — config.py:688).
+  * P2.3: scripts/pg_smoke.py — دخان اتصال + ON CONFLICT + statement_cache_size=0 (يقرأ DATABASE_URL من البيئة فقط، لا يطبع أي سر).
+  * P8.4: .github/workflows/ci.yml (Python 3.11 = runtime.txt، compileall + pytest -q على كل push/PR).
+  * P8.1: tests/test_intent_regression.py — الحالات العشر نصياً من الدليل (تمر 10/10) + tests/test_v14_8_0_audit_closure.py (13 اختباراً: الجدول/الفهرس/عدم التكرار/الخطاف/أعمدة sources).
+- **خارج نطاقي (قرار/إجراء مالك — لا وصول لوحات من الصندوق)**: P1 تدوير أسرار GitHub/Render وإلغاء SUPABASE_* من لوحة Render + Revoke توكن Supabase (الكود وrender.yaml خاليان من SUPABASE_* — مثبت بالفحص) · تطبيق/تحقق RLS على الإنتاج · مراقب /health خارجي (يوازيه watchdog cron القائم) · تصدير إعدادات دوري.
+- BOT_VERSION → 14.8.0 ("Audit Closure").
+
+Stage Summary:
+- 6 commits على فرع feature/v14.8.0-audit-closure (واحد لكل مرحلة) — الدمج إلى main بعد المجموعة الكاملة الخضراء فقط (Render autoDeploy).
+- لم يُختبَر حياً: تيليجرام إنتاجي (ممنوع §2) — كل الاختبارات حتمية محاكية.
