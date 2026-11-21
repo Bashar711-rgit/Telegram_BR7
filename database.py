@@ -1939,6 +1939,11 @@ class EnhancedDatabase:
         الاستدعاء المتكرر بنفس الاسم لا يكتب شيئاً (بلا تضخم للجدول).
         fail-safe بالكامل: أي خطأ يُسجل debug ولا يُعطّل مسار التنبيه.
         يعمل على المحركين (placeholders ? تُترجم عبر _pg للـPostgreSQL).
+
+        v14.8.0-fix: changed_at يُكتب بدقة ميلي ثانية صراحةً بدل الاعتماد على
+        DEFAULT CURRENT_TIMESTAMP — بدقة الثانية في SQLite، تغييران في نفس
+        الثانية كانا يُنتجان نفس changed_at = تصادم PK مركب (فقدان صف حقيقي)
+        وترتيباً غامضاً عند قراءة "آخر اسم".
         """
         try:
             uid = int(user_id)
@@ -1946,17 +1951,41 @@ class EnhancedDatabase:
             if uid <= 0 or not uname:
                 return
             row = await self._fetchone(
-                "SELECT username FROM telegram_usernames_history "
+                "SELECT username, changed_at FROM telegram_usernames_history "
                 "WHERE user_id = ? ORDER BY changed_at DESC LIMIT 1",
                 (uid,),
             )
             last = str((row or {}).get("username") or "")
             if last == uname:
                 return
+            now = datetime.utcnow()
+            # v14.8.0-fix2: تسلسل زمني صارم لكل مستخدم — PK المركب
+            # (user_id, changed_at) يفشل عند تداخل تغييرين في نفس الدقة
+            # (الاختبارات المتتالية تحديداً)، فنجعل الطابع الجديد أكبر
+            # صراحةً من آخر طابع محفوظ بـ 1ms: ترتيب حتمي + لا تصادم.
+            try:
+                last_changed = (row or {}).get("changed_at")
+                if last_changed is not None:
+                    if isinstance(last_changed, datetime):
+                        last_dt = last_changed
+                    else:
+                        _s = str(last_changed)
+                        _fmt = "%Y-%m-%d %H:%M:%S.%f" if "." in _s else "%Y-%m-%d %H:%M:%S"
+                        last_dt = datetime.strptime(_s, _fmt)
+                    _floor = last_dt + timedelta(milliseconds=1)
+                    if now <= _floor:
+                        now = _floor
+            except Exception:
+                pass
+            if self.db_type == "postgresql":
+                changed_at = now  # asyncpg يتطلب datetime للعمود TIMESTAMP
+            else:
+                # SQLite: نص ISO بدقة ms — المقارنة المعجمية = الزمنية
+                changed_at = now.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
             await self._execute(
                 "INSERT INTO telegram_usernames_history "
-                "(user_id, username, source_account) VALUES (?, ?, ?)",
-                (uid, uname, str(source_account or "")),
+                "(user_id, username, changed_at, source_account) VALUES (?, ?, ?, ?)",
+                (uid, uname, changed_at, str(source_account or "")),
             )
             await self._commit()
         except Exception as e:
