@@ -210,6 +210,11 @@ services:
       - key: MAX_EVENT_AGE_SECONDS
         value: "60"
 
+      # v15.4.1: سقف انتظار الطابور للأحداث الطازجة عند الوصول —
+      # ما وصل طازجاً لا يُرمى بسبب تأخر المعالجة؛ يُهجر فقط بعد 600s
+      - key: MAX_QUEUE_WAIT_SECONDS
+        value: "600"
+
       - key: STATS_INTERVAL
         value: "3600"
 

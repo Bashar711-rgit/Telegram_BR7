@@ -1166,6 +1166,8 @@ class EnhancedAccountMonitor:
         self._processed_hashes: LRUCache = LRUCache(maxsize=CFG.PROCESSED_HASHES_MAX_SIZE)
         self._processed_lock = asyncio.Lock()
         self._get_entity_sem = asyncio.Semaphore(5); self._pipeline_sem = asyncio.Semaphore(20)
+        # v15.4.1: خانق سجل الإسقاط — كان فيض اللوج يخنق المخرجات (سطر لكل إسقاط)
+        self._stale_log_seq = 0
         self._dlq = DeadLetterQueue(
             db,
             max_retries=CFG.DEAD_LETTER_MAX_RETRIES,
@@ -1486,6 +1488,26 @@ class EnhancedAccountMonitor:
                     except Exception as ins_err:
                         logger.debug(f"input_sender capture [{self.account['name']}]: {type(ins_err).__name__}")
                 event_data = await self._event_to_dict(event)
+                # ══ v15.4.1: بوابة الندرة عند لحظة الوصول — القديم لا يدخل
+                # الطابور أصلاً (بلا صف DB ولا إخلاء ولا هدر عمال). فيض
+                # catch_up يحذف هنا بتكلفة صفر بدل تشبع الطابور. ما وصل
+                # طازجاً يُختم "_fresh_at_capture" ولا يُعاقب لاحقاً على
+                # انتظار الطابور (إصلاح حلقة الموت: صفر تنبيهات دائم).
+                _cap_gate_dec = get_alert_gate().evaluate_event(event_data, stage="capture")
+                if not _cap_gate_dec.allowed:
+                    self._stale_log_seq += 1
+                    if self._stale_log_seq <= 3 or self._stale_log_seq % 100 == 0:
+                        _cm = _cap_gate_dec.meta or {}
+                        logger.info(
+                            f"⏳ stale event dropped [capture] | chat={_cm.get('chat_id')} "
+                            f"msg={_cm.get('message_id')} | age={_cm.get('age_seconds')}s "
+                            f"> limit={_cm.get('limit_seconds')}s (v15.4.1 arrival-freshness, "
+                            f"never queued, dropped#{self._stale_log_seq})"
+                        )
+                    await self._inc_stat("stale_capture_dropped")
+                    processing_time = (time.perf_counter() - start_time) * 1000
+                    await self._update_avg_time(processing_time)
+                    return
                 _event_queued = False
                 if event_data.get("has_media"):
                     media = event.message.media
@@ -2091,11 +2113,15 @@ class EnhancedAccountMonitor:
             _gate_dec = get_alert_gate().evaluate_event(data, stage="pipeline")
             if not _gate_dec.allowed:
                 _m = _gate_dec.meta or {}
-                logger.info(
-                    f"⏳ stale event dropped [pipeline] | chat={_m.get('chat_id')} "
-                    f"msg={_m.get('message_id')} | age={_m.get('age_seconds')}s "
-                    f"> limit={_m.get('limit_seconds')}s (unified_alerts age gate)"
-                )
+                self._stale_log_seq += 1
+                # v15.4.1: throttle — أول 3 إسقاطات ثم كل 100 (كان فيض سجل يخنق المخرجات)
+                if self._stale_log_seq <= 3 or self._stale_log_seq % 100 == 0:
+                    logger.info(
+                        f"⏳ stale event dropped [pipeline] | chat={_m.get('chat_id')} "
+                        f"msg={_m.get('message_id')} | {_gate_dec.reason} | "
+                        f"age={_m.get('age_seconds')}s > limit={_m.get('limit_seconds')}s "
+                        f"(unified_alerts gate, dropped#{self._stale_log_seq})"
+                    )
                 return
         except Exception as _gate_err:
             logger.debug(f"unified gate pipeline skipped: {type(_gate_err).__name__}")
@@ -2749,11 +2775,14 @@ class EnhancedAccountMonitor:
             _send_gate_dec = get_alert_gate().evaluate_event(data, stage="send")
             if not _send_gate_dec.allowed:
                 _sm = _send_gate_dec.meta or {}
-                logger.info(
-                    f"⏳ stale alert blocked [send] | chat={data.get('chat_id')} "
-                    f"msg={data.get('message_id')} | age={_sm.get('age_seconds')}s "
-                    f"> limit={_sm.get('limit_seconds')}s (unified_alerts age gate)"
-                )
+                self._stale_log_seq += 1
+                if self._stale_log_seq <= 3 or self._stale_log_seq % 100 == 0:
+                    logger.info(
+                        f"⏳ stale alert blocked [send] | chat={data.get('chat_id')} "
+                        f"msg={data.get('message_id')} | {_send_gate_dec.reason} | "
+                        f"age={_sm.get('age_seconds')}s > limit={_sm.get('limit_seconds')}s "
+                        f"(unified_alerts gate, dropped#{self._stale_log_seq})"
+                    )
                 return False
         except Exception as _send_gate_err:
             logger.debug(f"unified gate send skipped: {type(_send_gate_err).__name__}")

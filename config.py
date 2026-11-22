@@ -376,6 +376,10 @@ class _ConfigData:
     MESSAGE_QUEUE_SIZE: int
     PROCESSING_WORKERS: int
     PRODUCER_WORKERS: int
+    # v15.4.1: سقف انتظار الطابور للأحداث الطازجة عند الوصول — الهجر
+    # المرضي فقط (افتراضي 600s، 0 = معطّل). النضارة نفسها تُقاس عند
+    # الالتقاط (MAX_EVENT_AGE_SECONDS) لا عند المعالجة.
+    MAX_QUEUE_WAIT_SECONDS: int
     CACHE_TTL: int
     MAX_RECENT_HASHES: int
 
@@ -881,6 +885,10 @@ class Config:
             MAX_ALERTS_PER_MINUTE=SecretManager.get_int("MAX_ALERTS_PER_MINUTE", 60, required=False),
             MAX_ALERTS_PER_HOUR=SecretManager.get_int("MAX_ALERTS_PER_HOUR", 3600, required=False),
             ALERT_BURST_SIZE=SecretManager.get_int("ALERT_BURST_SIZE", 20, required=False),
+            # v15.4.1: سقف انتظار الطابور — ما وصل طازجاً (عمره عند الالتقاط
+            # <= MAX_EVENT_AGE_SECONDS) لا يُرمى لأنه انتظر في طابورنا؛
+            # يُهجر فقط إن تجاوز انتظاره هذا السقف (افتراضي 600s).
+            MAX_QUEUE_WAIT_SECONDS=SecretManager.get_int("MAX_QUEUE_WAIT_SECONDS", 600, required=False),
             # ========== الفترات ==========
             STATS_INTERVAL=SecretManager.get_int("STATS_INTERVAL", 3600, required=False),
             CLEANUP_INTERVAL=SecretManager.get_int("CLEANUP_INTERVAL", 86400, required=False),
@@ -1201,8 +1209,8 @@ class Config:
 #     يُسقط فوراً قبل الإثراء وقبل أي DB write).
 #   * SIMILARITY_WINDOW_SECONDS 3600 → 900 (العتبة 0.88 كما هي).
 # تُطبَّق من env في Render إن وُجدت (المصدر الرسمي) — القيم هنا الافتراضات.
-BOT_VERSION: Final = "15.4.0"
-BOT_CODENAME: Final = "Instant Throughput — Concurrency, 60s Freshness & Full Alert Budget"
+BOT_VERSION: Final = "15.4.1"
+BOT_CODENAME: Final = "Arrival-Freshness Gate — freshness measured at capture, queue-wait ceiling kills the zero-alert death loop"
 
 # =============================================================================
 # Pre-built config instance
