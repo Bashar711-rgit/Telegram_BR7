@@ -37,6 +37,39 @@ Telegram_BR7 — Lightweight Control Dashboard (v15.1.0)
 
 from __future__ import annotations
 
-DASHBOARD_VERSION: str = "15.1.0"
+DASHBOARD_VERSION: str = "15.2.0"
 
 __all__ = ["DASHBOARD_VERSION"]
+
+# ─── جسر سجلات اللوحة إلى loguru ──────────────────────────────────────────
+# وحدات اللوحة تستخدم logging القياسي؛ هذا الجسر المحدود (namespace
+# "dashboard" فقط) يوجّه سجلاتها إلى loguru لتبقى مرئية في bot.log
+# وسجل Render — بلا أي أثر على بقية namespaces.
+import logging as _stdlib_logging
+
+
+class _DashLoguruBridge(_stdlib_logging.Handler):
+    """يوصل سجلات logging القياسية لـ namespace اللوحة إلى loguru."""
+
+    def emit(self, record: _stdlib_logging.LogRecord) -> None:
+        try:
+            from loguru import logger as _loguru
+
+            # loguru يتطلب أسماء المستويات بحروف كبيرة (WARNING/ERROR/...)
+            try:
+                level = record.levelname.upper()
+                _loguru.level(level)
+            except ValueError:
+                level = "INFO"
+            _loguru.opt(exception=record.exc_info).log(
+                level, f"[dashboard.{record.name}] {record.getMessage()}"
+            )
+        except Exception:
+            pass
+
+
+_dash_root = _stdlib_logging.getLogger("dashboard")
+if not any(isinstance(_h, _DashLoguruBridge) for _h in _dash_root.handlers):
+    _dash_root.addHandler(_DashLoguruBridge())
+    _dash_root.setLevel(_stdlib_logging.INFO)
+    _dash_root.propagate = False

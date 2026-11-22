@@ -513,11 +513,77 @@ class DashboardAPI:
                 "identity": (ident or {}).get("data"),
                 "membership": (mem or {}).get("data"),
             })
+        # ═══ v15.2.0: حسابات اللوحة (panel_accounts — جلسات مشفّرة في DB) ═══
+        # تُدمج مع حسابات env: المراقب الحي يحمل الحالة الفعلية، والصفوف
+        # بلا مراقب تظهر بحالة DB (جاهز/متوقف/يحتاج إعادة دخول/خطأ).
+        try:
+            panel_rows = await self.db.get_panel_accounts()
+        except Exception:
+            panel_rows = []
+        mon_by_phone = {}
+        for m in (getattr(bot, "monitors", None) or []):
+            acc = getattr(m, "account", {}) or {}
+            pk = _re.sub(r"\D", "", str(acc.get("phone") or ""))
+            if pk:
+                mon_by_phone[pk] = m
+        env_phones = set(mon_by_phone.keys())
+        panel_phones = set()
+        for row in panel_rows:
+            pk = _re.sub(r"\D", "", str(row.get("phone") or ""))
+            panel_phones.add(pk)
+            mon = mon_by_phone.get(pk)
+            enabled = bool(int(row.get("monitoring_enabled") or 0))
+            st = getattr(mon, "_stats", {}) or {}
+            ev_ts = float(getattr(mon, "last_event_ts", 0.0) or 0.0)
+            if mon is not None and getattr(mon, "is_connected", False):
+                status = "active"
+            elif mon is not None and getattr(mon, "_terminal_error", None):
+                status = "needs_relogin"
+            elif mon is not None and st.get("last_error"):
+                status = "error"
+            elif not enabled:
+                status = "stopped"
+            else:
+                status = str(row.get("status") or "ready")
+            items.append({
+                "kind": "panel",
+                "row_id": int(row.get("id") or 0),
+                "name": str(row.get("display_name") or "").strip() or "حساب لوحة",
+                "username": str(row.get("username") or "") or None,
+                "tg_user_id": int(row.get("tg_user_id") or 0) or None,
+                "phone_masked": _mask_phone(row.get("phone")),
+                "is_main": False,
+                "enabled": enabled,
+                "monitoring_enabled": enabled,
+                "status": status,
+                "connected": bool(getattr(mon, "is_connected", False)) if mon else False,
+                "terminal_error": getattr(mon, "_terminal_error", None) if mon else None,
+                "events_received": int(getattr(mon, "events_received", 0) or 0) if mon else 0,
+                "last_event_age_s": int(now - ev_ts) if (mon and ev_ts) else None,
+                "messages_processed": int(st.get("messages_processed", 0) or 0) if mon else 0,
+                "alerts_sent": int(st.get("alerts_sent", 0) or 0) if mon else 0,
+                "errors": int(st.get("errors", 0) or 0) if mon else 0,
+                "send_errors": int(st.get("send_errors", 0) or 0) if mon else 0,
+                "duplicates": int(st.get("duplicates", 0) or 0) if mon else 0,
+                "rate_limited": int(st.get("rate_limited", 0) or 0) if mon else 0,
+                "last_error": _sanitize_detail(row.get("last_error") or (st.get("last_error") if mon else None)) or None,
+                "reconnect": {},
+                "identity": None,
+                "membership": (DASH.membership_cache.get(f"panel:{row.get('id')}") or {}).get("data"),
+            })
+        env_only_phones = env_phones - panel_phones
         return {
             "items": items,
-            "note": ("جلسات الحسابات تُدار من متغيرات البيئة على Render (المصدر الدائم) — "
-                     "الإضافة/الحذف تتم من Render Environment ثم إعادة نشر. اللوحة تعرض "
-                     "الحالة الحية وتختبر الاتصال وتعيد الربط دون إعادة نشر."),
+            "stats": {
+                "total": len(items),
+                "active": sum(1 for a in items if a.get("status") == "active"),
+                "stopped": sum(1 for a in items if a.get("status") == "stopped"),
+                "needs_relogin": sum(1 for a in items if a.get("status") == "needs_relogin"),
+                "error": sum(1 for a in items if a.get("status") == "error"),
+            },
+            "note": ("حسابات env تُدار من متغيرات Render — وحسابات اللوحة تُضاف/تُحذف "
+                     "من هذا التبويب بجلسات مشفّرة في قاعدة البيانات دون إعادة نشر. "
+                     f"env مستقلة: {len(env_only_phones)} · لوحة: {len(panel_rows)}."),
         }
 
     async def account_test(self, name: str) -> Dict[str, Any]:

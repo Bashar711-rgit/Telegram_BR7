@@ -271,6 +271,25 @@ class SecretManager:
             return False
 
     @classmethod
+    def encrypt_text(cls, plain: str) -> Optional[str]:
+        """v14.10.0: تشفير نص سرّي (Session String / API Hash للوحة التحكم)
+        → Fernet token نصي يُخزَّن في DB. فشل → None (لا استثناءات للوحة)."""
+        try:
+            return cls._get_fernet().encrypt(plain.encode()).decode()
+        except Exception as e:
+            logger.error(f"SecretManager.encrypt_text failed: {type(e).__name__}")
+            return None
+
+    @classmethod
+    def decrypt_text(cls, token: str) -> Optional[str]:
+        """v14.10.0: فك تشفير سرّي مخزّن — None عند الفشل (فشل-آمن)."""
+        try:
+            return cls._get_fernet().decrypt(token.encode()).decode()
+        except Exception as e:
+            logger.error(f"SecretManager.decrypt_text failed: {type(e).__name__}")
+            return None
+
+    @classmethod
     def get(cls, key: str, default: Any = None, required: bool = True) -> Any:
         if key in cls._cache:
             return cls._cache[key]
@@ -1136,8 +1155,15 @@ class Config:
 # فصل تام عن مسار استقبال الرسائل: جسر run_coroutine_threadsafe، كاش
 # single-flight، مفاتيح إيقاف فحص-ذاكرة في المسار الحرج، جلسات
 # HttpOnly+CSRF+RateLimit، سجل تدقيق على audit_logs الموجود.
-BOT_VERSION: Final = "15.1.0"
-BOT_CODENAME: Final = "Lightweight Control Dashboard"
+# v15.2.0: Panel Accounts — ربط حساب تيليجرام جديد من تبويب الحسابات في
+# /admin (رقم ← رمز ← 2FA عند الحاجة ← تحقق get_me ← حفظ جلسة مشفّرة
+# Fernet في panel_accounts ← تفعيل مراقب حي دون إعادة نشر). جلسات
+# Telethon المؤقتة تُدار مركزياً (linking/waiting_code/waiting_password/
+# verifying/ready/active/error)، حدود محاولات+FloodWait، محو أسرار فوري،
+# منع حذف آخر حساب نشط، ودمج حسابات DB مع env عند الإقلاع. محرك Telethon
+# والفلترة لا يُلمسان.
+BOT_VERSION: Final = "15.2.0"
+BOT_CODENAME: Final = "Dashboard Panel Accounts — Link New Telegram Account"
 
 # =============================================================================
 # Pre-built config instance

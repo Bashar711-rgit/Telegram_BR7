@@ -244,3 +244,49 @@ footer.copyright {
   .toolbar input { min-width: 150px; flex: 1; }
   .stat .v { font-size: 18px; }
 }
+
+/* ═════════ معالج ربط حساب جديد (v15.2.0) ═════════ */
+.wiz-card { width: min(94vw, 470px); max-height: 92vh; overflow-y: auto; }
+.wiz-steps {
+  list-style: none; display: flex; gap: 4px; margin: 6px 0 14px; padding: 0;
+}
+.wiz-steps li {
+  flex: 1; text-align: center; font-size: 11px; color: var(--muted);
+  padding: 6px 2px; border-bottom: 2px solid var(--line);
+}
+.wiz-steps li.cur { color: var(--accent); border-color: var(--accent); font-weight: 700; }
+.wiz-steps li.done { color: var(--ok); border-color: var(--ok); }
+.wiz-desc { color: var(--muted); font-size: 12.5px; margin: 0 0 12px; }
+.wiz-body { display: flex; flex-direction: column; gap: 10px; }
+.wiz-phonewrap { display: flex; gap: 8px; align-items: flex-end; }
+.wiz-phonewrap .field { flex: 1; }
+.wiz-code { text-align: center; letter-spacing: 8px; font-size: 18px; font-weight: 700; }
+.wiz-verify {
+  display: flex; flex-direction: column; align-items: center; gap: 10px;
+  padding: 8px 0; text-align: center;
+}
+.wiz-verify p { color: var(--muted); font-size: 13px; margin: 0; }
+.wiz-spinner {
+  width: 30px; height: 30px; border: 3px solid var(--line);
+  border-top-color: var(--accent); border-radius: 50%;
+  animation: wizspin 0.8s linear infinite;
+}
+@keyframes wizspin { to { transform: rotate(360deg); } }
+.wiz-check {
+  width: 46px; height: 46px; border-radius: 50%;
+  background: #143a2c; color: var(--ok);
+  display: grid; place-items: center; font-size: 22px; font-weight: 800;
+}
+.wiz-me {
+  width: 100%; background: var(--panel2); border: 1px solid var(--line);
+  border-radius: 8px; padding: 10px 12px;
+  display: grid; grid-template-columns: auto 1fr; gap: 4px 12px;
+  font-size: 13px; text-align: right;
+}
+.wiz-me span { color: var(--muted); }
+.wiz-me b { word-break: break-word; }
+.wiz-note { font-size: 12px; color: var(--muted); margin: 0; }
+@media (max-width: 560px) {
+  .wiz-phonewrap { flex-direction: column; align-items: stretch; }
+  .wiz-phonewrap .field { max-width: none !important; }
+}

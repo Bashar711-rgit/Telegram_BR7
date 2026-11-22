@@ -102,6 +102,7 @@ from __future__ import annotations
 import asyncio
 import gc
 import os
+import re
 import signal
 import sys
 import threading
@@ -521,6 +522,8 @@ class EnhancedTelegramBot:
         self.is_running = False
         self._start_time = time.monotonic()
         self.health = HealthMonitor(self)
+        # v15.2.0: كاش صفوف حسابات اللوحة للإقلاع (قراءة واحدة عند boot)
+        self._panel_rows_cache: Optional[List[Dict[str, Any]]] = None
 
         # ── Background task lifecycle (M-05 / M-16) ─────────────────────
         # Every task this module creates is tracked here so shutdown can
@@ -1953,6 +1956,214 @@ class EnhancedTelegramBot:
             lines.append("\nℹ️ تُعدّل عبر متغير البيئة CONTACT_TEMPLATES_JSON ثم إعادة التشغيل.")
             await event.reply("\n".join(lines), parse_mode="html")
 
+    # ─── v14.10.0: إدارة حسابات اللوحة (ربط/تفعيل/إيقاف/إعادة اتصال) ─────────
+    # كل هذه الدوال تعمل على الحلقة الرئيسية حصراً (تُستدعى من thread اللوحة
+    # عبر run_coroutine_threadsafe). فك تشفير الجلسة يحدث هنا في الذاكرة فقط.
+
+    async def spawn_panel_account(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        بناء مراقب لصف panel_accounts وتوصيله — تفعيل حساب جديد دون إعادة نشر.
+
+        يُحدّث حالة الصف في DB: active عند النجاح، error/needs_relogin عند
+        الفشل. المراقب يدخل تلقائياً في نظام توزيع المجموعات (تسجيل
+        events.NewMessage على كل المصادر المراقبة وفق إعدادات النظام).
+        """
+        from dashboard.accounts import build_panel_account_dict
+
+        row_id = int(row.get("id") or 0)
+        phone_key = re.sub(r"\D", "", str(row.get("phone") or ""))
+        if not row_id or not phone_key:
+            return {"ok": False, "error": "صف حساب غير صالح"}
+
+        # منع مراقب مكرر لنفس الرقم
+        for m in self.monitors:
+            acc_phone = re.sub(r"\D", "", str((getattr(m, "account", {}) or {}).get("phone") or ""))
+            if acc_phone == phone_key:
+                if getattr(m, "is_connected", False):
+                    await self.db.update_panel_account(row_id, status="error", last_error="مكرر مع حساب متصل فعلاً")
+                    return {"ok": False, "error": "هذا الحساب متصل فعلاً في النظام"}
+                # مراقب قائم غير متصل لنفس الرقم → أزله ليُعاد بناؤه نظيفاً
+                try:
+                    await m.disconnect()
+                except Exception:
+                    pass
+                try:
+                    self.monitors.remove(m)
+                except ValueError:
+                    pass
+                break
+
+        account = build_panel_account_dict(row)
+        if account is None:
+            await self.db.update_panel_account(
+                row_id, status="needs_relogin",
+                last_error="تعذر فك تشفير الجلسة — أعد ربط الحساب",
+            )
+            return {"ok": False, "error": "تعذر فك تشفير الجلسة — أعد ربط الحساب"}
+
+        mon = EnhancedAccountMonitor(account, self.db, self.filter, self.main_client)
+        mon.set_bot(self)
+        self.monitors.append(mon)
+        ok = False
+        try:
+            ok = await asyncio.wait_for(mon.connect(), timeout=120)
+        except asyncio.TimeoutError:
+            ok = False
+        except Exception as e:
+            logger.error(f"spawn_panel_account connect error: {type(e).__name__}: {e}")
+            ok = False
+
+        if ok:
+            await self.db.update_panel_account(row_id, status="active", last_error=None)
+            await self.db.update_panel_account(
+                row_id, username=account.get("username"), display_name=account.get("name"),
+                tg_user_id=account.get("tg_user_id"),
+            )
+            if self.main_client is None:
+                self.main_client = mon.client
+                logger.info(f"Main client set from panel account: {account['name']}")
+            logger.info(f"Panel account activated: {account['name']} (row {row_id})")
+            return {"ok": True, "connected": True, "row_id": row_id}
+
+        terminal = getattr(mon, "_terminal_error", None)
+        err_text = getattr(mon, "_last_connect_error", None) or "فشل الاتصال"
+        status = "needs_relogin" if terminal else "error"
+        await self.db.update_panel_account(row_id, status=status, last_error=str(err_text)[:400])
+        return {"ok": False, "connected": False, "error": str(err_text)[:200], "needs_relogin": bool(terminal)}
+
+    async def stop_panel_account(self, row_id: int) -> bool:
+        """إيقاف مراقبة حساب لوحة: قطع المراقب وإزالته من القائمة (حفظ الصف)."""
+        phone = None
+        try:
+            row = await self.db.get_panel_account(row_id)
+            phone = (row or {}).get("phone")
+        except Exception:
+            pass
+        phone_key = re.sub(r"\D", "", str(phone or ""))
+        for m in list(self.monitors):
+            acc_phone = re.sub(r"\D", "", str((getattr(m, "account", {}) or {}).get("phone") or ""))
+            if phone_key and acc_phone == phone_key:
+                try:
+                    await m.disconnect()
+                except Exception:
+                    pass
+                try:
+                    self.monitors.remove(m)
+                except ValueError:
+                    pass
+                if self.main_client is m.client:
+                    self.main_client = None
+                    for mm in self.monitors:
+                        if getattr(mm, "is_connected", False):
+                            self.main_client = mm.client
+                            break
+                logger.info(f"Panel account monitoring stopped (row {row_id})")
+                return True
+        return False
+
+    async def delete_panel_account(self, row_id: int) -> Dict[str, Any]:
+        """
+        حذف حساب لوحة نهائياً (الصف + الجلسة المشفّرة) — مع حماية
+        «آخر حساب نشط»: يُرفض الحذف إذا كان الهدف هو الوحيد المتصل.
+        """
+        row = await self.db.get_panel_account(int(row_id))
+        if not row:
+            return {"ok": False, "error": "الحساب غير موجود"}
+        phone_key = re.sub(r"\D", "", str(row.get("phone") or ""))
+        target = None
+        active_count = 0
+        for m in self.monitors:
+            acc_phone = re.sub(r"\D", "", str((getattr(m, "account", {}) or {}).get("phone") or ""))
+            if getattr(m, "is_connected", False):
+                active_count += 1
+            if phone_key and acc_phone == phone_key:
+                target = m
+        target_active = target is not None and bool(getattr(target, "is_connected", False))
+        if target_active and active_count <= 1:
+            return {"ok": False, "error": "لا يمكن حذف آخر حساب نشط — أضف حساباً آخر وفعّله أولاً"}
+        await self.stop_panel_account(int(row_id))
+        await self.db.delete_panel_account(int(row_id))
+        logger.info(f"Panel account deleted (row {row_id})")
+        return {"ok": True}
+
+    async def reconnect_account(self, kind: str, ref: Any) -> Dict[str, Any]:
+        """إعادة اتصال حساب (env أو panel) دون إعادة نشر — عبر المراقب القائم."""
+        monitors = list(self.monitors)
+        target = None
+        if kind == "env":
+            ref_str = str(ref or "")
+            for m in monitors:
+                if (getattr(m, "account", {}) or {}).get("prefix", "").upper() == ref_str.upper():
+                    target = m
+                    break
+            if target is None:
+                # ابحث بالرقم المقابل من config
+                import config as _cfg
+
+                acc = next((a for a in (_cfg.ACCOUNTS or []) if str(a.get("prefix", "")).upper() == ref_str.upper()), None)
+                if acc is not None:
+                    key = re.sub(r"\D", "", str(acc.get("phone") or ""))
+                    for m in monitors:
+                        if re.sub(r"\D", "", str((m.account or {}).get("phone") or "")) == key:
+                            target = m
+                            break
+        else:
+            row = await self.db.get_panel_account(int(ref)) if str(ref).isdigit() else None
+            if row is None:
+                return {"ok": False, "error": "الحساب غير موجود"}
+            key = re.sub(r"\D", "", str(row.get("phone") or ""))
+            for m in monitors:
+                if re.sub(r"\D", "", str((m.account or {}).get("phone") or "")) == key:
+                    target = m
+                    break
+            if target is None:
+                # لا مراقب قائم → بناء جديد (التفعيل عبر الصف)
+                return await self.spawn_panel_account(row)
+        if target is None:
+            return {"ok": False, "error": "لم يُوجد مراقب لهذا الحساب"}
+
+        try:
+            ok = await asyncio.wait_for(target.connect(), timeout=120)
+        except asyncio.TimeoutError:
+            ok = False
+        except Exception as e:
+            logger.error(f"reconnect_account error: {type(e).__name__}: {e}")
+            ok = False
+        if ok and self.main_client is None:
+            self.main_client = target.client
+        # مزامنة حالة صف اللوحة
+        if kind == "panel":
+            row_id = int(ref)
+            if ok:
+                await self.db.update_panel_account(row_id, status="active", last_error=None)
+            else:
+                terminal = getattr(target, "_terminal_error", None)
+                await self.db.update_panel_account(
+                    row_id,
+                    status="needs_relogin" if terminal else "error",
+                    last_error=str(getattr(target, "_last_connect_error", None) or "فشل الاتصال")[:400],
+                )
+        return {"ok": True, "connected": bool(ok)}
+
+    async def sync_panel_boot_status(self, duplicates: List[int], undecryptable: List[int]) -> None:
+        """مزامنة حالات حسابات اللوحة بعد الإقلاع (مكرر env / جلسة تالفة)."""
+        for row_id in duplicates:
+            try:
+                await self.db.update_panel_account(
+                    int(row_id), status="error",
+                    last_error="مكرر مع حساب بيئة بنفس الرقم — المراقبة تعطّلة لهذا الصف",
+                )
+            except Exception:
+                pass
+        for row_id in undecryptable:
+            try:
+                await self.db.update_panel_account(
+                    int(row_id), status="needs_relogin",
+                    last_error="تعذر فك تشفير الجلسة (مفتاح التشفير تغيّر؟) — أعد ربط الحساب",
+                )
+            except Exception:
+                pass
+
     # ─── Initialization ────────────────────────────────────────────────────────
     async def initialize(self) -> bool:
         logger.info("=" * 60)
@@ -2045,6 +2256,33 @@ class EnhancedTelegramBot:
         self._keep_alive_task = self._track_task(self._keep_alive_loop(), "keep_alive")
 
         accounts = sorted(ACCOUNTS, key=lambda a: a.get("priority", 0), reverse=True)
+
+        # ═══ v14.10.0: دمج حسابات اللوحة (DB — جلسات مشفّرة) مع حسابات env ═══
+        # env أولوية؛ صف بلا مراقبة مُفعّلة يبقى محفوظاً بلا اتصال (متوقف).
+        # الفشل كله فشل-آمن: مشكلة اللوحة لا توقف الإقلاع ولا تقلّل حسابات env.
+        try:
+            if self._panel_rows_cache is None:
+                self._panel_rows_cache = await self.db.get_panel_accounts()
+            from dashboard.accounts import merge_panel_accounts
+
+            panel_accs, dup_ids, undec_ids = merge_panel_accounts(
+                self._panel_rows_cache, accounts
+            )
+            if panel_accs:
+                accounts.extend(panel_accs)
+                accounts.sort(key=lambda a: a.get("priority", 0), reverse=True)
+                logger.info(
+                    f"Panel accounts merged at boot: {len(panel_accs)} "
+                    f"(duplicates={len(dup_ids)}, undecryptable={len(undec_ids)})"
+                )
+            if dup_ids or undec_ids:
+                await self.sync_panel_boot_status(dup_ids, undec_ids)
+        except Exception as panel_boot_err:
+            logger.warning(
+                f"Panel accounts boot-merge skipped (fail-safe): "
+                f"{type(panel_boot_err).__name__}: {panel_boot_err}"
+            )
+
         if not accounts:
             logger.warning(
                 "No accounts configured - monitoring disabled. "
@@ -2122,6 +2360,27 @@ class EnhancedTelegramBot:
                     break
 
         logger.info(f"\n📊 Connected: {connected}/{len(accounts)}")
+
+        # ═══ v14.10.0: مزامنة حالة صفوف اللوحة بعد الاتصال الإقلاعي ═══
+        # مراقب حساب لوحة فشل إقلاعه يُحدّث صفاً في DB (needs_relogin/error)
+        # ليعكسه المدخل فوراً بدل حالة 'جاهز' كاذبة.
+        for m in self.monitors:
+            acc = getattr(m, "account", {}) or {}
+            if acc.get("source") == "panel" and acc.get("row_id"):
+                row_id = int(acc["row_id"])
+                try:
+                    if getattr(m, "is_connected", False):
+                        await self.db.update_panel_account(row_id, status="active", last_error=None)
+                    else:
+                        terminal = getattr(m, "_terminal_error", None)
+                        err_text = str(getattr(m, "_last_connect_error", None) or "فشل الاتصال عند الإقلاع")
+                        await self.db.update_panel_account(
+                            row_id,
+                            status="needs_relogin" if terminal else "error",
+                            last_error=err_text[:400],
+                        )
+                except Exception as sync_err:
+                    logger.debug(f"panel boot sync row {row_id} failed: {type(sync_err).__name__}")
 
         if connected == 0:
             logger.warning(

@@ -45,6 +45,9 @@ from dashboard.state import (
 )
 
 COOKIE_NAME = "br7dash"
+# v15.2.0-fix: مرآة CSRF غير HttpOnly — النمط المزدوج يتطلب أن يقرأ JS التوكِن
+# ليرسله في الترويسة؛ HttpOnly وحدها تجعل كل عمليات التعديل 403 في المتصفح الحقيقي.
+CSRF_COOKIE_NAME = "br7dash_csrf"
 _LOGIN_PUBLIC_PATHS = {"/admin/api/login", "/admin/api/session"}
 
 try:  # أوقات الاختبار قد لا تكون env مضبوطة — قيم state الافتراضية كافية
@@ -83,7 +86,13 @@ def setup_dashboard(app: web.Application, bot: Any) -> None:
     """يُستدعى من خيط الصحة قبل AppRunner.setup — يضيف المسارات والوسيط."""
     from pathlib import Path
 
-    DASH.version = str(_cfg_val("BOT_VERSION", "15.1.0"))
+    # v15.2.0-fix: BOT_VERSION ثابت على مستوى الوحدة (ليس على CFG) — كانت
+    # الشارة تعرض قيمة افتراضية قديمة دائماً.
+    try:
+        from config import BOT_VERSION as _dash_bot_version
+    except Exception:  # pragma: no cover
+        _dash_bot_version = "15.2.0"
+    DASH.version = str(_dash_bot_version)
     DASH.username, _pw = _cfg_secret("DASHBOARD_USERNAME", "DASHBOARD_PASSWORD")
 
     # أصول الواجهة تُقرأ من القرص مرة واحدة فقط عند التركيب
@@ -147,6 +156,23 @@ def setup_dashboard(app: web.Application, bot: Any) -> None:
         except _BridgeError as e:
             return _json(e.payload, e.status)
 
+    async def _bridge_call_long(coro_factory: Callable[[], Any], timeout: float = 180.0) -> Any:
+        """جسر بمهلة طويلة للعمليات التي تتصل بتيليجرام فعلياً (spawn/إعادة
+        اتصال مراقب جديد — حتى 120s connect + هامش)."""
+        loop = getattr(bot, "_main_loop", None)
+        if loop is None or loop.is_closed():
+            raise _BridgeError(503, {"error": "bot_core_unavailable",
+                                     "note": "نواة البوت ليست جاهزة بعد — أعد المحاولة بعد دقيقة"})
+        fut = asyncio.run_coroutine_threadsafe(coro_factory(), loop)
+        try:
+            return await asyncio.wait_for(asyncio.wrap_future(fut), timeout=timeout)
+        except DashboardHTTPError as e:
+            raise _BridgeError(e.status, e.payload)
+        except asyncio.TimeoutError:
+            raise _BridgeError(504, {"error": "bridge_timeout"})
+        except Exception as e:  # noqa: BLE001
+            raise _BridgeError(500, {"error": "internal_error", "detail": type(e).__name__})
+
     async def body_json(request: web.Request) -> dict:
         try:
             data = await request.json()
@@ -184,8 +210,23 @@ def setup_dashboard(app: web.Application, bot: Any) -> None:
 
     # ── الأصول ──────────────────────────────────────────────────────────
     async def admin_index(request: web.Request) -> web.Response:
-        resp = web.Response(body=DASH.assets.get("index.html", b""), content_type="text/html",
-                            charset="utf-8")
+        body = DASH.assets.get("index.html", b"")
+        # v15.2.0: بوابة بمنفذ مُحوَّل (XTransformPort) — تُلحق المعلمة بروابط
+        # الأصول لتبلو اللوحة كاملة عبر البوابة؛ في الإنتاج لا معلمة فلا تغيير.
+        qport = request.query.get("XTransformPort", "")
+        if qport and body:
+            try:
+                html = body.decode("utf-8").replace(
+                    '/admin/assets/style.css',
+                    f'/admin/assets/style.css?XTransformPort={qport}',
+                ).replace(
+                    '/admin/assets/app.js',
+                    f'/admin/assets/app.js?XTransformPort={qport}',
+                )
+                body = html.encode("utf-8")
+            except Exception:
+                pass
+        resp = web.Response(body=body, content_type="text/html", charset="utf-8")
         resp.headers["Cache-Control"] = "no-store"
         resp.headers["X-Frame-Options"] = "DENY"
         resp.headers["X-Content-Type-Options"] = "nosniff"
@@ -239,9 +280,15 @@ def setup_dashboard(app: web.Application, bot: Any) -> None:
         token = _secrets.token_urlsafe(32)
         DASH.sessions.create(token, ip)
         _audit_bg("dashboard.login", "session", ip)
-        resp = _json({"ok": True, "username": DASH.username, "version": DASH.version})
+        resp = _json({"ok": True, "username": DASH.username, "version": DASH.version,
+                      "csrf": token})
         resp.set_cookie(
             COOKIE_NAME, token, max_age=ttl_seconds, httponly=True,
+            samesite="Strict", path="/admin", secure=_is_https(request),
+        )
+        # مرآة CSRF مقروءة للـ JS (نفس التوكِن، حماية SameSite=Strict كما هي)
+        resp.set_cookie(
+            CSRF_COOKIE_NAME, token, max_age=ttl_seconds, httponly=False,
             samesite="Strict", path="/admin", secure=_is_https(request),
         )
         return resp
@@ -252,6 +299,7 @@ def setup_dashboard(app: web.Application, bot: Any) -> None:
         _audit_bg("dashboard.logout", "session", _client_ip(request))
         resp = _json({"ok": True})
         resp.del_cookie(COOKIE_NAME, path="/admin")
+        resp.del_cookie(CSRF_COOKIE_NAME, path="/admin")
         return resp
 
     # ── الوحدة 1: الحالة ────────────────────────────────────────────────
@@ -293,6 +341,143 @@ def setup_dashboard(app: web.Application, bot: Any) -> None:
         body = await body_json(request)
         name = str(body.get("name") or "")[:64]
         return await bridge(lambda: api.account_membership(name))
+
+    # ── الوحدة 2-ب: ربط حساب جديد (v15.2.0) ─────────────────────────────
+    # AccountLinkManager يعيش على حلقة الصحة؛ كل عمليات DB/Telethon للمراقبة
+    # تُجسَّر إلى الحلقة الرئيسية عبر الجسر أعلاه. المصادقة وCSRF والحد
+    # الزمني لهذه المسارات يأتيان من dash_middleware تلقائياً.
+    from dashboard.crypto import encrypt_secret as _link_encrypt
+    from dashboard.link_flow import AccountLinkManager as _LinkManager
+
+    async def _link_find_existing(phone: str, tg_user_id):
+        async def _q():
+            return await api.db.get_panel_account_duplicate(phone, tg_user_id)
+        return await _bridge_call(_q)
+
+    async def _link_save_account(payload: dict):
+        async def _q():
+            return await api.db.insert_panel_account(
+                phone=payload["phone"],
+                display_name=payload.get("display_name") or "",
+                username=payload.get("username") or "",
+                tg_user_id=int(payload.get("tg_user_id") or 0),
+                api_id=str(payload.get("api_id") or ""),
+                api_hash_encrypted=_link_encrypt(str(payload.get("api_hash") or "")) if payload.get("api_hash") else "",
+                session_encrypted=_link_encrypt(payload["session_string"]),
+            )
+        return await _bridge_call(_q)
+
+    async def _link_activate(row_id: int, payload: dict):
+        async def _q():
+            row = await api.db.get_panel_account(int(row_id))
+            if not row:
+                return {"ok": False, "error": "الحساب المحفوظ غير موجود"}
+            return await bot.spawn_panel_account(row)
+        res = await _bridge_call_long(_q)
+        if res and res.get("ok"):
+            link_manager.mark_active(int(row_id))
+        else:
+            link_manager.mark_error(int(row_id), (res or {}).get("error") or "فشل تفعيل الحساب")
+
+    link_manager = _LinkManager(_link_find_existing, _link_save_account, _link_activate)
+    link_manager.start_sweeper()
+
+    async def api_account_add_start(request: web.Request) -> web.Response:
+        body = await body_json(request)
+        phone = str(body.get("phone") or "")
+        result = await link_manager.start(bot, phone)
+        _audit_bg(
+            "dashboard.account_add_start",
+            object_id=str(phone)[:3] + "***" + str(phone)[-2:] if phone else "",
+            new_value="ok" if result.get("ok") else str(result.get("error_code") or ""),
+        )
+        return _json(result)
+
+    async def api_account_add_code(request: web.Request) -> web.Response:
+        body = await body_json(request)
+        result = await link_manager.submit_code(str(body.get("op_id") or ""), str(body.get("code") or ""))
+        return _json(result)
+
+    async def api_account_add_password(request: web.Request) -> web.Response:
+        body = await body_json(request)
+        result = await link_manager.submit_password(str(body.get("op_id") or ""), str(body.get("password") or ""))
+        return _json(result)
+
+    async def api_account_add_cancel(request: web.Request) -> web.Response:
+        body = await body_json(request)
+        result = await link_manager.cancel(str(body.get("op_id") or ""))
+        _audit_bg("dashboard.account_add_cancel", object_id=str(body.get("op_id") or "")[:8])
+        return _json(result)
+
+    async def api_account_add_status(request: web.Request) -> web.Response:
+        op_id = request.query.get("op_id", "")
+        status = link_manager.status(op_id)
+        if status is None:
+            return _json({"error": "op_not_found", "note": "لا توجد عملية ربط بهذا المعرّف"}, 404)
+        return _json({"ok": True, "op": status})
+
+    async def api_account_row_toggle(request: web.Request) -> web.Response:
+        body = await body_json(request)
+        try:
+            row_id = int(body.get("row_id"))
+            enable = bool(body.get("enable"))
+        except (TypeError, ValueError):
+            return _json({"error": "invalid_row_id"}, 400)
+
+        async def _do():
+            row = await api.db.get_panel_account(row_id)
+            if not row:
+                return {"ok": False, "error": "الحساب غير موجود"}
+            await api.db.update_panel_account(row_id, monitoring_enabled=enable)
+            if not enable:
+                await bot.stop_panel_account(row_id)
+            else:
+                row2 = dict(row)
+                row2["monitoring_enabled"] = 1
+                return await bot.spawn_panel_account(row2)
+            return {"ok": True, "enable": enable}
+
+        try:
+            result = await _bridge_call_long(_do)
+        except _BridgeError as e:
+            return _json(e.payload, e.status)
+        _audit_bg("dashboard.account_toggle", object_id=str(row_id), new_value=str(enable))
+        return _json(result)
+
+    async def api_account_row_reconnect(request: web.Request) -> web.Response:
+        body = await body_json(request)
+        try:
+            row_id = int(body.get("row_id"))
+        except (TypeError, ValueError):
+            return _json({"error": "invalid_row_id"}, 400)
+
+        async def _do():
+            return await bot.reconnect_account("panel", row_id)
+
+        try:
+            result = await _bridge_call_long(_do)
+        except _BridgeError as e:
+            return _json(e.payload, e.status)
+        _audit_bg("dashboard.account_reconnect_row", object_id=str(row_id))
+        return _json(result)
+
+    async def api_account_row_delete(request: web.Request) -> web.Response:
+        body = await body_json(request)
+        try:
+            row_id = int(body.get("row_id"))
+        except (TypeError, ValueError):
+            return _json({"error": "invalid_row_id"}, 400)
+
+        async def _do():
+            return await bot.delete_panel_account(row_id)
+
+        try:
+            result = await _bridge_call(_do)
+        except _BridgeError as e:
+            return _json(e.payload, e.status)
+        if result.get("ok"):
+            _audit_bg("dashboard.account_delete", object_id=str(row_id))
+        return _json(result)
 
     # ── الوحدة 3: الكلمات + Playground ──────────────────────────────────
     async def api_keywords(request: web.Request) -> web.Response:
@@ -463,6 +648,16 @@ def setup_dashboard(app: web.Application, bot: Any) -> None:
     r.add_post("/admin/api/accounts/test", api_account_test)
     r.add_post("/admin/api/accounts/reconnect", api_account_reconnect)
     r.add_post("/admin/api/accounts/membership", api_account_membership)
+
+    # v15.2.0: ربط حساب جديد + إدارة صفوف حسابات اللوحة
+    r.add_post("/admin/api/accounts/add/start", api_account_add_start)
+    r.add_post("/admin/api/accounts/add/code", api_account_add_code)
+    r.add_post("/admin/api/accounts/add/password", api_account_add_password)
+    r.add_post("/admin/api/accounts/add/cancel", api_account_add_cancel)
+    r.add_get("/admin/api/accounts/add/status", api_account_add_status)
+    r.add_post("/admin/api/accounts/row/toggle", api_account_row_toggle)
+    r.add_post("/admin/api/accounts/row/reconnect", api_account_row_reconnect)
+    r.add_post("/admin/api/accounts/row/delete", api_account_row_delete)
 
     r.add_get("/admin/api/keywords", api_keywords)
     r.add_post("/admin/api/keywords/save", api_keywords_save)

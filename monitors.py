@@ -1086,6 +1086,9 @@ class EnhancedAccountMonitor:
     def __init__(self, account: Dict[str, Any], db: EnhancedDatabase, flt: EnhancedFilter, main_client: Optional[TelegramClient] = None):
         self.account = account; self.db = db; self.filter = flt; self.main_client = main_client
         self.client: Optional[TelegramClient] = None; self.is_connected = False; self.started_at: float = 0.0
+        # v14.10.0: هوية الحساب الحي (get_me عند الاتصال فقط) — تقرأها اللوحة
+        # بلا أي استدعاءات Telegram لكل طلب عرض (Lightweight Dashboard).
+        self.me_info: Dict[str, Any] = {}
         # ═══ v14.6.0 Activity Maintenance: آخر نشاط استقبال حقيقي لكل مراقب ═══
         # تحديث ذرّي من معالج الأحداث (بلا I/O) — يُقرأ من /health/full
         self.last_event_ts: float = 0.0
@@ -1270,6 +1273,18 @@ class EnhancedAccountMonitor:
                         return False
                     me = await client.get_me()
                     register_self_sender(getattr(me, "id", 0))
+                    # v14.10.0: تخزين هوية الحساب للوحة (قراءة خاملة لاحقاً)
+                    try:
+                        _first = (getattr(me, "first_name", None) or "").strip()
+                        _last = (getattr(me, "last_name", None) or "").strip()
+                        self.me_info = {
+                            "id": int(getattr(me, "id", 0) or 0) or None,
+                            "username": getattr(me, "username", None),
+                            "name": (_first + (" " + _last if _last else "")).strip() or None,
+                            "phone": getattr(me, "phone", None),
+                        }
+                    except Exception:
+                        pass
                     logger.info(f"Connected {account['name']} as @{me.username or me.id}")
                     self.client = client; self.is_connected = True; self.started_at = time.time()
                     self._last_connect_error = None; self._stats["last_error"] = None

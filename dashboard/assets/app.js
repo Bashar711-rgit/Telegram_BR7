@@ -47,12 +47,20 @@ $("modalCancel").addEventListener("click", () => { $("modal").classList.add("hid
 
 /* ── طبقة API (CSRF + 401) ── */
 function csrfToken() {
-  const m = document.cookie.match(/(?:^|;\s*)br7dash=([^;]*)/);
-  return m ? decodeURIComponent(m[1]) : "";
+  const m = document.cookie.match(/(?:^|;\s*)br7dash_csrf=([^;]*)/);
+  if (m) return decodeURIComponent(m[1]);
+  return sessionStorage.getItem("br7dash_csrf") || "";
 }
+
+/* بوابة بمنفذ مُحوّل (XTransformPort): تُلحق المعلمة بكل استدعاءات API
+   تلقائياً — في الإنتاج (Render) لا توجد المعلمة فتبقى المسارات كما هي. */
+const GW_PORT = new URLSearchParams(window.location.search).get("XTransformPort") || "";
+const GW_Q = GW_PORT ? "XTransformPort=" + encodeURIComponent(GW_PORT) : "";
+function gwPath(p) { return GW_Q ? p + (p.includes("?") ? "&" : "?") + GW_Q : p; }
 
 async function api(path, opts) {
   opts = opts || {};
+  path = gwPath(path);
   const init = { method: opts.method || "GET", headers: {}, credentials: "same-origin" };
   if (opts.body !== undefined) {
     init.headers["Content-Type"] = "application/json";
@@ -99,6 +107,7 @@ $("loginForm").addEventListener("submit", async (ev) => {
   $("loginBtn").disabled = false;
   if (r.ok && r.data.ok) {
     $("loginPass").value = "";
+    if (r.data.csrf) sessionStorage.setItem("br7dash_csrf", r.data.csrf);
     hideLogin();
     username = r.data.username;
     $("versionBadge").textContent = "v" + (r.data.version || "");
@@ -116,6 +125,7 @@ $("loginForm").addEventListener("submit", async (ev) => {
 $("logoutBtn").addEventListener("click", async () => {
   await api("/admin/api/logout", { method: "POST", body: {} });
   showLogin();
+  sessionStorage.removeItem("br7dash_csrf");
   toast("تم تسجيل الخروج");
 });
 
@@ -244,24 +254,45 @@ tabLoaders.accounts = async function () {
   renderAccounts(r.data);
 };
 
+const ACC_STATUS_AR = {
+  active: '<span class="pill ok">نشط</span>',
+  ready: '<span class="pill muted">جاهز</span>',
+  stopped: '<span class="pill muted">متوقف</span>',
+  needs_relogin: '<span class="pill warn">يحتاج إعادة دخول</span>',
+  error: '<span class="pill bad">خطأ</span>',
+};
+
 function renderAccounts(d) {
   $("accNote").textContent = d.note || "";
   const rows = (d.items || []).map((a) => {
-    const conn = a.connected ? '<span class="pill ok">متصل</span>' : '<span class="pill bad">منفصل</span>';
+    const isPanel = a.kind === "panel";
+    const conn = isPanel
+      ? (ACC_STATUS_AR[a.status] || '<span class="pill muted">—</span>')
+      : (a.connected ? '<span class="pill ok">متصل</span>' : '<span class="pill bad">منفصل</span>');
     const term = a.terminal_error ? ` <span class="pill bad" title="${esc(a.terminal_error)}">نهائي</span>` : "";
     const ident = a.identity ? `<small>${esc(a.identity.first_name || "")}${a.identity.username ? " · @" + esc(a.identity.username) : ""} · ${esc(a.identity.id || "")}</small>` : '<small>لم يُختبر</small>';
     const mem = a.membership ? (a.membership.status === "ok" ? '<span class="pill ok">عضو</span>' : `<span class="pill bad">${esc(a.membership.status)}</span>`) : '<span class="pill muted">لم يُفحص</span>';
     const err = a.last_error ? `<span title="${esc(a.last_error)}" style="color:#ffb4b4">${esc(String(a.last_error).slice(0, 40))}…</span>` : "—";
+    let actions;
+    if (isPanel) {
+      const tog = a.monitoring_enabled
+        ? `<button class="btn sm" data-act="rowToggle" data-row="${a.row_id}" data-enable="false">إيقاف المراقبة</button>`
+        : `<button class="btn sm primary" data-act="rowToggle" data-row="${a.row_id}" data-enable="true">تفعيل المراقبة</button>`;
+      actions = `${tog}
+        <button class="btn sm" data-act="rowReconnect" data-row="${a.row_id}">إعادة ربط</button>
+        <button class="btn sm danger" data-act="rowDelete" data-row="${a.row_id}">حذف</button>`;
+    } else {
+      actions = `<button class="btn sm" data-act="test" data-name="${esc(a.name)}">اختبار</button>
+        <button class="btn sm" data-act="membership" data-name="${esc(a.name)}">عضوية</button>
+        <button class="btn sm" data-act="reconnect" data-name="${esc(a.name)}">إعادة ربط</button>`;
+    }
+    const kindBadge = isPanel ? ' <span class="pill muted">لوحة</span>' : ' <span class="pill muted">env</span>';
     return `<tr>
-      <td><b>${esc(a.name)}</b>${a.is_main ? ' <span class="pill muted">رئيسي</span>' : ""}<br>${ident}</td>
+      <td><b>${esc(a.name)}</b>${a.is_main ? ' <span class="pill muted">رئيسي</span>' : ""}${kindBadge}<br>${ident}</td>
       <td>${esc(a.phone_masked)}</td><td>${conn}${term}</td><td>${mem}</td>
       <td>${fmtNum(a.events_received)}</td><td>${fmtNum(a.alerts_sent)}</td>
       <td>${fmtNum(a.errors + a.send_errors)}</td><td>${err}</td>
-      <td>
-        <button class="btn sm" data-act="test" data-name="${esc(a.name)}">اختبار</button>
-        <button class="btn sm" data-act="membership" data-name="${esc(a.name)}">عضوية</button>
-        <button class="btn sm" data-act="reconnect" data-name="${esc(a.name)}">إعادة ربط</button>
-      </td></tr>`;
+      <td>${actions}</td></tr>`;
   }).join("");
   $("accTable").innerHTML = "<thead><tr><th>الحساب</th><th>الهاتف</th><th>الاتصال</th><th>العضوية بالهدف</th><th>الأحداث</th><th>تنبيهات</th><th>أخطاء</th><th>آخر خطأ</th><th>إجراءات</th></tr></thead><tbody>" + (rows || "<tr><td colspan='9'>لا حسابات محملة</td></tr>") + "</tbody>";
 }
@@ -285,6 +316,22 @@ $("accTable").addEventListener("click", async (ev) => {
       if (!go) return;
       const r = await api("/admin/api/accounts/reconnect", { method: "POST", body: { name } });
       toast(r.ok && r.data.ok ? `✅ ${name}: أُعيد الربط` : `❌ ${name}: ${r.data.reason || "فشل"}`, !(r.ok && r.data.ok));
+    } else if (act === "rowToggle") {
+      const enable = btn.dataset.enable === "true";
+      const r = await api("/admin/api/accounts/row/toggle", { method: "POST", body: { row_id: Number(btn.dataset.row), enable } });
+      if (r.ok && r.data.ok) toast(enable ? "✅ تُفعّل المراقبة — الحساب يتصل الآن" : "✅ أُوقفت المراقبة — الحساب محفوظ معطلاً");
+      else toast("❌ " + ((r.data || {}).error || (r.data || {}).note || "فشل التغيير"), true);
+    } else if (act === "rowReconnect") {
+      const go = await confirmModal("إعادة اتصال حساب اللوحة؟ (دون إعادة نشر)", "إعادة الربط");
+      if (!go) return;
+      const r = await api("/admin/api/accounts/row/reconnect", { method: "POST", body: { row_id: Number(btn.dataset.row) } });
+      toast(r.ok && r.data.ok && r.data.connected ? "✅ تم الاتصال" : "❌ فشل الاتصال — راجع آخر خطأ في الجدول", !(r.ok && r.data.ok && r.data.connected));
+    } else if (act === "rowDelete") {
+      const go = await confirmModal("حذف الحساب وجلسته المشفّرة نهائياً؟ لا يمكن التراجع. (آخر حساب نشط محمي من الحذف)", "حذف نهائي");
+      if (!go) return;
+      const r = await api("/admin/api/accounts/row/delete", { method: "POST", body: { row_id: Number(btn.dataset.row) } });
+      if (r.ok && r.data.ok) toast("✅ تم حذف الحساب");
+      else toast("❌ " + ((r.data || {}).error || "فشل الحذف"), true);
     }
     tabLoaders.accounts().catch(() => {});
   } finally { btn.disabled = false; }
@@ -693,3 +740,219 @@ $("restartBtn").addEventListener("click", async () => {
     showLogin();
   }
 })();
+
+/* ═════════ الوحدة 2-ب: معالج ربط حساب جديد (v15.2.0) ═════════ */
+const WIZ_COUNTRIES = [
+  ["+966", "السعودية"], ["+971", "الإمارات"], ["+965", "الكويت"], ["+973", "البحرين"],
+  ["+974", "قطر"], ["+968", "عُمان"], ["+967", "اليمن"], ["+962", "الأردن"],
+  ["+963", "سوريا"], ["+961", "لبنان"], ["+964", "العراق"], ["+970", "فلسطين"],
+  ["+20", "مصر"], ["+218", "ليبيا"], ["+216", "تونس"], ["+213", "الجزائر"],
+  ["+212", "المغرب"], ["+249", "السودان"], ["+253", "جيبوتي"], ["+252", "الصومال"],
+  ["+222", "موريتانيا"], ["+90", "تركيا"], ["+44", "المملكة المتحدة"], ["+1", "أمريكا/كندا"],
+  ["+91", "الهند"], ["+92", "باكستان"], ["+62", "إندونيسيا"], ["+63", "الفلبين"],
+  ["+49", "ألمانيا"], ["+33", "فرنسا"], ["+39", "إيطاليا"], ["+34", "إسبانيا"],
+  ["+31", "هولندا"], ["+46", "السويد"], ["+60", "ماليزيا"], ["+84", "فيتنام"],
+];
+const WIZ_STATE_AR = {
+  linking: "جاري الربط", waiting_code: "بانتظار الرمز", waiting_password: "بانتظار كلمة المرور",
+  verifying: "جاري التحقق", ready: "جاهز", active: "نشط", error: "خطأ",
+};
+let wizOpId = null;
+let wizTimer = null;
+
+function wizShowStep(name) {
+  ["Phone", "Code", "Pass", "Verify"].forEach((s) => {
+    const el = $("wiz" + s);
+    if (el) el.classList.toggle("hidden", s !== name);
+  });
+  const idx = { Phone: 0, Code: 1, Pass: 2, Verify: 3 }[name];
+  document.querySelectorAll("#wizSteps li").forEach((li) => {
+    const i = Number(li.dataset.i);
+    li.className = i < idx ? "done" : i === idx ? "cur" : "";
+  });
+}
+function wizErr(id, msg) { const el = $(id); el.textContent = msg; el.classList.remove("hidden"); }
+function wizClearErr() { ["wizPhoneErr", "wizCodeErr", "wizPassErr"].forEach((id) => $(id).classList.add("hidden")); }
+function wizMsg(d) { return (d && (d.error_message || d.note || d.error)) || "حدث خطأ غير متوقع"; }
+function wizFmtWait(sec) {
+  sec = Math.max(0, Math.floor(sec || 0));
+  if (sec < 60) return sec + " ثانية";
+  const m = Math.floor(sec / 60);
+  if (m < 60) return m + " دقيقة";
+  return Math.floor(m / 60) + " ساعة " + (m % 60) + " د";
+}
+
+function openWizard() {
+  wizOpId = null;
+  clearInterval(wizTimer); wizTimer = null;
+  $("wizCC").innerHTML = WIZ_COUNTRIES.map(([c, n]) => `<option value="${c}">${c} — ${n}</option>`).join("");
+  $("wizCC").value = "+966";
+  $("wizPhoneInput").value = ""; $("wizCodeInput").value = ""; $("wizPassInput").value = "";
+  wizClearErr();
+  wizShowStep("Phone");
+  $("wiz").classList.remove("hidden");
+}
+
+function closeWizard() {
+  clearInterval(wizTimer); wizTimer = null;
+  if (wizOpId) {
+    api("/admin/api/accounts/add/cancel", { method: "POST", body: { op_id: wizOpId } }).catch(() => {});
+    wizOpId = null;
+  }
+  $("wiz").classList.add("hidden");
+  tabLoaders.accounts().catch(() => {});
+}
+
+function wizFlood(d) {
+  if (d && d.error_code === "flood_wait" && d.flood_wait > 0)
+    return `تجاوزت حد المحاولات لدى تيليجرام — انتظر ${wizFmtWait(d.flood_wait)} ثم أعد المحاولة`;
+  return wizMsg(d);
+}
+
+async function wizPhoneNext() {
+  const cc = $("wizCC").value;
+  const national = $("wizPhoneInput").value.replace(/\D/g, "");
+  wizClearErr();
+  if (!national || national.length < 6) { wizErr("wizPhoneErr", "أدخل رقم الهاتف كاملاً دون مفتاح الدولة"); return; }
+  const btn = $("wizPhoneNext");
+  btn.disabled = true; btn.textContent = "جارٍ الإرسال…";
+  try {
+    const r = await api("/admin/api/accounts/add/start", { method: "POST", body: { phone: cc + national } });
+    const d = r.data || {};
+    if (d.ok && d.op) {
+      wizOpId = d.op.op_id;
+      $("wizCodePhone").textContent = cc + national;
+      wizShowStep("Code");
+      setTimeout(() => $("wizCodeInput").focus(), 60);
+      wizPollStart();
+    } else {
+      wizErr("wizPhoneErr", wizFlood(d));
+    }
+  } finally { btn.disabled = false; btn.textContent = "إرسال رمز التحقق"; }
+}
+
+async function wizCodeNext() {
+  const code = $("wizCodeInput").value.replace(/\D/g, "");
+  wizClearErr();
+  if (!code) { wizErr("wizCodeErr", "أدخل رمز التأكيد"); return; }
+  const btn = $("wizCodeNext");
+  btn.disabled = true; btn.textContent = "جارٍ التحقق…";
+  try {
+    const r = await api("/admin/api/accounts/add/code", { method: "POST", body: { op_id: wizOpId, code } });
+    wizHandleResult(r.data || {}, "#wizCodeErr");
+  } finally { btn.disabled = false; btn.textContent = "متابعة"; }
+}
+
+async function wizPassNext() {
+  const password = $("wizPassInput").value;
+  wizClearErr();
+  if (!password) { wizErr("wizPassErr", "أدخل كلمة المرور"); return; }
+  const btn = $("wizPassNext");
+  btn.disabled = true; btn.textContent = "جارٍ التحقق…";
+  try {
+    const r = await api("/admin/api/accounts/add/password", { method: "POST", body: { op_id: wizOpId, password } });
+    $("wizPassInput").value = "";
+    wizHandleResult(r.data || {}, "#wizPassErr");
+  } finally { btn.disabled = false; btn.textContent = "تأكيد كلمة المرور"; }
+}
+
+function wizHandleResult(d, errBox) {
+  if (d.ok === false) {
+    if (d.error_code === "code_expired" || d.exhausted || d.error_code === "duplicate_after_auth") {
+      wizShowStep("Verify");
+      $("wizLoading").classList.add("hidden");
+      $("wizSuccess").classList.add("hidden");
+      $("wizFail").classList.remove("hidden");
+      $("wizFailMsg").textContent = wizFlood(d);
+      clearInterval(wizTimer); wizTimer = null;
+      wizOpId = null;
+    } else {
+      wizErr(errBox, wizFlood(d));
+      if (d.op && d.op.state === "waiting_password") {
+        wizShowStep("Pass");
+        setTimeout(() => $("wizPassInput").focus(), 60);
+      }
+    }
+    return;
+  }
+  const op = d.op;
+  if (!op) return;
+  const st = op.state;
+  if (st === "waiting_password") {
+    wizShowStep("Pass");
+    setTimeout(() => $("wizPassInput").focus(), 60);
+  } else if (st === "verifying") {
+    wizShowVerifyLoading();
+  } else if (st === "ready" || st === "active") {
+    wizShowSuccess(op);
+  }
+}
+
+function wizShowVerifyLoading() {
+  wizShowStep("Verify");
+  $("wizLoading").classList.remove("hidden");
+  $("wizSuccess").classList.add("hidden");
+  $("wizFail").classList.add("hidden");
+  wizPollStart();
+}
+
+function wizShowSuccess(op) {
+  clearInterval(wizTimer); wizTimer = null;
+  wizShowStep("Verify");
+  $("wizLoading").classList.add("hidden");
+  $("wizFail").classList.add("hidden");
+  const me = op.me || {};
+  $("wizMe").innerHTML = `
+    <span>الاسم</span><b>${esc(me.name || "—")}</b>
+    <span>المعرف</span><b>${me.id ? esc(String(me.id)) : "—"}</b>
+    <span>المستخدم</span><b>${me.username ? "@" + esc(me.username) : "—"}</b>
+    <span>الهاتف</span><b>${esc(me.phone || op.phone || "—")}</b>
+    <span>الحالة</span><b>${esc(WIZ_STATE_AR[op.state] || op.state)}</b>`;
+  $("wizActivateNote").textContent = op.state === "active"
+    ? "الحساب نشط ويشارك في المراقبة الآن."
+    : "الحساب محفوظ وجلسته مشفّرة — تفعيل المراقبة جارٍ على الخادم، حدّث الجدول بعد لحظات.";
+  $("wizSuccess").classList.remove("hidden");
+  wizOpId = null;
+}
+
+function wizPollStart() {
+  clearInterval(wizTimer);
+  wizTimer = setInterval(async () => {
+    if (!wizOpId) { clearInterval(wizTimer); return; }
+    const r = await api(`/admin/api/accounts/add/status?op_id=${encodeURIComponent(wizOpId)}`);
+    const d = r.data || {};
+    if (r.status === 404) { wizShowVerifyFail("انتهت العملية على الخادم — أبدأ من جديد"); return; }
+    if (d.ok && d.op) {
+      const st = d.op.state;
+      if (st === "verifying") wizShowVerifyLoading();
+      else if (st === "ready" || st === "active") wizShowSuccess(d.op);
+      else if (st === "error") wizShowVerifyFail(d.op.error_message || "فشلت عملية الربط");
+    }
+  }, 2500);
+}
+
+function wizShowVerifyFail(msg) {
+  wizShowStep("Verify");
+  $("wizLoading").classList.add("hidden");
+  $("wizSuccess").classList.add("hidden");
+  $("wizFail").classList.remove("hidden");
+  $("wizFailMsg").textContent = msg;
+  clearInterval(wizTimer); wizTimer = null;
+  wizOpId = null;
+}
+
+$("accAdd").addEventListener("click", openWizard);
+$("wizPhoneNext").addEventListener("click", wizPhoneNext);
+$("wizCodeNext").addEventListener("click", wizCodeNext);
+$("wizPassNext").addEventListener("click", wizPassNext);
+$("wizPhoneCancel").addEventListener("click", closeWizard);
+$("wizCodeCancel").addEventListener("click", closeWizard);
+$("wizPassCancel").addEventListener("click", closeWizard);
+$("wizDone").addEventListener("click", () => { wizOpId = null; $("wiz").classList.add("hidden"); tabLoaders.accounts().catch(() => {}); });
+$("wizClose").addEventListener("click", () => { wizOpId = null; $("wiz").classList.add("hidden"); });
+$("wizRestart").addEventListener("click", openWizard);
+$("wizPhoneInput").addEventListener("keydown", (e) => { if (e.key === "Enter") wizPhoneNext(); });
+$("wizCodeInput").addEventListener("keydown", (e) => { if (e.key === "Enter") wizCodeNext(); });
+$("wizPassInput").addEventListener("keydown", (e) => { if (e.key === "Enter") wizPassNext(); });
+$("wiz").addEventListener("click", (e) => { if (e.target === $("wiz")) closeWizard(); });
+/* ═════════ نهاية معالج الربط ═════════ */

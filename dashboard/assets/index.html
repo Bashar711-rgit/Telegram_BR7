@@ -82,8 +82,9 @@
   <section id="tab-accounts" class="panel">
     <div class="card">
       <div class="toolbar">
+        <button id="accAdd" class="btn sm primary">➕ إضافة حساب جديد</button>
         <button id="accRefresh" class="btn sm">تحديث</button>
-        <button id="accTestAll" class="btn sm primary">اختبار جميع الحسابات</button>
+        <button id="accTestAll" class="btn sm">اختبار جميع الحسابات</button>
         <span id="accNote" style="color:var(--muted);font-size:12px"></span>
       </div>
       <div class="tablewrap">
@@ -211,7 +212,7 @@
 
 </main>
 
-<footer class="copyright">Telegram BR7 · Lightweight Dashboard v15.1.0 · فصل كامل عن مسار استقبال الرسائل</footer>
+<footer class="copyright">Telegram BR7 · Lightweight Dashboard v15.2.0 · فصل كامل عن مسار استقبال الرسائل</footer>
 
 <div id="toast" class="toast hidden" role="status"></div>
 
@@ -221,6 +222,81 @@
     <div class="modal-actions">
       <button id="modalOk" class="btn danger">تأكيد</button>
       <button id="modalCancel" class="btn ghost">إلغاء</button>
+    </div>
+  </div>
+</div>
+
+<!-- ═══ معالج ربط حساب تيليجرام جديد (v15.2.0) ═══ -->
+<div id="wiz" class="modal hidden" role="dialog" aria-modal="true">
+  <div class="modal-card wiz-card">
+    <h3 style="margin-top:0">ربط حساب تيليجرام جديد</h3>
+    <ol id="wizSteps" class="wiz-steps">
+      <li data-i="0" class="cur">رقم الهاتف</li>
+      <li data-i="1">رمز التأكيد</li>
+      <li data-i="2">كلمة المرور</li>
+      <li data-i="3">التحقق والتفعيل</li>
+    </ol>
+
+    <div id="wizPhone" class="wiz-body">
+      <p class="wiz-desc">اختر مفتاح الدولة ثم أدخل رقم الهاتف — سيُرسل رمز التأكيد إلى تيليجرام على هذا الرقم.</p>
+      <div class="wiz-phonewrap">
+        <label class="field" style="max-width:150px">مفتاح الدولة
+          <select id="wizCC"></select>
+        </label>
+        <label class="field">رقم الهاتف
+          <input id="wizPhoneInput" type="tel" inputmode="numeric" placeholder="5XXXXXXXX" autocomplete="tel-national">
+        </label>
+      </div>
+      <div id="wizPhoneErr" class="error hidden"></div>
+      <div class="modal-actions">
+        <button id="wizPhoneCancel" class="btn ghost">إلغاء</button>
+        <button id="wizPhoneNext" class="btn primary">إرسال رمز التحقق</button>
+      </div>
+    </div>
+
+    <div id="wizCode" class="wiz-body hidden">
+      <p class="wiz-desc">أدخل رمز التأكيد المرسل من تيليجرام إلى <b id="wizCodePhone"></b>.</p>
+      <label class="field">رمز التأكيد
+        <input id="wizCodeInput" type="text" inputmode="numeric" maxlength="8" placeholder="-----" autocomplete="one-time-code" class="wiz-code">
+      </label>
+      <div id="wizCodeErr" class="error hidden"></div>
+      <div class="modal-actions">
+        <button id="wizCodeCancel" class="btn ghost">إلغاء</button>
+        <button id="wizCodeNext" class="btn primary">متابعة</button>
+      </div>
+    </div>
+
+    <div id="wizPass" class="wiz-body hidden">
+      <p class="wiz-desc">هذا الحساب محمي بالتحقق بخطوتين (2FA) — أدخل كلمة مرور تيليجرام الخاصة به.</p>
+      <label class="field">كلمة المرور
+        <input id="wizPassInput" type="password" autocomplete="current-password">
+      </label>
+      <div id="wizPassErr" class="error hidden"></div>
+      <div class="modal-actions">
+        <button id="wizPassCancel" class="btn ghost">إلغاء</button>
+        <button id="wizPassNext" class="btn primary">تأكيد كلمة المرور</button>
+      </div>
+    </div>
+
+    <div id="wizVerify" class="wiz-body hidden">
+      <div id="wizLoading" class="wiz-verify">
+        <div class="wiz-spinner"></div>
+        <p>جارٍ التحقق من الحساب وحفظ الجلسة المشفّرة وتفعيل المراقبة…</p>
+      </div>
+      <div id="wizSuccess" class="wiz-verify hidden">
+        <div class="wiz-check">✓</div>
+        <h3 style="margin:0">تمت إضافة الحساب بنجاح</h3>
+        <div id="wizMe" class="wiz-me"></div>
+        <p id="wizActivateNote" class="wiz-note"></p>
+        <button id="wizDone" class="btn primary">تم</button>
+      </div>
+      <div id="wizFail" class="hidden">
+        <div id="wizFailMsg" class="error"></div>
+        <div class="modal-actions" style="justify-content:center">
+          <button id="wizRestart" class="btn ghost">بدء من جديد</button>
+          <button id="wizClose" class="btn primary">إغلاق</button>
+        </div>
+      </div>
     </div>
   </div>
 </div>

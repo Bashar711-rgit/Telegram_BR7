@@ -848,6 +848,29 @@ class EnhancedDatabase:
                 source_account TEXT,
                 PRIMARY KEY (user_id, changed_at)
             );
+            -- v14.10.0: حسابات اللوحة (ربط حساب جديد من واجهة التحكم).
+            -- الجلسة وapi_hash مخزّنان مشفّرين (Fernet) — لا يُعادان للواجهة
+            -- أبداً. يُكتب صف فقط بعد نجاح المصادقة الكاملة.
+            CREATE TABLE IF NOT EXISTS panel_accounts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                phone TEXT UNIQUE NOT NULL,
+                display_name TEXT,
+                username TEXT,
+                tg_user_id INTEGER,
+                api_id TEXT,
+                api_hash_encrypted TEXT,
+                session_encrypted TEXT NOT NULL,
+                status TEXT DEFAULT 'ready',
+                monitoring_enabled INTEGER DEFAULT 1,
+                priority INTEGER DEFAULT 5,
+                is_main INTEGER DEFAULT 0,
+                last_error TEXT,
+                last_error_at DATETIME,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_panel_accounts_phone ON panel_accounts(phone);
+            CREATE INDEX IF NOT EXISTS idx_panel_accounts_status ON panel_accounts(status);
         """
         for stmt in stmts.split(";"):
             s = stmt.strip()
@@ -859,6 +882,7 @@ class EnhancedDatabase:
                         .replace("chat_id INTEGER PRIMARY KEY", "chat_id BIGINT PRIMARY KEY")
                         .replace("sender_id INTEGER,", "sender_id BIGINT,")
                         .replace("chat_id INTEGER,", "chat_id BIGINT,")
+                        .replace("tg_user_id INTEGER,", "tg_user_id BIGINT,")
                         .replace("INTEGER NOT NULL", "BIGINT NOT NULL")
                         .replace("access_hash INTEGER,", "access_hash BIGINT,")
                         .replace("last_chat_id INTEGER,", "last_chat_id BIGINT,")
@@ -877,6 +901,146 @@ class EnhancedDatabase:
                 except Exception as stmt_err:
                     logger.error(f"_create_tables statement failed ({self.db_type}): {type(stmt_err).__name__}: {str(stmt_err)[:200]} | stmt={s[:120]}")
         await self._commit()
+
+    # ─── v14.10.0: Panel accounts store (اللوحة — جلسات مشفّرة) ────────────
+    # كل الدوال فشل-آمنة: لا ترفع استثناءات للوحة — ترجع None/False/[].
+    # تُستدعى على الحلقة الرئيسية حصراً (عبر run_coroutine_threadsafe).
+
+    async def get_panel_accounts(self) -> List[Dict[str, Any]]:
+        """كل حسابات اللوحة — أعمدة محددة فقط (بلا جلسة: لا تُفك بلا داعٍ)."""
+        try:
+            return await self._fetchall(
+                "SELECT id, phone, display_name, username, tg_user_id, api_id, "
+                "api_hash_encrypted, session_encrypted, status, monitoring_enabled, "
+                "priority, is_main, last_error, created_at, updated_at "
+                "FROM panel_accounts ORDER BY id"
+            )
+        except Exception as e:
+            logger.error(f"get_panel_accounts failed: {type(e).__name__}: {e}")
+            return []
+
+    async def get_panel_account(self, row_id: int) -> Optional[Dict[str, Any]]:
+        try:
+            return await self._fetchone(
+                "SELECT id, phone, display_name, username, tg_user_id, api_id, "
+                "api_hash_encrypted, session_encrypted, status, monitoring_enabled, "
+                "priority, is_main, last_error, created_at, updated_at "
+                "FROM panel_accounts WHERE id = ?",
+                (int(row_id),),
+            )
+        except Exception as e:
+            logger.error(f"get_panel_account({row_id}) failed: {type(e).__name__}: {e}")
+            return None
+
+    async def get_panel_account_duplicate(
+        self, phone: str, tg_user_id: Optional[int] = None
+    ) -> Optional[Dict[str, Any]]:
+        """منع التكرار: نفس الرقم أو نفس معرّف تيليجرام (أي عمود فقط — خفيف)."""
+        try:
+            row = await self._fetchone(
+                "SELECT id, phone, tg_user_id, status, monitoring_enabled "
+                "FROM panel_accounts WHERE phone = ? LIMIT 1",
+                ((phone or "").strip(),),
+            )
+            if row:
+                return row
+            if tg_user_id:
+                return await self._fetchone(
+                    "SELECT id, phone, tg_user_id, status, monitoring_enabled "
+                    "FROM panel_accounts WHERE tg_user_id = ? LIMIT 1",
+                    (int(tg_user_id),),
+                )
+        except Exception as e:
+            logger.error(f"get_panel_account_duplicate failed: {type(e).__name__}: {e}")
+        return None
+
+    async def insert_panel_account(
+        self,
+        phone: str,
+        display_name: str,
+        username: str,
+        tg_user_id: int,
+        api_id: str,
+        api_hash_encrypted: str,
+        session_encrypted: str,
+        priority: int = 5,
+    ) -> Optional[int]:
+        """
+        حفظ حساب مُصادَق بالكامل (جلسة مشفّرة) → row_id.
+
+        idempotent: نفس الرقم موجود → يعيد id القائم (لا تكرار — UNIQUE phone).
+        لا يُكتب صف إلا بعد نجاح المصادقة (عقد الوحدة: بلا حسابات ناقصة).
+        """
+        try:
+            phone = (phone or "").strip()
+            existing = await self.get_panel_account_duplicate(phone, tg_user_id or None)
+            if existing:
+                return int(existing["id"])
+            await self._execute(
+                "INSERT INTO panel_accounts "
+                "(phone, display_name, username, tg_user_id, api_id, api_hash_encrypted, "
+                " session_encrypted, status, monitoring_enabled, priority) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'ready', 1, ?)",
+                (phone, display_name or "", username or "", int(tg_user_id or 0),
+                 (api_id or "").strip(), (api_hash_encrypted or "").strip(),
+                 session_encrypted, int(priority)),
+            )
+            await self._commit()
+            row = await self._fetchone("SELECT id FROM panel_accounts WHERE phone = ?", (phone,))
+            return int(row["id"]) if row else None
+        except Exception as e:
+            logger.error(f"insert_panel_account failed: {type(e).__name__}: {e}")
+            return None
+
+    async def update_panel_account(
+        self,
+        row_id: int,
+        *,
+        status: Optional[str] = None,
+        last_error: Optional[str] = None,
+        monitoring_enabled: Optional[bool] = None,
+        username: Optional[str] = None,
+        display_name: Optional[str] = None,
+        tg_user_id: Optional[int] = None,
+    ) -> bool:
+        """تحديث جزئي دقيق — الحقول المطلوبة فقط (لا SELECT * ولا كتابة عمياء)."""
+        sets: List[str] = []
+        params: List[Any] = []
+        if status is not None:
+            sets.append("status = ?"); params.append(str(status))
+            sets.append("last_error_at = CURRENT_TIMESTAMP")
+        if last_error is not None:
+            sets.append("last_error = ?"); params.append(str(last_error)[:400])
+        if monitoring_enabled is not None:
+            sets.append("monitoring_enabled = ?"); params.append(1 if monitoring_enabled else 0)
+        if username is not None:
+            sets.append("username = ?"); params.append(str(username))
+        if display_name is not None:
+            sets.append("display_name = ?"); params.append(str(display_name))
+        if tg_user_id is not None:
+            sets.append("tg_user_id = ?"); params.append(int(tg_user_id))
+        if not sets:
+            return False
+        sets.append("updated_at = CURRENT_TIMESTAMP")
+        sql = f"UPDATE panel_accounts SET {', '.join(sets)} WHERE id = ?"
+        params.append(int(row_id))
+        try:
+            await self._execute(sql, tuple(params))
+            await self._commit()
+            return True
+        except Exception as e:
+            logger.error(f"update_panel_account({row_id}) failed: {type(e).__name__}: {e}")
+            return False
+
+    async def delete_panel_account(self, row_id: int) -> bool:
+        """حذف نهائي (الصف + الجلسة المشفّرة) — آخر حساب نشط يُحمى في اللوحة."""
+        try:
+            await self._execute("DELETE FROM panel_accounts WHERE id = ?", (int(row_id),))
+            await self._commit()
+            return True
+        except Exception as e:
+            logger.error(f"delete_panel_account({row_id}) failed: {type(e).__name__}: {e}")
+            return False
 
     async def _migrate_bigint_ids(self) -> None:
         if self.db_type != "postgresql":
