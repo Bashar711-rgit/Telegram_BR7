@@ -158,12 +158,40 @@ services:
       # ════════════════════════════════════════════════════════════
       # Performance — معايرة v15.4.0 (طلب المالك: معالجة متزامنة فورية)
       # ════════════════════════════════════════════════════════════
-      # v15.4.0: 2 → 8 عمال متوازيين + 4 منتجات موازية لسحب الطابور.
+      # v15.4.0: 2 → 8 عمال متوازيين.
       - key: PROCESSING_WORKERS
         value: "8"
 
+      # v15.5.0: السحبة الدفعية (16 صف/استدعاء) استبدلت تعديد المنتجين —
+      # القيمة متروكة للتوافق لكن المنتج الفعلي واحد دفعي.
       - key: PRODUCER_WORKERS
         value: "4"
+
+      # ═══ v15.5.0 Fresh-First Stability — كسر حلقة موت FIFO ═══
+      # الطازج يدخل بأولوية 8 (فوق التراكم 5/7، تحت إعادة الإدراج النظامية 9)
+      # فيسحب فوراً بدل أن يموت انتظاراً خلف تراكم محكوم عليه (15266
+      # stale_dropped_queue_wait / صفر تنبيهات 2.6 ساعة).
+      - key: QUEUE_FRESH_PRIORITY
+        value: "8"
+
+      # صمام قبول الالتقاط: فوق 400 صف → الحدث الجديد يسقط فوراً عند
+      # الالتقاط (بلا صف DB بلا ذاكرة) — يمنع انفجار 456MB وحلقة الإسقاط
+      # الشاملة. 0 = معطّل.
+      - key: QUEUE_ADMISSION_MAX
+        value: "400"
+
+      # تخفيف حمل تلقائي (drain mode): عمق ≥ 200 → fuzzy OFF + إثراء
+      # المرسل عبر تيليجرام متوقف مؤقتاً؛ التعافي تحت 100 تلقائياً.
+      - key: FUZZY_DEGRADE_QUEUE_DEPTH
+        value: "200"
+
+      - key: FUZZY_RECOVER_QUEUE_DEPTH
+        value: "100"
+
+      # سحبة دفعية: 16 صف لكل SELECT/UPDATE/COMMIT واحدة — كان commit
+      # لكل رسالة ×12 مهمة متسابقة على قفل SQLite واحد.
+      - key: PRODUCER_POP_BATCH
+        value: "16"
 
       - key: MEMORY_THRESHOLD_MB
         value: "400"
@@ -378,8 +406,11 @@ services:
       - key: NEGATION_CLAUSE_BOUNDARIES_ENABLED
         value: "true"
 
+      # v15.5.0: false افتراضياً — أثقل بند CPU على 0.1 CPU من Render
+      # المجاني مع فلتر 24k نمط. المتحكم التلقائي (FUZZY_DEGRADE_QUEUE_DEPTH)
+      # يعيد تشغيله لحظياً عند خفوت الحمل إن ضبطته true هنا.
       - key: FUZZY_MATCHING_ENABLED
-        value: "true"
+        value: "false"
 
       - key: FUZZY_MAX_EDIT_DISTANCE
         value: "1"

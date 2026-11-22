@@ -615,59 +615,63 @@ class EnhancedTelegramBot:
         logger.info("Consumer loop started")
         internal_queue: asyncio.Queue = asyncio.Queue(maxsize=CFG.MESSAGE_QUEUE_SIZE)
 
+        # v15.5.0: منتج دفعي — pop_batch_from_queue يسحب حتى PRODUCER_POP_BATCH
+        # صف في SELECT/UPDATE/COMMIT واحدة (كان صفًّا واحدًا + commit لكل رسالة
+        # تحت القفل العام — تنافس 12 مهمة على SQLite). دلالة M-07 محفوظة:
+        # أي إلغاء/خطأ بين السحبة والإدخال يعيد الأحداث غير المُدخلة إلى DB
+        # بأولوية 9 (at-least-once كما سابقاً).
         async def producer():
+            batch_n = max(1, int(getattr(CFG, "PRODUCER_POP_BATCH", 16) or 16))
+            pending: list = []
             while self.is_running:
-                event_data = None
                 try:
-                    event_data = await self.db.pop_from_queue()
-                    if event_data:
-                        await internal_queue.put(event_data)
-                        # v9.12 (audit M-07): the put succeeded — clear the
-                        # local reference so a CancelledError below does
-                        # NOT trigger a re-enqueue of an already-queued item.
-                        event_data = None
-                    else:
-                        # v10.4: event-driven wakeup — add_to_queue sets
-                        # db.queue_notify the moment a row lands, so the
-                        # pop happens ~instantly instead of on the next
-                        # 0.1s poll tick. The timeout fallback keeps the
-                        # old cadence when the Event is unavailable; the
-                        # DB queue stays the durable source of truth.
-                        if getattr(CFG, "QUEUE_EVENT_WAKE", True):
-                            try:
-                                await asyncio.wait_for(self.db.queue_notify.wait(), timeout=0.1)
-                            except asyncio.TimeoutError:
-                                pass
-                            try:
-                                self.db.queue_notify.clear()
-                            except Exception:
-                                pass
-                        else:
-                            await asyncio.sleep(0.1)
+                    if not pending:
+                        pending = await self.db.pop_batch_from_queue(batch_n)
+                        if not pending:
+                            # v10.4: event-driven wakeup — نفس عقد النسخة
+                            # التفردية السابقة (انتظار إشارة add_to_queue مع
+                            # fallback 0.1s للحفاظ على الإيقاع القديم).
+                            if getattr(CFG, "QUEUE_EVENT_WAKE", True):
+                                try:
+                                    await asyncio.wait_for(self.db.queue_notify.wait(), timeout=0.1)
+                                except asyncio.TimeoutError:
+                                    pass
+                                try:
+                                    self.db.queue_notify.clear()
+                                except Exception:
+                                    pass
+                            else:
+                                await asyncio.sleep(0.1)
+                            continue
+                    item = pending.pop(0)
+                    try:
+                        await internal_queue.put(item)
+                    except asyncio.CancelledError:
+                        pending.insert(0, item)  # يعاد عبر معالج الإلغاء أدناه
+                        raise
                 except asyncio.CancelledError:
-                    # v9.12 (audit M-07): graceful shutdown window — if we
-                    # were cancelled BETWEEN pop_from_queue (which deletes
-                    # the row from the DB) and internal_queue.put (which
-                    # hands it to a worker), the event is in our local
-                    # `event_data` and would be lost. Re-enqueue it to the
-                    # DB so the next process picks it up. Best-effort; if
-                    # the DB is also shutting down we log and drop.
-                    if event_data is not None:
-                        try:
-                            await self.db.add_to_queue(event_data, priority=9)  # v9.12 (audit M-14): high priority for DLQ/shutdown re-inserts
-                            logger.info("Producer shutdown: re-enqueued 1 in-flight event to DB (M-07 ack-after-pop)")
-                        except Exception as e:
-                            logger.error(f"Producer shutdown: failed to re-enqueue in-flight event: {e}")
+                    # v9.12 (audit M-07): نافذة الإيقاف — كل حدث سُحب من DB
+                    # ولم يُسلَّم لطابور العمال يُعاد إلى DB (أولوية 9).
+                    if pending:
+                        _re = 0
+                        for _item in pending:
+                            try:
+                                await self.db.add_to_queue(_item, priority=9)
+                                _re += 1
+                            except Exception as e:
+                                logger.error(f"Producer shutdown: failed to re-enqueue in-flight event: {e}")
+                        if _re:
+                            logger.info(f"Producer shutdown: re-enqueued {_re} in-flight events to DB (M-07)")
                     break
                 except Exception as e:
                     logger.error(f"Producer error: {e}")
-                    # v9.12 (audit M-07): same window for non-Cancelled
-                    # exceptions — don't lose the in-flight event.
-                    if event_data is not None:
-                        try:
-                            await self.db.add_to_queue(event_data, priority=9)  # v9.12 (audit M-14): high priority for DLQ/shutdown re-inserts
-                        except Exception:
-                            pass
+                    if pending:
+                        for _item in pending:
+                            try:
+                                await self.db.add_to_queue(_item, priority=9)
+                            except Exception:
+                                pass
+                        pending = []
                     await asyncio.sleep(1)
 
         async def worker(worker_id: int):
@@ -758,14 +762,13 @@ class EnhancedTelegramBot:
                             pass
                     await asyncio.sleep(1)
 
-        # v15.4.0: منتجات متوازية (PRODUCER_WORKERS افتراضي 4) — سحب واحد
-        # تسلسلي كان عنق زجاجة انفجار 60 رسالة/دقيقة. كل منتج يحتفظ بدلالة
-        # M-07 الخاصة به (إعادة إدراج حدثه العالق عند الإلغاء). pop_from_queue
-        # آمنة للتزامن (FOR UPDATE SKIP LOCKED في PG، قفل الطابور في SQLite).
+        # v15.5.0: منتج واحد دفعي يكفي — PRODUCER_WORKERS × 1-row pops كان
+        # سباق قفل بلا فائدة؛ الدفعة الواحدة تُغني عن التعديد. تُترك القيمة
+        # للتوافق الخلفي لكن السحبة الدفعية هي المسار الفعلي الآن.
         _producer_n = max(1, int(getattr(CFG, "PRODUCER_WORKERS", 4)))
         producers = [
             asyncio.create_task(producer(), name=f"producer_{i}")
-            for i in range(_producer_n)
+            for i in range(1)  # v15.5.0: دفعة واحدة تسحب 16 صفًّا — تعديد المنتجين يضاعف تنافس القفل فقط
         ]
         workers = [asyncio.create_task(worker(i), name=f"worker_{i}") for i in range(CFG.PROCESSING_WORKERS)]
 
@@ -773,6 +776,69 @@ class EnhancedTelegramBot:
             await asyncio.gather(*producers, *workers, return_exceptions=True)
         except asyncio.CancelledError:
             pass
+
+    # ─── v15.5.0 متحكم تخفيف الحمل (Load-Shedding / Drain Mode) ───────────────
+    async def _load_shed_loop(self) -> None:
+        """مراقبة عمق الطابور كل 10 ثوانٍ — عند التشبع:
+
+        * fuzzy يُعطّل مؤقتاً (مطابقة exact/regex فقط) — أثقل بند CPU في
+          فلتر الـ24k نمط على 0.1 CPU من Render المجاني.
+        * drain_mode=True — خط المعالجة يتوقف عن إثراء المرسل عبر
+          تيليجرام (sender_resolve_failure=27 / success=0 — خسارة صافية
+          تحت الحمل).
+
+        تحت حد التعافي (hysteresis) يعود كل شيء تلقائياً. هذا يحفظ
+        المعدل: أفضل رسالة متأخرة 30 ثانية بلا fuzzy من صفر تنبيهات.
+        فشل-آمن بالكامل: أي استثناء → المحاولة بعد 10 ثوانٍ.
+        """
+        self.drain_mode = False
+        self._fuzzy_degraded = False
+        while self.is_running:
+            try:
+                try:
+                    depth = int(await self.db.queue_size())
+                except Exception:
+                    depth = 0
+                degrade_at = int(getattr(CFG, "FUZZY_DEGRADE_QUEUE_DEPTH", 200) or 0)
+                recover_at = int(getattr(CFG, "FUZZY_RECOVER_QUEUE_DEPTH", 100) or 0)
+
+                if degrade_at > 0 and depth >= degrade_at and not self.drain_mode:
+                    self.drain_mode = True
+                    logger.warning(
+                        f"🛡️ LOAD-SHED ON | queue={depth} >= {degrade_at} — "
+                        f"fuzzy OFF + sender-resolver skipped (alerts first)"
+                    )
+                    if not self._fuzzy_degraded:
+                        _flt = getattr(self, "filter", None)
+                        if _flt is not None and getattr(_flt, "_fuzzy_enabled", False):
+                            try:
+                                _flt._fuzzy_enabled = False
+                                self._fuzzy_degraded = True
+                                from unified_alerts.stats import get_unified_stats as _gus
+                                _gus().inc("fuzzy_degrade_on")
+                            except Exception:
+                                pass
+                elif self.drain_mode and depth <= recover_at:
+                    self.drain_mode = False
+                    logger.info(
+                        f"🟢 LOAD-SHED OFF | queue={depth} <= {recover_at} — "
+                        f"full pipeline restored"
+                    )
+                    if self._fuzzy_degraded:
+                        _flt = getattr(self, "filter", None)
+                        if _flt is not None:
+                            try:
+                                _flt._fuzzy_enabled = bool(getattr(CFG, "FUZZY_MATCHING_ENABLED", True))
+                                self._fuzzy_degraded = False
+                                from unified_alerts.stats import get_unified_stats as _gus
+                                _gus().inc("fuzzy_degrade_off")
+                            except Exception:
+                                pass
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.debug(f"load_shed_loop error (fail-safe): {type(e).__name__}: {e}")
+            await asyncio.sleep(10)
 
     def _get_monitor(self, name: str) -> Optional[EnhancedAccountMonitor]:
         name_lower = name.lower()
@@ -1079,6 +1145,15 @@ class EnhancedTelegramBot:
             "alert_latency": alert_latency.snapshot(),
             "dedup": get_dedup_snapshot(),
             "unified_gate": unified_snapshot(),  # v12.0 unified_alerts
+            # v15.5.0: حالة تخفيف الحمل الحية للقراءة في /health/full
+            "load_shed": {
+                "drain_mode": bool(getattr(self, "drain_mode", False)),
+                "fuzzy_degraded": bool(getattr(self, "_fuzzy_degraded", False)),
+                "degrade_at": int(getattr(CFG, "FUZZY_DEGRADE_QUEUE_DEPTH", 200) or 0),
+                "recover_at": int(getattr(CFG, "FUZZY_RECOVER_QUEUE_DEPTH", 100) or 0),
+                "admission_max": int(getattr(CFG, "QUEUE_ADMISSION_MAX", 400) or 0),
+                "fresh_priority": int(getattr(CFG, "QUEUE_FRESH_PRIORITY", 8) or 5),
+            },
             "antispam": get_antispam_snapshot(),
             # ══ v14.9.1: حالة أزرار التنبيهات (عضوية بوت التنبيهات) ══
             "alert_bot": (
@@ -2492,6 +2567,8 @@ class EnhancedTelegramBot:
 
         # Background Tasks (M-05/M-16: all tracked uniformly)
         self._consumer_task = self._track_task(self._consumer_loop(), "consumer")
+        # v15.5.0: متحكم تخفيف الحمل — fuzzy/resolver تخفيض تلقائي عند تشبع الطابور
+        self._load_shed_task = self._track_task(self._load_shed_loop(), "load_shed")
         self._stats_task = self._track_task(self._stats_reporter(), "stats")
         self._cleanup_task = self._track_task(self._cleanup_loop(), "cleanup")
         # v9.12 (audit H-08): dedicated short-cadence dedup cleanup task.

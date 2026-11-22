@@ -256,12 +256,19 @@ class UnifiedAlertGate:
     def snapshot(self) -> Dict[str, Any]:
         """لقطة إعدادات البوابة للقراءة في /health/full."""
         try:
-            return {
+            snap = {
                 "max_event_age_seconds": self._age_limit_seconds(),
                 "max_queue_wait_seconds": self._queue_wait_limit_seconds(),
-                "freshness_semantics": "arrival_v15_4_1",
+                "freshness_semantics": "arrival_v15_5_0",
                 "age_missing_ts_pass": True,
             }
+            try:
+                from config import CFG as _CFG
+                snap["admission_max"] = int(getattr(_CFG, "QUEUE_ADMISSION_MAX", 400) or 0)
+                snap["fresh_priority"] = int(getattr(_CFG, "QUEUE_FRESH_PRIORITY", 8) or 5)
+            except Exception:
+                pass
+            return snap
         except Exception:
             return {"max_event_age_seconds": None}
 

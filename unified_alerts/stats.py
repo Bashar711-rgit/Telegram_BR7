@@ -68,6 +68,12 @@ _BASE: Dict[str, int] = {
     "filter_too_long": 0,
     "filter_invalid": 0,
     "policy_errors": 0,
+    # ══ v15.5.0 Fresh-First Stability — تحكم الحمل ══
+    # أحداث سقطت عند الالتقاط لأن الطابور تجاوز QUEUE_ADMISSION_MAX
+    "capture_rejected_queue_full": 0,
+    # عدّ transitions تخفيف الحمل (تشخيص /health/full)
+    "fuzzy_degrade_on": 0,
+    "fuzzy_degrade_off": 0,
 }
 
 

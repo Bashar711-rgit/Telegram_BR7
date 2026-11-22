@@ -380,6 +380,26 @@ class _ConfigData:
     # المرضي فقط (افتراضي 600s، 0 = معطّل). النضارة نفسها تُقاس عند
     # الالتقاط (MAX_EVENT_AGE_SECONDS) لا عند المعالجة.
     MAX_QUEUE_WAIT_SECONDS: int
+    # ══ v15.5.0 Fresh-First Stability — كسر حلقة موت FIFO ══
+    # المشكلة الحية (2026-11-22): الطابور يسحب الأقدم أولاً ومع تراكم
+    # 1300+ صف كل رسالة طازجة كانت تموت انتظاراً (>600s) ثم تُرمى عند
+    # البوابة — صفر تنبيهات دائم. الحل: الطازج يدخل بأولوية أعلى فيسحب
+    # أولاً قبل العتيق (العتيق محكوم عليه تنظيفاً دورياً بلا خسارة).
+    QUEUE_FRESH_PRIORITY: int
+    # صمام قبول عند الالتقاط: عمق الطابور ≥ هذا الحد → الحدث الجديد يُسقط
+    # فوراً عند الالتقاط (تكلفة صفر) بدل إطعام طابور لا يُلحق معالجته —
+    # يمنع انفجار الذاكرة (hard_reset ×3 عند 456MB) وحلقة الإسقاط الشاملة.
+    # 0 = معطّل.
+    QUEUE_ADMISSION_MAX: int
+    # تخفيف الحمل التلقائي (drain mode): عمق الطابور ≥ هذا الحد → fuzzy
+    # يُعطّل مؤقتاً (exact/regex فقط) وإثراء المرسل عبر تيليجرام يتوقف —
+    # الطاقة كلها للتنبيهات. يعود كل شيء تلقائياً تحت حد التعافي (hysteresis).
+    # 0 = معطّل.
+    FUZZY_DEGRADE_QUEUE_DEPTH: int
+    FUZZY_RECOVER_QUEUE_DEPTH: int
+    # سحب الطابور دفعة واحدة (صفوف لكل سحبة) — يخفض تنافس قفل SQLite
+    # والعدد الهائل من الالتزامات (كان commit لكل رسالة ×12 مهمة).
+    PRODUCER_POP_BATCH: int
     CACHE_TTL: int
     MAX_RECENT_HASHES: int
 
@@ -889,6 +909,12 @@ class Config:
             MAX_ALERTS_PER_MINUTE=SecretManager.get_int("MAX_ALERTS_PER_MINUTE", 60, required=False),
             MAX_ALERTS_PER_HOUR=SecretManager.get_int("MAX_ALERTS_PER_HOUR", 3600, required=False),
             ALERT_BURST_SIZE=SecretManager.get_int("ALERT_BURST_SIZE", 20, required=False),
+            # ══ v15.5.0 Fresh-First Stability ══
+            QUEUE_FRESH_PRIORITY=SecretManager.get_int("QUEUE_FRESH_PRIORITY", 8, required=False),
+            QUEUE_ADMISSION_MAX=SecretManager.get_int("QUEUE_ADMISSION_MAX", 400, required=False),
+            FUZZY_DEGRADE_QUEUE_DEPTH=SecretManager.get_int("FUZZY_DEGRADE_QUEUE_DEPTH", 200, required=False),
+            FUZZY_RECOVER_QUEUE_DEPTH=SecretManager.get_int("FUZZY_RECOVER_QUEUE_DEPTH", 100, required=False),
+            PRODUCER_POP_BATCH=SecretManager.get_int("PRODUCER_POP_BATCH", 16, required=False),
             # v15.4.1: سقف انتظار الطابور — ما وصل طازجاً (عمره عند الالتقاط
             # <= MAX_EVENT_AGE_SECONDS) لا يُرمى لأنه انتظر في طابورنا؛
             # يُهجر فقط إن تجاوز انتظاره هذا السقف (افتراضي 600s).
@@ -1213,8 +1239,8 @@ class Config:
 #     يُسقط فوراً قبل الإثراء وقبل أي DB write).
 #   * SIMILARITY_WINDOW_SECONDS 3600 → 900 (العتبة 0.88 كما هي).
 # تُطبَّق من env في Render إن وُجدت (المصدر الرسمي) — القيم هنا الافتراضات.
-BOT_VERSION: Final = "15.4.1"
-BOT_CODENAME: Final = "Arrival-Freshness Gate — freshness measured at capture, queue-wait ceiling kills the zero-alert death loop"
+BOT_VERSION: Final = "15.5.0"
+BOT_CODENAME: Final = "Fresh-First Stability — fresh events jump the doomed backlog, capture-time admission valve, batch pops, auto load-shedding"
 
 # =============================================================================
 # Pre-built config instance

@@ -1548,6 +1548,76 @@ class EnhancedDatabase:
             self._queue_mirror_dirty = True
             return None
 
+    async def pop_batch_from_queue(self, limit: int = 16) -> list:
+        """══ v15.5.0 Fresh-First Stability — سحبة دفعة واحدة ══
+
+        المشكلة: pop_from_queue يلتقط صفًّا واحدًا لكل استدعاء تحت قفل
+        الطابور العام مع UPDATE + COMMIT لكل رسالة — مع 4 منتجين + 8
+        عمال + acks كلها تتسابق على نفس القفل كان الطابور عنق زجاجة
+       serialized (db_latency ~760ms على قرص Render المجاني).
+
+        الحل: SELECT بحدّ أقصى N صف + UPDATE دفعة واحدة + COMMIT واحد —
+        نفس دلالات claim (status='in_flight', claimed_at, attempts+1)
+        و نفس ترتيب الأولوية (priority DESC, created_at ASC) الذي يجعل
+        أحداث v15.5.0 الطازجة (priority=8) تسحب قبل التراكم العتيق.
+
+        فشل-آمن: أي خطأ يعيد ما التُقط فعلاً (قد يكون قائمة فارغة) —
+        الصفوف المعلّمة in_flight تُسترد عبر recover_stale_inflight
+        (at-least-once كما سابقاً تماماً).
+        """
+        out: list = []
+        try:
+            try:
+                limit = max(1, min(int(limit), 64))
+            except Exception:
+                limit = 16
+            now_ts = time.time()
+            if self.db_type == "sqlite":
+                async with self._queue_lock:
+                    cursor = await self._sqlite_conn.execute(
+                        "SELECT id, event_data FROM processing_queue "
+                        "WHERE status IS NULL OR status != 'in_flight' "
+                        "ORDER BY priority DESC, created_at ASC LIMIT ?",
+                        (limit,),
+                    )
+                    rows = await cursor.fetchall()
+                    if not rows:
+                        return []
+                    await self._sqlite_conn.executemany(
+                        "UPDATE processing_queue SET status = 'in_flight', "
+                        "claimed_at = ?, attempts = attempts + 1 WHERE id = ?",
+                        [(now_ts, r[0]) for r in rows],
+                    )
+                    await self._sqlite_conn.commit()
+                for r in rows:
+                    out.append(self._claim_payload(r[0], r[1]))
+                return out
+            else:
+                async with self._pool.acquire() as conn:
+                    async with conn.transaction():
+                        rows = await conn.fetch(
+                            "SELECT id, event_data FROM processing_queue "
+                            "WHERE (status IS NULL OR status <> 'in_flight') "
+                            "ORDER BY priority DESC, created_at ASC "
+                            "LIMIT $1 FOR UPDATE SKIP LOCKED",
+                            limit,
+                        )
+                        if not rows:
+                            return []
+                        for r in rows:
+                            await conn.execute(
+                                "UPDATE processing_queue SET status = 'in_flight', "
+                                "claimed_at = $1, attempts = attempts + 1 WHERE id = $2",
+                                now_ts, r["id"],
+                            )
+                for r in rows:
+                    out.append(self._claim_payload(r["id"], r["event_data"]))
+                return out
+        except Exception as e:
+            logger.error(f"pop_batch_from_queue failed: {e}")
+            self._queue_mirror_dirty = True
+            return out
+
     async def ack_queue_event(self, event_id: Any) -> bool:
         try:
             eid = int(event_id)

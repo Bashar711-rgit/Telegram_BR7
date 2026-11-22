@@ -1508,6 +1508,33 @@ class EnhancedAccountMonitor:
                     processing_time = (time.perf_counter() - start_time) * 1000
                     await self._update_avg_time(processing_time)
                     return
+                # ══ v15.5.0: صمام قبول عند الالتقاط — لا إطعام طابور محكوم عليه ══
+                # عمق الطابور ≥ QUEUE_ADMISSION_MAX → الرسالة لن تُعالج ضمن
+                # سقف انتظار 600s أبداً (المعدل التاريخي أثبت ذلك: 15266
+                # stale_dropped_queue_wait) — تسقط هنا بتكلفة صفر (بلا صف
+                # DB بلا ذاكرة بلا عمال) بدل أن تتضخم الطابور وتنفجر الذاكرة
+                # (hard_reset ×3). القراءة سريعة (mirror بلا DB hit).
+                try:
+                    _adm_max = int(getattr(CFG, "QUEUE_ADMISSION_MAX", 400) or 0)
+                    # الوسائط مستثناة: مسارها (_spawn_media_task) لا يغذي
+                    # processing_queue أصلاً — الصمام للنص/الطابور فقط.
+                    if _adm_max > 0 and not event_data.get("has_media") and int(await self.db.queue_size()) >= _adm_max:
+                        from unified_alerts.stats import get_unified_stats as _gus
+                        _gus().inc("capture_rejected_queue_full")
+                        self._stale_log_seq += 1
+                        if self._stale_log_seq <= 3 or self._stale_log_seq % 100 == 0:
+                            logger.warning(
+                                f"🚦 admission valve [{self.account['name']}] | "
+                                f"chat={event_data.get('chat_id')} msg={event_data.get('message_id')} | "
+                                f"queue>={_adm_max} — dropped at capture (never queued, "
+                                f"dropped#{self._stale_log_seq})"
+                            )
+                        processing_time = (time.perf_counter() - start_time) * 1000
+                        await self._update_avg_time(processing_time)
+                        await self._inc_stat("messages_processed")
+                        return
+                except Exception:
+                    pass  # فشل-آمن: فشل قياس العمق لا يمنع الالتقاط
                 _event_queued = False
                 if event_data.get("has_media"):
                     media = event.message.media
@@ -1519,7 +1546,11 @@ class EnhancedAccountMonitor:
                     await self._update_avg_time(processing_time)
                     await self._inc_stat("media_processed"); await self._inc_stat("messages_processed")
                     return
-                priority = 7 if event_data.get("has_text") else 3
+                # v15.5.0 Fresh-First: الطازج بأولوية أعلى من كل التراكم القديم
+                # (5 افتراضي / 7 نص قديم / 9 إعادة إدراج نظامية) — السحبة
+                # priority DESC تلتقطه فوراً بدل أن يموت انتظاراً خلف تراكم
+                # محكوم عليه. القديم المتبقي تنظيفه دوريّ بلا خسارة (v15.4.1).
+                priority = int(getattr(CFG, "QUEUE_FRESH_PRIORITY", 8) or 8) if event_data.get("has_text") else 3
                 queue_result = await self.db.add_to_queue(event_data, priority=priority)
                 _event_queued = queue_result > 0
                 if queue_result > 0:
@@ -2125,11 +2156,16 @@ class EnhancedAccountMonitor:
                 return
         except Exception as _gate_err:
             logger.debug(f"unified gate pipeline skipped: {type(_gate_err).__name__}")
+        # v15.5.0: في وضع التفريغ (drain) يتوقف إثراء المرسل عبر تيليجرام —
+        # 27 فشلاً مقابل صفر نجاح تحت الحمل (sender_resolve_failure=27 /
+        # success=0) — انتظار كيان بارد يضرب سلالة العمال بلا مقابل.
+        _draining = bool(getattr(getattr(self, "_bot_ref", None), "drain_mode", False))
         if data.get("_sender_needs_enrichment"):
-            try:
-                await self._enrich_sender_via_resolver(data)
-            except Exception as e:
-                logger.debug(f"deferred sender enrich skipped [{self.account['name']}]: {e}")
+            if not _draining:
+                try:
+                    await self._enrich_sender_via_resolver(data)
+                except Exception as e:
+                    logger.debug(f"deferred sender enrich skipped [{self.account['name']}]: {e}")
             try:
                 await self._enrich_sender_from_db(data)
             except Exception:
@@ -2227,6 +2263,12 @@ class EnhancedAccountMonitor:
             if msg_hash in self._processed_hashes:
                 return msg_hash, validated_text, False
             self._processed_hashes[msg_hash] = True
+            # v15.5.0 سقف ذاكرة: القاموس غير المحدود كان ينمو مع عمر العملية
+            # (16k حدث/يوم × 8 أيام ≈ 130k مُدخل) — جزء من انفجار RSS 456MB.
+            # التقليم نادر (مرة كل ~100k حدث) وتكلفته ميلي‌ثوانٍ.
+            if len(self._processed_hashes) > 100000:
+                for _k in list(self._processed_hashes.keys())[:20000]:
+                    self._processed_hashes.pop(_k, None)
         rec = MessageRecord(message_hash=msg_hash, chat_id=chat_id, sender_id=data.get("sender_id", 0),
             message_text=validated_text or f"[{media_type}]", timestamp=timestamp)
         is_new = await self.db.try_insert_message(rec)
