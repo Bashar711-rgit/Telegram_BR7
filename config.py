@@ -375,6 +375,7 @@ class _ConfigData:
     MAX_CACHE_SIZE: int
     MESSAGE_QUEUE_SIZE: int
     PROCESSING_WORKERS: int
+    PRODUCER_WORKERS: int
     CACHE_TTL: int
     MAX_RECENT_HASHES: int
 
@@ -412,6 +413,7 @@ class _ConfigData:
     # ── Rate Limiting ──
     MAX_ALERTS_PER_MINUTE: int
     MAX_ALERTS_PER_HOUR: int
+    ALERT_BURST_SIZE: int
 
     # ── Intervals ──
     STATS_INTERVAL: int
@@ -702,9 +704,17 @@ class Config:
             if tg == 0 or admin == 0:
                 raise ValueError("TARGET_GROUP_ID and ADMIN_CHAT_ID must be non-zero")
 
-        workers = SecretManager.get_int("PROCESSING_WORKERS", 3, required=False)
+        # v15.4.0 (طلب المالك — «معالجة الرسائل بنفس الوقت»): 3 → 8 عمال
+        # متوازيين للمعالجة — الطابور الداخلي asyncio.Queue، كل عالٍ يعالج
+        # حدثاً مستقلاً (_pipeline_sem سقف 20 لكل مراقب يبقى الحاجز الفعلي).
+        workers = SecretManager.get_int("PROCESSING_WORKERS", 8, required=False)
         if workers < 1:
             raise ValueError("PROCESSING_WORKERS must be >= 1")
+        # v15.4.0: منتجات متوازية لسحب الطابور الدائم — سحب واحد تسلسلي
+        # كان عنق زجاجة انفجار 60 رسالة/دقيقة (60 دورة DB متتالية).
+        producer_workers = SecretManager.get_int("PRODUCER_WORKERS", 4, required=False)
+        if producer_workers < 1:
+            producer_workers = 1
 
         spam = SecretManager.get_float("SPAM_SCORE_THRESHOLD", 0.7, required=False)
         if not 0 < spam <= 1:
@@ -820,6 +830,7 @@ class Config:
             MAX_CACHE_SIZE=SecretManager.get_int("MAX_CACHE_SIZE", 5000, required=False),
             MESSAGE_QUEUE_SIZE=SecretManager.get_int("MESSAGE_QUEUE_SIZE", 1000, required=False),
             PROCESSING_WORKERS=workers,
+            PRODUCER_WORKERS=producer_workers,
             CACHE_TTL=SecretManager.get_int("CACHE_TTL", 300, required=False),
             MAX_RECENT_HASHES=SecretManager.get_int("MAX_RECENT_HASHES", 500, required=False),
             # ========== قاعدة البيانات ==========
@@ -830,8 +841,12 @@ class Config:
             # ========== الفلترة القديمة (للتوافق) ==========
             FUZZY_MATCH_THRESHOLD=legacy_fuzzy,
             SPAM_SCORE_THRESHOLD=spam,
-            ALERT_COOLDOWN=SecretManager.get_int("ALERT_COOLDOWN", 300, required=False),
-            MAX_EVENT_AGE_SECONDS=SecretManager.get_int("MAX_EVENT_AGE_SECONDS", 1800, required=False),
+            # v15.4.0 (طلب المالك): كل التنبيهات الصالحة تُرسل — تنبيهات نفس
+            # المرسل المتتالية (محتوى مختلف) لا تُكتم بعد 30 ثانية.
+            ALERT_COOLDOWN=SecretManager.get_int("ALERT_COOLDOWN", 10, required=False),
+            # v15.4.0 (طلب المالك — «لا معالجة للرسائل التي مر عليها دقيقة»):
+            # 1800 → 60 ثانية — الأقدم من ذلك يُسقط عند بوابتي pipeline/send.
+            MAX_EVENT_AGE_SECONDS=SecretManager.get_int("MAX_EVENT_AGE_SECONDS", 60, required=False),
             ALERT_CARD_MAX_CHARS=SecretManager.get_int("ALERT_CARD_MAX_CHARS", 4000, required=False),
             QUEUE_STALE_PURGE_SECONDS=SecretManager.get_int("QUEUE_STALE_PURGE_SECONDS", 7200, required=False),
             QUEUE_INFLIGHT_MAX_AGE_SECONDS=SecretManager.get_int("QUEUE_INFLIGHT_MAX_AGE_SECONDS", 600, required=False),
@@ -860,8 +875,12 @@ class Config:
             RECONNECT_CHECK_INTERVAL=SecretManager.get_int("RECONNECT_CHECK_INTERVAL", 15, required=False),
             MAX_WORKER_RESTARTS=SecretManager.get_int("MAX_WORKER_RESTARTS", 10, required=False),
             # ========== تحديد المعدل ==========
-            MAX_ALERTS_PER_MINUTE=SecretManager.get_int("MAX_ALERTS_PER_MINUTE", 12, required=False),
-            MAX_ALERTS_PER_HOUR=SecretManager.get_int("MAX_ALERTS_PER_HOUR", 120, required=False),
+            # v15.4.0 (طلب المالك — «لو 60 رسالة وكلها تنبيهات مطلوبة تُعالج
+            # وتُرسل»): 12/دقيقة → 60/دقيقة و120/ساعة → 3600/ساعة + دفعة
+            # ابتدائية 20 توكن لانفجار الرسائل المتزامن.
+            MAX_ALERTS_PER_MINUTE=SecretManager.get_int("MAX_ALERTS_PER_MINUTE", 60, required=False),
+            MAX_ALERTS_PER_HOUR=SecretManager.get_int("MAX_ALERTS_PER_HOUR", 3600, required=False),
+            ALERT_BURST_SIZE=SecretManager.get_int("ALERT_BURST_SIZE", 20, required=False),
             # ========== الفترات ==========
             STATS_INTERVAL=SecretManager.get_int("STATS_INTERVAL", 3600, required=False),
             CLEANUP_INTERVAL=SecretManager.get_int("CLEANUP_INTERVAL", 86400, required=False),
@@ -966,7 +985,9 @@ class Config:
             CLAUSE_RESCORE_ENABLED=SecretManager.get_bool("CLAUSE_RESCORE_ENABLED", True),
             SIMILARITY_ENABLED=SecretManager.get_bool("SIMILARITY_ENABLED", True),
             SIMILARITY_THRESHOLD=SecretManager.get_float("SIMILARITY_THRESHOLD", 0.88, required=False),
-            SIMILARITY_WINDOW_SECONDS=SecretManager.get_int("SIMILARITY_WINDOW_SECONDS", 3600, required=False),
+            # v15.4.0: 3600 → 900 — العتبة 0.88 (شبه متطابق) تبقى صارمة،
+            # لكن قفل المرسل يتحرر بعد 15 دقيقة بدل ساعة كاملة.
+            SIMILARITY_WINDOW_SECONDS=SecretManager.get_int("SIMILARITY_WINDOW_SECONDS", 900, required=False),
             DIGEST_ENABLED=SecretManager.get_bool("DIGEST_ENABLED", True),
             DIGEST_HOUR_UTC=SecretManager.get_int("DIGEST_HOUR_UTC", 20, required=False),
             # ========== Sender Intelligence ==========
@@ -1168,8 +1189,20 @@ class Config:
 # (event_sender_gate عند الالتقاط، _validate_event قبل أي DB، _send_alert
 # عاقبة أخيرة قبل claim الـdedup)، ونصوص تنبيهات النظام بلا «B_Bot:»
 # (تنبيه نظام: بدلاً منها). توقيعات echo التاريخية للبطاقات القديمة باقية.
-BOT_VERSION: Final = "15.3.0"
-BOT_CODENAME: Final = "Target Identity Silence — Hide B_bot From Alert Cards"
+# v15.4.0: Instant Throughput — «رفع سرعة الالتقاط ومعالجة الرسائل بنفس
+# الوقت، لا معالجة للرسائل القديمة التي مر عليها دقيقة، وكل التنبيهات
+# الصالحة تُعالج وتُرسل حتى 60/دقيقة» (طلب المالك 2026-11-23):
+#   * PROCESSING_WORKERS 3 → 8 + PRODUCER_WORKERS الجديدة = 4 (سحب متوازي).
+#   * MAX_ALERTS_PER_MINUTE 12 → 60، MAX_ALERTS_PER_HOUR 120 → 3600،
+#     ALERT_BURST_SIZE الجديدة = 20 (توكن الدفعة الابتدائية).
+#   * ALERT_COOLDOWN 300 → 10 (أرضية database.py 30 → 10) — تنبيهات
+#     المرسل نفسه بمحتوى مختلف لا تُكتم.
+#   * MAX_EVENT_AGE_SECONDS 1800 → 60 (بوابة العمر pipeline/send — القديم
+#     يُسقط فوراً قبل الإثراء وقبل أي DB write).
+#   * SIMILARITY_WINDOW_SECONDS 3600 → 900 (العتبة 0.88 كما هي).
+# تُطبَّق من env في Render إن وُجدت (المصدر الرسمي) — القيم هنا الافتراضات.
+BOT_VERSION: Final = "15.4.0"
+BOT_CODENAME: Final = "Instant Throughput — Concurrency, 60s Freshness & Full Alert Budget"
 
 # =============================================================================
 # Pre-built config instance

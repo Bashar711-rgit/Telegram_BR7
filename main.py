@@ -490,9 +490,12 @@ class EnhancedTelegramBot:
     def __init__(self) -> None:
         self.db = EnhancedDatabase()
         self.filter = EnhancedFilter()
+        # v15.4.0: دفعة ابتدائية ALERT_BURST_SIZE توكن (افتراضي 20) — انفجار
+        # الرسائل المتزامن يُرسل فوراً بدل تقطير 1/ثانية من البداية.
         self.rate_limiter = AdaptiveRateLimiter(
             CFG.MAX_ALERTS_PER_MINUTE,
             CFG.MAX_ALERTS_PER_HOUR,
+            burst_size=max(1, int(getattr(CFG, "ALERT_BURST_SIZE", 20))),
         )
         self.memory_monitor = MemoryMonitor()
         self.main_client: Optional[TelegramClient] = None
@@ -755,11 +758,19 @@ class EnhancedTelegramBot:
                             pass
                     await asyncio.sleep(1)
 
-        producer_task = asyncio.create_task(producer(), name="producer")
+        # v15.4.0: منتجات متوازية (PRODUCER_WORKERS افتراضي 4) — سحب واحد
+        # تسلسلي كان عنق زجاجة انفجار 60 رسالة/دقيقة. كل منتج يحتفظ بدلالة
+        # M-07 الخاصة به (إعادة إدراج حدثه العالق عند الإلغاء). pop_from_queue
+        # آمنة للتزامن (FOR UPDATE SKIP LOCKED في PG، قفل الطابور في SQLite).
+        _producer_n = max(1, int(getattr(CFG, "PRODUCER_WORKERS", 4)))
+        producers = [
+            asyncio.create_task(producer(), name=f"producer_{i}")
+            for i in range(_producer_n)
+        ]
         workers = [asyncio.create_task(worker(i), name=f"worker_{i}") for i in range(CFG.PROCESSING_WORKERS)]
 
         try:
-            await asyncio.gather(producer_task, *workers, return_exceptions=True)
+            await asyncio.gather(*producers, *workers, return_exceptions=True)
         except asyncio.CancelledError:
             pass
 

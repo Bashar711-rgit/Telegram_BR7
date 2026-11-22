@@ -108,10 +108,11 @@ class TestAlertsAndCooldown:
         await db._execute(
             "INSERT INTO sender_stats (sender_id, reputation_score, last_alert_time, first_seen) "
             "VALUES (?, 50.0, ?, ?)",
-            (555, now - 10, now - 100),
+            (555, now - 5, now - 100),
         )
         await db._commit()
-        # Cooldown for rep=50: max(30, ALERT_COOLDOWN * (1 - 50/200)) — definitely > 10s
+        # v15.4.0 floor is 10s: cooldown = max(10, ALERT_COOLDOWN * (1 - 50/200)).
+        # 5s elapsed is safely below the floor — second alert blocked.
         assert await db.can_send_alert(sender_id=555) is False
 
     async def test_add_alert_batches(self, db):

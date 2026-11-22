@@ -3371,7 +3371,10 @@ class EnhancedDatabase:
             if row and row.get("last_alert_time"):
                 elapsed = now - float(row["last_alert_time"])
                 rep = float(row.get("reputation_score") or 50.0)
-                cooldown = max(30, CFG.ALERT_COOLDOWN * (1.0 - rep / 200.0))
+                # v15.4.0: الأرضية 30 → 10 ثانية — فترة التهدئة لكل مرسل لا
+                # تُكتم التنبيهات الصالحة المتتالية بمحتوى مختلف (طلب المالك:
+                # «لو 60 رسالة وكلها تنبيهات مطلوبة تُعالج وتُرسل»).
+                cooldown = max(10, CFG.ALERT_COOLDOWN * (1.0 - rep / 200.0))
                 allowed = elapsed >= cooldown
             else:
                 allowed = True

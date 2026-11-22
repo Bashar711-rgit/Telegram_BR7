@@ -156,10 +156,14 @@ services:
         sync: false       # يُضاف يدوياً أو تلقائياً من Render
 
       # ════════════════════════════════════════════════════════════
-      # Performance — معايرة لـ Render Free (512MB RAM)
+      # Performance — معايرة v15.4.0 (طلب المالك: معالجة متزامنة فورية)
       # ════════════════════════════════════════════════════════════
+      # v15.4.0: 2 → 8 عمال متوازيين + 4 منتجات موازية لسحب الطابور.
       - key: PROCESSING_WORKERS
-        value: "2"
+        value: "8"
+
+      - key: PRODUCER_WORKERS
+        value: "4"
 
       - key: MEMORY_THRESHOLD_MB
         value: "400"
@@ -188,14 +192,23 @@ services:
       - key: PREFILTER_MAX_EMOJIS
         value: "5"
 
+      # v15.4.0 (طلب المالك): كل التنبيهات الصالحة تُرسل — 60/دقيقة،
+      # 3600/ساعة، دفعة ابتدائية 20، تهدئة المرسل 10 ثوانٍ، وحداثة 60 ثانية
+      # (الأقدم من دقيقة يُسقط ولا يُعالج).
       - key: MAX_ALERTS_PER_MINUTE
-        value: "10"
+        value: "60"
 
       - key: MAX_ALERTS_PER_HOUR
-        value: "100"
+        value: "3600"
+
+      - key: ALERT_BURST_SIZE
+        value: "20"
 
       - key: ALERT_COOLDOWN
-        value: "300"
+        value: "10"
+
+      - key: MAX_EVENT_AGE_SECONDS
+        value: "60"
 
       - key: STATS_INTERVAL
         value: "3600"

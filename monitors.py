@@ -2841,7 +2841,10 @@ class EnhancedAccountMonitor:
                 _wait_fn = getattr(_rl, "wait_for_token", None)
                 if _wait_fn is not None:
                     try:
-                        _rate_ok = bool(await _wait_fn(account_name))
+                        # v15.4.0: سقف انتظار التوكن 35 → 90 ثانية — بميزانية
+                        # 60/دقيقة يتجدد التوكن 1/ثانية، انفجار 60 تنبيهاً
+                        # يُصرف خلال ~45 ثانية فلا يذهب تنبيه صالح إلى DLQ.
+                        _rate_ok = bool(await _wait_fn(account_name, max_wait_s=90))
                     except Exception:
                         _rate_ok = False
         if not _rate_ok:
