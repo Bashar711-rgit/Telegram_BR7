@@ -2220,6 +2220,11 @@ class EnhancedTelegramBot:
             )
             # v11.5.2: هوية البوت من هويّاتنا — رسائله في مجموعة الهدف لا تُراقب
             register_self_sender(self.alert_bot.bot_id)
+            # ══ v15.0: الإصلاح الحدوي الفوري عند فقدان العضوية ══
+            # بدل انتظار دورة الـwatchdog (60s) — كل اكتشاف لفقدان العضوية
+            # (فحص استباقي قبل الإرسال أو 403 أثناء الإرسال) يطلق الإصلاح
+            # حالاً، مع احترام cooldown نفسه (حماية من عواصف الإصلاح).
+            self.alert_bot.on_membership_lost = self._on_alertbot_membership_lost
             await self.alert_bot.check_membership()
             # ══ v14.9.1: الأزرار عبر Bot API حصراً — بوت غير عضو = تنبيهات
             # بلا أزرار. محاولة إصلاح ذاتي فورية + حلقة مراقبة تحدّث الحالة
@@ -2268,6 +2273,29 @@ class EnhancedTelegramBot:
     def _alertbot_heal_cooldown_ok(self) -> bool:
         cd = max(300, int(getattr(CFG, "ALERT_BOT_HEAL_COOLDOWN_SECONDS", 1800) or 1800))
         return (time.time() - self._alertbot_heal_last_ts) >= cd
+
+    def _on_alertbot_membership_lost(self) -> None:
+        """v15.0: الإصلاح الحدوي الفوري لفقدان عضوية بوت التنبيهات.
+
+        يستدعيه alert_bot فور اكتشاف فقدان العضوية (فحص استباقي قبل
+        الإرسال أو 403 أثناء الإرسال) — يطلق heal حالاً إذا انتهت
+        cooldown، وإلا يبقى الطلب في _heal_requested ويلتقطه الـwatchdog
+        فور انتهاء المهلة. بلا استثناءات — فشل-آمن."""
+        try:
+            if not self._alertbot_heal_cooldown_ok():
+                logger.debug(
+                    "[ALERTBOT-HEAL] membership-lost event suppressed "
+                    "(heal cooldown) — watchdog will retry after cooldown"
+                )
+                return
+            self._track_task(
+                self._heal_alertbot_membership(trigger="membership_lost_event"),
+                "alertbot_heal_event",
+            )
+        except Exception as e:
+            logger.debug(
+                f"[ALERTBOT-HEAL] event heal spawn failed: {type(e).__name__}"
+            )
 
     async def _heal_alertbot_membership(
         self,

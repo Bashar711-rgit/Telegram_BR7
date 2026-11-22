@@ -151,6 +151,10 @@ _METRIC_KEYS = (
     "view_V1", "view_V2", "view_V3", "view_V4",
     "reply_fix_success", "reply_fix_failure", "reply_fix_skipped",
     "user_buttons_dropped",
+    # ══ v15.0: استباقية أزرار التنبيهات ══
+    "membership_precheck_run",      # فحوصات العضوية الاستباقية قبل الإرسال
+    "membership_precheck_heal",     # مرات فقدان العضوية المكتشفة → إصلاح فوري
+    "t5_buttons_delivered",         # تنبيهات سلّم T5 (MTProto البوت) بأزرار فعلية
 )
 
 

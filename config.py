@@ -480,6 +480,19 @@ class _ConfigData:
     CAPTURE_BUFFER_SIZE: int
     CAPTURE_TTL_SECONDS: int
 
+    # ══ v15.0 Instant Capture ══
+    # CAPTURE_FROM_BOTS: التقاط الرسائل الصادرة عن حسابات البوتات الأخرى في
+    # مجموعات المراقبة (طلب المالك). الحماية من حلقة الصدى تبقى مفعّلة عبر
+    # is_self_sender (بوت التنبيهات + حسابات المراقبة) وecho guard البطاقات.
+    CAPTURE_FROM_BOTS: bool
+    # سقوف جلب كيانات المرسل في المسار الحرج للالتقاط (ثوانٍ float).
+    # الكيانات المخزنة تُعاد فورا (<5ms) — السقف يخص الجلب البارد فقط.
+    CAPTURE_SENDER_TIMEOUT_S: float
+    CAPTURE_INPUT_TIMEOUT_S: float
+    # فحص عضوية بوت التنبيهات الاستباقي قبل الإرسال (TTL بالثواني) —
+    # يضمن اكتشاف فقدان العضوية قبل أول تنبيه بلا أزرار لا بعده.
+    ALERT_BOT_MEMBERSHIP_TTL_S: int
+
     # ── Alert Dedup ──
     DEDUP_ENABLED: bool
     DEDUP_WINDOW_SECONDS: int
@@ -888,6 +901,11 @@ class Config:
             # كان false افتراضياً والقيمة true في render.yaml لم تصل env
             # الإنتاج — حماية افتراضية الآن بلا اعتماد على env.
             FAST_CAPTURE_ENABLED=SecretManager.get_bool("FAST_CAPTURE_ENABLED", True),
+            # ══ v15.0 Instant Capture ══
+            CAPTURE_FROM_BOTS=SecretManager.get_bool("CAPTURE_FROM_BOTS", True),
+            CAPTURE_SENDER_TIMEOUT_S=SecretManager.get_float("CAPTURE_SENDER_TIMEOUT_S", 0.4, required=False),
+            CAPTURE_INPUT_TIMEOUT_S=SecretManager.get_float("CAPTURE_INPUT_TIMEOUT_S", 0.25, required=False),
+            ALERT_BOT_MEMBERSHIP_TTL_S=SecretManager.get_int("ALERT_BOT_MEMBERSHIP_TTL_S", 300, required=False),
             CAPTURE_BUFFER_SIZE=SecretManager.get_int("CAPTURE_BUFFER_SIZE", 1000, required=False),
             CAPTURE_TTL_SECONDS=SecretManager.get_int("CAPTURE_TTL_SECONDS", 30, required=False),
             # ========== Dedup ==========
