@@ -37,3 +37,4 @@ venv/
 # ========== OS ==========
 .DS_Store
 Thumbs.db
+keywords_dashboard.json

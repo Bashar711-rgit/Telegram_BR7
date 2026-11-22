@@ -493,6 +493,24 @@ class _ConfigData:
     # يضمن اكتشاف فقدان العضوية قبل أول تنبيه بلا أزرار لا بعده.
     ALERT_BOT_MEMBERSHIP_TTL_S: int
 
+    # ══ v15.1.0 Lightweight Control Dashboard ══
+    # لوحة التحكم الخفيفة على نفس خادم aiohttp (صفر deps، صفر خيوط جديدة).
+    # بيانات الدخول الافتراضية bashar / bashar123r (طلب المالك) وتُتجاوز
+    # عبر env: DASHBOARD_USERNAME / DASHBOARD_PASSWORD. الجلسات HttpOnly
+    # SameSite=Strict + CSRF + Rate Limit + قفل محاولات. الأسرار (Session
+    # Strings / API Hash / Bot Token) لا تُعرض في الواجهة أبداً.
+    DASHBOARD_ENABLED: bool
+    DASHBOARD_USERNAME: str
+    DASHBOARD_PASSWORD: str
+    DASHBOARD_SESSION_TTL_MINUTES: int
+    DASHBOARD_MAX_SESSIONS: int
+    DASHBOARD_API_RATE_PER_MIN: int
+    DASHBOARD_LOGIN_RATE_PER_MIN: int
+    DASHBOARD_LOGIN_LOCKOUT_SECONDS: int
+    DASHBOARD_STALENESS_MINUTES: int
+    DASHBOARD_BRIDGE_TIMEOUT_S: float
+    DASHBOARD_OVERVIEW_TTL_S: int
+
     # ── Alert Dedup ──
     DEDUP_ENABLED: bool
     DEDUP_WINDOW_SECONDS: int
@@ -906,6 +924,18 @@ class Config:
             CAPTURE_SENDER_TIMEOUT_S=SecretManager.get_float("CAPTURE_SENDER_TIMEOUT_S", 0.4, required=False),
             CAPTURE_INPUT_TIMEOUT_S=SecretManager.get_float("CAPTURE_INPUT_TIMEOUT_S", 0.25, required=False),
             ALERT_BOT_MEMBERSHIP_TTL_S=SecretManager.get_int("ALERT_BOT_MEMBERSHIP_TTL_S", 300, required=False),
+            # ══ v15.1.0 Control Dashboard ══
+            DASHBOARD_ENABLED=SecretManager.get_bool("DASHBOARD_ENABLED", True),
+            DASHBOARD_USERNAME=str(SecretManager.get("DASHBOARD_USERNAME", "bashar", required=False) or "bashar"),
+            DASHBOARD_PASSWORD=str(SecretManager.get("DASHBOARD_PASSWORD", "bashar123r", required=False) or "bashar123r"),
+            DASHBOARD_SESSION_TTL_MINUTES=SecretManager.get_int("DASHBOARD_SESSION_TTL_MINUTES", 480, required=False),
+            DASHBOARD_MAX_SESSIONS=SecretManager.get_int("DASHBOARD_MAX_SESSIONS", 10, required=False),
+            DASHBOARD_API_RATE_PER_MIN=SecretManager.get_int("DASHBOARD_API_RATE_PER_MIN", 120, required=False),
+            DASHBOARD_LOGIN_RATE_PER_MIN=SecretManager.get_int("DASHBOARD_LOGIN_RATE_PER_MIN", 5, required=False),
+            DASHBOARD_LOGIN_LOCKOUT_SECONDS=SecretManager.get_int("DASHBOARD_LOGIN_LOCKOUT_SECONDS", 900, required=False),
+            DASHBOARD_STALENESS_MINUTES=SecretManager.get_int("DASHBOARD_STALENESS_MINUTES", 30, required=False),
+            DASHBOARD_BRIDGE_TIMEOUT_S=SecretManager.get_float("DASHBOARD_BRIDGE_TIMEOUT_S", 25.0, required=False),
+            DASHBOARD_OVERVIEW_TTL_S=SecretManager.get_int("DASHBOARD_OVERVIEW_TTL_S", 15, required=False),
             CAPTURE_BUFFER_SIZE=SecretManager.get_int("CAPTURE_BUFFER_SIZE", 1000, required=False),
             CAPTURE_TTL_SECONDS=SecretManager.get_int("CAPTURE_TTL_SECONDS", 30, required=False),
             # ========== Dedup ==========
@@ -1097,8 +1127,17 @@ class Config:
 # لقطة المستخدم للقناة الهدف: زر المرسل يُسمّى @username (زر URL عالمي
 # t.me — لا tg:// قابلة للرفض) وزر القروب يُسمّى «جروب» ويفتح المجموعة
 # المصدر؛ البدائل الصادقة بلا username/رابط قروب: مراسلة/عرض الرسالة.
-BOT_VERSION: Final = "14.9.3"
-BOT_CODENAME: Final = "Reference Button Layout"
+# v15.0.0: Instant Capture & Universal Buttons — التقاط رسائل البوتات
+# (CAPTURE_FROM_BOTS افتراضي ON)، فك انسداد المسار الحرج (جلب كيانات
+# موازٍ ~0.4s بدل 0.95s+)، فحص عضوية استباقي فوري + شفاء event-driven.
+# v15.1.0: Lightweight Control Dashboard — لوحة تحكم خفيفة على خادم aiohttp
+# نفسه (/admin، صفر deps، صفر خيوط جديدة): مركز مراقبة + حسابات + كلمات
+# (Filter Playground بالمحرك الحقيقي) + مجموعات + تنبيهات + إعدادات.
+# فصل تام عن مسار استقبال الرسائل: جسر run_coroutine_threadsafe، كاش
+# single-flight، مفاتيح إيقاف فحص-ذاكرة في المسار الحرج، جلسات
+# HttpOnly+CSRF+RateLimit، سجل تدقيق على audit_logs الموجود.
+BOT_VERSION: Final = "15.1.0"
+BOT_CODENAME: Final = "Lightweight Control Dashboard"
 
 # =============================================================================
 # Pre-built config instance

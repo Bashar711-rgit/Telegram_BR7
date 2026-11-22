@@ -125,6 +125,17 @@ try:
 except ImportError:
     AIOHTTP_AVAILABLE = False
 
+# v15.1.0: لوحة التحكم الخفيفة — استيراد محمي (فشل-آمن: /health أبداً
+# لا يتأثر بمشكلة في اللوحة)
+try:
+    from dashboard.server import setup_dashboard as _setup_dashboard
+    from dashboard.api import hydrate_dashboard as _hydrate_dashboard
+    DASHBOARD_AVAILABLE = True
+except Exception as _dash_import_err:  # pragma: no cover
+    DASHBOARD_AVAILABLE = False
+    _setup_dashboard = None
+    _hydrate_dashboard = None
+
 from telethon import TelegramClient, events as tl_events
 from telethon.errors import FloodWaitError
 from telethon.tl.types import InputPeerUser
@@ -517,6 +528,9 @@ class EnhancedTelegramBot:
         # never silently lost ("Task exception was never retrieved").
         self._background_tasks: Set[asyncio.Task] = set()
         self._shutdown_event = asyncio.Event()
+        # v15.1.0: مرجع الحلقة الرئيسية — الجسر الذي تمر عبره كل عمليات
+        # اللوحة الثقيلة (DB/Telethon/المحرك) من خيط الصحة المعزول.
+        self._main_loop: Optional[asyncio.AbstractEventLoop] = None
 
         # Individual references kept too, purely for readability/debugging
         # (all of these are also present in _background_tasks).
@@ -1270,6 +1284,18 @@ class EnhancedTelegramBot:
                 app.router.add_get('/health', health_handler)
                 app.router.add_get('/health/full', health_full_handler)
 
+                # v15.1.0: لوحة التحكم الخفيفة على نفس المنفذ والنفس التطبيق
+                # — فشل-آمن: أي خلل في تركيب اللوحة لا يمنع /health أبداً.
+                if DASHBOARD_AVAILABLE and getattr(CFG, "DASHBOARD_ENABLED", True):
+                    try:
+                        _setup_dashboard(app, self)
+                        logger.info("Dashboard mounted at /admin (lightweight, auth-gated, bridge-to-main-loop)")
+                    except Exception as _dash_err:
+                        logger.error(
+                            f"Dashboard setup failed (fail-safe, /health unaffected): "
+                            f"{type(_dash_err).__name__}: {_dash_err}"
+                        )
+
                 # Render Web Service: MUST bind to $PORT (default 10000)
                 port = int(os.getenv("PORT", 10000))
                 runner = web.AppRunner(app)
@@ -1933,6 +1959,10 @@ class EnhancedTelegramBot:
         logger.info(f"Enhanced Telegram Bot v{BOT_VERSION} (RENDER EDITION, HARDENED) – Initializing...")
         logger.info("=" * 60)
 
+        # v15.1.0: تثبيت مرجع الحلقة الرئيسية قبل بدء خيط الصحة — معالجات
+        # اللوحة تجسر كل عملياتها الثقيلة إلى هذه الحلقة حصراً.
+        self._main_loop = asyncio.get_running_loop()
+
         # v14.2.1 (wake-stability): خادم الصحة يبدأ أولاً وقبل أي شيء آخر —
         # حتى أثناء db.connect/المهاجرات/الصيانة الإقلاعية يستجيب المنفذ
         # فوراً بـ {"status": "starting"}، فينجح استيقاظ Render بدل أن
@@ -1997,10 +2027,20 @@ class EnhancedTelegramBot:
         # (قبل تشغيل أي مراقب — حتى تُتجاهل رسائل المصنفين كمزعجين منذ اللحظة الأولى).
         await setup_antispam(self.db)
 
-        # v14.0: الطبقة الويب = خادم الصحة القائم بذاته (يخدم /health و /health/full
-        # على $PORT). لوحة التحكم أُزيلت نهائياً من المشروع (طلب المالك).
-        # v14.2.1: بدء الخادم نُقل إلى أعلى initialize() — قبل db.connect —
-        # (wake-stability)؛ هنا لم يبق سوى التعليق التوثيقي.
+        # v15.1.0: ترطيب حالة اللوحة من app_settings (مفاتيح الإيقاف المتبقية
+        # من جلسة سابقة + الكلمات المخصصة) — فشل-آمن بلا استثناءات للإقلاع.
+        if DASHBOARD_AVAILABLE:
+            try:
+                await _hydrate_dashboard(self)
+            except Exception as _dh_err:
+                logger.warning(
+                    f"dashboard hydrate skipped (fail-safe): {type(_dh_err).__name__}: {_dh_err}"
+                )
+
+        # ══ v15.1.0 لوحة التحكم الخفيفة ══
+        # نفس خادم الصحة يخدم اللوحة على /admin (نفس المنفذ $PORT) — بلا
+        # FastAPI/uvicorn (درس v14.0). التركيب داخل _start_health_server_thread
+        # أعلاه، والترطيب أعلاه. فشل اللوحة لا يمس /health ولا مسار الرسائل.
 
         self._keep_alive_task = self._track_task(self._keep_alive_loop(), "keep_alive")
 
@@ -2689,6 +2729,40 @@ class EnhancedTelegramBot:
             logger.debug(f"memory_guard stop skipped: {type(_mg_err).__name__}: {_mg_err}")
         await self.db.close()
         logger.info("✅ Shutdown complete")
+
+    def request_safe_restart(self, reason: str = "dashboard") -> bool:
+        """══ v15.1.0: إعادة تشغيل آمنة مطلوبة من لوحة التحكم ══
+
+        إيقاف رشيق كامل (نفس مسار stop() الرسمي: تفريغ negative_memory →
+        إلغاء المهام المتعقوبة → فصل العملاء → إغلاق DB) ثم خروج نظيف
+        بـ exit code 0 — يعيد Render إقلاع الخدمة تلقائياً. تُستدعى من خيط
+        الصحة، لذا تُجدول على الحلقة الرئيسية عبر call_soon_threadsafe.
+        """
+        if not self.is_running:
+            logger.warning("safe_restart requested but bot is not running — ignored")
+            return False
+        loop = self._main_loop
+        if loop is None or loop.is_closed():
+            return False
+
+        def _schedule() -> None:
+            async def _restart() -> None:
+                logger.warning(f"🔄 Safe restart requested via dashboard (reason={reason})")
+                try:
+                    await self.stop(signal=reason)
+                except Exception as e:
+                    logger.error(f"safe_restart stop() error (continuing to exit): {e}")
+                await asyncio.sleep(0.3)
+                os._exit(0)
+
+            self._track_task(_restart(), f"safe_restart_{reason}")
+
+        try:
+            loop.call_soon_threadsafe(_schedule)
+            return True
+        except Exception as e:
+            logger.error(f"safe_restart scheduling failed: {type(e).__name__}: {e}")
+            return False
 
     async def _send_startup_message(self) -> None:
         if not self.main_client:

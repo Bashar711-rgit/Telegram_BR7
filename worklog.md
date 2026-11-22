@@ -645,3 +645,63 @@ Stage Summary:
   أعيد توجيهها للعقد الجديد (test_acceptance_5 → لا forward،
   test_unverified_mention → بطاقة واحدة، media test → بلا تكرار/تحويل،
   reply_fix بمفاتيح enabled صريحة). المجموعة الكاملة: **1095/1095 PASS**.
+
+## v15.1.0 — Lightweight Control Dashboard (لوحة التحكم الخفيفة) — 2026-11-22
+
+- **القرار الهندسي**: لوحة تشغيل/مراقبة خفيفة (Lightweight · Event-Driven · Low
+  Memory · Minimal DB Load) على نفس خادم aiohttp لخادم الصحة (/admin على نفس
+  منفذ $PORT) — درس v14.0 مطبَّق: صفر deps جديدة (لا FastAPI/uvicorn)، صفر
+  خيوط جديدة، صفر processes. محرك Telethon والفلترة دون إعادة كتابة.
+- **الفصل عن مسار استقبال الرسائل**: معالجات اللوحة تعيش على حلقة خيط الصحة
+  المعزول؛ كل عملية ثقيلة (DB/Telethon/المحرك) تُجسَّر إلى الحلقة الرئيسية
+  عبر run_coroutine_threadsafe بمهلة DASHBOARD_BRIDGE_TIMEOUT_S=25s. فشل
+  تركيب اللوحة fail-safe ولا يمنع /health أبداً (استيراد محمي + try/except).
+- **حزمة dashboard/** (أربعة ملفات + أصول):
+  * state.py — توتر-سيف خالص (بلا aiohttp/telethon/DB): مفاتيح الإيقاف
+    (فحص bool ذري في المسار الحرج)، جلسات (سقف 10، TTL انزلاقي 8h، طيّ كسول)،
+    RateLimiter نافذة منزلقة لكل IP، LoginGuard (قفل 15 د بعد المحاولات)،
+    كاش single-flight (overview 15s، groups 45s، alerts/errors 30s) — لا
+    مهام خلفية لكل مستخدم ولا استعلامات مكررة.
+  * api.py — كل الدوال على الحلقة الرئيسية حصراً: مركز المراقبة (يقرأ لقطة
+    /health/full + aggregates مجمعة محدودة)، الحسابات (اختبار get_me بتزامن
+    semaphore(3) + عضوية + إعادة ربط دون إعادة نشر + قناع الهاتف)، الكلمات
+    (وحدات أوراق بمسارات منقطة داخل قائمة بيضاء من 12 فئة + حفظ دائم في
+    app_settings:dashboard:keywords_json + reload_keywords بنفس مسار التحميل
+    الأصلي + إحصائيات أداء/تطابقات زائفة من message_analysis)، Filter
+    Playground (bot.filter.analyze() نفسها — المحرك الحقيقي حرفياً)،
+    المجموعات (CRUD sources الموجود + تجميعات 24h + كشف توقف الاستقبال
+    لكل مجموعة)، التنبيهات (سجل مقسم صفحات + إعادة إرسال الفاشل عبر
+    send_plain + mark_alert_dispatched + اختبار إرسال + معاينة القالب بنفس
+    build_alert_html/build_alert_buttons + إحصاء استخدام الأزرار)، الإعدادات
+    (مفاتيح إيقاف دائمة في app_settings:dashboard:ops + env check أسماء/حالة
+    حصراً بلا قيم سرية + أخطاء مفصلة + تدقيق مقسم + نسخ احتياطي عبر
+    export_critical_data + إعادة تشغيل آمنة).
+  * server.py — وسطاء aiohttp: جلسة كوكي HttpOnly+SameSite=Strict (Secure
+    خلف TLS)، CSRF بترويسة X-CSRF-Token (توكن الجلسة نفسه — طبقة ثانية)،
+    rate limit (API 120/د، login 5/د + قفل)، resolve_client_ip من security.py،
+    ترويسات nosniff/DENY/CSP، أصول تُقرأ من القرص مرة واحدة عند التركيب.
+  * assets/ — SPA واحدة Vanilla (HTML+CSS+JS بلا أي مكتبة): RTL داكن، 6
+    تبويبات (الحالة/الحسابات/الكلمات/المجموعات/التنبيهات/الإعدادات)، Polling
+    منضبط (تبويب الحالة فقط، 20 ثانية، يتوقف عند إخفاء الصفحة)، Pagination،
+    رسم 24 ساعة CSS خالص، شاشة دخول، توست، تأكيدات للعمليات الخطرة.
+- **المصادقة**: bashar / bashar123r (طلب المالك) — قابلة للتجاوز عبر
+  DASHBOARD_USERNAME/DASHBOARD_PASSWORD (render.yaml sync:false). مقارنة
+  constant-time عبر security.constant_time_equals. فشل الدخول يُعدّ في
+  الذاكرة حصراً (لا غزو DB)، والدخول الناجح يُدقَّق في audit_logs.
+- **المفاتيح الحية في المسار الحرج (monitors.py)**: فحص bool واحد أعلى
+  _analyze_and_alert (إيقاف الفلترة — الرسالة تبقى محفوظة بلا تحليل/تنبيه)
+  وآخر أعلى _send_alert (إيقاف التنبيهات — قبل طلب العملاء وقبل claim الـ
+  dedup حتى لا تُستهلك بصمة لن تُرسل). العدّادات في monitor._stats + DASH.
+- **كشف توقف الاستقبال** (ميزة الوحدة 1): stale flag في overview + لكل
+  مجموعة عندما last_event_ts/last_msg يتجاوز DASHBOARD_STALENESS_MINUTES=30
+  مع حسابات "متصلة" — يعرض آخر نشاط بدقة.
+- **لا schema جديد**: جدولان key/value في app_settings الموجود (dashboard:ops
+  و dashboard:keywords_json) + audit_logs الموجود (source='dashboard') — لا
+  حذف ولا تعديل جداول ولا بيانات.
+- **version bump**: BOT_VERSION 14.9.3 → 15.1.0 («Lightweight Control
+  Dashboard») + توثيق v15.0.0 الناقص في config.py.
+- **الاختبارات**: tests/test_dashboard_v15_1.py (53 اختباراً: مصادقة/CSRF/
+  rate limit/قفل، عدم كشف الأسرار وقناع الهاتف، Playground بالمحرك الحقيقي،
+  حفظ/استيراد/تصدير الكلمات، مجموعات CRUD، تنبيهات إعادة إرسال/قالب/أزرار،
+  مفاتيح إيقاف دائمة، env بلا قيم، تدقيق، نسخ احتياطي، إعادة تشغيل آمنة،
+  المسار الحرج). المجموعة الكاملة: **1170/1170 PASS** (أساس 1117 + 53).
