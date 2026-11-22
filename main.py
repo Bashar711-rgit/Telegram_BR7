@@ -801,39 +801,63 @@ class EnhancedTelegramBot:
                     depth = 0
                 degrade_at = int(getattr(CFG, "FUZZY_DEGRADE_QUEUE_DEPTH", 200) or 0)
                 recover_at = int(getattr(CFG, "FUZZY_RECOVER_QUEUE_DEPTH", 100) or 0)
+                # v15.5.0-r1: fuzzy أبعد أثراً من resolver — تعطيله يفوّت
+                # مطابقات قريبة (المطابق الأساسي exact/regex يعمل بدونه لكن
+                # الاحتياطي الضبابي يلتقط متغيرات الكلمات). السبب الجذري
+                # أثبت أنه FIFO + قفل DB لا CPU — لذا fuzzy يُعطّل فقط عند
+                # حافة الاختناق (85% من صمام القبول) حيث كل ثانية CPU حاسمة،
+                # بينما resolver يُتخطى مبكراً (200) — خسارة صافية دائمة
+                # تحت الحمل (27 فشلاً / صفر نجاح).
+                try:
+                    _adm = int(getattr(CFG, "QUEUE_ADMISSION_MAX", 400) or 0)
+                except Exception:
+                    _adm = 400
+                fuzzy_at = int(_adm * 0.85) if _adm > 0 else degrade_at
+                if fuzzy_at <= degrade_at:
+                    fuzzy_at = degrade_at
+                fuzzy_recover = max(recover_at, int(fuzzy_at * 0.7))
 
                 if degrade_at > 0 and depth >= degrade_at and not self.drain_mode:
                     self.drain_mode = True
                     logger.warning(
                         f"🛡️ LOAD-SHED ON | queue={depth} >= {degrade_at} — "
-                        f"fuzzy OFF + sender-resolver skipped (alerts first)"
+                        f"sender-resolver skipped (alerts first) | fuzzy gate at {fuzzy_at}"
                     )
-                    if not self._fuzzy_degraded:
-                        _flt = getattr(self, "filter", None)
-                        if _flt is not None and getattr(_flt, "_fuzzy_enabled", False):
-                            try:
-                                _flt._fuzzy_enabled = False
-                                self._fuzzy_degraded = True
-                                from unified_alerts.stats import get_unified_stats as _gus
-                                _gus().inc("fuzzy_degrade_on")
-                            except Exception:
-                                pass
                 elif self.drain_mode and depth <= recover_at:
                     self.drain_mode = False
                     logger.info(
                         f"🟢 LOAD-SHED OFF | queue={depth} <= {recover_at} — "
                         f"full pipeline restored"
                     )
-                    if self._fuzzy_degraded:
-                        _flt = getattr(self, "filter", None)
-                        if _flt is not None:
-                            try:
-                                _flt._fuzzy_enabled = bool(getattr(CFG, "FUZZY_MATCHING_ENABLED", True))
-                                self._fuzzy_degraded = False
-                                from unified_alerts.stats import get_unified_stats as _gus
-                                _gus().inc("fuzzy_degrade_off")
-                            except Exception:
-                                pass
+
+                # بوابة fuzzy منفصلة مع hysteresis خاص بها (حافة الاختناق فقط)
+                if fuzzy_at > 0 and depth >= fuzzy_at and not self._fuzzy_degraded:
+                    _flt = getattr(self, "filter", None)
+                    if _flt is not None and getattr(_flt, "_fuzzy_enabled", False):
+                        try:
+                            _flt._fuzzy_enabled = False
+                            self._fuzzy_degraded = True
+                            from unified_alerts.stats import get_unified_stats as _gus
+                            _gus().inc("fuzzy_degrade_on")
+                            logger.warning(
+                                f"🛡️ FUZZY DEGRADED | queue={depth} >= {fuzzy_at} — "
+                                f"exact/regex only (brink shedding)"
+                            )
+                        except Exception:
+                            pass
+                elif self._fuzzy_degraded and depth <= fuzzy_recover:
+                    _flt = getattr(self, "filter", None)
+                    if _flt is not None:
+                        try:
+                            _flt._fuzzy_enabled = bool(getattr(CFG, "FUZZY_MATCHING_ENABLED", True))
+                            self._fuzzy_degraded = False
+                            from unified_alerts.stats import get_unified_stats as _gus
+                            _gus().inc("fuzzy_degrade_off")
+                            logger.info(
+                                f"🟢 FUZZY RESTORED | queue={depth} <= {fuzzy_recover}"
+                            )
+                        except Exception:
+                            pass
             except asyncio.CancelledError:
                 raise
             except Exception as e:
