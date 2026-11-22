@@ -1162,8 +1162,14 @@ class Config:
 # verifying/ready/active/error)، حدود محاولات+FloodWait، محو أسرار فوري،
 # منع حذف آخر حساب نشط، ودمج حسابات DB مع env عند الإقلاع. محرك Telethon
 # والفلترة لا يُلمسان.
-BOT_VERSION: Final = "15.2.0"
-BOT_CODENAME: Final = "Dashboard Panel Accounts — Link New Telegram Account"
+# v15.3.0: Target Identity Silence — «إخفاء B_bot من بطاقة التنبيهات
+# بالكامل» (طلب المالك): هوية القناة الهدف لا تولّد تنبيهات إطلاقاً —
+# بوابة _target_identity_match (توحيد صيغ -100…/المجرّد) في ثلاث طبقات
+# (event_sender_gate عند الالتقاط، _validate_event قبل أي DB، _send_alert
+# عاقبة أخيرة قبل claim الـdedup)، ونصوص تنبيهات النظام بلا «B_Bot:»
+# (تنبيه نظام: بدلاً منها). توقيعات echo التاريخية للبطاقات القديمة باقية.
+BOT_VERSION: Final = "15.3.0"
+BOT_CODENAME: Final = "Target Identity Silence — Hide B_bot From Alert Cards"
 
 # =============================================================================
 # Pre-built config instance

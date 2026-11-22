@@ -128,10 +128,13 @@ class TestValidateEventEchoGuard:
 
     @pytest.mark.asyncio
     async def test_real_user_text_still_passes(self, monitor):
-        """رسالة مستخدم حقيقي (وإن ذُكر 👤 وسطها) تمر كالمعتاد."""
+        """رسالة مستخدم حقيقي (وإن ذُكر 👤 وسطها) تمر كالمعتاد.
+
+        v15.3.0: المحادثة هنا غير القناة الهدف عمداً — أحداث القناة الهدف
+        نفسها تُسقط الآن مبكراً (target identity silence)."""
         ok = await monitor._validate_event({
             "text": "السلام عليكم احتاج سكليف معتمد بصحتي",
-            "sender_id": 424242, "chat_id": -1001234567890,
+            "sender_id": 424242, "chat_id": -1001234567899,
         })
         assert ok is True
 

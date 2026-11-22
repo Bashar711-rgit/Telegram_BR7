@@ -6,7 +6,7 @@ unified_alerts/activity.py — نظام صيانة النشاط (Activity Mainte
 
 1. رسالة النشاط الدورية:
    عندما تمر ACTIVITY_MESSAGE_INTERVAL_SECONDS (افتراضي 90s) دون طلبات حقيقية،
-   تُرسل رسالة نصية بهوية B_Bot (Bot API عبر ALERT_BOT_TOKEN) إلى قناة النشاط
+   تُرسل رسالة نصية بهوية بوت التنبيهات (Bot API عبر ALERT_BOT_TOKEN) إلى قناة النشاط
    المخصصة (ACTIVITY_CHANNEL_ID) أو إلى قناة الطلبات نفسها عند التفعيل الصريح
    (ACTIVITY_MESSAGE_FALLBACK_MAIN). الرسالة مميزة بعلامة داخلية
    (monitors.is_activity_message) فلا تُحسب طلباً، ولا تدخل الكلمات المفتاحية،
@@ -307,7 +307,7 @@ class ActivityWatchdog:
             if rss_mb and rss_mb > threshold:
                 await self._admin_alert(
                     "memory_high",
-                    f"⚠️ B_Bot: استهلاك الذاكرة {rss_mb}MB تجاوز الحد "
+                    f"⚠️ تنبيه نظام: استهلاك الذاكرة {rss_mb}MB تجاوز الحد "
                     f"{int(threshold)}MB — memory_guard يعالج تلقائياً عند 85%/95%.",
                 )
         except ImportError:
@@ -325,7 +325,7 @@ class ActivityWatchdog:
             if total > 0 and connected == 0:
                 await self._admin_alert(
                     "all_monitors_down",
-                    f"🚨 B_Bot: جميع الحسابات ({total}) غير متصلة — المراقبة "
+                    f"🚨 تنبيه نظام: جميع الحسابات ({total}) غير متصلة — المراقبة "
                     f"متوقفة. إعادة الاتصال التلقائي مسلَّح وسيستمر بالمحاولة.",
                 )
             elif connected > 0:
@@ -337,14 +337,14 @@ class ActivityWatchdog:
                     if idle_s > idle_min * 60:
                         await self._admin_alert(
                             "idle_no_events",
-                            f"⚠️ B_Bot: لا أحداث واردة منذ "
+                            f"⚠️ تنبيه نظام: لا أحداث واردة منذ "
                             f"{int(idle_s / 60)} دقيقة مع {connected} حساب متصل — "
                             f"تحقق من اتصال تيليجرام/نشاط المجموعات المراقَبة.",
                         )
             if self.queue_stall_detected:
                 await self._admin_alert(
                     "queue_stalled",
-                    f"⚠️ B_Bot: الطابور متوقف ({self._last_queue_size} حدثاً "
+                    f"⚠️ تنبيه نظام: الطابور متوقف ({self._last_queue_size} حدثاً "
                     f"بلا معالجة 3 دورات) — افحص /health/full.",
                 )
         except Exception:

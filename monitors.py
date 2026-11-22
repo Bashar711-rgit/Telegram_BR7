@@ -235,23 +235,62 @@ def is_self_sender(sender_id) -> bool:
         return False
 
 
-def event_sender_gate(sender_id, sender=None) -> bool:
+# ══ v15.3.0 (طلب المالك — «إخفاء B_bot من بطاقة التنبيهات بالكامل») ══
+# هوية القناة الهدف نفسها لا تصلح مصدر تنبيه أبداً: أي حدث داخل القناة
+# الهدف أو منسوب إليها (نشر يدوي، تنبيهات النظام، صدى البطاقات) يُسقط
+# مبكراً — فلا يُبنى تنبيه تظهر هوية «اسم القناة الهدف» في بطاقته.
+# المطابقة توحّد الصيغ (-100… / المجرّد) كي تغطي كل العملاء (Telethon
+# يعيد المعرّفات بصيغتين حسب الإصدار والسياق).
+def _target_identity_match(pid) -> bool:
+    """هل هذا المعرّف هو هوية القناة الهدف بأي صيغة؟ (بلا I/O، فشل-آمن)
+
+    معرّفات القنوات/المجموعات سالبة (-100…) ومعرّفات المستخدمين موجبة —
+    الرفض هنا للقيم غير الصالحة (0/None/غير رقمي) فقط، والصيغ تُوحَّد
+    بإزالة البادئة -100 من الطرفين قبل المقارنة.
+    """
+    try:
+        v = int(pid or 0)
+    except (TypeError, ValueError):
+        return False
+    if v == 0:
+        return False
+    try:
+        t = int(getattr(CFG, "TARGET_GROUP_ID", 0) or 0)
+    except Exception:
+        return False
+    if t == 0:
+        return False
+    if v == t:
+        return True
+    vs, ts = str(v), str(t)
+    if vs.startswith("-100"):
+        vs = vs[4:]
+    if ts.startswith("-100"):
+        ts = ts[4:]
+    return bool(vs) and vs == ts
+
+
+def event_sender_gate(sender_id, sender=None, chat_id=None) -> bool:
     """v15.0 — بوابة هوية المرسل في معالج الأحداث (قابلة للاختبار الوحدوي).
 
     يعيد True عند «تخطي» الحدث، False عند «الالتقاط»:
       * هوية ذاتية (بوت التنبيهات/حسابات المراقبة المسجلة) → تخطٍّ
         (حاجز حلقة الصدى الذاتي — v11.5.2).
+      * v15.3.0: هوية القناة الهدف (كمرسِل أو كمحادثة) → تخطٍّ — رسائل
+        القناة الهدف نفسها لا تولّد تنبيهات إطلاقاً (طلب المالك).
       * رسائل البوتات الأخرى → **التقاط** (طلب المالك v15.0 — كانت تُهمل
         كلياً قبلاً). التبديل اليدوي CAPTURE_FROM_BOTS=false يستعيد
         السلوك القديم داخل هذه الدالة أيضاً.
       * المرسلون الآخرون (مستخدمون/قنوات مجهولة) → التقاط.
     بلا I/O وبلا استثناءات — فشل-آمن دائماً نحو الالتقاط.
     """
+    if chat_id is not None and _target_identity_match(chat_id):
+        return True
     try:
         sid = int(sender_id or 0)
     except Exception:
         sid = 0
-    if sid and is_self_sender(sid):
+    if sid and (is_self_sender(sid) or _target_identity_match(sid)):
         return True
     if not bool(getattr(CFG, "CAPTURE_FROM_BOTS", True)):
         if sender is not None and bool(getattr(sender, "bot", False)):
@@ -1374,7 +1413,10 @@ class EnhancedAccountMonitor:
                 # عبر is_self_sender (بوت التنبيهات + حسابات المراقبة
                 # المسجلة عند الاتصال) قبل أي عدّ أو التقاط — والحارس
                 # الثاني باقٍ في _validate_event (echo guard البطاقات).
-                if event_sender_gate(getattr(event, "sender_id", 0), event.sender):
+                if event_sender_gate(
+                    getattr(event, "sender_id", 0), event.sender,
+                    chat_id=getattr(event, "chat_id", None),
+                ):
                     return
                 if not bool(getattr(CFG, "CAPTURE_FROM_BOTS", True)):
                     # بديل التبديل اليدوي: استعادة سلوك التجاهل القديم
@@ -2104,6 +2146,12 @@ class EnhancedAccountMonitor:
 
     async def _validate_event(self, data: Dict[str, Any]) -> bool:
         sender_id = data.get("sender_id", 0); chat_id = data.get("chat_id", 0)
+        # ══ v15.3.0: هوية القناة الهدف لا تولّد تنبيهات أبداً ══
+        # (نشر يدوي بالقناة / تنبيهات النظام / أي صدى — يُسقط قبل أي
+        # استعلام DB كي لا تظهر هوية القناة الهدف في بطاقة تنبيه)
+        if _target_identity_match(chat_id) or _target_identity_match(sender_id):
+            await self._inc_stat("echo_skipped")
+            return False
         if await self.db.is_blocked_sender(sender_id): return False
         if await self.db.is_blocked_chat(chat_id): return False
         if await self.db.is_feature_enabled("sources_scope") and not await self.db.is_source_allowed(chat_id):
@@ -2681,6 +2729,13 @@ class EnhancedAccountMonitor:
         swallowed and the ladder falls through.
         """
         if not self._bot_ref:
+            return False
+        # ══ v15.3.0: عاقبة أخيرة — بطاقة من/عن هوية القناة الهدف لا تُرسل ══
+        # دفاع عمق بعد البوابتين (event_sender_gate + _validate_event):
+        # لا يصل القناة الهدف أبداً تنبيه تحمل هويتها هي (اسم القناة في
+        # سطر المرسل). قبل طلب العملاء وقبل claim الـdedup بلا استهلاك.
+        if _target_identity_match(data.get("chat_id")) or _target_identity_match(data.get("sender_id")):
+            logger.warning("⛔ v15.3.0: تنبيه بهوية القناة الهدف أُسقط (target identity silence)")
             return False
         # ══ v15.1.0: إيقاف إرسال التنبيهات مؤقتاً (من لوحة التحكم) ══
         # الفلترة والتقاط مستمران — فقط التسليم للقناة الهدف يتوقف. الفحص

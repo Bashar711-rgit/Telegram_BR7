@@ -37,7 +37,7 @@ Telegram_BR7 — Lightweight Control Dashboard (v15.1.0)
 
 from __future__ import annotations
 
-DASHBOARD_VERSION: str = "15.2.0"
+DASHBOARD_VERSION: str = "15.3.0"
 
 __all__ = ["DASHBOARD_VERSION"]
 

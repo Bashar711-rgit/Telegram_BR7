@@ -153,8 +153,10 @@ class TestGateBeforeAlertBuild:
         return EnhancedAccountMonitor(account, db, None)
 
     def _event(self, text: str) -> dict:
+        # v15.3.0: chat_id غير القناة الهدف عمداً — أحداث القناة الهدف
+        # تُسقط مبكراً الآن (target identity silence).
         return {
-            "text": text, "sender_id": 4242, "chat_id": -1001234567890,
+            "text": text, "sender_id": 4242, "chat_id": -1001234567899,
             "message_id": 77, "account_name": "LEN_PIPE",
             "sender_type": "user", "media_type": "none",
         }

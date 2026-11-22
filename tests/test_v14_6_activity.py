@@ -579,9 +579,11 @@ class TestPipelineExclusion:
 
     @pytest.mark.asyncio
     async def test_real_request_still_passes(self, monitor):
+        # v15.3.0: chat غير القناة الهدف عمداً — أحداث القناة الهدف نفسها
+        # تُسقط مبكراً الآن (target identity silence).
         ok = await monitor._validate_event({
             "text": "عندي واجب ابي احد يحله",
-            "sender_id": 424242, "chat_id": TARGET,
+            "sender_id": 424242, "chat_id": -1001234567899,
         })
         assert ok is True
 
