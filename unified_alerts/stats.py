@@ -24,6 +24,11 @@ _LOCK = threading.Lock()
 
 # العدادات الأساسية — مفاتيح ثابتة (تظهر دائماً في snapshot حتى بصفر)
 _BASE: Dict[str, int] = {
+    # ══ v15.4.1 — بوابة الندرة عند لحظة الوصول (Arrival-Freshness) ══
+    # إسقاطات عند الالتقاط — القديم لا يدخل الطابور أصلاً (تكلفة صفر)
+    "stale_dropped_capture": 0,
+    # هجر الطابور المرضي — حدث طازج عند الوصول تجاوز MAX_QUEUE_WAIT_SECONDS
+    "stale_dropped_queue_wait": 0,
     # بوابة العمر — إسقاطات في مرحلة pipeline (أقرب نقطة، قبل الإثراء)
     "stale_dropped_pipeline": 0,
     # بوابة العمر — إسقاطات في مرحلة send (الحدث اعتق في الطابور)
@@ -103,6 +108,13 @@ def unified_snapshot() -> Dict[str, Any]:
         snap = _singleton.snapshot()
         snap["enabled"] = True
         snap["version"] = "12.4.0"
+        # v15.4.1: دمج إعدادات البوابة الحية (الدلالة + الحدان) للعرض
+        try:
+            from unified_alerts.gate import get_alert_gate
+
+            snap.update(get_alert_gate().snapshot())
+        except Exception:
+            pass
         return snap
     except Exception:
         out = dict(_BASE)

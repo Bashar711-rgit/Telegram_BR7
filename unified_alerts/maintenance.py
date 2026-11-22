@@ -58,11 +58,14 @@ async def purge_stale_queue_rows(
             try:
                 from config import CFG
 
+                # v15.4.1: الافتراضي 600s (سقف انتظار الطابور) — الصفوف
+                # الأقدم منه محكوم عليها بالبوابة أصلاً، تطهيرها صفر فقدان.
+                # (كان 7200 فتنجو تراكمية الساعة الواحدة وتستنزف العمال.)
                 max_age_seconds = int(
-                    getattr(CFG, "QUEUE_STALE_PURGE_SECONDS", 7200) or 7200
+                    getattr(CFG, "QUEUE_STALE_PURGE_SECONDS", 600) or 600
                 )
             except Exception:
-                max_age_seconds = 7200
+                max_age_seconds = 600
         deleted = await db.purge_stale_queue_rows(max_age_seconds=max_age_seconds)
         deleted = int(deleted or 0)
         if deleted:

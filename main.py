@@ -1532,6 +1532,19 @@ class EnhancedTelegramBot:
                 break
             except Exception as e:
                 logger.debug(f"inflight recovery loop error (fail-safe): {type(e).__name__}: {e}")
+            # ══ v15.4.1: تطهير دوري سريع للطابور (كل دورة استرداد ≈ 120s) —
+            # الصفوف الأقدم من QUEUE_STALE_PURGE_SECONDS (600s) محكوم عليها
+            # بالبوابة أصلاً — تطهيرها يفرغ أي تراكم خلال دقائق بدل إهدار
+            # العمال عليه ساعات (كان يومياً بعمر 7200s — غير كافٍ إطلاقاً).
+            try:
+                from unified_alerts.maintenance import purge_stale_queue_rows as _qpurge
+                _n = await _qpurge(self.db)
+                if _n:
+                    logger.info(f"v15.4.1 periodic queue purge: {_n} stale rows removed (≤600s cadence)")
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.debug(f"periodic queue purge skipped (fail-safe): {type(e).__name__}: {e}")
             await asyncio.sleep(interval)
 
     async def _dedup_cleanup_loop(self) -> None:

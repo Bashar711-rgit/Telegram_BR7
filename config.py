@@ -852,7 +852,11 @@ class Config:
             # 1800 → 60 ثانية — الأقدم من ذلك يُسقط عند بوابتي pipeline/send.
             MAX_EVENT_AGE_SECONDS=SecretManager.get_int("MAX_EVENT_AGE_SECONDS", 60, required=False),
             ALERT_CARD_MAX_CHARS=SecretManager.get_int("ALERT_CARD_MAX_CHARS", 4000, required=False),
-            QUEUE_STALE_PURGE_SECONDS=SecretManager.get_int("QUEUE_STALE_PURGE_SECONDS", 7200, required=False),
+            # v15.4.1: 7200 → 600 — صفوف الطابور الأقدم من سقف انتظار الطابور
+            # محكوم عليها بالبوابة أصلاً (ختم الطازج يُهجر عند 600s، والقديم
+            # بلا ختم يُسقط عند العمر الأصلي) — تطهيرها = صفر فقدان، يفرغ
+            # التراكم فوراً بدل إهدار العمال عليه ساعات.
+            QUEUE_STALE_PURGE_SECONDS=SecretManager.get_int("QUEUE_STALE_PURGE_SECONDS", 600, required=False),
             QUEUE_INFLIGHT_MAX_AGE_SECONDS=SecretManager.get_int("QUEUE_INFLIGHT_MAX_AGE_SECONDS", 600, required=False),
             QUEUE_INFLIGHT_MAX_ATTEMPTS=SecretManager.get_int("QUEUE_INFLIGHT_MAX_ATTEMPTS", 3, required=False),
             QUEUE_RECOVER_INTERVAL_SECONDS=SecretManager.get_int("QUEUE_RECOVER_INTERVAL_SECONDS", 120, required=False),
