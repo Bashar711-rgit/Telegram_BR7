@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Telegram BR7 — لوحة التحكم</title>
+<link rel="stylesheet" href="/admin/assets/style.css">
+</head>
+<body>
+
+<!-- شاشة الدخول -->
+<div id="loginOverlay" class="login-overlay hidden">
+  <form id="loginForm" class="login-card" autocomplete="off">
+    <h1>Telegram BR7</h1>
+    <p style="color:var(--muted);margin:0 0 16px">لوحة التحكم — تسجيل الدخول</p>
+    <div id="loginError" class="error hidden" role="alert"></div>
+    <label class="field">اسم المستخدم
+      <input id="loginUser" type="text" autocomplete="username" required>
+    </label>
+    <label class="field">كلمة المرور
+      <input id="loginPass" type="password" autocomplete="current-password" required>
+    </label>
+    <button type="submit" class="btn primary" id="loginBtn" style="width:100%">دخول</button>
+  </form>
+</div>
+
+<!-- الشريط العلوي -->
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">BR7</span>
+    <div>
+      <h1>Telegram BR7</h1>
+      <small>نظام المراقبة والإدارة</small>
+    </div>
+  </div>
+  <div class="top-actions">
+    <span id="opsBanner" class="ops-banner hidden"></span>
+    <span id="versionBadge" class="badge">v—</span>
+    <button id="logoutBtn" class="btn ghost sm">خروج</button>
+  </div>
+</header>
+
+<!-- التبويبات -->
+<nav class="tabs" id="tabs" aria-label="الوحدات">
+  <button data-tab="overview" class="tab active">📊 الحالة</button>
+  <button data-tab="accounts" class="tab">👤 الحسابات</button>
+  <button data-tab="keywords" class="tab">🔑 الكلمات</button>
+  <button data-tab="groups" class="tab">👥 المجموعات</button>
+  <button data-tab="alerts" class="tab">🔔 التنبيهات</button>
+  <button data-tab="ops" class="tab">⚙️ الإعدادات</button>
+</nav>
+
+<main>
+
+  <!-- ═══ الوحدة 1: الحالة ═══ -->
+  <section id="tab-overview" class="panel active">
+    <div id="stalenessBanner" class="banner danger hidden"></div>
+    <div id="opsBannerOv" class="banner warn hidden"></div>
+    <div class="cards" id="ovCards"></div>
+    <div class="grid2">
+      <div class="card">
+        <h3>الرسائل والتنبيهات — آخر 24 ساعة</h3>
+        <div class="chartwrap"><div id="chart24" class="chart"></div></div>
+        <div class="chips" style="margin-top:8px">
+          <span class="chip"><span style="color:var(--accent)">▬</span> رسائل مستلمة</span>
+          <span class="chip"><span style="color:var(--warn)">▬</span> تنبيهات</span>
+        </div>
+      </div>
+      <div class="card">
+        <h3>آخر الأخطاء والملاحظات</h3>
+        <ul id="ovErrors" class="plainlist"></ul>
+      </div>
+    </div>
+    <div class="card">
+      <h3>حالة الحسابات المباشرة</h3>
+      <div class="tablewrap"><table id="ovMonitors" class="table"></table></div>
+    </div>
+  </section>
+
+  <!-- ═══ الوحدة 2: الحسابات ═══ -->
+  <section id="tab-accounts" class="panel">
+    <div class="card">
+      <div class="toolbar">
+        <button id="accRefresh" class="btn sm">تحديث</button>
+        <button id="accTestAll" class="btn sm primary">اختبار جميع الحسابات</button>
+        <span id="accNote" style="color:var(--muted);font-size:12px"></span>
+      </div>
+      <div class="tablewrap">
+        <table id="accTable" class="table"></table>
+      </div>
+    </div>
+  </section>
+
+  <!-- ═══ الوحدة 3: الكلمات ═══ -->
+  <section id="tab-keywords" class="panel">
+    <div class="card">
+      <h3>🧪 Filter Playground — اختبار رسالة بالمحرك الحقيقي</h3>
+      <p style="color:var(--muted);font-size:12px;margin:0 0 8px">
+        ضع رسالة حقيقية في المربع — تُحلل بنفس محرك الفلترة الفعلي (لا نسخة مبسطة):
+      </p>
+      <textarea id="pgText" placeholder="مثال: أبي أحد يساعدني في حل واجب الرياضيات ضروري"></textarea>
+      <div class="toolbar" style="margin-top:8px">
+        <button id="pgRun" class="btn primary sm">تحليل الرسالة</button>
+        <span id="pgEngine" style="color:var(--muted);font-size:12px"></span>
+      </div>
+      <div id="pgResults"></div>
+    </div>
+    <div class="grid2">
+      <div class="card">
+        <h3>📚 فئات الكلمات القابلة للتعديل</h3>
+        <div id="kwCats"></div>
+        <div class="toolbar" style="margin-top:10px">
+          <button id="kwSave" class="btn primary sm">حفظ كل التعديلات</button>
+          <button id="kwExport" class="btn sm">تصدير JSON</button>
+          <input type="file" id="kwImportFile" accept=".json" style="display:none">
+          <button id="kwImportBtn" class="btn sm">استيراد JSON</button>
+          <span id="kwCustomBadge" class="badge hidden">مخصص مُطبَّق</span>
+        </div>
+      </div>
+      <div class="card">
+        <h3>⚖️ أوزان التقييم (scoring_weights)</h3>
+        <div id="kwWeights"></div>
+        <h3 style="margin-top:16px">📈 أداء الكلمات — آخر 7 أيام</h3>
+        <div id="kwStats"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ═══ الوحدة 4: المجموعات ═══ -->
+  <section id="tab-groups" class="panel">
+    <div class="card">
+      <div class="toolbar">
+        <input id="grpAddInput" type="text" placeholder="t.me/username أو @username أو -100...">
+        <button id="grpAddBtn" class="btn primary sm">إضافة مجموعة</button>
+        <button id="grpRefresh" class="btn sm">تحديث</button>
+      </div>
+      <div id="grpAllowAll" class="banner warn hidden">
+        وضع «السماح للجميع»: لا توجد مجموعات محددة — تُراقب كل المجموعات التي توجد فيها الحسابات.
+        أضف مجموعة واحدة لتفعيل نمط القائمة المحددة.
+      </div>
+      <div class="tablewrap"><table id="grpTable" class="table"></table></div>
+    </div>
+  </section>
+
+  <!-- ═══ الوحدة 5: التنبيهات ═══ -->
+  <section id="tab-alerts" class="panel">
+    <div class="card">
+      <div class="toolbar">
+        <button id="alTestBtn" class="btn primary sm">إرسال تنبيه اختباري</button>
+        <button id="alTemplateBtn" class="btn sm">معاينة القالب</button>
+        <button id="alRefresh" class="btn sm">تحديث</button>
+        <select id="alStatusFilter">
+          <option value="all">كل الحالات</option>
+          <option value="sent">الناجحة</option>
+          <option value="failed">الفاشلة</option>
+          <option value="unknown">غير المعروفة</option>
+        </select>
+      </div>
+      <div class="chips" id="alStatsChips"></div>
+      <div class="tablewrap"><table id="alTable" class="table"></table></div>
+      <div class="pagination">
+        <button id="alPrev" class="btn sm">السابق</button>
+        <span id="alPageInfo" style="color:var(--muted);font-size:12px"></span>
+        <button id="alNext" class="btn sm">التالي</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ═══ الوحدة 6: الإعدادات ═══ -->
+  <section id="tab-ops" class="panel">
+    <div class="card">
+      <h3>🎛️ مفاتيح التشغيل</h3>
+      <div class="switchrow">
+        <div><b>إيقاف الفلترة مؤقتاً</b><br><small>الرسائل تُلتقط وتُحفظ لكن لا تُحلل ولا تُرسل تنبيهات لها</small></div>
+        <label class="switch"><input type="checkbox" id="swFilter"><span class="slider"></span></label>
+      </div>
+      <div class="switchrow">
+        <div><b>إيقاف إرسال التنبيهات مؤقتاً</b><br><small>الفلترة مستمرة والتقاط عادي — فقط الإرسال للقناة الهدف يتوقف</small></div>
+        <label class="switch"><input type="checkbox" id="swAlerts"><span class="slider"></span></label>
+      </div>
+    </div>
+    <div class="grid2">
+      <div class="card">
+        <h3>🛡️ متغيرات البيئة (حماية كاملة للأسرار)</h3>
+        <div id="envGroups"></div>
+      </div>
+      <div class="card">
+        <h3>⚠️ الأخطاء التفصيلية</h3>
+        <div id="opsErrors"></div>
+      </div>
+    </div>
+    <div class="card">
+      <h3>📋 سجل العمليات الإدارية (Audit Log)</h3>
+      <div class="tablewrap"><table id="auditTable" class="table"></table></div>
+      <div class="pagination">
+        <button id="audPrev" class="btn sm">السابق</button>
+        <span id="audPageInfo" style="color:var(--muted);font-size:12px"></span>
+        <button id="audNext" class="btn sm">التالي</button>
+      </div>
+    </div>
+    <div class="card">
+      <h3>💾 النسخ الاحتياطي وإعادة التشغيل</h3>
+      <div class="toolbar">
+        <button id="backupBtn" class="btn sm">تنزيل نسخة احتياطية (JSON)</button>
+        <button id="restartBtn" class="btn danger sm">إعادة تشغيل آمنة</button>
+        <span id="memInfo" style="color:var(--muted);font-size:12px"></span>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<footer class="copyright">Telegram BR7 · Lightweight Dashboard v15.1.0 · فصل كامل عن مسار استقبال الرسائل</footer>
+
+<div id="toast" class="toast hidden" role="status"></div>
+
+<div id="modal" class="modal hidden">
+  <div class="modal-card">
+    <div id="modalBody" class="msg"></div>
+    <div class="modal-actions">
+      <button id="modalOk" class="btn danger">تأكيد</button>
+      <button id="modalCancel" class="btn ghost">إلغاء</button>
+    </div>
+  </div>
+</div>
+
+<script src="/admin/assets/app.js"></script>
+</body>
+</html>

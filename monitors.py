@@ -181,6 +181,9 @@ from dedup import content_fingerprint, get_deduplicator, normalize_for_fingerpri
 from similarity import get_similarity_gate
 from antispam import get_antispam
 from unified_alerts import get_alert_gate, validate_and_repair_card
+# v15.1.0: مفاتيح التشغيل الجارية للوحة (فحص ذاكرة صفرية التكلفة في المسار
+# الحرج — dashboard.state بلا aiohttp/telethon/DB فاستيراده خفيف دائماً)
+from dashboard.state import DASH as _DASH
 from sender_resolver import (
     extract_flat as _sender_extract_flat,
     extract_sender as _sender_extract,
@@ -2141,6 +2144,14 @@ class EnhancedAccountMonitor:
         return msg_hash, validated_text, is_new
 
     async def _analyze_and_alert(self, data: Dict[str, Any], msg_hash: str, validated_text: Optional[str]):
+        # ══ v15.1.0: إيقاف الفلترة مؤقتاً (من لوحة التحكم) ══
+        # فحص ذاكرة خالص (bool) — الرسالة ما تزال تُلتقط وتُحفظ في messages
+        # لكن لا تُحلل ولا تُحسم ولا تُنبه حتى إعادة التفعيل. يُحفظ المفتاح
+        # في app_settings فيبقى بعد إعادة التشغيل (إيقاف صريح لا يُنسى).
+        if _DASH.ops.filtering_paused:
+            self._stats["ops_paused_filter_msgs"] = self._stats.get("ops_paused_filter_msgs", 0) + 1
+            _DASH.ops.bump("paused_filter_msgs")
+            return
         sender_id = data.get("sender_id", 0); has_media = bool(data.get("media_object"))
         start_time = time.perf_counter()
         # ══ v14.7.0: لقطة الذكاء على الخلفية ══
@@ -2655,6 +2666,14 @@ class EnhancedAccountMonitor:
         swallowed and the ladder falls through.
         """
         if not self._bot_ref:
+            return False
+        # ══ v15.1.0: إيقاف إرسال التنبيهات مؤقتاً (من لوحة التحكم) ══
+        # الفلترة والتقاط مستمران — فقط التسليم للقناة الهدف يتوقف. الفحص
+        # قبل طلب العملاء وقبل claim الـdedup حتى لا تُستهلك بصمة تنبيه
+        # لن يُرسل فعلياً (لا خسارة تنبيهات بعد إعادة التفعيل لهذا الحدث).
+        if _DASH.ops.alerts_paused:
+            self._stats["ops_paused_alert_msgs"] = self._stats.get("ops_paused_alert_msgs", 0) + 1
+            _DASH.ops.bump("paused_alert_msgs")
             return False
         try:
             _send_gate_dec = get_alert_gate().evaluate_event(data, stage="send")
