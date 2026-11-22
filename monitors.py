@@ -1,6 +1,21 @@
 #!/usr/bin/env python3
 """
-monitors.py – Account Monitor v14.5.2 (v9.10.0 LINE, aligned to the v14.5.2 stack)
+monitors.py – Account Monitor v15.0.0 (v9.10.0 LINE, aligned to the v15.0 stack)
+
+v15.0.0 — Instant Capture (طلب المالك: «الالتقاط حتى من البوتات + استقبال فوري»):
+  * CAPTURE_FROM_BOTS=true (افتراضي): رسائل البوتات الأخرى تُلتقط الآن
+    مثل أي مرسل. الحارس القديم `sender.bot → return` أُزيل من المعالج
+    واستُبدل ببوابة event_sender_gate(): هوية ذاتية → تخطٍّ (حاجز
+    الصدى الذاتي)، بوت خارجي → التقاط. الحارس الثاني باقٍ في
+    _validate_event (echo guard البطاقات + is_self_sender + activity).
+  * التقاط input_sender في المسار الحرج صار خلفياً (spawn_bg) — كان
+    await بسقف 0.5s يعطّل استقبال أحداث الحسابات الأخرى على الكيانات
+    الباردة. سلّم الذكر عند الإرسال يملك بدائل جاهزة — صفر فقدان وظيفة.
+  * _event_to_dict: input_sender من الكاش حصراً (خاصية بلا شبكة)،
+    والجلب البارد للمرسل + input بالتوازي (asyncio.gather) بسقوفين
+    قابلين للضبط CAPTURE_SENDER_TIMEOUT_S=0.4 / CAPTURE_INPUT_TIMEOUT_S=0.25.
+    أسوأ حالة 0.4s بدل 0.95s+0.5s متتالية سابقاً — والحالة المخزنة
+    (الغالبية) صفر انتظار شبكي.
 
 v14.5.2 (طلب المستخدم — توسيع وسائل الوصول للمرسل):
   * _send_alert() now passes TWO new optional parameters to
@@ -215,6 +230,30 @@ def is_self_sender(sender_id) -> bool:
         return int(sender_id or 0) in _SELF_SENDER_IDS
     except Exception:
         return False
+
+
+def event_sender_gate(sender_id, sender=None) -> bool:
+    """v15.0 — بوابة هوية المرسل في معالج الأحداث (قابلة للاختبار الوحدوي).
+
+    يعيد True عند «تخطي» الحدث، False عند «الالتقاط»:
+      * هوية ذاتية (بوت التنبيهات/حسابات المراقبة المسجلة) → تخطٍّ
+        (حاجز حلقة الصدى الذاتي — v11.5.2).
+      * رسائل البوتات الأخرى → **التقاط** (طلب المالك v15.0 — كانت تُهمل
+        كلياً قبلاً). التبديل اليدوي CAPTURE_FROM_BOTS=false يستعيد
+        السلوك القديم داخل هذه الدالة أيضاً.
+      * المرسلون الآخرون (مستخدمون/قنوات مجهولة) → التقاط.
+    بلا I/O وبلا استثناءات — فشل-آمن دائماً نحو الالتقاط.
+    """
+    try:
+        sid = int(sender_id or 0)
+    except Exception:
+        sid = 0
+    if sid and is_self_sender(sid):
+        return True
+    if not bool(getattr(CFG, "CAPTURE_FROM_BOTS", True)):
+        if sender is not None and bool(getattr(sender, "bot", False)):
+            return True
+    return False
 
 
 _ALERT_CARD_HEADER = "المرسل:"
@@ -1311,7 +1350,18 @@ class EnhancedAccountMonitor:
             try:
                 if event.out: return
                 if event.chat_id == CFG.ADMIN_CHAT_ID: return
-                if event.sender and getattr(event.sender, "bot", False): return
+                # ══ v15.0 (طلب المالك — «الالتقاط حتى من البوتات») ══
+                # الحارس القديم كان يهمل كل رسائل البوتات كلياً. الآن:
+                # البوتات تُلتقط مثل أي مرسل، وحماية حلقة الصدى الذاتية
+                # عبر is_self_sender (بوت التنبيهات + حسابات المراقبة
+                # المسجلة عند الاتصال) قبل أي عدّ أو التقاط — والحارس
+                # الثاني باقٍ في _validate_event (echo guard البطاقات).
+                if event_sender_gate(getattr(event, "sender_id", 0), event.sender):
+                    return
+                if not bool(getattr(CFG, "CAPTURE_FROM_BOTS", True)):
+                    # بديل التبديل اليدوي: استعادة سلوك التجاهل القديم
+                    # بلا نشر جديد (CAPTURE_FROM_BOTS=false).
+                    if event.sender and getattr(event.sender, "bot", False): return
                 msg_date = event.message.date
                 if msg_date and self.started_at > 0:
                     if msg_date.timestamp() < self.started_at - 5: return
@@ -1362,15 +1412,17 @@ class EnhancedAccountMonitor:
                     try:
                         _fid = getattr(event.message, "from_id", None)
                         if isinstance(_fid, (InputPeerUser, InputPeerUserFromMessage)):
-                            _ins = await asyncio.wait_for(event.get_input_sender(), timeout=0.5)
-                            if _ins is not None:
-                                _recent_input_senders[(event.chat_id, event.message.id)] = {
-                                    "account": self.account["name"],
-                                    "input_sender": _ins,
-                                    "ts": time.time(),
-                                }
-                                while len(_recent_input_senders) > _RECENT_INPUT_SENDERS_MAX:
-                                    _recent_input_senders.popitem(last=False)
+                            # ══ v15.0: التقاط input_sender خلفياً — صفر انتظار
+                            # في المسار الحرج للالتقاط. كان await بسقف 0.5s
+                            # على كيان بارد يؤخر دخول الرسالة للطابور ويعطّل
+                            # استقبال أحداث الحسابات الأخرى. سلّم الذكر عند
+                            # الإرسال يملك بدائل جاهزة إذا لم يصل الالتقاط
+                            # الخلفي بعد (InputUserFromMessage/own_view/
+                            # hash-store) — فلا فقدان وظيفة إطلاقاً.
+                            spawn_bg(
+                                self._capture_recent_input_sender(event),
+                                name=f"input_sender_cap_{self.account['name']}_{getattr(event.message, 'id', 0)}",
+                            )
                     except Exception as ins_err:
                         logger.debug(f"input_sender capture [{self.account['name']}]: {type(ins_err).__name__}")
                 event_data = await self._event_to_dict(event)
@@ -1470,23 +1522,76 @@ class EnhancedAccountMonitor:
         if exc is not None:
             logger.error(f"Unhandled media task exception [{self.account['name']}]: {exc}")
 
-    async def _event_to_dict(self, event: events.NewMessage.Event) -> Dict[str, Any]:
-        # v14.7.0: مهلتي جلب المرسل 1.2s/0.75s → 0.6s/0.35s — الجلب البارد
-        # كان يضاف كاملاً إلى receive_lag داخل معالج الأحداث (ويعطل استقبال
-        # أحداث الحسابات الأخرى). عند انتهاء المهلة يضبط الإثراء اللاحق
-        # (_enrich_sender_via_resolver + DB) الهوية في مسار العامل بدلاً
-        # من المسار الحرج للالتقاط — بلا فقدان هوية.
-        sender = event.sender
-        if sender is None and bool(getattr(event, "sender_id", None)):
-            try:
-                sender = await asyncio.wait_for(event.get_sender(), timeout=0.6)
-            except Exception:
-                sender = event.sender
-        _inp = None
+    async def _capture_recent_input_sender(self, event: events.NewMessage.Event) -> None:
+        """v15.0: التقاط input_sender خلفياً إلى _recent_input_senders.
+
+        يعمل خارج المسار الحرج (spawn_bg) — يغذي سلّم بناء mention عند
+        الإرسال. أي فشل صامت: السلّم عند الإرسال يملك بدائل جاهزة
+        (InputUserFromMessage / own_view_from_message / account_hash_store)."""
         try:
-            _inp = await asyncio.wait_for(event.get_input_sender(), timeout=0.35)
+            _ins = await asyncio.wait_for(
+                event.get_input_sender(),
+                timeout=max(0.05, float(getattr(CFG, "CAPTURE_INPUT_TIMEOUT_S", 0.25) or 0.25)),
+            )
+            if _ins is None:
+                return
+            _recent_input_senders[(event.chat_id, event.message.id)] = {
+                "account": self.account["name"],
+                "input_sender": _ins,
+                "ts": time.time(),
+            }
+            while len(_recent_input_senders) > _RECENT_INPUT_SENDERS_MAX:
+                _recent_input_senders.popitem(last=False)
+        except asyncio.CancelledError:
+            raise
         except Exception:
-            _inp = None
+            pass
+
+    async def _event_to_dict(self, event: events.NewMessage.Event) -> Dict[str, Any]:
+        # ══ v15.0: مسار التقاط فوري ══
+        # * input_sender من الكاش حصراً (خاصية بلا شبكة) بدل await دائم.
+        # * الجلب البارد (مرسل غير مخزن) يجري **بالتوازي** وبسقوفين قصيرين
+        #   قابلين للضبط (CAPTURE_SENDER_TIMEOUT_S/CAPTURE_INPUT_TIMEOUT_S):
+        #   أسوأ حالة ≈ 0.4s بدل 0.95s+0.5s المتتالية سابقاً.
+        # * الحالة المخزنة (الغالبية الساحقة): صفر انتظار شبكي.
+        # * المرسل البارد الذي لم يصل في السقف: الإثراء اللاحق
+        #   (_enrich_sender_via_resolver + DB) يكمل الهوية في مسار العامل
+        #   — بلا فقدان هوية (عقد v14.7.0 باقٍ كما هو).
+        sender = event.sender
+        _inp = getattr(event, "input_sender", None)
+        if sender is None and bool(getattr(event, "sender_id", None)):
+            _t_send = max(0.05, float(getattr(CFG, "CAPTURE_SENDER_TIMEOUT_S", 0.4) or 0.4))
+            _t_inp = max(0.05, float(getattr(CFG, "CAPTURE_INPUT_TIMEOUT_S", 0.25) or 0.25))
+
+            async def _f_sender() -> Any:
+                try:
+                    return await asyncio.wait_for(event.get_sender(), timeout=_t_send)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    return None
+
+            async def _f_input() -> Any:
+                try:
+                    return await asyncio.wait_for(event.get_input_sender(), timeout=_t_inp)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    return None
+
+            try:
+                _s2, _i2 = await asyncio.gather(_f_sender(), _f_input())
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                _s2, _i2 = None, None
+            if _s2 is not None:
+                sender = _s2
+            if _inp is None and _i2 is not None:
+                _inp = _i2
+            if sender is None:
+                # ربما وصل من الكاش أثناء الجلب البارد
+                sender = event.sender
         _inp_hash: Optional[int] = None
         if isinstance(_inp, InputPeerUser):
             _ih = getattr(_inp, "access_hash", None)

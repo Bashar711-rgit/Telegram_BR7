@@ -1,6 +1,16 @@
 #!/usr/bin/env python3
 """
-alert_bot.py - v14.9.3 Alert Bot - نظام مراسلة المرسل + واجهة التنبيهات الموحدة.
+alert_bot.py - v15.0.0 Alert Bot - نظام مراسلة المرسل + واجهة التنبيهات الموحدة.
+
+v15.0.0 — الأزرار فعّالة لكل تنبيه (طلب المالك):
+  * فحص عضوية استباقي قبل الإرسال (_pre_send_membership_check, TTL-driven
+    عبر ALERT_BOT_MEMBERSHIP_TTL_S=300) — فقدان عضوية البوت في قناة
+    الهدف يُكتشف **قبل** أول تنبيه بلا أزرار لا بعده.
+  * إصلاح فوري (حدثي): اكتشاف فقدان العضوية (استباقياً أو عبر 403)
+    يستدعي on_membership_lost → main يطلق heal حالاً بدل انتظار دورة
+    الـwatchdog (60s) — مع احترام cooldown نفسه.
+  * مقياس t5_buttons_delivered: يثبت في /health أن أزرار التنبيه
+    تنجح حتى عبر مسار MTProto الاحتياطي للبوت.
 
 v14.9.3 — الصيغة المرجعية الموحدة (طلب المالك 21-11: «كامل التنبيهات بهذا
 الشكل ودون تكرار او اعاده تحويل او اعاده توجيه»):
@@ -150,9 +160,13 @@ from typing import Any, Dict, List, Optional, Tuple
 import aiohttp
 from loguru import logger
 
-from config import InputSanitizer
+# v15.0: CFG لقراءة سقف TTL الفحص الاستباقي للعضوية
+# (ALERT_BOT_MEMBERSHIP_TTL_S) — كان الملف بلا وصول للإعدادات إطلاقاً.
+from config import CFG, InputSanitizer  # noqa: E402
 # v12.0 unified_alerts: عقد سلامة البطاقة — فحص/إصلاح قبل كل إرسال Bot API
 from unified_alerts.card import validate_and_repair_card  # noqa: E402
+# v15.0: spawn_bg للإصلاح الحدوي الفوري عند فقدان عضوية البوت.
+from task_util import spawn_bg  # noqa: E402
 # v11.2: نظام مراسلة المرسل — المصدر الوحيد لاختيار رابط المرسل (spec #8).
 # لا يُبنى رابط مرسل يدوياً في هذا الملف ولا في أي ملف آخر — ContactTarget
 # يقرر (username ← user_id ← لا شيء) ويستخدم الاسم والزر نفس selected_url.
@@ -802,6 +816,11 @@ class AlertBot:
         # إشارة طلب إصلاح ذاتي — يرفعها send() عند 403 not-member ويلتقطها
         # حلقة المراقبة في main (alertbot_membership watchdog).
         self._heal_requested: bool = False
+        # ══ v15.0: استباقية الأزرار لكل تنبيه ══
+        # callback اختياري يمثله main — يُستدعى فور اكتشاف فقدان عضوية
+        # البوت (فحص استباقي قبل الإرسال أو 403 أثناء الإرسال) لإطلاق
+        # الإصلاح الذاتي **حالياً** بدل انتظار دورة المراقبة (60s).
+        self.on_membership_lost: Optional[Any] = None
 
     async def _get_session(self) -> Any:
         """جلسة مشتركة معاد استخدامها (F-24) — يُعاد إنشاؤها إن أُغلقت.
@@ -846,6 +865,66 @@ class AlertBot:
         self.membership_status = str(status or "")[:40]
         self.membership_error = str(error or "")[:160]
         self._membership_last_check_ts = time.time()
+
+    # ── v15.0: استباقية العضوية (أزرار فعّالة لكل تنبيه) ──
+    def _notify_membership_lost(self) -> None:
+        """إطلاق الإصلاح الفوري (حدثي) عند فقدان العضوية — بلا انتظار
+        دورة الـwatchdog. يشغّل callback الخاص بـmain إن وُجد، ويترك
+        _heal_requested=True كضمانة إضافية للـwatchdog.
+        بلا استثناءات — فشل الـcallback لا يؤثر على الإرسال."""
+        self._heal_requested = True
+        _contact_metric("membership_precheck_heal")
+        cb = self.on_membership_lost
+        if cb is None:
+            return
+        try:
+            result = cb()
+            if asyncio.iscoroutine(result):
+                spawn_bg(result, name="alertbot_heal_membership_lost")
+        except Exception as e:
+            logger.debug(
+                f"[ALERT] membership_lost callback error: {type(e).__name__}"
+            )
+
+    async def _pre_send_membership_check(self) -> None:
+        """فحص عضوية استباقي قبل الإرسال (TTL-driven) — للحالة المعروفة بفقدها.
+
+        v15.0 — طلب المالك «الأزرار فعّالة لكل تنبيه»: كان فقدان العضوية
+        يُكتشف فقط بعد فشل أول تنبيه (403) — الآن عندما تكون الحالة
+        membership_ok=False (غير عضو — مُثبت من فحص سابق) وانتهى TTL
+        الفحص (ALERT_BOT_MEMBERSHIP_TTL_S، افتراضي 300s) يُعاد الفحص
+        قبل الإرسال مباشرة: قد يكون البوت أُعيد يدوياً للقناة — يُصبح
+        Bot API متاحاً بالأزرار من أول تنبيه، وإذا ما زال مفقوداً يُطلق
+        الإصلاح الفوري قبل الإرسال لا بعده.
+
+        الحالة None (غير مُفحوصة) تبقى مسؤولية فحص الإقلاع
+        (check_membership في _alert_bot_boot_check) — والفشل السريع 403
+        أثناء الإرسال يطلق الإصلاح الفوري (_notify_membership_lost)
+        فتُغطى دورة كاملة بلا فحص زائد في المسار الساخن.
+        فحص HTTP واحد فقط عند انتهاء TTL — فشل-آمن تماماً."""
+        try:
+            if self.membership_ok is not False:
+                # True → الأزرار تعمل | None → غير مُفحوص (فحص الإقلاع يملكه،
+                # و403 أثناء الإرسال يطلق الإصلاح الفوري فوراً).
+                return
+            ttl = max(30, int(getattr(CFG, "ALERT_BOT_MEMBERSHIP_TTL_S", 300) or 300))
+            if (time.time() - self._membership_last_check_ts) < ttl:
+                return
+            _contact_metric("membership_precheck_run")
+            await self.check_membership()
+            if self.membership_ok is False:
+                logger.warning(
+                    "[ALERT] membership PRE-SEND check: bot NOT member — "
+                    "triggering instant heal before send "
+                    "(v15.0 proactive buttons guarantee)"
+                )
+                self._notify_membership_lost()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.debug(
+                f"[ALERT] pre-send membership check skipped: {type(e).__name__}"
+            )
 
     def status_snapshot(self) -> Dict[str, Any]:
         """لقطة حالة أزرار التنبيهات (عضوية البوت) — تُعرض في /health/full.
@@ -1077,6 +1156,11 @@ class AlertBot:
         # leaves None (reply-fix runs unthreaded — reply_fix.py handles
         # None safely) and a Bot API delivery sets its own id below.
         self.last_alert_message_id = None
+        # ══ v15.0: فحص عضوية استباقي قبل الإرسال ══
+        # (طلب المالك: الأزرار فعّالة لكل تنبيه) — يكتشف فقدان العضوية
+        # قبل أول تنبيه فاشل، ويطلق الإصلاح الفوري حالاً. TTL-driven:
+        # بلا طلبات زائدة، وفشل-آمن تماماً (لا يؤخر ولا يمنع الإرسال).
+        await self._pre_send_membership_check()
         try:
             built = build_alert_html(
                 data, analysis,
@@ -1303,7 +1387,8 @@ class AlertBot:
             # ذاتياً من حلقة المراقبة في main.
             if "not a member" in desc.lower():
                 self._note_membership(False, "", self.last_error)
-                self._heal_requested = True
+                # ══ v15.0: إصلاح فوري (حدثي) — بلا انتظار دورة الـwatchdog ══
+                self._notify_membership_lost()
             # ── v11.0: طبقة الإرسال الاحتياطية بالأزرار — عميل البوت الحي
             # (Telethon) بنفس النص والأزرار قبل الاستسلام لحسابات المستخدمين.
             if self._client is not None:
@@ -1347,6 +1432,9 @@ class AlertBot:
                         formatting_entities=_pack.get("formatting_entities"),
                         heal_pack=_heal_pack,
                     ):
+                        # ══ v15.0: عدّاد إثبات — تنبيه عبر مسار MTProto الاحتياطي
+                        # للبوت مع أزرار فعلية (الأزرار محفوظة حتى عند فشل Bot API). ══
+                        _contact_metric("t5_buttons_delivered")
                         method = "text_only" if (sender_dropped or buttons_dropped) else base_method
                         _contact_metric(
                             "contact_button_success" if method in ("username", "mention_button")
