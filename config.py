@@ -934,9 +934,9 @@ class Config:
             # يُهجر فقط إن تجاوز انتظاره هذا السقف (افتراضي 600s).
             MAX_QUEUE_WAIT_SECONDS=SecretManager.get_int("MAX_QUEUE_WAIT_SECONDS", 600, required=False),
             # ══ v15.6.0: البوابة السرعة + السقف التكيفي ══
-            FAST_GATE_ENABLED=SecretManager.get_bool("FAST_GATE_ENABLED", True, required=False),
-            FAST_GATE_RESCUE_FUZZY=SecretManager.get_bool("FAST_GATE_RESCUE_FUZZY", True, required=False),
-            ADAPTIVE_QUEUE_WAIT_ENABLED=SecretManager.get_bool("ADAPTIVE_QUEUE_WAIT_ENABLED", True, required=False),
+            FAST_GATE_ENABLED=SecretManager.get_bool("FAST_GATE_ENABLED", True),
+            FAST_GATE_RESCUE_FUZZY=SecretManager.get_bool("FAST_GATE_RESCUE_FUZZY", True),
+            ADAPTIVE_QUEUE_WAIT_ENABLED=SecretManager.get_bool("ADAPTIVE_QUEUE_WAIT_ENABLED", True),
             ADAPTIVE_QUEUE_WAIT_MULTIPLIER=SecretManager.get_int("ADAPTIVE_QUEUE_WAIT_MULTIPLIER", 3, required=False),
             ADAPTIVE_QUEUE_WAIT_MAX_SECONDS=SecretManager.get_int("ADAPTIVE_QUEUE_WAIT_MAX_SECONDS", 1800, required=False),
             # ========== الفترات ==========

@@ -155,6 +155,7 @@ from config import (
 from database import EnhancedDatabase
 from dedup import get_dedup_snapshot, init_deduplicator
 from unified_alerts import run_startup_maintenance, unified_snapshot  # v12.0 unified_alerts
+from unified_alerts.gate import get_alert_gate  # v15.6.0: السقف التكيفي لانتظار الطابور
 from unified_alerts.activity import ActivityWatchdog  # v14.6.0 Activity Maintenance System
 from antispam import get_antispam, setup_antispam, get_antispam_snapshot
 from filter_engine import EnhancedFilter
@@ -479,6 +480,15 @@ class MemoryMonitor:
         return self._current_rss()
 
 
+# ══ v15.6.0: لقطة البوابة السرعة الآمنة لـ/health/full ══
+def _fast_gate_health_snapshot() -> Dict[str, Any]:
+    try:
+        from fast_gate import health_snapshot
+        return health_snapshot()
+    except Exception:
+        return {"enabled": False, "engine": "snapshot_error"}
+
+
 # =============================================================================
 # Main Bot Class v14.5.1 (hardened)
 # =============================================================================
@@ -490,6 +500,15 @@ class EnhancedTelegramBot:
     def __init__(self) -> None:
         self.db = EnhancedDatabase()
         self.filter = EnhancedFilter()
+        # ══ v15.6.0: البوابة السرعة — رفض فوري مكافئ لـno_keyword ══
+        # بناء الأتمتة من حالة المحرك الحية (مصادر القبول + متغيرات
+        # fuzzy). فشل البناء = بوابة معطلة = كل شيء يتحلل كاملاً كما
+        # v15.5.0 — صفر مخاطر سلوكية.
+        try:
+            from fast_gate import ensure_fast_gate
+            ensure_fast_gate(self.filter)
+        except Exception as _fg_err:
+            logger.warning(f"FastGate init skipped (fail-open): {type(_fg_err).__name__}: {_fg_err}")
         # v15.4.0: دفعة ابتدائية ALERT_BURST_SIZE توكن (افتراضي 20) — انفجار
         # الرسائل المتزامن يُرسل فوراً بدل تقطير 1/ثانية من البداية.
         self.rate_limiter = AdaptiveRateLimiter(
@@ -858,6 +877,45 @@ class EnhancedTelegramBot:
                             )
                         except Exception:
                             pass
+
+                # ══ v15.6.0: السقف التكيفي لانتظار الطابور ══
+                # تحت الضغط: الأحداث الطازجة التي تجاوزت MAX_QUEUE_WAIT_SECONDS
+                # تُسلّم متأخرة بدل إسقاطها (متأخر دقائق أفضل من أبدًا —
+                # فلسفة المالك). ثلاثة مستويات مع نطاق فتورة (hysteresis):
+                #   drain_mode / ≥ fuzzy_at  → السقف × المضاعف (حتى 1800s)
+                #   ≥ 50% من صمام القبول      → السقف × 2
+                #   ≤ 35% من صمام القبول      → عودة للسقف القياسي (CFG)
+                try:
+                    if bool(getattr(CFG, "ADAPTIVE_QUEUE_WAIT_ENABLED", True)):
+                        _gate_obj = get_alert_gate()
+                        _base_wait = int(getattr(CFG, "MAX_QUEUE_WAIT_SECONDS", 600) or 600)
+                        _w_mult = max(1, int(getattr(CFG, "ADAPTIVE_QUEUE_WAIT_MULTIPLIER", 3)))
+                        _w_max = int(getattr(CFG, "ADAPTIVE_QUEUE_WAIT_MAX_SECONDS", 1800) or 1800)
+                        _adm_v = _adm if _adm > 0 else 400
+                        if self.drain_mode or depth >= fuzzy_at:
+                            _want_ceil: Optional[int] = min(
+                                _w_max, max(_base_wait, _base_wait * _w_mult)
+                            )
+                        elif depth >= int(_adm_v * 0.5):
+                            _want_ceil = min(_w_max, max(_base_wait, _base_wait * 2))
+                        elif depth <= int(_adm_v * 0.35):
+                            _want_ceil = None
+                        else:
+                            _want_ceil = _gate_obj._adaptive_wait_ceiling  # نطاق الفتورة
+                        _cur_ceil = _gate_obj._adaptive_wait_ceiling
+                        if _want_ceil != _cur_ceil:
+                            _gate_obj.set_adaptive_wait_ceiling(_want_ceil)
+                            logger.warning(
+                                f"⏱️ ADAPTIVE QUEUE-WAIT CEILING → "
+                                f"{_want_ceil if _want_ceil else f'default({_base_wait}s)'}"
+                                f" | queue={depth} | admission={_adm_v}"
+                            )
+                    else:
+                        _gate_obj = get_alert_gate()
+                        if _gate_obj._adaptive_wait_ceiling is not None:
+                            _gate_obj.set_adaptive_wait_ceiling(None)
+                except Exception as _aqw_err:
+                    logger.debug(f"adaptive ceiling skipped (fail-safe): {type(_aqw_err).__name__}")
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -1178,6 +1236,13 @@ class EnhancedTelegramBot:
                 "admission_max": int(getattr(CFG, "QUEUE_ADMISSION_MAX", 400) or 0),
                 "fresh_priority": int(getattr(CFG, "QUEUE_FRESH_PRIORITY", 8) or 5),
             },
+            # ══ v15.6.0: البوابة السرعة + التقاط البوتات ══
+            "fast_gate": _fast_gate_health_snapshot(),
+            "capture_from_bots": bool(getattr(CFG, "CAPTURE_FROM_BOTS", True)),
+            "bot_messages_captured": sum(
+                int(getattr(m, "_stats", {}).get("bot_messages_captured", 0) or 0)
+                for m in getattr(self, "monitors", [])
+            ),
             "antispam": get_antispam_snapshot(),
             # ══ v14.9.1: حالة أزرار التنبيهات (عضوية بوت التنبيهات) ══
             "alert_bot": (

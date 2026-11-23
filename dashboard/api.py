@@ -793,6 +793,14 @@ class DashboardAPI:
         reload = getattr(self.bot.filter, "reload_keywords", None)
         if reload is not None:
             await reload(str(KW_FILE))
+            # ══ v15.6.0: إعادة بناء البوابة السرعة من القوائم الجديدة ══
+            try:
+                from fast_gate import get_fast_gate as _fgg
+                _fg = _fgg()
+                if _fg is not None:
+                    _fg.schedule_rebuild()
+            except Exception:
+                pass
 
     async def keywords_export(self) -> Dict[str, Any]:
         from config import KEYWORDS
@@ -1476,6 +1484,14 @@ async def hydrate_dashboard(bot: Any) -> None:
                 reload = getattr(getattr(bot, "filter", None), "reload_keywords", None)
                 if reload is not None:
                     await reload(str(KW_FILE))
+                    # ══ v15.6.0: إعادة بناء البوابة السرعة بعد الاسترداد ══
+                    try:
+                        from fast_gate import get_fast_gate as _fgg
+                        _fg = _fgg()
+                        if _fg is not None:
+                            _fg.schedule_rebuild()
+                    except Exception:
+                        pass
                 from loguru import logger
                 logger.info("dashboard: custom keywords restored from app_settings")
     except Exception as e:
