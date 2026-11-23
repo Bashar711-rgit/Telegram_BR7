@@ -1426,6 +1426,65 @@ class DashboardAPI:
         return {"ok": True,
                 "note": "تم بدء الإيقاف الرشيق — ستعود اللوحة خلال دقيقة تقريباً"}
 
+    # ═══════════════════════════════════════════════════════════════════
+    # v15.7.1: عمليات الطابور والذاكرة — تنفيذ حقيقي على نواة البوت عبر
+    # الجسر (المصادقة + CSRF + Rate-Limit يغطيان المسارين تلقائياً)
+    # ═══════════════════════════════════════════════════════════════════
+    async def ops_purge_queue(self) -> Dict[str, Any]:
+        """حذف الطابور يدوياً — إسقاط صريح للتراكم المعلق (عملية حساسة)."""
+        before = 0
+        try:
+            before = int(await self.db.queue_size())
+        except Exception:
+            before = 0
+        fn = getattr(self.bot, "purge_all_queues", None)
+        if fn is None:
+            raise DashboardHTTPError(503, {"error": "purge_unavailable"})
+        res = await fn()
+        after = 0
+        try:
+            after = int(await self.db.queue_size())
+        except Exception:
+            after = 0
+        detail = (f"before={before},db={res.get('db_purged', 0)},"
+                  f"mem={res.get('memory_drained', 0)},after={after}")
+        await _audit(self.db, "dashboard.purge_queue", "queue", "",
+                     new_value=detail)
+        return {
+            "ok": True,
+            "before": before,
+            "db_purged": int(res.get("db_purged", 0)),
+            "memory_drained": int(res.get("memory_drained", 0)),
+            "total": int(res.get("total", 0)),
+            "after": after,
+            "note": ("تم حذف جميع الأحداث المعلقة من الطابور نهائياً — "
+                     "الأحداث الجديدة تُعالج طبيعياً"),
+        }
+
+    async def ops_memory_cleanup(self) -> Dict[str, Any]:
+        """تنظيف الذاكرة يدوياً — مسح الكاشات + gc بلا إغلاق DB (آمن أثناء التشغيل)."""
+        fn = getattr(self.bot, "manual_memory_cleanup", None)
+        if fn is None:
+            raise DashboardHTTPError(503, {"error": "cleanup_unavailable"})
+        res = await fn()
+        try:
+            detail = (f"rss={res.get('rss_before_mb')}->{res.get('rss_after_mb')}MB,"
+                      f"gc={res.get('gc_objects', 0)}")
+        except Exception:
+            detail = "ok"
+        await _audit(self.db, "dashboard.memory_cleanup", "process", "",
+                     new_value=detail)
+        return {
+            "ok": True,
+            "rss_before_mb": res.get("rss_before_mb"),
+            "rss_after_mb": res.get("rss_after_mb"),
+            "freed_mb": res.get("freed_mb"),
+            "gc_objects": res.get("gc_objects"),
+            "manual_cleanups": res.get("manual_cleanups"),
+            "note": ("تم مسح الكاشات (الكيانات/الفلترة/قاعدة البيانات) وتشغيل "
+                     "جامع النفايات — لم يُقاطع أي تشغيل"),
+        }
+
     async def ops_status(self) -> Dict[str, Any]:
         """حالة مفاتيح التشغيل + حارس الذاكرة (يُستدعى من خيط الصحة مباشرة)."""
         out: Dict[str, Any] = {

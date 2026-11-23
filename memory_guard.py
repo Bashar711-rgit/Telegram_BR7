@@ -73,6 +73,11 @@ _RESET_LOCK = asyncio.Lock()
 # مرجع المهمة المحفوظ (منع GC + نقطة الإلغاء النظيف)
 _guard_task: Optional[asyncio.Task] = None
 _guard_started_at: float = 0.0
+# ═══ v15.7.1: نسخة الحارس الحية — للتنظيف اليدوي من لوحة التحكم ═══
+# تُخزَّن عند start_memory_guard وتُصفَّر عند stop_memory_guard. إن لم
+# يبدأ الحارس أصلاً (psutil مفقود) فالتنظيف اليدوي يبني نسخة مؤقتة
+# خفيفة بدلها — لا حلقة مراقبة، لا مؤقتات.
+_guard_instance: Optional["MemoryGuard"] = None
 
 # ═══ v14.5.5-diag: إحصاءات حية للكشف عبر /health/full ═══
 # تُحدَّث في كل دورة فحص وعند كل إجراء — فشل-آمنة تماماً.
@@ -80,6 +85,7 @@ _stats: Dict[str, Any] = {
     "running": False,
     "soft_resets": 0,
     "hard_resets": 0,
+    "manual_cleanups": 0,
     "last_rss_mb": 0.0,
     "last_check_ts": 0.0,
     "last_action": "",
@@ -327,6 +333,59 @@ class MemoryGuard:
         except Exception:
             pass
 
+    # ── v15.7.1: تنظيف يدوي خفيف عند الطلب من لوحة التحكم ──────────────
+    async def manual_cleanup(self) -> Dict[str, Any]:
+        """══ تنظيف ذاكرة يدوي — المسار الخفيف الآمن ══
+
+        يفعل بالضبط ما تفعله خطوة مسح الكاشات في Soft Reset:
+        1) مسح كاشات db القابلة للتنظيف (blocked/features/message_cache...)
+        2) مسح كاش الكيانات في كل مراقب (_entity_cache — أكبر مستهلك
+           بعد Telethon نفسه) تحت قفل المراقب
+        3) مسح كاشات محرك الفلترة (_text_cache/_hash_cache — اللاصقة)
+        4) gc.collect() كامل
+
+        ما لا يفعله عمداً (هذا عمل Soft Reset الثقيل وليس زر لوحة):
+        - إلغاء المهام العابرة (write-behind معلق)
+        - إغلاق/إعادة اتصال DB — لأن الزر يُضغط أثناء التشغيل الطبيعي
+          ويجب ألا يُقاطع الكتابة إطلاقاً.
+
+        محمي بـ _RESET_LOCK حتى لا يتداخل مع Soft Reset حقيقي يجري
+        بالتزامن — لو دخل soft_reset أولاً ينتظر التنظيف اليدوي دوره.
+
+        العائد: إحصاءات صادقة (RSS قبل/بعد، كائنات gc). ملاحظة فنية:
+        المُخصص قد يحتفظ بالصفحات بعد gc — انخفاض RSS الفعلي قد يتأخر
+        أو يكون جزئياً؛ هذا يُعرض للوحة كما هو بلا تضخيم.
+        """
+        async with _RESET_LOCK:
+            rss0 = _rss_mb()
+            self._clear_caches()
+            gc_n = 0
+            try:
+                gc_n = gc.collect()
+            except Exception:
+                pass
+            rss1 = _rss_mb()
+            self._manual_cleanups = getattr(self, "_manual_cleanups", 0) + 1
+            try:
+                _stats["manual_cleanups"] = self._manual_cleanups
+                _stats["last_action"] = "manual_cleanup"
+                _stats["last_action_ts"] = time.time()
+                if rss1 > 0:
+                    _stats["last_rss_mb"] = round(rss1, 1)
+            except Exception:
+                pass
+            logger.info(
+                f"MEMORY MANUAL CLEANUP #{self._manual_cleanups}: "
+                f"rss {rss0:.1f}→{rss1:.1f} MB, gc freed {gc_n} objects"
+            )
+            return {
+                "rss_before_mb": round(rss0, 1),
+                "rss_after_mb": round(rss1, 1),
+                "freed_mb": round(max(0.0, rss0 - rss1), 1),
+                "gc_objects": int(gc_n),
+                "manual_cleanups": self._manual_cleanups,
+            }
+
     # ── Hard Reset (95%) — عملية جديدة عبر إعادة تشغيل Render ──────────
     async def _hard_reset(self, reason: str) -> None:
         self._hard_resets += 1
@@ -389,7 +448,7 @@ async def start_memory_guard(db: Any, monitors_ref: Any = None) -> bool:
     يعيد True إن بدأ فعلاً، False إن كان يعمل أصلاً أو psutil مفقود
     والـRSS غير قابل للقياس إطلاقاً (لا معنى لحارس أعمى).
     """
-    global _guard_task, _guard_started_at
+    global _guard_task, _guard_started_at, _guard_instance
     if _guard_task is not None and not _guard_task.done():
         logger.debug("memory_guard already running — start request ignored")
         return False
@@ -398,6 +457,7 @@ async def start_memory_guard(db: Any, monitors_ref: Any = None) -> bool:
         return False
     _guard_started_at = time.monotonic()
     guard = MemoryGuard(db, monitors_ref)
+    _guard_instance = guard  # v15.7.1: للتنظيف اليدوي من اللوحة
     _guard_task = asyncio.ensure_future(guard.run_loop(), loop=asyncio.get_running_loop())
     _guard_task.set_name("memory_guard")
     _guard_task.add_done_callback(_on_guard_done)
@@ -406,9 +466,10 @@ async def start_memory_guard(db: Any, monitors_ref: Any = None) -> bool:
 
 async def stop_memory_guard() -> None:
     """إلغاء نظيف — يُستدعى من main.stop() قبل db.close()."""
-    global _guard_task
+    global _guard_task, _guard_instance
     task = _guard_task
     _guard_task = None
+    _guard_instance = None  # v15.7.1: نسخة الحارس انتهت مع الحلقة
     if task is None or task.done():
         return
     task.cancel()
@@ -421,3 +482,19 @@ async def stop_memory_guard() -> None:
     except Exception as e:
         logger.debug(f"memory_guard stop: {type(e).__name__}: {e}")
     logger.info("memory_guard stopped")
+
+
+# ═══ v15.7.1: التنظيف اليدوي من لوحة التحكم ═══════════════════════════
+async def manual_cleanup(db: Any = None, monitors_ref: Any = None) -> Dict[str, Any]:
+    """تنظيف يدوي خفيف عند الطلب من اللوحة — المسار الآمن فقط.
+
+    يستخدم نسخة الحارس الحية إن كانت تعمل (نفس الكاشات التي يراها)،
+    وإلا يبني نسخة مؤقتة خفيفة من المراجع المُمرّرة — الحارس قد لا
+    يبدأ أصلاً على بيئة بلا psutil، والتنظيف اليدوي يبقى متاحاً.
+    لا حلقة مراقبة تُنشأ ولا تُلغى هنا إطلاقاً.
+    """
+    g = _guard_instance
+    if g is not None:
+        return await g.manual_cleanup()
+    temp = MemoryGuard(db, monitors_ref)
+    return await temp.manual_cleanup()

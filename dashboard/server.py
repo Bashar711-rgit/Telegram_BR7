@@ -567,6 +567,13 @@ def setup_dashboard(app: web.Application, bot: Any) -> None:
     async def api_ops_restart(request: web.Request) -> web.Response:
         return await bridge(api.request_restart)
 
+    # v15.7.1: عمليات الطابور والذاكرة — نفس الجسر والمصادقة والـCSRF
+    async def api_ops_purge_queue(request: web.Request) -> web.Response:
+        return await bridge(api.ops_purge_queue)
+
+    async def api_ops_memory_cleanup(request: web.Request) -> web.Response:
+        return await bridge(api.ops_memory_cleanup)
+
     async def api_ops_env(request: web.Request) -> web.Response:
         return await bridge(api.ops_env)
 
@@ -802,6 +809,8 @@ def setup_dashboard(app: web.Application, bot: Any) -> None:
     r.add_get("/admin/api/ops", api_ops)
     r.add_post("/admin/api/ops/toggle", api_ops_toggle)
     r.add_post("/admin/api/ops/restart", api_ops_restart)
+    r.add_post("/admin/api/ops/purge_queue", api_ops_purge_queue)
+    r.add_post("/admin/api/ops/memory_cleanup", api_ops_memory_cleanup)
     r.add_get("/admin/api/ops/env", api_ops_env)
     r.add_get("/admin/api/ops/errors", api_ops_errors)
     r.add_get("/admin/api/ops/audit", api_ops_audit)

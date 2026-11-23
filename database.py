@@ -1733,6 +1733,51 @@ class EnhancedDatabase:
             logger.debug(f"recover_stale_inflight failed (fail-safe): {type(e).__name__}: {e}")
         return stats_out
 
+    async def purge_processing_queue(self) -> Dict[str, int]:
+        """══ v15.7.1: حذف الطابور يدوياً من لوحة التحكم ══
+
+        عملية تشغيلية صريحة بطلب من المشرف (زر اللوحة): حذف كل صفوف
+        processing_queue — المعلّقة (pending) والمسحوبة (in_flight) —
+        لإفراغ التراكم فوراً بدل انتظار التفريغ الطبيعي.
+
+        العمد هنا إسقاط at-least-once: الأحداث المحذوفة لن تعاد ولن
+        تستردّها recover_stale_inflight (حُذفت أصلاً). ack لاحق لحدث
+        in_flight محذوف يعيد False ويسجل debug فقط — لا أثر جانبي.
+
+        القفل نفسه (_queue_lock) يحكم النافذة ضد pop_batch/add_to_queue
+        فلا سباق مع المنتجين. المرآة تُصفَّر صراحة (الحذف الكامل يجعل
+        العدّ 0 حتماً). يدعم SQLite وPostgres كما بقية دوال الطابور.
+        """
+        purged = 0
+        try:
+            if self.db_type == "sqlite":
+                async with self._queue_lock:
+                    cursor = await self._sqlite_conn.execute(
+                        "DELETE FROM processing_queue"
+                    )
+                    purged = cursor.rowcount or 0
+                    await self._sqlite_conn.commit()
+                    self._queue_size_mirror = 0
+                    self._queue_mirror_dirty = False
+            else:
+                async with self._pool.acquire() as conn:
+                    status = await conn.execute("DELETE FROM processing_queue")
+                    # asyncpg يعيد سلسلة حالة مثل "DELETE 42" — ليس رقماً
+                    try:
+                        purged = int(str(status).split()[-1])
+                    except (ValueError, IndexError):
+                        purged = 0
+                async with self._queue_lock:
+                    self._queue_size_mirror = 0
+                    self._queue_mirror_dirty = False
+            if purged:
+                logger.warning(f"QUEUE PURGED manually via dashboard: {purged} event(s) dropped")
+        except Exception as e:
+            self._queue_mirror_dirty = True
+            logger.error(f"purge_processing_queue failed: {type(e).__name__}: {e}")
+            raise
+        return {"purged": int(purged)}
+
     async def alert_exists(self, msg_hash: str) -> bool:
         h = str(msg_hash or "")
         try:

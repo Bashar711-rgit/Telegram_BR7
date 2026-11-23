@@ -633,6 +633,9 @@ class EnhancedTelegramBot:
         """
         logger.info("Consumer loop started")
         internal_queue: asyncio.Queue = asyncio.Queue(maxsize=CFG.MESSAGE_QUEUE_SIZE)
+        # v15.7.1: مرجع على self لأجل حذف الطابور من لوحة التحكم — خط
+        # واحد بلا أي تغيير سلوكي على المنتج/المستهلك.
+        self._internal_queue = internal_queue
 
         # v15.5.0: منتج دفعي — pop_batch_from_queue يسحب حتى PRODUCER_POP_BATCH
         # صف في SELECT/UPDATE/COMMIT واحدة (كان صفًّا واحدًا + commit لكل رسالة
@@ -3212,6 +3215,62 @@ class EnhancedTelegramBot:
         except Exception as e:
             logger.error(f"safe_restart scheduling failed: {type(e).__name__}: {e}")
             return False
+
+    # ── v15.7.1: عمليات الطابور والذاكرة عند الطلب من لوحة التحكم ──────
+    async def purge_all_queues(self) -> Dict[str, Any]:
+        """══ حذف الطابور يدوياً (زر اللوحة) — عمليّة صريحة بإسقاط ══
+
+        المسار:
+        1) تفريغ طابور التسليم الداخلي (internal_queue) بأمان — العناصر
+           المسحوبة من DB ولم تُسلَّم للعمال بعد؛ get_nowait متزامن
+           على نفس حلقة البوت (الجسر ينفذ هنا) فلا سباق مع المنتج.
+        2) DELETE كامل لجدول processing_queue عبر purge_processing_queue
+           (تحت _queue_lock — ذرة ضد pop_batch/add_to_queue).
+
+        العناصر القليلة العالقة بين السحبة والوضع قد تُعالج طبيعياً بعد
+        الحذف إن فاتها التفريغ — تقريب مقبول لعملية تشغيلية يدوية،
+        والعدّ المُعاد للوحة صادق في كل الحالات.
+
+        ملاحظة أمان: يُنفَّذ فقط عبر dashboard API (مصادق + CSRF +
+        تدقيق)، ولا يظهر في أي مسار تلقائي.
+        """
+        drained = 0
+        q = getattr(self, "_internal_queue", None)
+        if q is not None:
+            try:
+                while True:
+                    q.get_nowait()
+                    drained += 1
+                    if drained >= 10000:  # حد أمان ضد سباق لا نهائي
+                        break
+            except asyncio.QueueEmpty:
+                pass
+            except Exception as e:
+                logger.debug(f"purge internal_queue partial: {type(e).__name__}: {e}")
+        res = await self.db.purge_processing_queue()
+        total = drained + int(res.get("purged", 0))
+        logger.warning(
+            f"QUEUE PURGE complete: db={res.get('purged', 0)}, "
+            f"in_memory={drained}, total={total}"
+        )
+        return {
+            "db_purged": int(res.get("purged", 0)),
+            "memory_drained": int(drained),
+            "total": int(total),
+        }
+
+    async def manual_memory_cleanup(self) -> Dict[str, Any]:
+        """══ تنظيف الذاكرة يدوياً (زر اللوحة) — المسار الخفيف الآمن ══
+
+        يوكّل لـ memory_guard.manual_cleanup: مسح كاشات db + كاش الكيانات
+        لكل مراقب + كاشات محرك الفلترة + gc.collect — بلا إغلاق DB ولا
+        إلغاء مهام عابرة (هذا عمل Soft Reset الثقيل فقط). يعيد إحصاءات
+        صادقة (RSS قبل/بعد، كائنات gc) تُعرض للوحة كما هي.
+        """
+        from memory_guard import manual_cleanup as _mc
+        res = await _mc(self.db, self.monitors)
+        logger.info(f"Manual memory cleanup via dashboard: {res}")
+        return res
 
     async def _send_startup_message(self) -> None:
         if not self.main_client:

@@ -820,6 +820,50 @@ $("restartBtn").addEventListener("click", async () => {
   else toast(r.data.error || "فشل", true);
 });
 
+/* ── v15.7.1: حذف الطابور + تنظيف الذاكرة ── */
+$("purgeQueueBtn").addEventListener("click", async () => {
+  const go1 = await confirmModal("حذف جميع الأحداث المعلقة في الطابور نهائياً؟ الأحداث المحذوفة لن تُعالج ولن تُسترد. الأحداث الجديدة تُعالج طبيعياً.", "تأكيد");
+  if (!go1) return;
+  const typed = await promptModal("عملية حساسة — اكتب حذف للتأكيد النهائي:", "", "", "تأكيد نهائي");
+  if (typed === null) return;
+  if ((typed || "").trim() !== "حذف") { toast("لم يُكتب تأكيد صحيح — أُلغيت العملية", true); return; }
+  const r = await api("/admin/api/ops/purge_queue", { method: "POST", body: {} });
+  if (r.ok && r.data.ok) {
+    toast(`🗑 حُذف ${r.data.total} حدثاً (قاعدة بيانات: ${r.data.db_purged} · ذاكرة: ${r.data.memory_drained}) — المتبقي: ${r.data.after}`);
+    refreshQueueMemInfo();
+  } else toast((r.data && (r.data.note || r.data.error)) || "فشل الحذف", true);
+});
+
+$("memCleanBtn").addEventListener("click", async () => {
+  const go = await confirmModal("تنظيف الذاكرة الآن؟ مسح الكاشات (الكيانات/الفلترة/قاعدة البيانات) + جامع النفايات — آمن ولا يقاطع المعالجة.", "تنظيف");
+  if (!go) return;
+  const r = await api("/admin/api/ops/memory_cleanup", { method: "POST", body: {} });
+  if (r.ok && r.data.ok) {
+    const fb = (r.data.freed_mb || 0);
+    toast(`🧹 تم التنظيف — RSS: ${r.data.rss_before_mb} ← ${r.data.rss_after_mb} MB · gc: ${r.data.gc_objects} كائن${fb > 0 ? ` · تحرر ${fb} MB` : ""}`);
+    refreshQueueMemInfo();
+  } else toast((r.data && (r.data.note || r.data.error)) || "فشل التنظيف", true);
+});
+
+async function refreshQueueMemInfo() {
+  try {
+    const [rq, rm] = await Promise.all([
+      api("/admin/api/overview"),
+      api("/admin/api/ops"),
+    ]);
+    const parts = [];
+    if (rq.ok) {
+      const q = (rq.data.system && rq.data.system.queue_size) ?? rq.data.queue_size;
+      if (q !== undefined) parts.push(`الطابور الآن: ${q}`);
+    }
+    if (rm.ok) {
+      const mg = rm.data.mem_guard || {};
+      if (mg.limit_mb) parts.push(`الذاكرة: ${mg.last_rss_mb || 0}/${mg.limit_mb} MB${mg.manual_cleanups ? ` · تنظيفات يدوية: ${mg.manual_cleanups}` : ""}`);
+    }
+    $("queueMemInfo").textContent = parts.join(" · ");
+  } catch { /* بلا صوت */ }
+}
+
 /* ── الإقلاع ── */
 (async function boot() {
   const r = await api("/admin/api/session");
