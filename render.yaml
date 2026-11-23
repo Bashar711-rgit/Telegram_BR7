@@ -332,6 +332,25 @@ services:
       - key: REGEX_GUARD_WORKERS
         value: "6"
 
+      # v15.6.0 — البوابة السريعة (fast_gate.py / Aho-Corasick): رفض فوري
+      # مكافئ رياضياً لمسار no_keyword — 98.6% من الحركة تُرفض في مسح واحد
+      # O(len) بدل 15-20 مسح شجرة + fuzzy + regex. فشل-آمن دائماً نحو
+      # التحليل الكامل (أي خلل أو غياب → analyze كما اليوم). العقد
+      # الموثق بالاختبارات: قبول المحرك ⇒ analyze — صفر خسارة تنبيهات.
+      - key: FAST_GATE_ENABLED
+        value: "true"     # قاطع طوارئ: false = تعطيل فوري للبوابة
+      - key: FAST_GATE_RESCUE_FUZZY
+        value: "true"     # الإنقاذ الضبابي الاحتياطي قبل أي رفض
+
+      # v15.6.0 — السقف التكيفي لانتظار الطابور: تحت الضغط تُسلَّم الأحداث
+      # الطازجة متأخرة (حتى 1800s) بدل إسقاطها — متأخر دقائق أفضل من أبدًا.
+      - key: ADAPTIVE_QUEUE_WAIT_ENABLED
+        value: "true"
+      - key: ADAPTIVE_QUEUE_WAIT_MULTIPLIER
+        value: "3"
+      - key: ADAPTIVE_QUEUE_WAIT_MAX_SECONDS
+        value: "1800"
+
       # Sender Intelligence / Resolver — sender_resolver.py v1.0 (monitors v9.9)
       # طبقة خلفية فقط: تُثري بيانات المرسل (username/access_hash/أعلام الحساب)
       # لحظة وصول الرسالة وتحفظها في sender_contacts. لا تغيّر شكل التنبيهات
