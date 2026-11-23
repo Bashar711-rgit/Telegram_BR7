@@ -29,6 +29,10 @@ _BASE: Dict[str, int] = {
     "stale_dropped_capture": 0,
     # هجر الطابور المرضي — حدث طازج عند الوصول تجاوز MAX_QUEUE_WAIT_SECONDS
     "stale_dropped_queue_wait": 0,
+    # ══ v15.6.0 — السقف التكيفي ══
+    # أحداث كانت ستُسقط بالسقف القياسي وأنقذها السقف التكيفي (تسلّم متأخر
+    # بدل أبدًا) — مقياس القيمة المباشرة للسقف في /health/full
+    "adaptive_wait_extension_used": 0,
     # بوابة العمر — إسقاطات في مرحلة pipeline (أقرب نقطة، قبل الإثراء)
     "stale_dropped_pipeline": 0,
     # بوابة العمر — إسقاطات في مرحلة send (الحدث اعتق في الطابور)

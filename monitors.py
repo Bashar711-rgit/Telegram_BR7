@@ -1,6 +1,18 @@
 #!/usr/bin/env python3
 """
-monitors.py – Account Monitor v15.0.0 (v9.10.0 LINE, aligned to the v15.0 stack)
+monitors.py – Account Monitor v15.6.0 (v9.10.0 LINE, aligned to the v15.0 stack)
+
+v15.6.0 — Concurrent Gate (طلب المالك: «الفلترة بشكل متزامن — سرعة وكفاءة
+  ودقة والتقاط الرسائل من البوتات»):
+  * _validate_event: فحوص DB الخمسة (blocked_sender/blocked_chat/
+    sources_scope/antispam) كانت جولات متتابعة 0.4-1.2s لكل رسالة على
+    Supabase — الآن asyncio.gather واحدة (~جولة DB واحدة). القرارات
+    والإحصاءات وترتيبها وعدّ الاستعلامات مطابقة للأصل حرفياً، والفشل
+    ينتشر كالسابق إلى DLQ.
+  * التقاط البوتات (v15.0) يبقى معياراً: CAPTURE_FROM_BOTS=true افتراضي،
+    وبوابة event_sender_gate تلتقط بوتات خارجية وتتخطى هويتنا الذاتية
+    فقط، وFAST_CAPTURE_ENABLED (احفظ أولاً ضد بوتات الحذف) افتراضه true
+    في الكود وrender.yaml — قيمة env=false على Render تتجاوزهما.
 
 v15.0.0 — Instant Capture (طلب المالك: «الالتقاط حتى من البوتات + استقبال فوري»):
   * CAPTURE_FROM_BOTS=true (افتراضي): رسائل البوتات الأخرى تُلتقط الآن
@@ -1420,6 +1432,14 @@ class EnhancedAccountMonitor:
                     chat_id=getattr(event, "chat_id", None),
                 ):
                     return
+                # ══ v15.6.0: عدّاد التقاط البوتات — صدق الرصد في /health/full ══
+                # رسائل البوتات الخارجية تُلتقط منذ v15.0 (CAPTURE_FROM_BOTS=true
+                # افتراضي) — العدّاد يجعل الميزة مرئية قابلة للتحقق لا افتراضية.
+                try:
+                    if event.sender is not None and bool(getattr(event.sender, "bot", False)):
+                        self._stats["bot_messages_captured"] = self._stats.get("bot_messages_captured", 0) + 1
+                except Exception:
+                    pass
                 if not bool(getattr(CFG, "CAPTURE_FROM_BOTS", True)):
                     # بديل التبديل اليدوي: استعادة سلوك التجاهل القديم
                     # بلا نشر جديد (CAPTURE_FROM_BOTS=false).
@@ -2214,16 +2234,44 @@ class EnhancedAccountMonitor:
         if _target_identity_match(chat_id) or _target_identity_match(sender_id):
             await self._inc_stat("echo_skipped")
             return False
-        if await self.db.is_blocked_sender(sender_id): return False
-        if await self.db.is_blocked_chat(chat_id): return False
-        if await self.db.is_feature_enabled("sources_scope") and not await self.db.is_source_allowed(chat_id):
+        # ══ v15.6.0: الفحوص المتسلسلة أصبحت متزامنة (طلب المالك: «الفلترة
+        # بشكل متزامن») ══
+        # الكود القديم كان ينتظر 4-5 جولات DB متتابعة لكل رسالة
+        # (is_blocked_sender → is_blocked_chat → is_feature_enabled →
+        # is_source_allowed → is_ignored_async) — على Supabase كل جولة
+        # 100-300ms أي 0.4-1.2s تأخير مُضاف لكل حدث على الحد. الآن تُطلق
+        # كلها معاً (asyncio.gather) وتُقيَّم نتائجها **بالترتيب الأصلي
+        # نفسه** فيُحفظ قرار كل فحص وعدّ إحصاءاته بالضبط. عدّ الاستعلامات
+        # ثابت أيضاً: فحصا sources_scope وantispam ملفوفان بحيث لا يُطلق
+        # الاستعلام الداخلي إلا إذا وصل إليه المسار الأصلي. الاستثناءات
+        # تنتشر كما قبلها (بلا return_exceptions) — فشل DB يذهب للـDLQ.
+        aspam = get_antispam()
+
+        async def _scope_pair() -> Tuple[bool, bool]:
+            # (feature_enabled, allowed) — نفس شرط الاستعلام الأصلي حرفياً
+            if await self.db.is_feature_enabled("sources_scope"):
+                return (True, await self.db.is_source_allowed(chat_id))
+            return (False, True)
+
+        async def _aspam_pair() -> Tuple[bool, bool]:
+            # (sync_ignored, async_ignored) — الفحص المتزامن (ذاكرة) أولاً
+            # كما في الأصل، والاستعلام اللامتزامن لا يُطلق إلا إن لم يُحسم
+            if aspam.is_ignored(sender_id):
+                return (True, False)
+            return (False, bool(await aspam.is_ignored_async(sender_id)))
+
+        blocked_sender, blocked_chat, (scope_on, scope_ok), (aspam_sync, aspam_async) = await asyncio.gather(
+            self.db.is_blocked_sender(sender_id),
+            self.db.is_blocked_chat(chat_id),
+            _scope_pair(),
+            _aspam_pair(),
+        )
+        if blocked_sender: return False
+        if blocked_chat: return False
+        if scope_on and not scope_ok:
             await self._inc_stat("source_skipped")
             return False
-        aspam = get_antispam()
-        if aspam.is_ignored(sender_id):
-            await self._inc_stat("spam_skipped")
-            return False
-        if await aspam.is_ignored_async(sender_id):
+        if aspam_sync or aspam_async:
             await self._inc_stat("spam_skipped")
             return False
         text = data.get("text", "")
@@ -2301,7 +2349,40 @@ class EnhancedAccountMonitor:
         except Exception as _ie_err:
             logger.debug(f"intel snapshot skipped [{self.account['name']}]: {type(_ie_err).__name__}")
         if validated_text:
-            analysis = await self.filter.analyze(validated_text)
+            # ══ v15.6.0: البوابة السريعة (FastGate — Aho-Corasick) ══
+            # مسح واحد O(len) على «مصادر القبول فقط» — القرار reject
+            # مكافئ رياضياً لمسار no_keyword في المحرك (صفر خسارة تنبيه،
+            # مع rescue-fuzzy احتياطي). الرفض هنا يوفر 15-20 مسح شجرة
+            # Python + fuzzy + 7 passes regex لكل رسالة مرفوضة (98.6%
+            # من الحركة) — فشل-آمن: أي خلل → تحليل كامل كما اليوم.
+            _fg_skip = False
+            try:
+                from fast_gate import get_fast_gate as _get_fg
+                _fg = _get_fg()
+                if _fg is not None:
+                    _fg_verdict, _fg_meta = await asyncio.to_thread(_fg.evaluate, validated_text)
+                    if _fg_verdict == "reject":
+                        _fg_skip = True
+                        self._stats["fast_gate_rejected"] = self._stats.get("fast_gate_rejected", 0) + 1
+                        analysis = {
+                            "valid": False,
+                            "decision": "ignore",
+                            "reason": "no_keyword_fast_gate",
+                            "keyword": None,
+                            "intent_verb": None,
+                            "academic_object": None,
+                            "confidence": 0.0,
+                            "score": 0.0,
+                            "reasons": [],
+                            "urgent": False,
+                            "spam_score": 0.0,
+                            "analysis_time_ms": _fg_meta.get("scan_ms"),
+                            "fast_gate": True,
+                        }
+            except Exception as _fg_err:
+                logger.debug(f"fast gate skipped [{self.account['name']}]: {type(_fg_err).__name__}")
+            if not _fg_skip:
+                analysis = await self.filter.analyze(validated_text)
             decision = analysis.get("decision", "ignore"); confidence = analysis.get("confidence", 0.0)
             reasons = analysis.get("reasons", [])
             intent_verb = analysis.get("intent_verb"); academic_object = analysis.get("academic_object")

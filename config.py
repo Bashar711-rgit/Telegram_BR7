@@ -400,6 +400,20 @@ class _ConfigData:
     # سحب الطابور دفعة واحدة (صفوف لكل سحبة) — يخفض تنافس قفل SQLite
     # والعدد الهائل من الالتزامات (كان commit لكل رسالة ×12 مهمة).
     PRODUCER_POP_BATCH: int
+    # ══ v15.6.0: البوابة السرعة + السقف التكيفي لانتظار الطابور ══
+    # FastGate: رفض فوري (Aho-Corasick على مصادر القبول فقط) مكافئ لـ
+    # no_keyword — يوفر 15-20 مسح شجرة لكل رسالة مرفوضة. false = كل
+    # الرسائل تتحلل كاملاً كما v15.5.0.
+    FAST_GATE_ENABLED: bool
+    # الطبقة الاحتياطية: fallback الضبابي الحقيقي للمحرك قبل أي رفض فوري
+    # (يغطي أي حافة رياضية نادرة لم تغطها متغيرات التحرير-1).
+    FAST_GATE_RESCUE_FUZZY: bool
+    # تحت الضغط (drain_mode أو طابور ≥ 50% من صمام القبول) يرفع سقف
+    # انتظار الطابور MAX_QUEUE_WAIT_SECONDS — الحدث الطازج يُسلّم
+    # متأخراً بدل إسقاطه (متأخر دقائق أفضل من أبدًا — فلسفة المالك).
+    ADAPTIVE_QUEUE_WAIT_ENABLED: bool
+    ADAPTIVE_QUEUE_WAIT_MULTIPLIER: int
+    ADAPTIVE_QUEUE_WAIT_MAX_SECONDS: int
     CACHE_TTL: int
     MAX_RECENT_HASHES: int
 
@@ -919,6 +933,12 @@ class Config:
             # <= MAX_EVENT_AGE_SECONDS) لا يُرمى لأنه انتظر في طابورنا؛
             # يُهجر فقط إن تجاوز انتظاره هذا السقف (افتراضي 600s).
             MAX_QUEUE_WAIT_SECONDS=SecretManager.get_int("MAX_QUEUE_WAIT_SECONDS", 600, required=False),
+            # ══ v15.6.0: البوابة السرعة + السقف التكيفي ══
+            FAST_GATE_ENABLED=SecretManager.get_bool("FAST_GATE_ENABLED", True, required=False),
+            FAST_GATE_RESCUE_FUZZY=SecretManager.get_bool("FAST_GATE_RESCUE_FUZZY", True, required=False),
+            ADAPTIVE_QUEUE_WAIT_ENABLED=SecretManager.get_bool("ADAPTIVE_QUEUE_WAIT_ENABLED", True, required=False),
+            ADAPTIVE_QUEUE_WAIT_MULTIPLIER=SecretManager.get_int("ADAPTIVE_QUEUE_WAIT_MULTIPLIER", 3, required=False),
+            ADAPTIVE_QUEUE_WAIT_MAX_SECONDS=SecretManager.get_int("ADAPTIVE_QUEUE_WAIT_MAX_SECONDS", 1800, required=False),
             # ========== الفترات ==========
             STATS_INTERVAL=SecretManager.get_int("STATS_INTERVAL", 3600, required=False),
             CLEANUP_INTERVAL=SecretManager.get_int("CLEANUP_INTERVAL", 86400, required=False),
@@ -1129,8 +1149,8 @@ class Config:
             TEXT_CACHE_TTL=SecretManager.get_int("TEXT_CACHE_TTL", 300, required=False),
             # ========== v14.5.1 Execution / Regex Guard ==========
             REGEX_TIMEOUT_S=SecretManager.get_float("REGEX_TIMEOUT_S", 0.25, required=False),
-            REGEX_GUARD_WORKERS=SecretManager.get_int("REGEX_GUARD_WORKERS", 4, required=False),
-            FILTER_EXECUTOR_WORKERS=SecretManager.get_int("FILTER_EXECUTOR_WORKERS", 4, required=False),
+            REGEX_GUARD_WORKERS=SecretManager.get_int("REGEX_GUARD_WORKERS", 6, required=False),
+            FILTER_EXECUTOR_WORKERS=SecretManager.get_int("FILTER_EXECUTOR_WORKERS", 6, required=False),
             # ========== v14.5.1 Metrics ==========
             METRICS_WINDOW=SecretManager.get_int("METRICS_WINDOW", 2000, required=False),
             METRICS_Z_THRESHOLD=SecretManager.get_float("METRICS_Z_THRESHOLD", 3.5, required=False),
@@ -1239,8 +1259,34 @@ class Config:
 #     يُسقط فوراً قبل الإثراء وقبل أي DB write).
 #   * SIMILARITY_WINDOW_SECONDS 3600 → 900 (العتبة 0.88 كما هي).
 # تُطبَّق من env في Render إن وُجدت (المصدر الرسمي) — القيم هنا الافتراضات.
-BOT_VERSION: Final = "15.5.0"
-BOT_CODENAME: Final = "Fresh-First Stability — fresh events jump the doomed backlog, capture-time admission valve, batch pops, auto load-shedding"
+#
+# ── v15.6.0 (طلب المالك: «الفلترة بشكل متزامن — سرعة وكفاءة ودقة والتقاط
+#    الرسائل من البوتات») ──
+#   * توازي بوابة التحقق: فحوص DB الخمسة في _validate_event كانت متسلسلة
+#     (0.4-1.2s لكل رسالة على Supabase) — أصبحت جولة واحدة متزامنة
+#     (asyncio.gather) بقرارات وإحصاءات وعدّ استعلامات مطابقة للأصل.
+#   * FILTER_EXECUTOR_WORKERS 4 → 6 وREGEX_GUARD_WORKERS 4 → 6 —
+#     تعميق تجمع خيوط الفلترة المتزامنة (rapidfuzz يحرر GIL أثناء
+#     الحساب فتتداخل الخيوط فعلياً) — قابل للضبط من env.
+#   * التقاط البوتات: CAPTURE_FROM_BOTS=true وFAST_CAPTURE_ENABLED=true
+#     (احفظ أولاً ضد بوتات الحذف) — أُضيفت صراحة في render.yaml؛ إن وُجدت
+#     قيمة false في env على Render فهي تتجاوز هذه الافتراضات وتُلغي الميزة.
+#   * FastGate (fast_gate.py): بوابة رفض فوري بأتمتة Aho-Corasick مبنية
+#     من «مصادر القبول فقط» في المحرك (request/indirect/implicit/
+#     help_anchor + F-04 توكنات + متغيرات fuzzy تحرير-1 المطابقة لعتبة
+#     rapidfuzz 85) — القرار reject مكافئ رياضياً لمسار no_keyword
+#     (كل مسار قبول يحتاج keyword من هذه المصادر — filter_engine
+#     L1826-1830/L1797-1808). 98.6% من الحركة رافضة → توفير 15-20
+#     مسح شجرة Python + fuzzy + 7 passes regex لكل رسالة مرفوضة،
+#     الذاكرة ≤25MB، فشل-آمن نحو التحليل الكامل دائماً، وبناء خلفي
+#     عند reload_keywords إدارياً.
+#   * السقف التكيفي لانتظار الطابور: تحت الضغط (drain_mode أو ≥50%
+#     من صمام القبول) يُرفع MAX_QUEUE_WAIT_SECONDS ×3 (حتى 1800s) —
+#     الحدث الطازج يُسلّم متأخراً بدل إسقاطه (قتل نمط stale_dropped_
+#     queue_wait=285 أسقاط من بوت حي). فوق التشبع يبقى صمام القبول
+#     عند الالتقاط هو الحارس (تكلفة صفر كما v15.4.1).
+BOT_VERSION: Final = "15.6.0"
+BOT_CODENAME: Final = "Concurrent Gate — parallel DB validation, FastGate Aho-Corasick instant rejection, deeper filter executor, adaptive queue-wait ceiling, bot-capture hardened"
 
 # =============================================================================
 # Pre-built config instance

@@ -73,7 +73,32 @@ class UnifiedAlertGate:
         dec = get_alert_gate().evaluate_event(data, stage="pipeline")
         if not dec.allowed:
             return  # الحدث قديم — مُسقط بصدق ومُحصى
+
+    ══ v15.6.0: السقف التكيفي لانتظار الطابور ══
+    تحت الضغط (drain_mode أو طابور ≥ 50% من صمام القبول) يرفع حلقة
+    load_shed في main.py السقف عبر set_adaptive_wait_ceiling — الحدث
+    الطازج الذي تجاوز MAX_QUEUE_WAIT_SECONDS يُسلّم متأخراً بدل
+    إسقاطه (متأخر دقائق أفضل من أبدًا — فلسفة المالك). القيمة None
+    تعيد السلوك القياسي (CFG فقط).
     """
+
+    def __init__(self) -> None:
+        # سقف انتظار تكيفي بالثواني — None = السلوك القياسي (CFG فقط)
+        self._adaptive_wait_ceiling: Optional[int] = None
+
+    def set_adaptive_wait_ceiling(self, seconds: Optional[int]) -> None:
+        """ضبط السقف التكيفي (يُستدعى من حلقة load_shed كل 10s)."""
+        if seconds is None:
+            self._adaptive_wait_ceiling = None
+            return
+        try:
+            val = int(seconds)
+        except Exception:
+            return
+        if val <= 0:
+            self._adaptive_wait_ceiling = None
+            return
+        self._adaptive_wait_ceiling = min(val, _MAX_AGE_LIMIT)
 
     # ── إعدادات حيّة (تُقرأ من CFG عند كل استدعاء — المصدر الرسمي بعد حذف اللوحة v14.0: env في Render) ──
     @staticmethod
@@ -185,6 +210,11 @@ class UnifiedAlertGate:
             # لا يجعلها قديمة (إصلاح حلقة الموت).
             if data.get("_fresh_at_capture"):
                 wait_limit = self._queue_wait_limit_seconds()
+                base_wait_limit = wait_limit
+                # ══ v15.6.0: السقف التكيفي — تحت الضغط نسلّم متأخراً ══
+                _ceil = self._adaptive_wait_ceiling
+                if _ceil is not None and _ceil > wait_limit:
+                    wait_limit = _ceil
                 if wait_limit <= 0:
                     return GateDecision(allowed=True, reason="fresh_by_arrival")
                 try:
@@ -207,6 +237,12 @@ class UnifiedAlertGate:
                             "message_id": data.get("message_id"),
                         },
                     )
+                if (
+                    _ceil is not None
+                    and waited > base_wait_limit + _BOUNDARY_GRACE_SECONDS
+                ):
+                    # حدث كان سيُسقط بالسقف القياسي — السقف التكيفي أنقذه
+                    stats.inc("adaptive_wait_extension_used")
                 return GateDecision(
                     allowed=True,
                     reason="fresh_by_arrival",
@@ -261,6 +297,8 @@ class UnifiedAlertGate:
                 "max_queue_wait_seconds": self._queue_wait_limit_seconds(),
                 "freshness_semantics": "arrival_v15_5_0",
                 "age_missing_ts_pass": True,
+                # ══ v15.6.0: السقف التكيفي الحي ══
+                "adaptive_wait_ceiling": self._adaptive_wait_ceiling,
             }
             try:
                 from config import CFG as _CFG
