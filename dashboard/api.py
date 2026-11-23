@@ -66,6 +66,8 @@ KEYWORDS_KEY = "dashboard:keywords_json"
 
 _ALERT_LOG_LIMIT = 20
 _AUDIT_LOG_LIMIT = 20
+_BLOCKED_LOG_LIMIT = 50
+_PEOPLE_LOG_LIMIT = 50
 
 
 class DashboardHTTPError(Exception):
@@ -1378,13 +1380,18 @@ class DashboardAPI:
         return {"system_health": health_rows, "dead_letters": dead,
                 "notifications": notifs, "monitors": monitors}
 
-    async def ops_audit(self, page: int) -> Dict[str, Any]:
+    async def ops_audit(self, page: int, q: str = "", action: str = "",
+                        since_hours: int = 0) -> Dict[str, Any]:
         try:
             page = max(1, min(int(page), 500))
         except (TypeError, ValueError):
             page = 1
+        q = str(q or "").strip()[:64]
+        action = str(action or "").strip()[:60]
         rows = await self.db.get_audit_logs(
-            limit=_AUDIT_LOG_LIMIT + 1, offset=(page - 1) * _AUDIT_LOG_LIMIT
+            limit=_AUDIT_LOG_LIMIT + 1, offset=(page - 1) * _AUDIT_LOG_LIMIT,
+            action=action or None, q=q or None,
+            since_hours=int(since_hours or 0) or None,
         )
         has_more = len(rows) > _AUDIT_LOG_LIMIT
         rows = rows[:_AUDIT_LOG_LIMIT]
@@ -1430,6 +1437,439 @@ class DashboardAPI:
         except Exception:
             out["mem_guard"] = {}
         return out
+
+    # ═══════════════════════════════════════════════════════════════════
+    # الوحدة 7: الحظر (blocked_senders / blocked_chats — المستهلكة فعلاً
+    # في monitors._validate_event مع كاش TTL، فالتعديل يُطبَّق خلال ≤30ث
+    # دون إعادة تشغيل)
+    # ═══════════════════════════════════════════════════════════════════
+    async def blocked_list(self, kind: str, q: str, page: int) -> Dict[str, Any]:
+        try:
+            page = max(1, min(int(page), 200))
+        except (TypeError, ValueError):
+            page = 1
+        kind = str(kind or "sender").lower()
+        if kind not in ("sender", "chat"):
+            kind = "sender"
+        q = str(q or "").strip()[:64]
+        rows = await self.db.list_blocked(kind, q=q, limit=500)
+        offset = (page - 1) * _BLOCKED_LOG_LIMIT
+        total = len(rows)
+        page_rows = rows[offset:offset + _BLOCKED_LOG_LIMIT]
+        items: List[Dict[str, Any]] = []
+        for r in page_rows:
+            items.append({
+                "kind": kind,
+                "entity_id": int(r.get("entity_id") or 0),
+                "reason": _sanitize_detail(r.get("reason"), 160) or None,
+                "blocked_by": _sanitize_detail(r.get("blocked_by"), 60) or "system",
+                "blocked_at": str(r.get("blocked_at") or "") or None,
+                "username": _sanitize_detail(r.get("username"), 64) or None,
+                "name": _sanitize_detail(
+                    f"{r.get('first_name') or ''} {r.get('last_name') or ''}".strip(), 80
+                ) or None,
+                "is_bot": bool(r.get("is_bot")),
+            })
+        overview = await self.db.blocked_overview()
+        capture_bots = None
+        try:
+            from config import CFG as _c
+            capture_bots = bool(getattr(_c, "CAPTURE_FROM_BOTS", True))
+        except Exception:
+            capture_bots = None
+        return {
+            "items": items, "kind": kind, "q": q, "page": page,
+            "has_more": total > offset + _BLOCKED_LOG_LIMIT,
+            "total": total, "limit": _BLOCKED_LOG_LIMIT,
+            "overview": overview, "capture_from_bots": capture_bots,
+            "note": ("حظر المرسل/البوت يمنع معالجة رسائله فوراً (كاش ≤30ث). "
+                     "التقاط البوتات عموماً يُدار من env CAPTURE_FROM_BOTS على Render — "
+                     "ولحظر بوت بعينه أضفه هنا."),
+        }
+
+    async def blocked_add(self, raw_input: str, kind: str, reason: str) -> Dict[str, Any]:
+        raw = str(raw_input or "").strip()[:200]
+        kind = str(kind or "").strip().lower()
+        if kind not in ("sender", "chat", "bot"):
+            raise DashboardHTTPError(400, {"error": "invalid_kind",
+                                           "note": "النوع يجب أن يكون sender أو chat أو bot"})
+        reason = _sanitize_detail(reason, 160)
+        by = f"dashboard:{DASH.username}"
+        entity_id, username = _parse_group_input(raw)
+        is_bot = False
+        resolved_title = ""
+        if entity_id is None and not username:
+            raise DashboardHTTPError(400, {"error": "invalid_input",
+                                           "note": "استخدم رابط t.me أو @username أو معرفاً رقمياً"})
+        if entity_id is None:
+            # مسار username — يتطلب حل الكيان عبر main_client (نفس مسار group_add)
+            client = getattr(self.bot, "main_client", None)
+            if client is None:
+                raise DashboardHTTPError(503, {"error": "no_main_client"})
+            try:
+                entity = await asyncio_wait_for(client.get_entity(username), timeout=25)
+            except Exception as e:
+                raise DashboardHTTPError(400, {"error": f"resolve_failed:{type(e).__name__}",
+                                               "note": "تعذر حل الكيان — تأكد من الرمز أو استخدم المعرف الرقمي"})
+            entity_id = int(getattr(entity, "id", 0) or 0)
+            if not entity_id:
+                raise DashboardHTTPError(400, {"error": "resolve_failed"})
+            is_bot = bool(getattr(entity, "bot", False))
+            resolved_title = str(getattr(entity, "title", "") or getattr(entity, "first_name", "") or username)
+            if kind in ("sender", "bot"):
+                pass  # معرف المستخدم موجب كما هو
+            else:
+                # توحيد صيغة المجموعات/القنوات بصيغة Telethon كما تصل الأحداث
+                if getattr(entity, "broadcast", False) or getattr(entity, "megagroup", False):
+                    if entity_id > 0:
+                        entity_id = int(f"-100{entity_id}")
+                elif entity_id > 0:
+                    entity_id = -entity_id
+        if kind == "bot":
+            is_bot = True
+        if kind in ("sender", "bot") and entity_id <= 0:
+            raise DashboardHTTPError(400, {"error": "expected_positive_user_id",
+                                           "note": "معرف المرسل/البوت يجب أن يكون موجباً"})
+        if kind == "chat":
+            if entity_id > 0:
+                # معرف رقمي موجب لمجموعة — اقبله كما أدخله المالك (بصيغة أحداثه)
+                pass
+        final_kind = "sender" if kind in ("sender", "bot") else "chat"
+        if final_kind == "sender":
+            await self.db.block_sender(int(entity_id), reason=reason, by=by)
+        else:
+            await self.db.block_chat(int(entity_id), reason=reason, by=by)
+        await _audit(self.db, "dashboard.blocked_add", "blocked_" + final_kind,
+                     str(entity_id), new_value=reason or f"kind={kind}")
+        DASH.overview_cache.invalidate()
+        return {"ok": True, "kind": final_kind, "entity_id": int(entity_id),
+                "is_bot": is_bot, "title": _sanitize_detail(resolved_title, 80) or None,
+                "username": username or None}
+
+    async def blocked_remove(self, kind: str, entity_id: int) -> Dict[str, Any]:
+        kind = str(kind or "").strip().lower()
+        if kind not in ("sender", "chat"):
+            raise DashboardHTTPError(400, {"error": "invalid_kind"})
+        try:
+            eid = int(entity_id)
+        except (TypeError, ValueError):
+            raise DashboardHTTPError(400, {"error": "invalid_entity_id"})
+        if kind == "sender":
+            await self.db.unblock_sender(eid)
+        else:
+            await self.db.unblock_chat(eid)
+        await _audit(self.db, "dashboard.blocked_remove", "blocked_" + kind, str(eid))
+        DASH.overview_cache.invalidate()
+        return {"ok": True}
+
+    async def blocked_bulk_remove(self, kind: str, ids: List[int]) -> Dict[str, Any]:
+        kind = str(kind or "").strip().lower()
+        if kind not in ("sender", "chat"):
+            raise DashboardHTTPError(400, {"error": "invalid_kind"})
+        clean: List[int] = []
+        for x in (ids or [])[:200]:
+            try:
+                clean.append(int(x))
+            except (TypeError, ValueError):
+                continue
+        if not clean:
+            raise DashboardHTTPError(400, {"error": "nothing_to_remove"})
+        removed = await self.db.unblock_bulk(kind, clean)
+        await _audit(self.db, "dashboard.blocked_bulk", "blocked_" + kind,
+                     new_value=f"removed={removed}")
+        DASH.overview_cache.invalidate()
+        return {"ok": True, "removed": int(removed)}
+
+    # ═══════════════════════════════════════════════════════════════════
+    # الوحدة 8: الأشخاص (sender_contacts + sender_stats) — قراءة عرضية
+    # وإجراءات حظر/سماح تمرّ بالدوال الموجودة نفسها
+    # ═══════════════════════════════════════════════════════════════════
+    async def people_list(self, q: str, flag: str, page: int) -> Dict[str, Any]:
+        try:
+            page = max(1, min(int(page), 200))
+        except (TypeError, ValueError):
+            page = 1
+        q = str(q or "").strip()[:64]
+        flag = str(flag or "all").lower()
+        if flag not in ("all", "blocked", "bots", "allowed"):
+            flag = "all"
+        offset = (page - 1) * _PEOPLE_LOG_LIMIT
+        rows = await self.db.list_people(q=q, flag=flag,
+                                         limit=_PEOPLE_LOG_LIMIT + 1, offset=offset)
+        has_more = len(rows) > _PEOPLE_LOG_LIMIT
+        rows = rows[:_PEOPLE_LOG_LIMIT]
+        items: List[Dict[str, Any]] = []
+        for r in rows:
+            items.append({
+                "sender_id": int(r.get("sender_id") or 0),
+                "username": _sanitize_detail(r.get("username"), 64) or None,
+                "name": _sanitize_detail(
+                    f"{r.get('first_name') or ''} {r.get('last_name') or ''}".strip(), 80
+                ) or None,
+                "is_bot": bool(r.get("is_bot")),
+                "is_scam": bool(r.get("is_scam")),
+                "total_messages": int(r.get("total_messages") or 0),
+                "alerts_sent": int(r.get("alerts_sent") or 0),
+                "reputation": float(r.get("reputation_score") or 50.0),
+                "is_blocked": bool(r.get("is_blocked")),
+                "is_allowed": bool(r.get("is_allowed")),
+            })
+        overview = await self.db.people_overview()
+        return {"items": items, "q": q, "flag": flag, "page": page,
+                "has_more": has_more, "limit": _PEOPLE_LOG_LIMIT,
+                "overview": overview}
+
+    async def person_action(self, action: str, sender_id: int, note: str = "") -> Dict[str, Any]:
+        action = str(action or "").strip().lower()
+        if action not in ("block", "unblock", "allow", "disallow"):
+            raise DashboardHTTPError(400, {"error": "invalid_action"})
+        try:
+            sid = int(sender_id)
+        except (TypeError, ValueError):
+            raise DashboardHTTPError(400, {"error": "invalid_sender_id"})
+        if sid <= 0:
+            raise DashboardHTTPError(400, {"error": "expected_positive_user_id"})
+        note = _sanitize_detail(note, 160)
+        by = f"dashboard:{DASH.username}"
+        if action == "block":
+            await self.db.block_sender(sid, reason=note, by=by)
+        elif action == "unblock":
+            await self.db.unblock_sender(sid)
+        elif action == "allow":
+            await self.db.add_allowed_entity("sender", sid, note=note)
+        else:
+            await self.db.remove_allowed_entity("sender", sid)
+        await _audit(self.db, f"dashboard.person_{action}", "person", str(sid),
+                     new_value=note)
+        DASH.overview_cache.invalidate()
+        return {"ok": True, "action": action, "sender_id": sid}
+
+    # ═══════════════════════════════════════════════════════════════════
+    # الوحدة 9: القواعد (rules — المستهلكة فعلاً عبر db.apply_rules في
+    # monitors._analyze_and_alert مع كاش TTL ≤30ث، مفاتيح rule_engine/allowlist)
+    # ═══════════════════════════════════════════════════════════════════
+    async def rules_list(self) -> Dict[str, Any]:
+        rows = await self.db.list_rules(limit=200)
+        items: List[Dict[str, Any]] = []
+        for r in rows:
+            conds = r.get("conditions") or {}
+            items.append({
+                "id": int(r.get("id") or 0),
+                "name": _sanitize_detail(r.get("name"), 120) or "—",
+                "conditions": conds if isinstance(conds, dict) else {},
+                "action": str(r.get("action") or "tag"),
+                "action_value": _sanitize_detail(r.get("action_value"), 120) or "",
+                "priority": int(r.get("priority") or 100),
+                "hits": int(r.get("hits") or 0),
+                "enabled": bool(r.get("enabled")),
+                "created_by": _sanitize_detail(r.get("created_by"), 60) or "",
+                "created_at": str(r.get("created_at") or "") or None,
+            })
+        rule_engine_on = await self.db.is_feature_enabled("rule_engine")
+        allowlist_on = await self.db.is_feature_enabled("allowlist")
+        return {"items": items, "total": len(items),
+                "rule_engine_enabled": bool(rule_engine_on),
+                "allowlist_enabled": bool(allowlist_on),
+                "condition_keys": list(self.db.RULE_CONDITION_KEYS),
+                "actions": list(self.db.RULE_ACTIONS)}
+
+    async def rule_add(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(payload, dict):
+            raise DashboardHTTPError(400, {"error": "invalid_payload"})
+        name = str(payload.get("name") or "").strip()[:120]
+        if not name:
+            raise DashboardHTTPError(400, {"error": "name_required"})
+        conds, err = self.db.validate_rule_conditions(payload.get("conditions"))
+        if err:
+            raise DashboardHTTPError(400, {"error": f"invalid_conditions:{err}"})
+        action = str(payload.get("action") or "tag").lower()
+        if action not in self.db.RULE_ACTIONS:
+            raise DashboardHTTPError(400, {"error": "invalid_action",
+                                           "note": "الإجراء: allow | block | tag"})
+        try:
+            priority = int(payload.get("priority") or 100)
+        except (TypeError, ValueError):
+            priority = 100
+        created = await self.db.add_rule(
+            name, conds, action,
+            action_value=str(payload.get("action_value") or "")[:200],
+            priority=priority,
+            created_by=f"dashboard:{DASH.username}",
+        )
+        if not created:
+            raise DashboardHTTPError(500, {"error": "rule_create_failed"})
+        await _audit(self.db, "dashboard.rule_add", "rule", str(created.get("id")),
+                     new_value=f"{name} → {action}")
+        DASH.overview_cache.invalidate()
+        return {"ok": True, "rule": {"id": int(created.get("id") or 0), "name": name}}
+
+    async def rule_edit(self, rule_id: int, payload: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            rid = int(rule_id)
+        except (TypeError, ValueError):
+            raise DashboardHTTPError(400, {"error": "invalid_rule_id"})
+        if not isinstance(payload, dict):
+            raise DashboardHTTPError(400, {"error": "invalid_payload"})
+        updates: Dict[str, Any] = {}
+        if "name" in payload:
+            name = str(payload.get("name") or "").strip()[:120]
+            if not name:
+                raise DashboardHTTPError(400, {"error": "name_required"})
+            updates["name"] = name
+        if "conditions" in payload:
+            conds, err = self.db.validate_rule_conditions(payload.get("conditions"))
+            if err:
+                raise DashboardHTTPError(400, {"error": f"invalid_conditions:{err}"})
+            updates["conditions"] = conds
+        if "action" in payload:
+            action = str(payload.get("action") or "").lower()
+            if action not in self.db.RULE_ACTIONS:
+                raise DashboardHTTPError(400, {"error": "invalid_action"})
+            updates["action"] = action
+        if "action_value" in payload:
+            updates["action_value"] = str(payload.get("action_value") or "")[:200]
+        if "priority" in payload:
+            try:
+                updates["priority"] = int(payload.get("priority") or 100)
+            except (TypeError, ValueError):
+                raise DashboardHTTPError(400, {"error": "invalid_priority"})
+        if not updates:
+            raise DashboardHTTPError(400, {"error": "nothing_to_update"})
+        try:
+            updated = await self.db.update_rule(rid, updates)
+        except ValueError as e:
+            raise DashboardHTTPError(400, {"error": f"invalid_update:{e}"})
+        if not updated:
+            raise DashboardHTTPError(404, {"error": "rule_not_found"})
+        await _audit(self.db, "dashboard.rule_edit", "rule", str(rid),
+                     new_value=",".join(sorted(updates.keys())))
+        DASH.overview_cache.invalidate()
+        return {"ok": True, "id": rid}
+
+    async def rule_toggle(self, rule_id: int, enabled: bool) -> Dict[str, Any]:
+        try:
+            rid = int(rule_id)
+        except (TypeError, ValueError):
+            raise DashboardHTTPError(400, {"error": "invalid_rule_id"})
+        ok = await self.db.set_rule_enabled(rid, bool(enabled))
+        if not ok:
+            raise DashboardHTTPError(404, {"error": "rule_not_found"})
+        await _audit(self.db, "dashboard.rule_toggle", "rule", str(rid),
+                     new_value="enabled" if enabled else "disabled")
+        DASH.overview_cache.invalidate()
+        return {"ok": True, "enabled": bool(enabled)}
+
+    async def rule_delete(self, rule_id: int) -> Dict[str, Any]:
+        try:
+            rid = int(rule_id)
+        except (TypeError, ValueError):
+            raise DashboardHTTPError(400, {"error": "invalid_rule_id"})
+        ok = await self.db.delete_rule(rid)
+        if not ok:
+            raise DashboardHTTPError(404, {"error": "rule_not_found"})
+        await _audit(self.db, "dashboard.rule_delete", "rule", str(rid))
+        DASH.overview_cache.invalidate()
+        return {"ok": True}
+
+    async def rules_export(self) -> Dict[str, Any]:
+        rows = await self.db.list_rules(limit=200)
+        clean: List[Dict[str, Any]] = []
+        for r in rows:
+            clean.append({
+                "name": r.get("name") or "",
+                "conditions": r.get("conditions") or {},
+                "action": r.get("action") or "tag",
+                "action_value": r.get("action_value") or "",
+                "priority": int(r.get("priority") or 100),
+                "enabled": bool(r.get("enabled")),
+            })
+        return {"rules": clean, "exported_at": _now_iso(),
+                "version": DASH.version}
+
+    async def rules_import(self, json_text: str) -> Dict[str, Any]:
+        raw = (json_text or "").strip()
+        if not raw or len(raw.encode("utf-8")) > MAX_IMPORT_BYTES:
+            raise DashboardHTTPError(400, {"error": "invalid_or_too_large"})
+        try:
+            data = _json.loads(raw)
+        except Exception as e:
+            raise DashboardHTTPError(400, {"error": f"invalid_json:{type(e).__name__}"})
+        rules_in = data.get("rules") if isinstance(data, dict) else None
+        if not isinstance(rules_in, list) or not rules_in:
+            raise DashboardHTTPError(400, {"error": "no_rules"})
+        if len(rules_in) > 200:
+            raise DashboardHTTPError(400, {"error": "too_many_rules"})
+        applied, skipped = 0, 0
+        for r in rules_in[:200]:
+            if not isinstance(r, dict):
+                skipped += 1
+                continue
+            conds, err = self.db.validate_rule_conditions(r.get("conditions"))
+            if err:
+                skipped += 1
+                continue
+            action = str(r.get("action") or "tag").lower()
+            if action not in self.db.RULE_ACTIONS:
+                skipped += 1
+                continue
+            try:
+                ok = await self.db.add_rule(
+                    str(r.get("name") or "قاعدة")[:120], conds, action,
+                    action_value=str(r.get("action_value") or "")[:200],
+                    priority=int(r.get("priority") or 100),
+                    created_by=f"dashboard:{DASH.username}",
+                )
+            except Exception:
+                ok = None
+            if ok:
+                applied += 1
+            else:
+                skipped += 1
+        await _audit(self.db, "dashboard.rules_import", "rules", "",
+                     new_value=f"applied={applied} skipped={skipped}")
+        DASH.overview_cache.invalidate()
+        return {"ok": True, "applied": applied, "skipped": skipped}
+
+    # ═══════════════════════════════════════════════════════════════════
+    # الوحدة 10: الميزات (features — نفس الجدول الذي تقرؤه monitors عبر
+    # is_feature_enabled بكاش ≤30ث — تفعيل/تعطيل دون إعادة تشغيل)
+    # ═══════════════════════════════════════════════════════════════════
+    async def features_list(self) -> Dict[str, Any]:
+        rows = await self.db.list_features()
+        return {"items": rows,
+                "note": ("التعطيل/التفعيل يُطبَّق خلال ≤30ث (كاش الميزات) دون إعادة تشغيل — "
+                         "كل بند مرتبط فعلياً بمسار المعالجة في monitors.")}
+
+    async def feature_toggle(self, key: str, enabled: bool) -> Dict[str, Any]:
+        key = str(key or "").strip()[:60]
+        if not key:
+            raise DashboardHTTPError(400, {"error": "invalid_key"})
+        ok = await self.db.set_feature_enabled(key, bool(enabled),
+                                              by=f"dashboard:{DASH.username}")
+        if not ok:
+            raise DashboardHTTPError(400, {"error": "unknown_feature_key"})
+        await _audit(self.db, "dashboard.feature_toggle", "feature", key,
+                     new_value="enabled" if enabled else "disabled")
+        DASH.overview_cache.invalidate()
+        return {"ok": True, "key": key, "enabled": bool(enabled)}
+
+    async def panel_rename(self, row_id: int, display_name: str) -> Dict[str, Any]:
+        try:
+            rid = int(row_id)
+        except (TypeError, ValueError):
+            raise DashboardHTTPError(400, {"error": "invalid_row_id"})
+        name = str(display_name or "").strip()[:80]
+        if not name:
+            raise DashboardHTTPError(400, {"error": "name_required"})
+        row = await self.db.get_panel_account(rid)
+        if not row:
+            raise DashboardHTTPError(404, {"error": "panel_account_not_found"})
+        ok = await self.db.update_panel_account(rid, display_name=name)
+        if not ok:
+            raise DashboardHTTPError(500, {"error": "rename_failed"})
+        await _audit(self.db, "dashboard.panel_rename", "panel_account", str(rid),
+                     new_value=name)
+        return {"ok": True}
 
 
 def _cfg() -> Any:

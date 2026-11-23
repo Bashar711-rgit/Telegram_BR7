@@ -45,9 +45,13 @@
 <nav class="tabs" id="tabs" aria-label="الوحدات">
   <button data-tab="overview" class="tab active">📊 الحالة</button>
   <button data-tab="accounts" class="tab">👤 الحسابات</button>
+  <button data-tab="groups" class="tab">👥 المصادر</button>
+  <button data-tab="blocked" class="tab">🚫 الحظر</button>
+  <button data-tab="people" class="tab">🧑‍💼 الأشخاص</button>
   <button data-tab="keywords" class="tab">🔑 الكلمات</button>
-  <button data-tab="groups" class="tab">👥 المجموعات</button>
+  <button data-tab="rules" class="tab">📏 القواعد</button>
   <button data-tab="alerts" class="tab">🔔 التنبيهات</button>
+  <button data-tab="features" class="tab">🧩 الميزات</button>
   <button data-tab="ops" class="tab">⚙️ الإعدادات</button>
 </nav>
 
@@ -110,6 +114,10 @@
     <div class="grid2">
       <div class="card">
         <h3>📚 فئات الكلمات القابلة للتعديل</h3>
+        <div class="toolbar">
+          <input id="kwSearch" type="search" placeholder="بحث في القوائم والعناصر…" class="searchbar">
+          <button id="kwSearchClear" class="btn ghost sm">مسح</button>
+        </div>
         <div id="kwCats"></div>
         <div class="toolbar" style="margin-top:10px">
           <button id="kwSave" class="btn primary sm">حفظ كل التعديلات</button>
@@ -128,19 +136,124 @@
     </div>
   </section>
 
-  <!-- ═══ الوحدة 4: المجموعات ═══ -->
+  <!-- ═══ الوحدة 4: مصادر المراقبة ═══ -->
   <section id="tab-groups" class="panel">
     <div class="card">
       <div class="toolbar">
         <input id="grpAddInput" type="text" placeholder="t.me/username أو @username أو -100...">
-        <button id="grpAddBtn" class="btn primary sm">إضافة مجموعة</button>
+        <button id="grpAddBtn" class="btn primary sm">إضافة مصدر</button>
         <button id="grpRefresh" class="btn sm">تحديث</button>
+        <input id="grpSearch" type="search" placeholder="بحث في المصادر…" class="searchbar">
       </div>
       <div id="grpAllowAll" class="banner warn hidden">
         وضع «السماح للجميع»: لا توجد مجموعات محددة — تُراقب كل المجموعات التي توجد فيها الحسابات.
-        أضف مجموعة واحدة لتفعيل نمط القائمة المحددة.
+        أضف مجموعة واحدة لتفعيل نمط القائمة المحددة (مفتاح نطاق المصادر في تبويب الميزات).
+      </div>
+      <div id="grpBulkBar" class="bulkbar hidden">
+        <span id="grpBulkCount">0 محدد</span>
+        <button id="grpBulkPause" class="btn sm warn">⏸ إيقاف المراقبة للمحدد</button>
+        <button id="grpBulkResume" class="btn sm">▶ تفعيل المحدد</button>
+        <button id="grpBulkRemove" class="btn sm danger">🗑 إزالة المحدد</button>
       </div>
       <div class="tablewrap"><table id="grpTable" class="table"></table></div>
+    </div>
+  </section>
+
+  <!-- ═══ الوحدة 7: الحظر ═══ -->
+  <section id="tab-blocked" class="panel">
+    <div class="card">
+      <h3>🚫 إضافة حظر جديد</h3>
+      <div class="toolbar">
+        <select id="blkKind">
+          <option value="sender">شخص — ID أو @username</option>
+          <option value="bot">بوت — ID أو @username</option>
+          <option value="chat">مجموعة/قناة — رابط أو ID</option>
+        </select>
+        <input id="blkInput" type="text" placeholder="123456789 أو t.me/name أو -100...">
+        <input id="blkReason" type="text" placeholder="سبب الحظر (اختياري)" style="max-width:240px">
+        <button id="blkAddBtn" class="btn primary sm">حظر</button>
+      </div>
+      <small id="blkNote" style="color:var(--muted);font-size:12px;display:block;margin-top:6px"></small>
+    </div>
+    <div class="card">
+      <div class="toolbar">
+        <select id="blkKindFilter">
+          <option value="sender">مرسلون محظورون</option>
+          <option value="chat">مجموعات/قنوات محظورة</option>
+        </select>
+        <input id="blkSearch" type="search" placeholder="بحث بالمعرف/الاسم/السبب…" class="searchbar">
+        <button id="blkRefresh" class="btn sm">تحديث</button>
+        <button id="blkBulkRemove" class="btn danger sm" disabled>إلغاء حظر المحدد</button>
+      </div>
+      <div class="chips" id="blkChips"></div>
+      <div class="tablewrap"><table id="blkTable" class="table"></table></div>
+      <div class="pagination">
+        <button id="blkPrev" class="btn sm">السابق</button>
+        <span id="blkPageInfo" style="color:var(--muted);font-size:12px"></span>
+        <button id="blkNext" class="btn sm">التالي</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ═══ الوحدة 8: الأشخاص ═══ -->
+  <section id="tab-people" class="panel">
+    <div class="card">
+      <div class="toolbar">
+        <select id="pplFlag">
+          <option value="all">الجميع</option>
+          <option value="blocked">المحظورون</option>
+          <option value="bots">البوتات</option>
+          <option value="allowed">قائمة السماح</option>
+        </select>
+        <input id="pplSearch" type="search" placeholder="بحث بالاسم أو @username أو المعرف…" class="searchbar">
+        <button id="pplRefresh" class="btn sm">تحديث</button>
+      </div>
+      <div class="chips" id="pplChips"></div>
+      <div class="tablewrap"><table id="pplTable" class="table"></table></div>
+      <div class="pagination">
+        <button id="pplPrev" class="btn sm">السابق</button>
+        <span id="pplPageInfo" style="color:var(--muted);font-size:12px"></span>
+        <button id="pplNext" class="btn sm">التالي</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ═══ الوحدة 9: القواعد ═══ -->
+  <section id="tab-rules" class="panel">
+    <div class="card">
+      <h3>➕ إضافة / تعديل قاعدة</h3>
+      <div class="toolbar">
+        <input id="rlName" type="text" placeholder="اسم القاعدة" style="max-width:180px">
+        <select id="rlCondKey">
+          <option value="keyword">كلمة داخل الرسالة</option>
+          <option value="source_chat_id">معرف المصدر</option>
+          <option value="sender_id">معرف المرسل</option>
+          <option value="min_confidence">أدنى ثقة (0..1)</option>
+        </select>
+        <input id="rlCondVal" type="text" placeholder="قيمة الشرط">
+        <select id="rlAction">
+          <option value="tag">وسم (tag)</option>
+          <option value="allow">سماح دائم (allow)</option>
+          <option value="block">حظر (block)</option>
+        </select>
+        <input id="rlActionValue" type="text" placeholder="قيمة الوسم (لـ tag)" style="max-width:160px">
+        <input id="rlPriority" type="number" value="100" min="1" max="100000" style="max-width:90px" title="الأولوية">
+        <button id="rlSaveBtn" class="btn primary sm">إضافة قاعدة</button>
+        <button id="rlCancelEdit" class="btn ghost sm hidden">إلغاء التعديل</button>
+      </div>
+      <small style="color:var(--muted);font-size:12px;display:block;margin-top:6px">
+        تُقيَّم القواعد فعلياً في مسار المعالجة (بعد الفلترة وقبل الإرسال): block يوقف التنبيه، allow يقبل دائماً، tag يضيف وسم البطاقة. التطبيق خلال ≤30ث دون إعادة تشغيل.
+      </small>
+    </div>
+    <div class="card">
+      <div class="toolbar">
+        <span id="rlEngineBadge"></span>
+        <button id="rlExport" class="btn sm">تصدير JSON</button>
+        <input type="file" id="rlImportFile" accept=".json" style="display:none">
+        <button id="rlImportBtn" class="btn sm">استيراد JSON</button>
+        <button id="rlRefresh" class="btn sm">تحديث</button>
+      </div>
+      <div class="tablewrap"><table id="rlTable" class="table"></table></div>
     </div>
   </section>
 
@@ -165,6 +278,15 @@
         <span id="alPageInfo" style="color:var(--muted);font-size:12px"></span>
         <button id="alNext" class="btn sm">التالي</button>
       </div>
+    </div>
+  </section>
+
+  <!-- ═══ الوحدة 10: الميزات ═══ -->
+  <section id="tab-features" class="panel">
+    <div class="card">
+      <h3>🧩 ميزات النظام — تفعيل/تعطيل دون إعادة تشغيل</h3>
+      <small id="featNote" style="color:var(--muted);font-size:12px;display:block;margin-bottom:8px"></small>
+      <div id="featList"></div>
     </div>
   </section>
 
@@ -193,6 +315,16 @@
     </div>
     <div class="card">
       <h3>📋 سجل العمليات الإدارية (Audit Log)</h3>
+      <div class="toolbar">
+        <input id="audSearch" type="search" placeholder="بحث في السجل…" class="searchbar">
+        <select id="audHours">
+          <option value="0">كل الفترات</option>
+          <option value="24">آخر 24 ساعة</option>
+          <option value="168">آخر 7 أيام</option>
+          <option value="720">آخر 30 يوماً</option>
+        </select>
+        <button id="audApply" class="btn sm">تطبيق الفلاتر</button>
+      </div>
       <div class="tablewrap"><table id="auditTable" class="table"></table></div>
       <div class="pagination">
         <button id="audPrev" class="btn sm">السابق</button>
@@ -212,7 +344,7 @@
 
 </main>
 
-<footer class="copyright">Telegram BR7 · Lightweight Dashboard v15.2.0 · فصل كامل عن مسار استقبال الرسائل</footer>
+<footer class="copyright">Telegram BR7 · Admin Center Dashboard v15.7.0 · فصل كامل عن مسار استقبال الرسائل</footer>
 
 <div id="toast" class="toast hidden" role="status"></div>
 

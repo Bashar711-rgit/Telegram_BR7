@@ -42,8 +42,27 @@ function confirmModal(msg, okLabel) {
   $("modal").classList.remove("hidden");
   return new Promise((res) => { modalResolver = res; });
 }
-$("modalOk").addEventListener("click", () => { $("modal").classList.add("hidden"); if (modalResolver) modalResolver(true); modalResolver = null; });
-$("modalCancel").addEventListener("click", () => { $("modal").classList.add("hidden"); if (modalResolver) modalResolver(false); modalResolver = null; });
+/* نافذة مع إدخال نصي (v15.7.0) — تعيد القيمة أو null عند الإلغاء */
+function promptModal(msg, placeholder, defVal, okLabel) {
+  $("modalBody").innerHTML = esc(msg) +
+    '<br><input id="modalInput" type="text" style="width:100%;margin-top:12px" placeholder="' +
+    esc(placeholder || "") + '" value="' + esc(defVal || "") + '">';
+  $("modalOk").textContent = okLabel || "حفظ";
+  $("modal").classList.remove("hidden");
+  return new Promise((res) => { modalResolver = res; });
+}
+$("modalOk").addEventListener("click", () => {
+  const inp = $("modalInput");
+  const val = inp ? inp.value.trim() : true;
+  $("modal").classList.add("hidden");
+  if (modalResolver) modalResolver(val);
+  modalResolver = null;
+});
+$("modalCancel").addEventListener("click", () => {
+  $("modal").classList.add("hidden");
+  if (modalResolver) modalResolver(null);
+  modalResolver = null;
+});
 
 /* ── طبقة API (CSRF + 401) ── */
 function csrfToken() {
@@ -280,6 +299,7 @@ function renderAccounts(d) {
         : `<button class="btn sm primary" data-act="rowToggle" data-row="${a.row_id}" data-enable="true">تفعيل المراقبة</button>`;
       actions = `${tog}
         <button class="btn sm" data-act="rowReconnect" data-row="${a.row_id}">إعادة ربط</button>
+        <button class="btn sm" data-act="rowRename" data-row="${a.row_id}" data-name="${esc(a.name)}">تسمية</button>
         <button class="btn sm danger" data-act="rowDelete" data-row="${a.row_id}">حذف</button>`;
     } else {
       actions = `<button class="btn sm" data-act="test" data-name="${esc(a.name)}">اختبار</button>
@@ -326,6 +346,11 @@ $("accTable").addEventListener("click", async (ev) => {
       if (!go) return;
       const r = await api("/admin/api/accounts/row/reconnect", { method: "POST", body: { row_id: Number(btn.dataset.row) } });
       toast(r.ok && r.data.ok && r.data.connected ? "✅ تم الاتصال" : "❌ فشل الاتصال — راجع آخر خطأ في الجدول", !(r.ok && r.data.ok && r.data.connected));
+    } else if (act === "rowRename") {
+      const newName = await promptModal("اسم العرض الجديد لهذا الحساب:", "الاسم", btn.dataset.name || "", "حفظ");
+      if (!newName) return;
+      const r = await api("/admin/api/accounts/row/rename", { method: "POST", body: { row_id: Number(btn.dataset.row), display_name: newName } });
+      toast(r.ok && r.data.ok ? "✅ حُدّث الاسم" : "❌ " + ((r.data || {}).error || "فشل"), !(r.ok && r.data.ok));
     } else if (act === "rowDelete") {
       const go = await confirmModal("حذف الحساب وجلسته المشفّرة نهائياً؟ لا يمكن التراجع. (آخر حساب نشط محمي من الحذف)", "حذف نهائي");
       if (!go) return;
@@ -493,10 +518,19 @@ tabLoaders.groups = async function () {
 
 function renderGroups(d) {
   $("grpAllowAll").classList.toggle("hidden", !d.allow_all);
-  const rows = (d.items || []).map((g) => {
+  grpState.items = d.items || [];
+  const q = ($("grpSearch").value || "").trim().toLowerCase();
+  const items = q
+    ? grpState.items.filter((g) =>
+        String(g.title || "").toLowerCase().includes(q) ||
+        String(g.username || "").toLowerCase().includes(q) ||
+        String(g.chat_id || "").includes(q))
+    : grpState.items;
+  const rows = items.map((g) => {
     const st = g.enabled ? '<span class="pill ok">مراقبة</span>' : '<span class="pill warn">موقوفة</span>';
     const stale = g.stale ? ' <span class="pill bad" title="توقف استقبال الرسائل من هذه المجموعة">متوقفة؟</span>' : "";
     return `<tr>
+      <td><input type="checkbox" data-grpcb="${esc(g.chat_id)}"></td>
       <td><b>${esc(g.title)}</b>${g.username ? `<br><small>@${esc(g.username)}</small>` : ""}</td>
       <td><code>${esc(g.chat_id)}</code></td><td>${st}${stale}</td>
       <td>${fmtNum(g.msgs_total)}</td><td>${fmtNum(g.alerts_24h)}</td>
@@ -506,8 +540,59 @@ function renderGroups(d) {
         <button class="btn sm danger" data-act="remove" data-id="${g.chat_id}">إزالة</button>
       </td></tr>`;
   }).join("");
-  $("grpTable").innerHTML = "<thead><tr><th>المجموعة</th><th>المعرف</th><th>الحالة</th><th>الرسائل (7 أيام)</th><th>تنبيهات 24س</th><th>آخر رسالة</th><th>إجراءات</th></tr></thead><tbody>" + (rows || "<tr><td colspan='7'>لا مجموعات محددة</td></tr>") + "</tbody>";
+  $("grpTable").innerHTML = "<thead><tr><th><input type=\"checkbox\" id=\"grpAll\"></th><th>المجموعة</th><th>المعرف</th><th>الحالة</th><th>الرسائل (7 أيام)</th><th>تنبيهات 24س</th><th>آخر رسالة</th><th>إجراءات</th></tr></thead><tbody>" + (rows || `<tr><td colspan='8'>${q ? "لا نتائج مطابقة" : "لا مجموعات محددة"}</td></tr>`) + "</tbody>";
+  updateGrpBulk();
 }
+
+let grpState = { items: [] };
+function grpSelected() {
+  return Array.from(document.querySelectorAll("#grpTable input[data-grpcb]:checked"))
+    .map((cb) => Number(cb.dataset.grpcb)).filter((n) => Number.isFinite(n));
+}
+function updateGrpBulk() {
+  const n = grpSelected().length;
+  $("grpBulkBar").classList.toggle("hidden", n === 0);
+  $("grpBulkCount").textContent = `${n} محدد`;
+}
+$("grpSearch").addEventListener("input", () => {
+  clearTimeout($("grpSearch")._tm);
+  $("grpSearch")._tm = setTimeout(() => { if (grpState.items.length) renderGroups({ items: grpState.items, allow_all: !$("grpAllowAll").classList.contains("hidden") }); }, 250);
+});
+$("grpTable").addEventListener("change", (ev) => {
+  if (ev.target.id === "grpAll") {
+    const checked = ev.target.checked;
+    document.querySelectorAll("#grpTable input[data-grpcb]").forEach((cb) => { cb.checked = checked; });
+  }
+  updateGrpBulk();
+});
+async function grpBulkToggle(enable) {
+  const ids = grpSelected();
+  if (!ids.length) return;
+  const go = await confirmModal(`${enable ? "تفعيل" : "إيقاف"} مراقبة ${ids.length} مصدر؟`, "تنفيذ");
+  if (!go) return;
+  let done = 0;
+  for (const chat_id of ids) {
+    const r = await api("/admin/api/groups/toggle", { method: "POST", body: { chat_id, enabled: enable } });
+    if (r.ok) done++;
+  }
+  toast(`✅ تم تحديث ${done}/${ids.length}`);
+  tabLoaders.groups().catch(() => {});
+}
+$("grpBulkPause").addEventListener("click", () => grpBulkToggle(false));
+$("grpBulkResume").addEventListener("click", () => grpBulkToggle(true));
+$("grpBulkRemove").addEventListener("click", async () => {
+  const ids = grpSelected();
+  if (!ids.length) return;
+  const go = await confirmModal(`إزالة ${ids.length} مصدر من المراقبة؟ (لن تُحذف رسائلها)`, "إزالة المحدد");
+  if (!go) return;
+  let done = 0;
+  for (const chat_id of ids) {
+    const r = await api("/admin/api/groups/remove", { method: "POST", body: { chat_id } });
+    if (r.ok) done++;
+  }
+  toast(`✅ أُزيل ${done}/${ids.length}`);
+  tabLoaders.groups().catch(() => {});
+});
 
 $("grpAddBtn").addEventListener("click", async () => {
   const input = $("grpAddInput").value.trim();
@@ -684,9 +769,13 @@ async function loadOpsErrors() {
 }
 
 let audPage = 1;
+let audFilters = { q: "", hours: 0 };
 async function loadAudit(page) {
   audPage = page || 1;
-  const r = await api(`/admin/api/ops/audit?page=${audPage}`);
+  let qs = `page=${audPage}`;
+  if (audFilters.q) qs += `&q=${encodeURIComponent(audFilters.q)}`;
+  if (audFilters.hours) qs += `&hours=${audFilters.hours}`;
+  const r = await api(`/admin/api/ops/audit?${qs}`);
   if (!r.ok) return;
   const d = r.data;
   const rows = (d.items || []).map((a) =>
@@ -699,6 +788,11 @@ async function loadAudit(page) {
 }
 $("audPrev").addEventListener("click", () => loadAudit(audPage - 1).catch(() => {}));
 $("audNext").addEventListener("click", () => loadAudit(audPage + 1).catch(() => {}));
+$("audApply").addEventListener("click", () => {
+  audFilters.q = $("audSearch").value.trim();
+  audFilters.hours = Number($("audHours").value) || 0;
+  loadAudit(1).catch(() => {});
+});
 
 async function loadMemInfo() {
   const r = await api("/admin/api/ops");
@@ -956,3 +1050,413 @@ $("wizCodeInput").addEventListener("keydown", (e) => { if (e.key === "Enter") wi
 $("wizPassInput").addEventListener("keydown", (e) => { if (e.key === "Enter") wizPassNext(); });
 $("wiz").addEventListener("click", (e) => { if (e.target === $("wiz")) closeWizard(); });
 /* ═════════ نهاية معالج الربط ═════════ */
+
+/* ═════════ الوحدة 3-ب: بحث الكلمات (v15.7.0) ═════════ */
+function kwFilterApply() {
+  const q = ($("kwSearch").value || "").trim().toLowerCase();
+  document.querySelectorAll("#kwCats details").forEach((d) => {
+    if (!q) { d.style.display = ""; d.open = false; return; }
+    const hit = (d.textContent || "").toLowerCase().includes(q);
+    d.style.display = hit ? "" : "none";
+    if (hit) d.open = true;
+  });
+}
+$("kwSearch").addEventListener("input", () => {
+  clearTimeout($("kwSearch")._tm);
+  $("kwSearch")._tm = setTimeout(kwFilterApply, 250);
+});
+$("kwSearchClear").addEventListener("click", () => {
+  $("kwSearch").value = "";
+  kwFilterApply();
+});
+
+/* ═════════ الوحدة 7: الحظر (v15.7.0) ═════════ */
+let blkPage = 1;
+let blkKind = "sender";
+
+tabLoaders.blocked = async function () { await loadBlocked(); };
+
+const BLK_PLACEHOLDERS = {
+  sender: "123456789 أو @username أو t.me/name",
+  bot: "123456789 أو @botname أو t.me/botname",
+  chat: "t.me/group أو -1001234567890",
+};
+
+async function loadBlocked() {
+  const kind = $("blkKindFilter").value;
+  const q = $("blkSearch").value.trim();
+  const r = await api(`/admin/api/blocked?kind=${kind}&q=${encodeURIComponent(q)}&page=${blkPage}`);
+  if (!r.ok) { toast("تعذر تحميل قوائم الحظر", true); return; }
+  renderBlocked(r.data, kind);
+}
+
+function renderBlocked(d, kind) {
+  blkKind = kind;
+  $("blkNote").textContent = d.note || "";
+  const ov = d.overview || {};
+  const cap = d.capture_from_bots;
+  $("blkChips").innerHTML =
+    `<span class="chip">مرسلون محظورون: <b>${fmtNum(ov.senders)}</b></span>` +
+    `<span class="chip">مجموعات محظورة: <b>${fmtNum(ov.chats)}</b></span>` +
+    `<span class="chip">بوتات محظورة: <b>${fmtNum(ov.bots)}</b></span>` +
+    (cap === null ? "" : `<span class="chip">التقاط البوتات (env): <b>${cap ? "مفعّل" : "معطّل"}</b></span>`);
+  const rows = (d.items || []).map((b) => {
+    const who = b.username ? "@" + b.username : (b.name || "—");
+    const bot = b.is_bot ? ' <span class="pill muted">بوت</span>' : "";
+    const reason = b.reason ? esc(b.reason) : '<small>بدون سبب</small>';
+    return `<tr>
+      <td><input type="checkbox" data-blkcb="${esc(b.entity_id)}"></td>
+      <td><code>${esc(b.entity_id)}</code></td>
+      <td>${esc(who)}${bot}</td>
+      <td>${reason}</td>
+      <td><small>${esc(b.blocked_by || "")}</small></td>
+      <td><small>${esc(b.blocked_at || "")}</small></td>
+      <td><button class="btn sm" data-blkact="remove" data-id="${esc(b.entity_id)}">إلغاء الحظر</button></td>
+    </tr>`;
+  }).join("");
+  $("blkTable").innerHTML = "<thead><tr><th></th><th>المعرف</th><th>الكيان</th><th>السبب</th><th>بواسطة</th><th>التاريخ</th><th></th></tr></thead><tbody>" +
+    (rows || "<tr><td colspan='7'>لا حظر في هذه القائمة</td></tr>") + "</tbody>";
+  $("blkPageInfo").textContent = `صفحة ${d.page} · الإجمالي ${fmtNum(d.total)}`;
+  $("blkPrev").disabled = d.page <= 1;
+  $("blkNext").disabled = !d.has_more;
+  updateBlkBulk();
+}
+
+function blkSelected() {
+  return Array.from(document.querySelectorAll("#blkTable input[data-blkcb]:checked"))
+    .map((cb) => Number(cb.dataset.blkcb)).filter((n) => Number.isFinite(n));
+}
+function updateBlkBulk() {
+  const n = blkSelected().length;
+  $("blkBulkRemove").disabled = n === 0;
+  $("blkBulkRemove").textContent = n ? `إلغاء حظر ${n} المحدد` : "إلغاء حظر المحدد";
+}
+$("blkTable").addEventListener("change", () => updateBlkBulk());
+
+$("blkKind").addEventListener("change", () => {
+  $("blkInput").placeholder = BLK_PLACEHOLDERS[$("blkKind").value] || BLK_PLACEHOLDERS.sender;
+});
+
+$("blkAddBtn").addEventListener("click", async () => {
+  const input = $("blkInput").value.trim();
+  if (!input) { toast("أدخل المعرف أو الرابط", true); return; }
+  const kind = $("blkKind").value;
+  const label = kind === "chat" ? "حظر هذه المجموعة/القناة ومنع معالجة رسائلها؟"
+    : kind === "bot" ? "حظر هذا البوت ومنع معالجة رسائله؟"
+    : "حظر هذا المرسل ومنع معالجة رسائله؟";
+  const go = await confirmModal(label, "حظر");
+  if (!go) return;
+  const r = await api("/admin/api/blocked/add", {
+    method: "POST",
+    body: { input, kind, reason: $("blkReason").value.trim() },
+  });
+  if (r.ok && r.data.ok) {
+    const t = r.data.title ? ` (${r.data.title})` : "";
+    toast(`✅ تم الحظر [${r.data.kind}] ${r.data.entity_id}${t}`);
+    $("blkInput").value = "";
+    $("blkReason").value = "";
+    if (r.data.kind !== $("blkKindFilter").value) $("blkKindFilter").value = r.data.kind;
+    blkPage = 1;
+    loadBlocked().catch(() => {});
+  } else {
+    toast(r.data.note || r.data.error || "فشل الحظر", true);
+  }
+});
+
+$("blkRefresh").addEventListener("click", () => loadBlocked().catch(() => {}));
+$("blkKindFilter").addEventListener("change", () => { blkPage = 1; loadBlocked().catch(() => {}); });
+$("blkSearch").addEventListener("keydown", (e) => { if (e.key === "Enter") { blkPage = 1; loadBlocked().catch(() => {}); } });
+$("blkPrev").addEventListener("click", () => { if (blkPage > 1) { blkPage--; loadBlocked().catch(() => {}); } });
+$("blkNext").addEventListener("click", () => { blkPage++; loadBlocked().catch(() => {}); });
+
+$("blkTable").addEventListener("click", async (ev) => {
+  const btn = ev.target.closest("button[data-blkact]");
+  if (!btn) return;
+  const go = await confirmModal(`إلغاء الحظر عن ${btn.dataset.id}؟ ستعود معالجة رسائله خلال ≤30ث`, "إلغاء الحظر");
+  if (!go) return;
+  const r = await api("/admin/api/blocked/remove", {
+    method: "POST",
+    body: { kind: $("blkKindFilter").value, entity_id: Number(btn.dataset.id) },
+  });
+  toast(r.ok && r.data.ok ? "✅ أُلغي الحظر" : "❌ فشل", !(r.ok && r.data.ok));
+  loadBlocked().catch(() => {});
+});
+
+$("blkBulkRemove").addEventListener("click", async () => {
+  const ids = blkSelected();
+  if (!ids.length) return;
+  const go = await confirmModal(`إلغاء حظر ${ids.length} عنصراً؟ ستعود معالجة رسائلهم خلال ≤30ث`, "تنفيذ");
+  if (!go) return;
+  const r = await api("/admin/api/blocked/bulk", {
+    method: "POST",
+    body: { kind: $("blkKindFilter").value, ids },
+  });
+  toast(r.ok && r.data.ok ? `✅ أُلغي حظر ${r.data.removed}` : "❌ فشل", !(r.ok && r.data.ok));
+  loadBlocked().catch(() => {});
+});
+
+/* ═════════ الوحدة 8: الأشخاص (v15.7.0) ═════════ */
+let pplPage = 1;
+
+tabLoaders.people = async function () { await loadPeople(); };
+
+async function loadPeople() {
+  const flag = $("pplFlag").value;
+  const q = $("pplSearch").value.trim();
+  const r = await api(`/admin/api/people?flag=${flag}&q=${encodeURIComponent(q)}&page=${pplPage}`);
+  if (!r.ok) { toast("تعذر تحميل الأشخاص", true); return; }
+  renderPeople(r.data);
+}
+
+function renderPeople(d) {
+  const ov = d.overview || {};
+  $("pplChips").innerHTML =
+    `<span class="chip">إجمالي المرسلين: <b>${fmtNum(ov.total)}</b></span>` +
+    `<span class="chip">بوتات: <b>${fmtNum(ov.bots)}</b></span>` +
+    `<span class="chip">محظورون: <b>${fmtNum(ov.blocked)}</b></span>` +
+    `<span class="chip">قائمة السماح: <b>${fmtNum(ov.allowed)}</b></span>`;
+  const rows = (d.items || []).map((p) => {
+    const badges = [];
+    if (p.is_bot) badges.push('<span class="pill muted">بوت</span>');
+    if (p.is_scam) badges.push('<span class="pill bad">scam</span>');
+    if (p.is_blocked) badges.push('<span class="pill bad">محظور</span>');
+    if (p.is_allowed) badges.push('<span class="pill ok">مسموح</span>');
+    const who = p.username ? "@" + p.username : (p.name || "—");
+    const acts = [];
+    if (p.is_blocked) acts.push(`<button class="btn sm" data-pplact="unblock" data-id="${p.sender_id}">إلغاء الحظر</button>`);
+    else acts.push(`<button class="btn sm danger" data-pplact="block" data-id="${p.sender_id}" data-name="${esc(who)}">حظر</button>`);
+    if (p.is_allowed) acts.push(`<button class="btn sm" data-pplact="disallow" data-id="${p.sender_id}">إزالة السماح</button>`);
+    else acts.push(`<button class="btn sm" data-pplact="allow" data-id="${p.sender_id}">سماح</button>`);
+    return `<tr>
+      <td><b>${esc(who)}</b><br><code>${esc(p.sender_id)}</code> ${badges.join(" ")}</td>
+      <td>${fmtNum(p.total_messages)}</td>
+      <td>${fmtNum(p.alerts_sent)}</td>
+      <td>${esc(String(p.reputation))}</td>
+      <td>${acts.join(" ")}</td>
+    </tr>`;
+  }).join("");
+  $("pplTable").innerHTML = "<thead><tr><th>الشخص</th><th>رسائل</th><th>تنبيهات</th><th>السمعة</th><th>إجراءات</th></tr></thead><tbody>" +
+    (rows || "<tr><td colspan='5'>لا بيانات — تظهر الأشخاص بعد أول رسالة تُلتقط</td></tr>") + "</tbody>";
+  $("pplPageInfo").textContent = `صفحة ${d.page}`;
+  $("pplPrev").disabled = d.page <= 1;
+  $("pplNext").disabled = !d.has_more;
+}
+
+$("pplRefresh").addEventListener("click", () => loadPeople().catch(() => {}));
+$("pplFlag").addEventListener("change", () => { pplPage = 1; loadPeople().catch(() => {}); });
+$("pplSearch").addEventListener("keydown", (e) => { if (e.key === "Enter") { pplPage = 1; loadPeople().catch(() => {}); } });
+$("pplPrev").addEventListener("click", () => { if (pplPage > 1) { pplPage--; loadPeople().catch(() => {}); } });
+$("pplNext").addEventListener("click", () => { pplPage++; loadPeople().catch(() => {}); });
+
+$("pplTable").addEventListener("click", async (ev) => {
+  const btn = ev.target.closest("button[data-pplact]");
+  if (!btn) return;
+  const act = btn.dataset.pplact;
+  const id = btn.dataset.id;
+  const name = btn.dataset.name || id;
+  let note = "";
+  if (act === "block") {
+    const typed = await promptModal(`سبب حظر ${name}؟ (اختياري)`, "السبب", "", "حظر");
+    if (typed === null) return;
+    note = typed;
+    const go = await confirmModal(`حظر ${name} ومنع معالجة رسائله نهائياً؟`, "حظر");
+    if (!go) return;
+  } else if (act === "unblock") {
+    const go = await confirmModal(`إلغاء الحظر عن ${id}؟`, "تنفيذ");
+    if (!go) return;
+  } else if (act === "allow") {
+    const go = await confirmModal(`إضافة ${id} لقائمة السماح؟ رسائله تتجاوز الفلترة العادية (داخل مفتاح allowlist).`, "سماح");
+    if (!go) return;
+  } else {
+    const go = await confirmModal(`إزالة ${id} من قائمة السماح؟`, "تنفيذ");
+    if (!go) return;
+  }
+  const r = await api("/admin/api/people/action", { method: "POST", body: { action: act, sender_id: Number(id), note } });
+  toast(r.ok && r.data.ok ? "✅ تم التنفيذ" : "❌ " + ((r.data || {}).error || "فشل"), !(r.ok && r.data.ok));
+  loadPeople().catch(() => {});
+});
+
+/* ═════════ الوحدة 9: القواعد (v15.7.0) ═════════ */
+let rlEditingId = null;
+const RL_COND_LABELS = {
+  keyword: "كلمة", source_chat_id: "المصدر", sender_id: "المرسل", min_confidence: "ثقة ≥",
+};
+const RL_ACTION_LABELS = { allow: "سماح", block: "حظر", tag: "وسم" };
+
+tabLoaders.rules = async function () { await loadRules(); };
+
+async function loadRules() {
+  const r = await api("/admin/api/rules");
+  if (!r.ok) { toast("تعذر تحميل القواعد", true); return; }
+  renderRules(r.data);
+}
+
+function condChips(conds) {
+  return Object.keys(conds || {}).map((k) =>
+    `<span class="cond-chip">${esc(RL_COND_LABELS[k] || k)}: <b>${esc(String(conds[k]))}</b></span>`
+  ).join(" ");
+}
+
+function renderRules(d) {
+  $("rlEngineBadge").innerHTML =
+    `<span class="chip">محرك القواعد: <b>${d.rule_engine_enabled ? "مفعّل" : "معطّل"}</b></span>` +
+    `<span class="chip">قائمة السماح: <b>${d.allowlist_enabled ? "مفعّلة" : "معطّلة"}</b></span>` +
+    `<span class="chip">الإجمالي: <b>${fmtNum(d.total)}</b></span>`;
+  const rows = (d.items || []).map((r) => {
+    const st = r.enabled ? '<span class="pill ok">مفعّلة</span>' : '<span class="pill warn">معطّلة</span>';
+    const av = r.action === "tag" && r.action_value ? ` → <small>${esc(r.action_value)}</small>` : "";
+    return `<tr>
+      <td><b>${esc(r.name)}</b><br><small>${esc(r.created_by || "")} · أولوية ${esc(String(r.priority))} · تطابقات ${fmtNum(r.hits)}</small></td>
+      <td>${condChips(r.conditions)}</td>
+      <td><span class="pill muted">${esc(RL_ACTION_LABELS[r.action] || r.action)}</span>${av}</td>
+      <td>${st}</td>
+      <td>
+        <button class="btn sm" data-rlact="edit" data-id="${r.id}">تعديل</button>
+        <button class="btn sm" data-rlact="toggle" data-id="${r.id}" data-en="${r.enabled ? 1 : 0}">${r.enabled ? "تعطيل" : "تفعيل"}</button>
+        <button class="btn sm danger" data-rlact="delete" data-id="${r.id}">حذف</button>
+      </td>
+    </tr>`;
+  }).join("");
+  $("rlTable").innerHTML = "<thead><tr><th>القاعدة</th><th>الشروط</th><th>الإجراء</th><th>الحالة</th><th>إجراءات</th></tr></thead><tbody>" +
+    (rows || "<tr><td colspan='5'>لا قواعد — أضف أول قاعدة من الأعلى</td></tr>") + "</tbody>";
+}
+
+function rlFormReset() {
+  rlEditingId = null;
+  $("rlName").value = "";
+  $("rlCondVal").value = "";
+  $("rlActionValue").value = "";
+  $("rlPriority").value = 100;
+  $("rlSaveBtn").textContent = "إضافة قاعدة";
+  $("rlCancelEdit").classList.add("hidden");
+}
+
+$("rlCancelEdit").addEventListener("click", rlFormReset);
+
+$("rlSaveBtn").addEventListener("click", async () => {
+  const name = $("rlName").value.trim();
+  const key = $("rlCondKey").value;
+  const rawVal = $("rlCondVal").value.trim();
+  const action = $("rlAction").value;
+  if (!name) { toast("أدخل اسم القاعدة", true); return; }
+  if (!rawVal) { toast("أدخل قيمة الشرط", true); return; }
+  let value = rawVal;
+  if (key === "min_confidence") {
+    const f = parseFloat(rawVal);
+    if (isNaN(f) || f < 0 || f > 1) { toast("الثقة بين 0 و 1", true); return; }
+    value = f;
+  } else if (key === "source_chat_id" || key === "sender_id") {
+    if (!/^-?\d+$/.test(rawVal)) { toast("المعرف يجب أن يكون رقماً", true); return; }
+    value = Number(rawVal);
+  }
+  const payload = {
+    name,
+    conditions: { [key]: value },
+    action,
+    action_value: $("rlActionValue").value.trim(),
+    priority: Number($("rlPriority").value) || 100,
+  };
+  if (rlEditingId) {
+    const r = await api("/admin/api/rules/edit", { method: "POST", body: { rule_id: rlEditingId, payload } });
+    if (r.ok && r.data.ok) { toast("✅ حُدّثت القاعدة — تطبيق خلال ≤30ث"); rlFormReset(); loadRules().catch(() => {}); }
+    else toast("❌ " + (r.data.error || "فشل التحديث"), true);
+  } else {
+    const go = await confirmModal("إضافة هذه القاعدة لمسار المعالجة الفعلي؟", "إضافة");
+    if (!go) return;
+    const r = await api("/admin/api/rules/add", { method: "POST", body: payload });
+    if (r.ok && r.data.ok) { toast("✅ أُضيفت القاعدة — تطبيق خلال ≤30ث"); rlFormReset(); loadRules().catch(() => {}); }
+    else toast("❌ " + (r.data.error || "فشل الإضافة"), true);
+  }
+});
+
+$("rlTable").addEventListener("click", async (ev) => {
+  const btn = ev.target.closest("button[data-rlact]");
+  if (!btn) return;
+  const act = btn.dataset.rlact, id = Number(btn.dataset.id);
+  if (act === "delete") {
+    const go = await confirmModal("حذف هذه القاعدة نهائياً؟", "حذف");
+    if (!go) return;
+    const r = await api("/admin/api/rules/delete", { method: "POST", body: { rule_id: id } });
+    toast(r.ok && r.data.ok ? "✅ حُذفت" : "❌ فشل", !(r.ok && r.data.ok));
+    loadRules().catch(() => {});
+  } else if (act === "toggle") {
+    const enable = btn.dataset.en !== "1";
+    const r = await api("/admin/api/rules/toggle", { method: "POST", body: { rule_id: id, enabled: enable } });
+    toast(r.ok && r.data.ok ? (enable ? "✅ فُعّلت" : "⏸️ عُطّلت") : "❌ فشل", !(r.ok && r.data.ok));
+    loadRules().catch(() => {});
+  } else if (act === "edit") {
+    const r = await api("/admin/api/rules");
+    if (!r.ok) return;
+    const rule = (r.data.items || []).find((x) => x.id === id);
+    if (!rule) { toast("القاعدة غير موجودة", true); return; }
+    rlEditingId = id;
+    $("rlName").value = rule.name === "—" ? "" : rule.name;
+    const keys = Object.keys(rule.conditions || {});
+    $("rlCondKey").value = keys[0] || "keyword";
+    $("rlCondVal").value = keys.length ? String(rule.conditions[keys[0]]) : "";
+    $("rlAction").value = rule.action;
+    $("rlActionValue").value = rule.action_value || "";
+    $("rlPriority").value = rule.priority;
+    $("rlSaveBtn").textContent = "حفظ التعديل";
+    $("rlCancelEdit").classList.remove("hidden");
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  }
+});
+
+$("rlExport").addEventListener("click", async () => {
+  const r = await api("/admin/api/rules/export");
+  if (!r.ok) { toast("فشل التصدير", true); return; }
+  downloadJSON(r.data, "br7-rules.json");
+  toast("تم التصدير");
+});
+$("rlImportBtn").addEventListener("click", () => $("rlImportFile").click());
+$("rlImportFile").addEventListener("change", async (ev) => {
+  const file = ev.target.files[0];
+  if (!file) return;
+  try {
+    const text = await file.text();
+    const go = await confirmModal("استيراد القواعد من الملف وإضافتها للمحرك؟", "استيراد");
+    if (!go) return;
+    const r = await api("/admin/api/rules/import", { method: "POST", body: { json_text: text } });
+    if (r.ok && r.data.ok) { toast(`✅ استُوردت ${r.data.applied} (متجاوزة: ${r.data.skipped})`); loadRules().catch(() => {}); }
+    else toast("فشل الاستيراد: " + (r.data.error || "?"), true);
+  } catch (e) { toast("ملف غير صالح", true); }
+  ev.target.value = "";
+});
+$("rlRefresh").addEventListener("click", () => loadRules().catch(() => {}));
+
+/* ═════════ الوحدة 10: الميزات (v15.7.0) ═════════ */
+tabLoaders.features = async function () { await loadFeatures(); };
+
+async function loadFeatures() {
+  const r = await api("/admin/api/features");
+  if (!r.ok) { toast("تعذر تحميل الميزات", true); return; }
+  $("featNote").textContent = r.data.note || "";
+  $("featList").innerHTML = (r.data.items || []).map((f) => {
+    const badges = f.overridden ? '<span class="pill muted">مخصص من اللوحة</span>' : '<span class="pill muted">افتراضي</span>';
+    return `<div class="featrow">
+      <div class="meta">
+        <b>${esc(f.label)}</b>
+        <small>${esc(f.impact)}</small>
+        <div class="badges">${badges}${f.updated_by ? ` <small>آخر تعديل: ${esc(f.updated_by)} · ${esc(f.updated_at || "")}</small>` : ""}</div>
+      </div>
+      <label class="switch"><input type="checkbox" data-feat="${esc(f.key)}" ${f.enabled ? "checked" : ""}><span class="slider"></span></label>
+    </div>`;
+  }).join("");
+}
+
+$("featList").addEventListener("change", async (ev) => {
+  const sw = ev.target.closest("input[data-feat]");
+  if (!sw) return;
+  const key = sw.dataset.feat;
+  const enable = sw.checked;
+  const go = await confirmModal(
+    enable ? `تفعيل «${key}»؟ يُطبَّق على مسار المعالجة خلال ≤30ث دون إعادة تشغيل.`
+           : `تعطيل «${key}»؟ راجع وصف التأثير أعلاه قبل المتابعة.`,
+    enable ? "تفعيل" : "تعطيل");
+  if (!go) { sw.checked = !enable; return; }
+  const r = await api("/admin/api/features/toggle", { method: "POST", body: { key, enabled: enable } });
+  if (r.ok && r.data.ok) toast(`✅ ${key}: ${enable ? "مفعّل" : "معطّل"} — يُطبَّق خلال ≤30ث`);
+  else { toast("❌ " + ((r.data || {}).error || "فشل"), true); sw.checked = !enable; }
+  loadFeatures().catch(() => {});
+});

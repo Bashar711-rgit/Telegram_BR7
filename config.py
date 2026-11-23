@@ -1285,8 +1285,8 @@ class Config:
 #     الحدث الطازج يُسلّم متأخراً بدل إسقاطه (قتل نمط stale_dropped_
 #     queue_wait=285 أسقاط من بوت حي). فوق التشبع يبقى صمام القبول
 #     عند الالتقاط هو الحارس (تكلفة صفر كما v15.4.1).
-BOT_VERSION: Final = "15.6.0"
-BOT_CODENAME: Final = "Concurrent Gate — parallel DB validation, FastGate Aho-Corasick instant rejection, deeper filter executor, adaptive queue-wait ceiling, bot-capture hardened"
+BOT_VERSION: Final = "15.7.0"
+BOT_CODENAME: Final = "Admin Center Dashboard — blocked lists / people browser / rules CRUD / feature switches / bulk ops + search, all DB-driven hot-applied, zero touch to the message path"
 
 # =============================================================================
 # Pre-built config instance

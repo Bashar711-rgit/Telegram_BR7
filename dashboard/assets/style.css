@@ -290,3 +290,38 @@ footer.copyright {
   .wiz-phonewrap { flex-direction: column; align-items: stretch; }
   .wiz-phonewrap .field { max-width: none !important; }
 }
+
+/* ═════════ مركز الإدارة المتكامل (v15.7.0) ═════════ */
+.searchbar { min-width: 200px; }
+.bulkbar {
+  display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+  background: var(--bg2); border: 1px dashed var(--line); border-radius: 10px;
+  padding: 8px 12px; margin-bottom: 10px; font-size: 12px; color: var(--muted);
+}
+.bulkbar span { font-weight: 700; color: var(--text); }
+.btn.warn { border-color: #6b531f; color: #ffd88a; }
+.btn.warn:hover { background: #3a2b12; }
+.table input[type="checkbox"] {
+  width: 16px; height: 16px; accent-color: var(--accent); cursor: pointer;
+}
+.cond-chip {
+  display: inline-block; background: var(--panel2); border: 1px solid var(--line);
+  color: var(--muted); border-radius: 8px; padding: 2px 8px; margin: 2px;
+  font-size: 11px; font-family: monospace;
+}
+.cond-chip b { color: var(--accent); }
+.featrow {
+  display: flex; align-items: flex-start; justify-content: space-between; gap: 12px;
+  padding: 12px 0; border-bottom: 1px solid var(--line);
+}
+.featrow:last-child { border-bottom: 0; }
+.featrow .meta { flex: 1; }
+.featrow .meta small { display: block; margin-top: 3px; line-height: 1.7; }
+.featrow .meta .badges { margin-top: 6px; }
+.featrow .switch { margin-top: 2px; }
+.tabs::-webkit-scrollbar { height: 6px; }
+.tabs::-webkit-scrollbar-thumb { background: var(--line); border-radius: 3px; }
+@media (max-width: 600px) {
+  .tab { padding: 8px 12px; font-size: 13px; }
+  .searchbar { min-width: 140px; flex: 1; }
+}

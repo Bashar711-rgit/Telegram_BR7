@@ -3322,6 +3322,181 @@ class EnhancedDatabase:
         await self._commit()
         self._blocked_chats_cache.pop(chat_id, None)
 
+    # ─── Blocked Management — v15.7.0 (dashboard-driven) ───────────────────
+    # قراءة/عرض/حذف جماعي لقوائم الحظر الموجودة (blocked_senders/blocked_chats)
+    # — الكتابة الفردية عبر block_sender/block_chat الموجودة والمستهلكة فعلاً
+    # في monitors._validate_event. صفر تغيير على المسار الحرج.
+    BLOCKED_KINDS = ("sender", "chat")
+
+    async def list_blocked(self, kind: str, q: str = "",
+                           limit: int = 500) -> List[Dict[str, Any]]:
+        """سجل الحظر مع بحث اختياري — kind: sender | chat.
+
+        sender يُثرى من sender_contacts (username/اسم/is_bot) للعرض فقط —
+        لا JOIN على المسار الحرج، هنا حصراً (لوحة التحكم).
+        """
+        kind = str(kind or "sender").lower()
+        if kind not in self.BLOCKED_KINDS:
+            return []
+        try:
+            limit = max(1, min(int(limit), 1000))
+        except Exception:
+            limit = 500
+        where: List[str] = []
+        params: List[Any] = []
+        if q:
+            needle = f"%{_escape_like(q)}%"
+            if kind == "sender":
+                where.append(
+                    "(CAST(b.sender_id AS TEXT) LIKE ? ESCAPE '\\'"
+                    " OR COALESCE(c.username, '') LIKE ? ESCAPE '\\'"
+                    " OR COALESCE(c.first_name, '') LIKE ? ESCAPE '\\'"
+                    " OR COALESCE(b.reason, '') LIKE ? ESCAPE '\\')"
+                )
+            else:
+                where.append(
+                    "(CAST(b.chat_id AS TEXT) LIKE ? ESCAPE '\\'"
+                    " OR COALESCE(b.reason, '') LIKE ? ESCAPE '\\')"
+                )
+            params.extend([needle] * (4 if kind == "sender" else 2))
+        wsql = ("WHERE " + " AND ".join(where)) if where else ""
+        if kind == "sender":
+            sql = (
+                "SELECT b.sender_id AS entity_id, b.reason, b.blocked_by, b.blocked_at, "
+                "c.username, c.first_name, c.last_name, c.is_bot "
+                "FROM blocked_senders b "
+                "LEFT JOIN sender_contacts c ON c.sender_id = b.sender_id "
+                f"{wsql} ORDER BY b.blocked_at DESC, b.sender_id DESC LIMIT ?"
+            )
+        else:
+            sql = (
+                "SELECT b.chat_id AS entity_id, b.reason, b.blocked_by, b.blocked_at "
+                f"FROM blocked_chats b {wsql} "
+                "ORDER BY b.blocked_at DESC, b.chat_id DESC LIMIT ?"
+            )
+        params.append(limit)
+        try:
+            rows = await self._fetchall(sql, tuple(params))
+            for r in rows:
+                r["kind"] = kind
+            return rows
+        except Exception as e:
+            logger.debug(f"list_blocked skipped: {e}")
+            return []
+
+    async def blocked_overview(self) -> Dict[str, int]:
+        """عدّادات قوائم الحظر للوحة — استعلامان COUNT فقط عند فتح التبويب."""
+        out = {"senders": 0, "chats": 0, "bots": 0}
+        try:
+            row = await self._fetchone("SELECT COUNT(*) AS c FROM blocked_senders")
+            out["senders"] = int(row["c"]) if row and row.get("c") else 0
+            row = await self._fetchone("SELECT COUNT(*) AS c FROM blocked_chats")
+            out["chats"] = int(row["c"]) if row and row.get("c") else 0
+            row = await self._fetchone(
+                "SELECT COUNT(*) AS c FROM blocked_senders b "
+                "LEFT JOIN sender_contacts c ON c.sender_id = b.sender_id "
+                "WHERE c.is_bot = 1"
+            )
+            out["bots"] = int(row["c"]) if row and row.get("c") else 0
+        except Exception as e:
+            logger.debug(f"blocked_overview skipped: {e}")
+        return out
+
+    async def unblock_bulk(self, kind: str, ids: List[int]) -> int:
+        """إلغاء حظر جماعي — يفرغ كاش الحظر لكل معرف (نفس مسار unblock الفردي)."""
+        kind = str(kind or "").lower()
+        if kind not in self.BLOCKED_KINDS or not ids:
+            return 0
+        if len(ids) > 200:
+            ids = ids[:200]
+        cache = self._blocked_senders_cache if kind == "sender" else self._blocked_chats_cache
+        table = "blocked_senders" if kind == "sender" else "blocked_chats"
+        col = "sender_id" if kind == "sender" else "chat_id"
+        removed = 0
+        for rid in ids:
+            try:
+                eid = int(rid)
+            except Exception:
+                continue
+            try:
+                cur = await self._execute(
+                    f"DELETE FROM {table} WHERE {col} = ?", (eid,)
+                )
+                await self._commit()
+                cache.pop(eid, None)
+                removed += cur.rowcount or 0
+            except Exception as e:
+                logger.debug(f"unblock_bulk[{kind}:{eid}] skipped: {e}")
+        return removed
+
+    # ─── People Browser — v15.7.0 (dashboard-driven) ───────────────────────
+    async def list_people(self, q: str = "", limit: int = 100,
+                          offset: int = 0, flag: str = "all") -> List[Dict[str, Any]]:
+        """مستعرض الأشخاص (sender_contacts + sender_stats) مع أعلام
+        محظور/مسموح — قراءة عرضية للوحة حصراً."""
+        try:
+            limit = max(1, min(int(limit), 300))
+            offset = max(0, int(offset))
+        except Exception:
+            limit, offset = 100, 0
+        where: List[str] = []
+        params: List[Any] = []
+        if q:
+            needle = f"%{_escape_like(q)}%"
+            where.append(
+                "(CAST(sc.sender_id AS TEXT) LIKE ? ESCAPE '\\'"
+                " OR COALESCE(sc.username, '') LIKE ? ESCAPE '\\'"
+                " OR COALESCE(sc.first_name, '') LIKE ? ESCAPE '\\'"
+                " OR COALESCE(sc.last_name, '') LIKE ? ESCAPE '\\')"
+            )
+            params.extend([needle] * 4)
+        if flag == "blocked":
+            where.append("EXISTS (SELECT 1 FROM blocked_senders bs WHERE bs.sender_id = sc.sender_id)")
+        elif flag == "bots":
+            where.append("sc.is_bot = 1")
+        elif flag == "allowed":
+            where.append(
+                "EXISTS (SELECT 1 FROM allowed_entities ae "
+                "WHERE ae.entity_type = 'sender' AND ae.entity_id = sc.sender_id)"
+            )
+        wsql = ("WHERE " + " AND ".join(where)) if where else ""
+        sql = (
+            "SELECT sc.sender_id, sc.username, sc.first_name, sc.last_name, sc.is_bot, "
+            "sc.is_verified, sc.is_scam, sc.is_restricted, sc.last_seen, "
+            "COALESCE(ss.total_messages, 0) AS total_messages, "
+            "COALESCE(ss.alerts_sent, 0) AS alerts_sent, "
+            "COALESCE(ss.reputation_score, 50.0) AS reputation_score, "
+            "EXISTS (SELECT 1 FROM blocked_senders bs WHERE bs.sender_id = sc.sender_id) AS is_blocked, "
+            "EXISTS (SELECT 1 FROM allowed_entities ae "
+            "WHERE ae.entity_type = 'sender' AND ae.entity_id = sc.sender_id) AS is_allowed "
+            "FROM sender_contacts sc LEFT JOIN sender_stats ss ON ss.sender_id = sc.sender_id "
+            f"{wsql} ORDER BY COALESCE(ss.total_messages, 0) DESC, sc.sender_id DESC "
+            "LIMIT ? OFFSET ?"
+        )
+        params.extend([limit, offset])
+        try:
+            return await self._fetchall(sql, tuple(params))
+        except Exception as e:
+            logger.debug(f"list_people skipped: {e}")
+            return []
+
+    async def people_overview(self) -> Dict[str, int]:
+        out = {"total": 0, "bots": 0, "blocked": 0, "allowed": 0}
+        try:
+            row = await self._fetchone("SELECT COUNT(*) AS c FROM sender_contacts")
+            out["total"] = int(row["c"]) if row and row.get("c") else 0
+            row = await self._fetchone("SELECT COUNT(*) AS c FROM sender_contacts WHERE is_bot = 1")
+            out["bots"] = int(row["c"]) if row and row.get("c") else 0
+            row = await self._fetchone("SELECT COUNT(*) AS c FROM blocked_senders")
+            out["blocked"] = int(row["c"]) if row and row.get("c") else 0
+            row = await self._fetchone(
+                "SELECT COUNT(*) AS c FROM allowed_entities WHERE entity_type = 'sender'"
+            )
+            out["allowed"] = int(row["c"]) if row and row.get("c") else 0
+        except Exception as e:
+            logger.debug(f"people_overview skipped: {e}")
+        return out
+
     # ─── Alerts ────────────────────────────────────────────────────────────
     async def add_alert(self, rec: AlertRecord) -> bool:
         async with self._stats_lock:

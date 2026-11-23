@@ -578,13 +578,135 @@ def setup_dashboard(app: web.Application, bot: Any) -> None:
             page = int(request.query.get("page", "1"))
         except ValueError:
             page = 1
-        return await bridge(lambda: api.ops_audit(page))
+        q = str(request.query.get("q", ""))[:64]
+        action = str(request.query.get("action", ""))[:60]
+        try:
+            since_hours = int(request.query.get("hours", "0"))
+        except ValueError:
+            since_hours = 0
+        return await bridge(lambda: api.ops_audit(page, q=q, action=action,
+                                                  since_hours=since_hours))
 
     async def api_ops_backup(request: web.Request) -> web.Response:
         from datetime import datetime
         fname = f"br7-backup-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}.json"
         return await bridge_attach(api.ops_backup,
                                    {"Content-Disposition": f'attachment; filename="{fname}"'})
+
+    # ── الوحدة 7: الحظر (v15.7.0) ────────────────────────────────────────
+    async def api_blocked(request: web.Request) -> web.Response:
+        try:
+            page = int(request.query.get("page", "1"))
+        except ValueError:
+            page = 1
+        kind = str(request.query.get("kind", "sender"))[:10]
+        q = str(request.query.get("q", ""))[:64]
+        return await bridge(lambda: api.blocked_list(kind, q, page))
+
+    async def api_blocked_add(request: web.Request) -> web.Response:
+        body = await body_json(request)
+        raw = str(body.get("input") or "")[:200]
+        kind = str(body.get("kind") or "sender")[:10]
+        reason = str(body.get("reason") or "")[:200]
+        return await bridge(lambda: api.blocked_add(raw, kind, reason))
+
+    async def api_blocked_remove(request: web.Request) -> web.Response:
+        body = await body_json(request)
+        kind = str(body.get("kind") or "")[:10]
+        try:
+            entity_id = int(body.get("entity_id"))
+        except (TypeError, ValueError):
+            return _json({"error": "invalid_entity_id"}, 400)
+        return await bridge(lambda: api.blocked_remove(kind, entity_id))
+
+    async def api_blocked_bulk(request: web.Request) -> web.Response:
+        body = await body_json(request)
+        kind = str(body.get("kind") or "")[:10]
+        ids = body.get("ids") if isinstance(body.get("ids"), list) else []
+        return await bridge(lambda: api.blocked_bulk_remove(kind, ids))
+
+    # ── الوحدة 8: الأشخاص (v15.7.0) ──────────────────────────────────────
+    async def api_people(request: web.Request) -> web.Response:
+        try:
+            page = int(request.query.get("page", "1"))
+        except ValueError:
+            page = 1
+        q = str(request.query.get("q", ""))[:64]
+        flag = str(request.query.get("flag", "all"))[:10]
+        return await bridge(lambda: api.people_list(q, flag, page))
+
+    async def api_people_action(request: web.Request) -> web.Response:
+        body = await body_json(request)
+        action = str(body.get("action") or "")[:10]
+        note = str(body.get("note") or "")[:200]
+        try:
+            sender_id = int(body.get("sender_id"))
+        except (TypeError, ValueError):
+            return _json({"error": "invalid_sender_id"}, 400)
+        return await bridge(lambda: api.person_action(action, sender_id, note))
+
+    # ── الوحدة 9: القواعد (v15.7.0) ──────────────────────────────────────
+    async def api_rules(request: web.Request) -> web.Response:
+        return await bridge(api.rules_list)
+
+    async def api_rules_add(request: web.Request) -> web.Response:
+        body = await body_json(request)
+        return await bridge(lambda: api.rule_add(body))
+
+    async def api_rules_edit(request: web.Request) -> web.Response:
+        body = await body_json(request)
+        try:
+            rule_id = int(body.get("rule_id"))
+        except (TypeError, ValueError):
+            return _json({"error": "invalid_rule_id"}, 400)
+        payload = body.get("payload") if isinstance(body.get("payload"), dict) else {}
+        return await bridge(lambda: api.rule_edit(rule_id, payload))
+
+    async def api_rules_toggle(request: web.Request) -> web.Response:
+        body = await body_json(request)
+        try:
+            rule_id = int(body.get("rule_id"))
+            enabled = bool(body.get("enabled"))
+        except (TypeError, ValueError):
+            return _json({"error": "invalid_rule_id"}, 400)
+        return await bridge(lambda: api.rule_toggle(rule_id, enabled))
+
+    async def api_rules_delete(request: web.Request) -> web.Response:
+        body = await body_json(request)
+        try:
+            rule_id = int(body.get("rule_id"))
+        except (TypeError, ValueError):
+            return _json({"error": "invalid_rule_id"}, 400)
+        return await bridge(lambda: api.rule_delete(rule_id))
+
+    async def api_rules_export(request: web.Request) -> web.Response:
+        return await bridge_attach(api.rules_export,
+                                   {"Content-Disposition": 'attachment; filename="br7-rules.json"'})
+
+    async def api_rules_import(request: web.Request) -> web.Response:
+        body = await body_json(request)
+        text = str(body.get("json_text") or "")
+        return await bridge(lambda: api.rules_import(text))
+
+    # ── الوحدة 10: الميزات (v15.7.0) ─────────────────────────────────────
+    async def api_features(request: web.Request) -> web.Response:
+        return await bridge(api.features_list)
+
+    async def api_features_toggle(request: web.Request) -> web.Response:
+        body = await body_json(request)
+        key = str(body.get("key") or "")[:60]
+        enabled = bool(body.get("enabled"))
+        return await bridge(lambda: api.feature_toggle(key, enabled))
+
+    # ── حسابات اللوحة: تعديل الاسم (v15.7.0) ─────────────────────────────
+    async def api_account_row_rename(request: web.Request) -> web.Response:
+        body = await body_json(request)
+        try:
+            row_id = int(body.get("row_id"))
+        except (TypeError, ValueError):
+            return _json({"error": "invalid_row_id"}, 400)
+        name = str(body.get("display_name") or "")[:80]
+        return await bridge(lambda: api.panel_rename(row_id, name))
 
     # ── الوسيط: مصادقة + CSRF + rate limit + ترويسات ────────────────────
     @web.middleware
@@ -684,6 +806,28 @@ def setup_dashboard(app: web.Application, bot: Any) -> None:
     r.add_get("/admin/api/ops/errors", api_ops_errors)
     r.add_get("/admin/api/ops/audit", api_ops_audit)
     r.add_get("/admin/api/ops/backup", api_ops_backup)
+
+    # v15.7.0: مركز الإدارة المتكامل — الحظر/الأشخاص/القواعد/الميزات
+    r.add_get("/admin/api/blocked", api_blocked)
+    r.add_post("/admin/api/blocked/add", api_blocked_add)
+    r.add_post("/admin/api/blocked/remove", api_blocked_remove)
+    r.add_post("/admin/api/blocked/bulk", api_blocked_bulk)
+
+    r.add_get("/admin/api/people", api_people)
+    r.add_post("/admin/api/people/action", api_people_action)
+
+    r.add_get("/admin/api/rules", api_rules)
+    r.add_post("/admin/api/rules/add", api_rules_add)
+    r.add_post("/admin/api/rules/edit", api_rules_edit)
+    r.add_post("/admin/api/rules/toggle", api_rules_toggle)
+    r.add_post("/admin/api/rules/delete", api_rules_delete)
+    r.add_get("/admin/api/rules/export", api_rules_export)
+    r.add_post("/admin/api/rules/import", api_rules_import)
+
+    r.add_get("/admin/api/features", api_features)
+    r.add_post("/admin/api/features/toggle", api_features_toggle)
+
+    r.add_post("/admin/api/accounts/row/rename", api_account_row_rename)
 
 
 async def api_db_audit(api: DashboardAPI, action: str, object_id: str,
