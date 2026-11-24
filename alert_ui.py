@@ -51,6 +51,9 @@ from telethon.sessions import StringSession
 # v11.3: فحص قابلية نقر اسم المرسل + الإصلاح الذاتي — المصدر الموحد للموضع
 # (contact_target) حتى لا يتشعب حساب الإزاحة في ملفات متعددة.
 from contact_target import SENDER_LABEL, metric_inc, utf16_len  # noqa: E402
+# v16.3.0: بوابة السلك — نفس عقد شكل الروابط المستخدم في Bot API ومسار
+# الحسابات (unified_alerts.card) كي لا يصل رابط مشوّه إلى MTProto أبداً.
+from unified_alerts.card import is_safe_button_url  # noqa: E402
 
 try:  # Telethon ≥ 1.45 — طبقة الأزرار المُعاد هيكلتها
     from telethon.tl.types import (
@@ -247,14 +250,25 @@ class AlertBotClient:
     # ── تحويل الأزرار (بنية build_alert_buttons ← كائنات Telethon) ──
     @staticmethod
     def _convert_row(row: List[Dict[str, Any]]) -> List[Any]:
-        """زر بلا بيانات صالحة يُحذف بصدق — لا أزرار ميتة أبداً."""
+        """زر بلا بيانات صالحة يُحذف بصدق — لا أزرار ميتة أبداً.
+
+        v16.3.0: بوابة السلك (is_safe_button_url) — رابط لا يطابق شكل
+        تيليجرام يُحذف هنا أيضاً (طبقة MTProto) بدل رفض الإرسال من الخادم،
+        والتكرار (نص، رابط) من إعادة بناء اللوحة يُزال عند التحويل."""
         out: List[Any] = []
+        seen: set = set()
         for b in row or []:
             text = str(b.get("text") or "").strip()
             if not text:
                 continue
             url = str(b.get("url") or "").strip()
             if url:
+                if not is_safe_button_url(url):
+                    continue  # رابط مشوّه → حذف صادق (لا زر ميت يُرفض كلياً)
+                key = (text, url)
+                if key in seen:
+                    continue  # منع تكرار الزر عند إعادة بناء/إرسال البطاقة
+                seen.add(key)
                 out.append(_mk_url_button(text, url))
                 continue
             copy_spec = b.get("copy_text")

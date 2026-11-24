@@ -164,7 +164,11 @@ from loguru import logger
 # (ALERT_BOT_MEMBERSHIP_TTL_S) — كان الملف بلا وصول للإعدادات إطلاقاً.
 from config import CFG, InputSanitizer  # noqa: E402
 # v12.0 unified_alerts: عقد سلامة البطاقة — فحص/إصلاح قبل كل إرسال Bot API
-from unified_alerts.card import validate_and_repair_card  # noqa: E402
+from unified_alerts.card import (  # noqa: E402
+    is_safe_button_url,
+    sanitize_alert_buttons,
+    validate_and_repair_card,
+)
 # v15.0: spawn_bg للإصلاح الحدوي الفوري عند فقدان عضوية البوت.
 from task_util import spawn_bg  # noqa: E402
 # v11.2: نظام مراسلة المرسل — المصدر الوحيد لاختيار رابط المرسل (spec #8).
@@ -326,11 +330,19 @@ def build_alert_buttons(
     * include_user_button=False بعد رفض tg://user (خصوصية) — يُسقط زر
       المرسل فقط ويبقى زر القروب.
     * copy_text: معامل محفوظ للتوافق الخلفي (v10.9.1) — مُتجاهَل منذ v11.1.
+    * v16.3.0: كل رابط يُتحقق من شكله قبل قرار الزر (is_safe_button_url) —
+      الرابط المشوّه = غير موجود، والزر المكرر (نص، رابط) يُزال؛ لا يصل
+      السلك رابط ميت يرفضه Bot API مع الحمولة كلها.
     * كل تنبيه جديد مستقبلاً يستخدم هذه الدالة تلقائياً — لا تُبنى أزرار
       يدوياً في أي مسار آخر.
     """
     row: List[Dict[str, Any]] = []
     username = _clean_username(sender_username)
+    # ══ v16.3.0: التحقق من صحة الروابط قبل إرسال التنبيه (نقطة القرار) ══
+    # username/رابط لا يطابق شكل تيليجرام = غير موجود — لا رابط ميت يصل
+    # السلك ولا زر يُرفض مع الحمولة كلها؛ المسار يسقط بصدق للبديل التالي.
+    if username and not is_safe_button_url(f"{_TG_URL}{username}"):
+        username = ""
     try:
         sid = int(sender_id or 0)
     except Exception:
@@ -343,8 +355,8 @@ def build_alert_buttons(
         url: Optional[str] = None
         if username:
             url = f"{_TG_URL}{username}"
-        elif contact_url:
-            url = str(contact_url)
+        elif contact_url and is_safe_button_url(contact_url):
+            url = str(contact_url).strip()
         elif sid and str(sender_type or "").strip().lower() not in _NO_USER_BUTTON_TYPES:
             # أفضل رابط مباشر ممكن لمن لا يملك username
             url = f"tg://user?id={sid}"
@@ -358,8 +370,13 @@ def build_alert_buttons(
     # 2) زر القروب — v14.9.2: «جروب» يفتح المجموعة المصدر مباشرة (نفس
     #    صيغة اللقطة المرجعية). بلا رابط قروب: «عرض الرسالة» برابط الرسالة
     #    إن وجد — بلا روابط وهمية أبداً.
+    #    v16.3.0: رابط مشوّه (فراغ/مخطط/بنية مكسورة) = غير موجود — زر
+    #    القروب يسقط إلى «عرض الرسالة» وعرض الرسالة بلا رابط يُحذف، فلا
+    #    يُرفض الإرسال كله من Bot API (BUTTON_URL_INVALID) أبداً.
     group = str(group_link or "").strip()
     if group in ("", "#"):
+        group = ""
+    if group and not is_safe_button_url(group):
         group = ""
     if group:
         row.append({"text": BTN_GROUP, "url": group})
@@ -367,10 +384,23 @@ def build_alert_buttons(
         view_url = str(msg_link or "").strip()
         if view_url in ("", "#"):
             view_url = ""
+        if view_url and not is_safe_button_url(view_url):
+            view_url = ""
         if view_url:
             row.append({"text": BTN_VIEW, "url": view_url})
 
-    return [row] if row else []
+    # v16.3.0: منع تكرار الأزرار (نص، رابط) — أي مسار إعادة بناء/إعادة
+    # إرسال يمر من هنا فلا يتضاعف زر مهما كان مصدر التكرار.
+    _seen: set = set()
+    deduped: List[Dict[str, Any]] = []
+    for _b in row:
+        _key = (_b.get("text"), _b.get("url"))
+        if _key in _seen:
+            continue
+        _seen.add(_key)
+        deduped.append(_b)
+
+    return [deduped] if deduped else []
 
 
 def _has_tg_user_button(built: Dict[str, Any]) -> bool:
@@ -1112,6 +1142,20 @@ class AlertBot:
                 for row in kb
             ]
             kb = [row for row in kb if row]
+        # ══ v16.3.0: بوابة السلك — آخر حاجز قبل Bot API ══
+        # زر برابط لا يطابق شكل تيليجرام (فراغ/مخطط/بنية مكسورة) يُحذف بصدق
+        # هنا بدل رفض الحمولة كلها (BUTTON_URL_INVALID → إعادة إرسال)،
+        # والتكرار (نص، رابط) من مسارات إعادة البناء يُزال. الأزرار الصالحة
+        # تبقى كما هي حرفياً — لا أثر على التنبيه السليم.
+        try:
+            kb, _gate_dropped = sanitize_alert_buttons(kb)
+            if _gate_dropped:
+                logger.warning(
+                    f"[ALERT] buttons_gate dropped={_gate_dropped} "
+                    "(unsafe_or_duplicate_url) — الصالح باقٍ والتنبيه يُرسل"
+                )
+        except Exception:
+            pass
         payload: Dict[str, Any] = {
             "chat_id": self.chat_id,
             "text": built["text"],

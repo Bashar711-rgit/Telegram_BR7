@@ -29,6 +29,18 @@ v14.5.1 — إصلاح جذري للقص:
 
 فشل-آمن: أي خلل في الفحص نفسه يعيد البطاقة كما هي (ok=True بلا تعديل) —
 الفحص ميزة، وأخطاؤه لا تُسقط تنبيهات صالحة.
+
+v16.3.0 — بوابة السلك للأزرار (مواصفة الأزرار §2):
+  * «تحقق من صحة الروابط قبل إرسال التنبيه»: زر برابط لا يطابق الأشكال
+    التي يعالجها تيليجرام فعلاً يُحذف بصدق هنا — قبل أن يصل السلك — بدل
+    رفض Bot API للحمولة كلها (BUTTON_URL_INVALID → إعادة إرسال مهدورة).
+  * «امنع تكرار الأزرار عند إعادة إرسال البطاقة»: أي زر (نص، رابط) مكرر
+    يُزال من اللوحة النهائية — مسارات إعادة البناء/الإرسال كلها تمر هنا.
+  * الأشكال المقبولة: t.me عام/خاص c//دعوات +hash/joinchat، http(s)
+    خارجي، وtg://user?id و tg://openmessage?user_id بالأرقام حصراً.
+  * شرط شكل لا شرط وجود: فحص هوية الاسم 5-32 يبقى في nav_resolver.VERIFY —
+    هذه البوابة تمنع ما يكسر الإرسال فقط، والزر بلا رابط صالح يُحذف دون
+    أن يمنع إرسال التنبيه (شرط سلوك صادق موثق).
 """
 
 from __future__ import annotations
@@ -60,6 +72,14 @@ _TAG_CANON = {"strong": "b", "em": "i", "ins": "u", "strike": "s", "del": "s"}
 _ANCHOR_OPEN = re.compile(r'<a\s+href="[^"]*">', re.IGNORECASE)
 _ANY_TAG = re.compile(r"<[^>]+>")
 _ZERO_WIDTH = re.compile(r"[\u200b\u200c\u200d\u200e\u200f\u2060\ufeff]")
+
+# ══ v16.3.0: أنماط بوابة السلك للأزرار ══
+# شرط الشكل (سلامة URL) لا شرط الهوية — تيليجرام يقبل كزر URL أي http(s)،
+# لكن رابطاً بفراغ/حرف تحكم أو مخططاً غريباً يرفضه مع الحمولة كلها.
+_TG_USERNAME_SHAPE_RE = re.compile(r"^[A-Za-z0-9_]{1,64}$")
+_TG_INVITE_HASH_RE = re.compile(r"^[A-Za-z0-9_-]{10,256}$")
+_TG_URL_PREFIXES = ("https://t.me/", "http://t.me/")
+_TG_USER_SCHEMES = ("tg://user?id=", "tg://openmessage?user_id=")
 
 
 def utf16_len(text: str) -> int:
@@ -113,6 +133,8 @@ class CardReport:
 
 
 def _is_valid_url(url: Any) -> bool:
+    """Legacy (v12.0): فحص المخطط فقط — أبقيت للتوافق الخلفي.
+    البوابة الفعلية منذ v16.3.0 هي is_safe_button_url أدناه."""
     try:
         u = str(url or "").strip()
         if not u:
@@ -126,30 +148,102 @@ def _is_valid_url(url: Any) -> bool:
         return False
 
 
-def _clean_buttons(buttons: Any) -> Tuple[Optional[List[List[Dict[str, Any]]]], int]:
-    """إزالة الأزرار المعطوبة — يعيد (اللوحة النظيفة أو None، عدد المحذوف)."""
+def is_safe_button_url(url: Any) -> bool:
+    """══ بوابة السلك v16.3.0 — عقد شكل رابط زر URL قبل الإرسال ══
+
+    True فقط للأشكال التي يعالجها تيليجرام كزر URL فعلاً (فحص شكل صرف —
+    بلا شبكة، نفس قرار nav_resolver: الفحص الشبكي غير مصرّح ولا مفيد):
+      https://t.me/{username}[/{digits}[/{digits}]]  — عام (+موضوعات)
+      https://t.me/c/{inner}[/{digits}[/{digits}]]   — خاص -100 (أعضاء)
+      https://t.me/+{hash}                           — دعوة حديثة
+      https://t.me/joinchat/{hash}                   — دعوة كلاسيكية
+      http(s):// آخر                                  — رابط خارجي صالح المخطط
+      tg://user?id={digits} | tg://openmessage?user_id={digits} — مراسلة
+    يرفض: فراغ/حرف تحكم داخل الرابط، مخطط آخر، شكل t.me مشوه، tg:// آخر،
+    طول > 512. أي استثناء في الفحص → False (الحذف الصادق أأمن)."""
+    try:
+        u = str(url or "").strip()
+        if not u or len(u) > 512:
+            return False
+        for ch in u:
+            if ord(ch) < 0x20 or ch == " " or ch == "\x7f":
+                return False  # فراغ/تحكم = BUTTON_URL_INVALID مؤكد من الخادم
+        if u.startswith("tg://"):
+            for prefix in _TG_USER_SCHEMES:
+                if u.startswith(prefix):
+                    tail = u[len(prefix):]
+                    return tail.isdigit() and int(tail) > 0
+            return False
+        if u.startswith(("http://", "https://")):
+            for prefix in _TG_URL_PREFIXES:
+                if u.startswith(prefix):
+                    rest = u[len(prefix):].rstrip("/")
+                    if not rest:
+                        return False
+                    parts = rest.split("/")
+                    if parts[0] == "c":
+                        # t.me/c/{inner}[/{msg}[/{topic}]] — أرقام موجبة حصراً
+                        if len(parts) < 2 or not parts[1].isdigit() or int(parts[1]) == 0:
+                            return False
+                        return all(p.isdigit() for p in parts[2:])
+                    if parts[0] == "joinchat":
+                        return len(parts) == 2 and bool(_TG_INVITE_HASH_RE.match(parts[1]))
+                    if parts[0].startswith("+"):
+                        return bool(_TG_INVITE_HASH_RE.match(parts[0][1:]))
+                    # {username}[/{digits}[/{digits}]] — شكل URL سليم فقط
+                    if not _TG_USERNAME_SHAPE_RE.match(parts[0]):
+                        return False
+                    return all(p.isdigit() for p in parts[1:])
+            return True  # http/https خارج t.me — مخطط صالح
+        return False
+    except Exception:
+        return False
+
+
+def sanitize_alert_buttons(buttons: Any) -> Tuple[Optional[List[List[Dict[str, Any]]]], int]:
+    """══ بوابة السلك v16.3.0 — اللوحة النهائية قبل الإرسال ══
+
+    لكل زر: نص غير فارغ + رابط يمر is_safe_button_url + سقف النص 64 +
+    منع التكرار (نص، رابط) — التكرار ينتج من مسارات إعادة بناء/إعادة
+    إرسال البطاقة فيُزال هنا (شرط المواصفة الصريح).
+    يعيد (اللوحة النظيفة، عدد المحذوف). buttons=None → (None, 0).
+    الزر المحذوف لا يمنع إرسال التنبيه — الأزرار الصالحة تبقى كما هي."""
     if buttons is None:
         return None, 0
     dropped = 0
     try:
         clean_kb: List[List[Dict[str, Any]]] = []
+        seen: set = set()
         for row in buttons or []:
             clean_row: List[Dict[str, Any]] = []
             for btn in row or []:
                 try:
                     txt = str(btn.get("text") or "").strip()
-                    url = btn.get("url")
-                    if txt and _is_valid_url(url):
-                        clean_row.append({"text": txt[:64], "url": str(url)})
-                    else:
+                    url = str(btn.get("url") or "").strip()
+                    if not txt or not is_safe_button_url(url):
                         dropped += 1
+                        continue
+                    key = (txt, url)
+                    if key in seen:
+                        dropped += 1
+                        continue
+                    seen.add(key)
+                    clean_row.append({"text": txt[:64], "url": url})
                 except Exception:
                     dropped += 1
             if clean_row:
                 clean_kb.append(clean_row)
         return clean_kb, dropped
     except Exception:
+        # فشل-آمن (نفس عقد الملف): خلل البوابة لا يمنع البطاقة الأصلية
         return buttons, dropped
+
+
+def _clean_buttons(buttons: Any) -> Tuple[Optional[List[List[Dict[str, Any]]]], int]:
+    """إزالة الأزرار المعطوبة — v16.3.0: بوابة السلك الموحدة (تحقق شكل
+    الرابط + منع التكرار) بدل فحص المخطط فقط. يعيد (اللوحة النظيفة أو
+    None، عدد المحذوف)."""
+    return sanitize_alert_buttons(buttons)
 
 
 def _truncate_safe_html(text: str, max_units: int) -> str:
