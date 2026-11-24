@@ -108,6 +108,9 @@ table.table { width: 100%; border-collapse: collapse; font-size: 13px; }
 }
 .table th { color: var(--muted); font-weight: 600; font-size: 12px; }
 .table tr:hover td { background: var(--panel2); }
+/* v16.2.0: عمود الإجراءات يلتف بدل القص — الحسابات تحمل 4+ أزرار */
+.table td:last-child { white-space: normal; min-width: 200px; }
+.table td:last-child .btn { margin-top: 3px; }
 .pill {
   display: inline-block; padding: 2px 9px; border-radius: 999px; font-size: 11px; font-weight: 700;
 }
