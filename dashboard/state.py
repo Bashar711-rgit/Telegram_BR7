@@ -296,7 +296,7 @@ class DashboardState:
         "guard_user",
         "overview_cache", "groups_cache", "alerts_cache", "errors_cache",
         "identity_cache", "membership_cache", "cpu_last", "cpu_lock",
-        "username", "version",
+        "username", "version", "panel_auth_state",
     )
 
     def __init__(self) -> None:
@@ -321,6 +321,9 @@ class DashboardState:
         self.cpu_lock = threading.Lock()
         self.username: str = "bashar"
         self.version: str = "15.1.0"
+        # v16.2.0: تشخيص مصادقة اللوحة (عدد المستخدمين + وجود الجدول) —
+        # أرقام غير حساسة، تظهر في /admin/api/session للكشف عن قفل المالك.
+        self.panel_auth_state: Dict[str, Any] = {"users": None, "table_ok": None}
 
     def note_cpu(self, value: float) -> None:
         with self.cpu_lock:

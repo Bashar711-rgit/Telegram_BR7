@@ -26,6 +26,15 @@
       <input id="loginTotp" type="text" inputmode="numeric" maxlength="8" autocomplete="one-time-code" placeholder="6 أرقام — فقط إن كانت مفعّلة لحسابك">
     </label>
     <button type="submit" class="btn primary" id="loginBtn" style="width:100%">دخول</button>
+    <div id="recoverSection" class="hidden" style="margin-top:14px">
+      <label class="field">كلمة مرور جديدة للمالك (8+ أحرف)
+        <input id="recoverPass" type="password" autocomplete="new-password" placeholder="كلمة المرور الجديدة التي ستدخل بها بعد الاستعادة">
+      </label>
+      <p style="color:var(--muted);font-size:12px;margin:4px 0 10px">
+        الاستعادة تتحقق من كلمة مرور البيئة (env) في الخادم ثم تُعين كلمة المرور الجديدة لحساب المالك وتسجّل دخولك بها.
+      </p>
+    </div>
+    <a href="#" id="recoverLink" style="display:block;text-align:center;margin-top:12px;color:var(--muted);font-size:13px">لا تستطيع الدخول؟ استعادة حساب المالك</a>
   </form>
 </div>
 

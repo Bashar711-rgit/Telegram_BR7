@@ -124,6 +124,13 @@ function hideLogin() {
   $("loginOverlay").classList.add("hidden");
 }
 
+$("recoverLink").addEventListener("click", (ev) => {
+  ev.preventDefault();
+  const sec = $("recoverSection");
+  sec.classList.toggle("hidden");
+  if (!sec.classList.contains("hidden")) $("recoverPass").focus();
+});
+
 $("loginForm").addEventListener("submit", async (ev) => {
   ev.preventDefault();
   $("loginBtn").disabled = true;
@@ -134,18 +141,32 @@ $("loginForm").addEventListener("submit", async (ev) => {
   const totp = $("loginTotp").value.trim();
   const body = { username: $("loginUser").value.trim(), password: $("loginPass").value };
   if (totp) body.totp_code = totp; /* P1-UI: رمز المصادقة الثنائية الاختياري */
+  const recSec = $("recoverSection");
+  if (!recSec.classList.contains("hidden")) {
+    const np = $("recoverPass").value || "";
+    if (np.length < 8) {
+      errBox.textContent = "أدخل كلمة مرور جديدة (8 أحرف على الأقل) في خانة الاستعادة";
+      errBox.classList.remove("hidden");
+      $("loginBtn").disabled = false;
+      return;
+    }
+    body.recover_owner = true;
+    body.new_password = np;
+  }
   const r = await api("/admin/api/login", { method: "POST", body });
   $("loginBtn").disabled = false;
   const d = r.data || {};
   if (r.ok && d.ok) {
     $("loginPass").value = "";
     $("loginTotp").value = "";
+    $("recoverPass").value = "";
+    $("recoverSection").classList.add("hidden");
     if (d.csrf) sessionStorage.setItem("br7dash_csrf", d.csrf);
     setAuthContext(d);
     hideLogin();
     username = d.username;
     $("versionBadge").textContent = "v" + (d.version || "");
-    toast("تم تسجيل الدخول");
+    toast(d.recovered ? "تمت الاستعادة وتسجيل الدخول" : "تم تسجيل الدخول");
     loadOpsBanner();
     switchTab(currentTab);
     if (d.must_change_password) openMustPwModal(); /* بوابة تغيير كلمة المرور الإجبارية */
@@ -157,7 +178,9 @@ $("loginForm").addEventListener("submit", async (ev) => {
     errBox.textContent = d.note || "تم تجاوز عدد المحاولات — حاول بعد قليل";
     errBox.classList.remove("hidden");
   } else {
-    errBox.textContent = d.note || (d.error === "invalid_credentials" ? "بيانات الدخول غير صحيحة" : "تعذر الاتصال — أعد المحاولة");
+    errBox.textContent = d.note || (d.error === "invalid_credentials"
+      ? "بيانات الدخول غير صحيحة — إن كانت هذه بيانات المالك جرّب «استعادة حساب المالك» أسفل النموذج"
+      : "تعذر الاتصال — أعد المحاولة");
     errBox.classList.remove("hidden");
   }
 });

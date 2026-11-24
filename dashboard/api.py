@@ -2022,6 +2022,13 @@ async def hydrate_dashboard(bot: Any) -> None:
         from dashboard.auth.sessions import AuthSessionStore as _AuthStore
         if not isinstance(DASH.sessions, _AuthStore):
             DASH.sessions = _AuthStore()
+        # v16.2.0: تشخيص حي — جدول المستخدمين موجود؟ كم مستخدماً؟ (بلا أسرار)
+        try:
+            _tu = await db._fetchone("SELECT COUNT(*) AS n FROM panel_users", ())
+            DASH.panel_auth_state = {
+                "users": int((_tu or {}).get("n") or 0), "table_ok": True}
+        except Exception:
+            DASH.panel_auth_state = {"users": 0, "table_ok": False}
         if await _auth_users.count_users(db) == 0:
             from config import CFG as _cfg_c
             _uname = str(getattr(_cfg_c, "DASHBOARD_USERNAME", "") or "").strip() or "bashar"

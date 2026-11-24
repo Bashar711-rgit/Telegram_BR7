@@ -135,6 +135,8 @@ def setup_auth_routes(app: "web.Application", ctx: Any) -> None:
     async def api_session(request: "web.Request") -> web.Response:
         token = request.cookies.get(ctx.cookie_name)
         sess = DASH.sessions.validate(token)
+        # v16.2.0: تشخيص غير حساس — يكشف قفل المالك (جدول/عدد مستخدمين)
+        panel_auth = dict(getattr(DASH, "panel_auth_state", None) or {})
         if sess:
             return _json({
                 "authenticated": True,
@@ -143,9 +145,11 @@ def setup_auth_routes(app: "web.Application", ctx: Any) -> None:
                 "permissions": permissions.permissions_list(str(sess.get("role") or "viewer")),
                 "must_change_password": bool(sess.get("must_change")),
                 "version": ctx.version,
+                "panel_auth": panel_auth,
                 "ops": DASH.ops.snapshot(),
             })
-        return _json({"authenticated": False, "version": ctx.version})
+        return _json({"authenticated": False, "version": ctx.version,
+                      "panel_auth": panel_auth})
 
     async def api_login(request: "web.Request") -> web.Response:
         ip = ctx.client_ip(request)
@@ -181,6 +185,62 @@ def setup_auth_routes(app: "web.Application", ctx: Any) -> None:
         except Exception:
             return _json({"error": "internal_error"}, 500)
 
+        # ── v16.2.0: استعادة المالك (break-glass) ─────────────────────────
+        # امتلاك كلمة مرور env الخادمية يثبت سيطرة المالك على Render —
+        # فيُعاد تعيين كلمة مرور المالك (أو إنشاؤه) ويُدوَّر كل الجلسات.
+        recovered = False
+        if (bool(body.get("recover_owner")) and username and password
+                and str(getattr(ctx, "env_username", "") or "")
+                and str(getattr(ctx, "env_password", "") or "")):
+            _env_u = str(ctx.env_username)
+            _env_p = str(ctx.env_password)
+            if (username.lower() == _env_u.lower()
+                    and _secrets.compare_digest(password, _env_p)):
+                new_pw = str(body.get("new_password") or "")
+                if len(new_pw) < 8:
+                    return _json({"error": "weak_password",
+                                  "note": "كلمة المرور الجديدة يجب أن تكون 8 أحرف على الأقل"}, 400)
+
+                async def _rec():
+                    _h = passwords.hash_password(new_pw)
+                    _u = await auth_users.get_user_by_username(api.db, _env_u)
+                    if _u is None:
+                        return await auth_users.create_user(
+                            api.db, _env_u, _h, passwords.backend_name(), "owner",
+                            display_name="Owner", must_change=0)
+                    await auth_users.update_user_fields(
+                        api.db, int(_u.get("id") or 0),
+                        password_hash=_h, password_algo=passwords.backend_name(),
+                        must_change_password=0, is_active=1)
+                    await auth_users.revoke_all_user_sessions(
+                        api.db, int(_u.get("id") or 0))
+                    return await auth_users.get_user_by_username(api.db, _env_u)
+
+                try:
+                    rec_u = await ctx.bridge_call(_rec)
+                except ctx.bridge_error as e:
+                    return _json(e.payload, e.status)
+                except Exception:
+                    rec_u = None
+                if rec_u is not None:
+                    user = dict(rec_u)
+                    recovered = True
+                    ctx.audit_bg("dashboard.owner_recovery",
+                                 str(user.get("id") or ""),
+                                 new_value="password_reset+sessions_revoked",
+                                 actor="dashboard:recovery", ip=ip, ua=_ua(request))
+                else:
+                    return _json({"error": "recovery_failed",
+                                  "note": "تعذّر حفظ الحساب — راجع حالة الترحيل (panel_users)"}, 500)
+            else:
+                # بيانات env غير مطابقة — سلوك فاشل عادي (بلا أي معلومة زائدة)
+                DASH.guard.record_failure(ip)
+                if ukey:
+                    DASH.guard_user.record_failure(ukey)
+                ctx.audit_bg("dashboard.recovery_failed", "session", username[:32],
+                             actor="dashboard:recovery", ip=ip, ua=_ua(request))
+                return _json({"error": "invalid_credentials"}, 401)
+
         # ── v16.2.0: شفاء ذاتي للمالك ─────────────────────────────────────
         # لو جدول panel_users فارغ تماماً (فشلت تهيئة المالك عند إقلاع سابق
         # — ترحيل/توقيت مثلاً) تُقبل بيانات env دفعة واحدة ويُنشأ المالك
@@ -214,8 +274,9 @@ def setup_auth_routes(app: "web.Application", ctx: Any) -> None:
                         _u = None
                     if _u is not None:
                         user = dict(_u)
-                        ctx.audit_bg("dashboard.owner_selfheal", "panel_user",
+                        ctx.audit_bg("dashboard.owner_selfheal",
                                      str(_u.get("id") or ""),
+                                     new_value="owner_created_from_env",
                                      actor="dashboard:bootstrap", ip=ip,
                                      ua=_ua(request))
 
@@ -286,6 +347,7 @@ def setup_auth_routes(app: "web.Application", ctx: Any) -> None:
         resp = _json({"ok": True, "username": username, "role": role,
                       "permissions": permissions.permissions_list(role),
                       "must_change_password": must_change,
+                      "recovered": recovered,
                       "version": ctx.version, "csrf": csrf})
         secure = ctx.is_https(request)
         resp.set_cookie(ctx.cookie_name, token, max_age=ctx.ttl_seconds,

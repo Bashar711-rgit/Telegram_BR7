@@ -501,8 +501,8 @@ def setup_dashboard(app: web.Application, bot: Any) -> None:
         except _BridgeError as e:
             return _json(e.payload, e.status)
         if result.get("ok"):
-            _audit_bg("dashboard.account_env_exclude", object_type="account",
-                      object_id=str(prefix), new_value="excluded_permanently")
+            _audit_bg("dashboard.account_env_exclude",
+                      str(prefix), new_value="excluded_permanently")
         return _json(result)
 
     # ── الوحدة 3: الكلمات + Playground ──────────────────────────────────
