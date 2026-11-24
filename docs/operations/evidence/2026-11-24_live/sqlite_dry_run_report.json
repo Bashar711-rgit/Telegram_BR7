@@ -1,0 +1,611 @@
+{
+ "tool": "supabase_migrate_sqlite.py",
+ "version": "v16.3.0",
+ "mode": "DRY_RUN",
+ "sqlite_source": "/home/z/my-project/br7_bot/telegram_bot.db",
+ "backup_manifest": null,
+ "started_utc": "2026-11-24T18:31:37.827451+00:00",
+ "tables": {
+  "alert_dedup": {
+   "source_rows": 0,
+   "pg_rows_before": 159,
+   "columns_used": [
+    "fingerprint",
+    "sender_id",
+    "first_seen",
+    "last_seen",
+    "hits"
+   ],
+   "columns_dropped": [],
+   "pg_rows_after": 159,
+   "inserted": 0
+  },
+  "alerts": {
+   "source_rows": 0,
+   "pg_rows_before": 2506,
+   "columns_used": [
+    "id",
+    "message_hash",
+    "chat_id",
+    "sender_id",
+    "account_name",
+    "keyword",
+    "alert_text",
+    "timestamp",
+    "created_at",
+    "decision",
+    "confidence",
+    "reasons",
+    "intent_verb",
+    "academic_object",
+    "negation_detected",
+    "advert_score",
+    "contact_method",
+    "alert_status",
+    "alert_sent_at",
+    "alerted_to",
+    "notification_attempts",
+    "notification_error",
+    "button_message_url",
+    "button_user_url"
+   ],
+   "columns_dropped": [],
+   "pg_rows_after": 2506,
+   "inserted": 0
+  },
+  "allowed_entities": {
+   "source_rows": 0,
+   "pg_rows_before": 0,
+   "columns_used": [
+    "id",
+    "entity_type",
+    "entity_id",
+    "note",
+    "created_at"
+   ],
+   "columns_dropped": [],
+   "pg_rows_after": 0,
+   "inserted": 0
+  },
+  "app_settings": {
+   "source_rows": 0,
+   "pg_rows_before": 7,
+   "columns_used": [
+    "key",
+    "value",
+    "updated_at"
+   ],
+   "columns_dropped": [],
+   "pg_rows_after": 7,
+   "inserted": 0
+  },
+  "audit_logs": {
+   "source_rows": 0,
+   "pg_rows_before": 99,
+   "columns_used": [
+    "id",
+    "actor",
+    "action",
+    "object_type",
+    "object_id",
+    "old_value",
+    "new_value",
+    "source",
+    "created_at",
+    "ip",
+    "user_agent",
+    "request_id"
+   ],
+   "columns_dropped": [],
+   "pg_rows_after": 99,
+   "inserted": 0
+  },
+  "blocked_chats": {
+   "source_rows": 0,
+   "pg_rows_before": 0,
+   "columns_used": [
+    "chat_id",
+    "reason",
+    "blocked_by",
+    "blocked_at"
+   ],
+   "columns_dropped": [],
+   "pg_rows_after": 0,
+   "inserted": 0
+  },
+  "blocked_senders": {
+   "source_rows": 0,
+   "pg_rows_before": 11,
+   "columns_used": [
+    "sender_id",
+    "reason",
+    "blocked_by",
+    "blocked_at"
+   ],
+   "columns_dropped": [],
+   "pg_rows_after": 11,
+   "inserted": 0
+  },
+  "dead_letters": {
+   "source_rows": 0,
+   "pg_rows_before": 5509,
+   "columns_used": [
+    "id",
+    "event_data",
+    "error_text",
+    "retry_count",
+    "resolved",
+    "created_at",
+    "updated_at"
+   ],
+   "columns_dropped": [],
+   "pg_rows_after": 5509,
+   "inserted": 0
+  },
+  "features": {
+   "source_rows": 0,
+   "pg_rows_before": 0,
+   "columns_used": [
+    "key",
+    "enabled",
+    "updated_by",
+    "updated_at"
+   ],
+   "columns_dropped": [],
+   "pg_rows_after": 0,
+   "inserted": 0
+  },
+  "group_memberships": {
+   "source_rows": 0,
+   "pg_rows_before": 85537,
+   "columns_used": [
+    "chat_id",
+    "user_id",
+    "chat_title",
+    "chat_username",
+    "chat_type",
+    "member_status",
+    "member_role",
+    "admin_permissions",
+    "joined_at",
+    "is_member",
+    "is_admin",
+    "is_owner",
+    "is_banned",
+    "is_restricted",
+    "is_muted",
+    "updated_at"
+   ],
+   "columns_dropped": [],
+   "pg_rows_after": 85537,
+   "inserted": 0
+  },
+  "group_messages": {
+   "source_rows": 0,
+   "pg_rows_before": 218837,
+   "columns_used": [
+    "chat_id",
+    "message_id",
+    "user_id",
+    "message_text",
+    "message_date",
+    "edit_date",
+    "message_link",
+    "reply_to_message_id",
+    "reply_to_user_id",
+    "is_reply",
+    "is_forward",
+    "is_edited",
+    "is_deleted",
+    "is_pinned",
+    "views",
+    "forwards",
+    "replies_count",
+    "media_type",
+    "media_id",
+    "file_name",
+    "file_size",
+    "entities",
+    "urls",
+    "mentions",
+    "hashtags",
+    "phone_numbers",
+    "msg_hash",
+    "created_at",
+    "updated_at"
+   ],
+   "columns_dropped": [],
+   "pg_rows_after": 218837,
+   "inserted": 0
+  },
+  "message_analysis": {
+   "source_rows": 0,
+   "pg_rows_before": 12046,
+   "columns_used": [
+    "id",
+    "chat_id",
+    "message_id",
+    "user_id",
+    "msg_hash",
+    "intent",
+    "intent_confidence",
+    "matched_keywords",
+    "matched_patterns",
+    "academic_context",
+    "action_score",
+    "urgency_score",
+    "negation_score",
+    "spam_score",
+    "advertisement_score",
+    "similarity_score",
+    "fuzzy_score",
+    "final_score",
+    "classification",
+    "accepted",
+    "rejected",
+    "duplicate",
+    "rejection_reason",
+    "detection_reason",
+    "processing_time_ms",
+    "engine_version",
+    "filter_version",
+    "created_at"
+   ],
+   "columns_dropped": [],
+   "pg_rows_after": 12046,
+   "inserted": 0
+  },
+  "messages": {
+   "source_rows": 1,
+   "pg_rows_before": 218646,
+   "columns_used": [
+    "id",
+    "message_hash",
+    "chat_id",
+    "sender_id",
+    "message_text",
+    "keyword_found",
+    "score",
+    "spam_score",
+    "timestamp",
+    "created_at"
+   ],
+   "columns_dropped": [],
+   "pg_rows_after": 218646,
+   "inserted": 0
+  },
+  "notifications": {
+   "source_rows": 0,
+   "pg_rows_before": 120,
+   "columns_used": [
+    "id",
+    "ntype",
+    "title",
+    "body",
+    "severity",
+    "object_type",
+    "object_id",
+    "is_read",
+    "created_at"
+   ],
+   "columns_dropped": [],
+   "pg_rows_after": 120,
+   "inserted": 0
+  },
+  "panel_accounts": {
+   "source_rows": 0,
+   "pg_rows_before": 1,
+   "columns_used": [
+    "id",
+    "phone",
+    "display_name",
+    "username",
+    "tg_user_id",
+    "api_id",
+    "api_hash_encrypted",
+    "session_encrypted",
+    "status",
+    "monitoring_enabled",
+    "priority",
+    "is_main",
+    "last_error",
+    "last_error_at",
+    "created_at",
+    "updated_at"
+   ],
+   "columns_dropped": [],
+   "pg_rows_after": 1,
+   "inserted": 0
+  },
+  "panel_sessions": {
+   "source_rows": 0,
+   "pg_rows_before": 10,
+   "columns_used": [
+    "token_hash",
+    "csrf_hash",
+    "user_id",
+    "username",
+    "role",
+    "must_change",
+    "ip",
+    "user_agent",
+    "created_at",
+    "last_seen",
+    "expires_at",
+    "revoked_at"
+   ],
+   "columns_dropped": [],
+   "pg_rows_after": 10,
+   "inserted": 0
+  },
+  "panel_users": {
+   "source_rows": 0,
+   "pg_rows_before": 1,
+   "columns_used": [
+    "id",
+    "username",
+    "password_hash",
+    "password_algo",
+    "display_name",
+    "role",
+    "is_active",
+    "must_change_password",
+    "totp_enabled",
+    "totp_secret_encrypted",
+    "recovery_codes",
+    "created_at",
+    "updated_at",
+    "last_login_at"
+   ],
+   "columns_dropped": [],
+   "pg_rows_after": 1,
+   "inserted": 0
+  },
+  "processing_queue": {
+   "source_rows": 4,
+   "pg_rows_before": 153,
+   "columns_used": [
+    "id",
+    "event_data",
+    "priority",
+    "status",
+    "claimed_at",
+    "attempts",
+    "dedup_key",
+    "created_at"
+   ],
+   "columns_dropped": [],
+   "pg_rows_after": 153,
+   "inserted": 0
+  },
+  "rules": {
+   "source_rows": 0,
+   "pg_rows_before": 0,
+   "columns_used": [
+    "id",
+    "name",
+    "conditions",
+    "action",
+    "action_value",
+    "priority",
+    "hits",
+    "enabled",
+    "created_by",
+    "created_at"
+   ],
+   "columns_dropped": [],
+   "pg_rows_after": 0,
+   "inserted": 0
+  },
+  "sender_access": {
+   "source_rows": 0,
+   "pg_rows_before": 91796,
+   "columns_used": [
+    "sender_id",
+    "account_name",
+    "access_hash",
+    "updated_at"
+   ],
+   "columns_dropped": [],
+   "pg_rows_after": 91796,
+   "inserted": 0
+  },
+  "sender_account_hashes": {
+   "source_rows": 0,
+   "pg_rows_before": 0,
+   "columns_used": [
+    "account_name",
+    "sender_id",
+    "access_hash",
+    "updated_at"
+   ],
+   "columns_dropped": [],
+   "pg_rows_after": 0,
+   "inserted": 0
+  },
+  "sender_contacts": {
+   "source_rows": 0,
+   "pg_rows_before": 69435,
+   "columns_used": [
+    "sender_id",
+    "access_hash",
+    "username",
+    "first_name",
+    "last_name",
+    "last_chat_id",
+    "last_message_id",
+    "last_message_link",
+    "last_group_link",
+    "phone",
+    "is_bot",
+    "is_verified",
+    "is_premium",
+    "is_scam",
+    "is_fake",
+    "is_restricted",
+    "is_deleted",
+    "is_contact",
+    "is_mutual_contact",
+    "photo_available",
+    "restriction_reason",
+    "lang_code",
+    "status",
+    "usernames",
+    "last_seen",
+    "last_updated",
+    "updated_at",
+    "owner_account"
+   ],
+   "columns_dropped": [],
+   "pg_rows_after": 69435,
+   "inserted": 0
+  },
+  "sender_stats": {
+   "source_rows": 0,
+   "pg_rows_before": 69528,
+   "columns_used": [
+    "sender_id",
+    "total_messages",
+    "alerts_sent",
+    "valid_requests",
+    "invalid_requests",
+    "reputation_score",
+    "last_alert_time",
+    "first_seen",
+    "updated_at"
+   ],
+   "columns_dropped": [],
+   "pg_rows_after": 69528,
+   "inserted": 0
+  },
+  "sources": {
+   "source_rows": 0,
+   "pg_rows_before": 0,
+   "columns_used": [
+    "id",
+    "chat_id",
+    "username",
+    "title",
+    "type",
+    "enabled",
+    "added_by",
+    "notes",
+    "created_at",
+    "chat_type",
+    "member_count",
+    "last_seen_at"
+   ],
+   "columns_dropped": [],
+   "pg_rows_after": 0,
+   "inserted": 0
+  },
+  "spam_ignore": {
+   "source_rows": 0,
+   "pg_rows_before": 6840,
+   "columns_used": [
+    "sender_id",
+    "reason",
+    "evidence",
+    "classified",
+    "created_at"
+   ],
+   "columns_dropped": [],
+   "pg_rows_after": 6840,
+   "inserted": 0
+  },
+  "spam_watch": {
+   "source_rows": 0,
+   "pg_rows_before": 27614,
+   "columns_used": [
+    "id",
+    "sender_id",
+    "reason",
+    "evidence",
+    "watch_until",
+    "created_at"
+   ],
+   "columns_dropped": [],
+   "pg_rows_after": 27614,
+   "inserted": 0
+  },
+  "system_health": {
+   "source_rows": 0,
+   "pg_rows_before": 3,
+   "columns_used": [
+    "id",
+    "component",
+    "status",
+    "details",
+    "timestamp"
+   ],
+   "columns_dropped": [],
+   "pg_rows_after": 3,
+   "inserted": 0
+  },
+  "telegram_usernames_history": {
+   "source_rows": 2,
+   "pg_rows_before": 1414,
+   "columns_used": [
+    "user_id",
+    "username",
+    "changed_at",
+    "source_account"
+   ],
+   "columns_dropped": [],
+   "pg_rows_after": 1414,
+   "inserted": 0
+  },
+  "user_activity": {
+   "source_rows": 0,
+   "pg_rows_before": 85359,
+   "columns_used": [
+    "user_id",
+    "chat_id",
+    "first_seen_at",
+    "last_seen_at",
+    "total_messages",
+    "first_message_id",
+    "last_message_id",
+    "activity_hours",
+    "activity_days",
+    "updated_at"
+   ],
+   "columns_dropped": [],
+   "pg_rows_after": 85359,
+   "inserted": 0
+  },
+  "users": {
+   "source_rows": 0,
+   "pg_rows_before": 69701,
+   "columns_used": [
+    "user_id",
+    "access_hash",
+    "first_name",
+    "last_name",
+    "full_name",
+    "username",
+    "phone",
+    "bio",
+    "profile_photo",
+    "is_bot",
+    "is_verified",
+    "is_premium",
+    "is_scam",
+    "is_fake",
+    "is_deleted",
+    "status",
+    "last_seen",
+    "created_at",
+    "updated_at"
+   ],
+   "columns_dropped": [],
+   "pg_rows_after": 69701,
+   "inserted": 0
+  }
+ },
+ "skipped": [],
+ "failures": [],
+ "total_inserted": 0,
+ "finished_utc": "2026-11-24T18:31:48.822725+00:00",
+ "verdict": "PLANNED"
+}

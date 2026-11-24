@@ -907,3 +907,22 @@ Stage Summary:
 - متطلبات مواصفة Database Manager الثمانية كلها موجودة في database.py منذ إصدارات سابقة ومُثبتة الآن باختبارات فعلية على PG حقيقي (Pool/إعادة اتصال/معالجة أخطاء/معاملات/مهلات/إعادة محاولة/منع تكرار/إغلاق صحيح).
 - حزمة التجهيز النهائية للأمان الإنتاجي جاهزة ومجربة: RLS v16 للجداول الثلاثين + النسخة الاحتياطية + التدقيق الحي + أداة الترحيل — التنفيذ الحي متبقي على DSN المالك (الخطوات موثقة في docs/operations/SUPABASE_STATE.md §5).
 - كود التشغيل لم يُلمس — صفر مخاطر نشر.
+
+---
+Task ID: v16.3.0-supabase-live (supabase-hardening: LIVE execution)
+Agent: Z.ai Code (main orchestrator)
+Task: التنفيذ الحي على Supabase الإنتاجية — نسخة احتياطية + تدقيق + RLS v16 + قرار ترحيل SQLite + اختبارات حية + تنظيف كامل
+
+Work Log:
+- [المشروع المُثبت]: telegram-br7-db (ref heclpjexqqomuwmxlysw، ap-northeast-1، PostgreSQL 17.11، ACTIVE_HEALTHY) — مؤكد أنه إنتاج البوت بكتابة حية (messages 218,579→218,646+ خلال الجلسة، alerts 2,505→2,506).
+- [مسار الوصول]: كلمة مرور postgres المرسلة رفضها الخادم (InvalidPasswordError بكل الصيغ) وALTER ROLE ممنوع بقيود المنصة — كل العمليات عبر Management API /database/query (بدور postgres ذي BYPASSRLS) + دور صيانة مؤقت br7_maint بمنح محدودة من المالك br7_app. br7_app لم يُلمس — اتصال Render مستمر.
+- [نسخة احتياطية أولاً]: supabase_backup.py عبر br7_maint → COMPLETE 971,828 صف/33 جدولاً + schema_migrations.json — صفر فشل — manifest SHA256 في docs/operations/evidence/2026-11-24_live/backup_manifest.json.
+- [تدقيق قرائي]: supabase_verify.py → MATCH EXIT=0 (30 جدولاً كاملة، أعمدة حرجة سليمة، فهارس موجودة، ~116ms) قبل وبعد RLS.
+- [RLS v16 حياً عبر المالك]: ENABLE+FORCE + br7_app_full على 33 جدولاً (شاملة panel_* الأربعة وtelegram_usernames_history)؛ REVOKE كامل من anon/authenticated/service_role (صفر منح جمهورية متبقية حتى منح المنصة على schema_migrations)؛ REVOKE CREATE FROM PUBLIC لا حاجة له (ACL =U أصلاً وbr7_app يملك UC صريحاً)؛ سياسة br7_alerts_blocklist محفوظة؛ schema_migrations تُركت عمداً (ملك منصة).
+- [قرار ترحيل SQLite بالأدلة]: 7 صفوف اختبار فقط محلياً — DRY_RUN: PLANNED/0 — قرار عدم الحقن (عناصر طابور اختبار ستُعالج من العامل الحي كأحداث وهمية) — الملف لم يُمس — التقرير في الأدلة.
+- [حزمة حية 6/6 PASS]: messages CRUD / ON CONFLICT dedup / app_settings عربية / queue tx ذرية / 6 كتّاب عبر Pool (60/60 distinct=60) / تنظيف مُتحقق. دليل إضافي: العامل الحي سحب صف اختبار <1s.
+- [تنظيف صفر بقايا]: DROP POLICY br7_maint_tmp ×33 + إلغاء Default Privileges + REVOKE + DROP ROLE → role_exists=0، policies=0، grants=0.
+- [تحقق نهائي]: verify MATCH صفر انحراف (enabled=34 forced=33) + /health ok/db_healthy=true + /health/full (monitors 2/2، main_client up، queue سليم).
+
+Stage Summary:
+- Supabase الإنتاجية الآن بحالتها المصلدة المقصودة: RLS مفروض على كل جداول التطبيق بدور البوت الوحيد المصرح، صفر منح جمهورية، نسخة احتياطية كاملة موثقة بأعداد وSHA256، وكل الاختبارات الحية ناجحة — البوت يعمل بلا انقطاع طول العملية.

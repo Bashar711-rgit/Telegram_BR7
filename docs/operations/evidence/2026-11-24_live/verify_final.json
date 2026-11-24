@@ -1,0 +1,453 @@
+{
+ "tool": "supabase_verify.py",
+ "version": "v16.3.0",
+ "started_utc": "2026-11-24T18:33:07.223899+00:00",
+ "read_only": true,
+ "checks": {
+  "server": "PostgreSQL 17.11 on aarch64-unknown-linux-gnu, compiled by gcc (GCC) 15.2.0, 64-bit",
+  "role": {
+   "current_user": "br7_maint",
+   "session_user": "br7_maint",
+   "is_superuser": false
+  },
+  "latency_ms": {
+   "pings": [
+    116.5,
+    116.8,
+    116.5,
+    116.5,
+    116.8
+   ],
+   "avg": 116.6
+  },
+  "tables": {
+   "expected": 30,
+   "actual_total": 33,
+   "missing": [],
+   "legacy_present": [
+    "dashboard_accounts",
+    "dashboard_users",
+    "filter_decisions"
+   ],
+   "extra_unknown": []
+  },
+  "row_counts": {
+   "alert_dedup": 159,
+   "alerts": 2506,
+   "allowed_entities": 0,
+   "app_settings": 7,
+   "audit_logs": 99,
+   "blocked_chats": 0,
+   "blocked_senders": 11,
+   "dashboard_accounts": 0,
+   "dashboard_users": 0,
+   "dead_letters": 5509,
+   "features": 0,
+   "filter_decisions": 6706,
+   "group_memberships": 85540,
+   "group_messages": 218854,
+   "message_analysis": 12046,
+   "messages": 218661,
+   "notifications": 120,
+   "panel_accounts": 1,
+   "panel_sessions": 10,
+   "panel_users": 1,
+   "processing_queue": 157,
+   "rules": 0,
+   "sender_access": 91798,
+   "sender_account_hashes": 0,
+   "sender_contacts": 69437,
+   "sender_stats": 69530,
+   "sources": 0,
+   "spam_ignore": 6840,
+   "spam_watch": 27617,
+   "system_health": 3,
+   "telegram_usernames_history": 1414,
+   "user_activity": 85363,
+   "users": 69703
+  },
+  "required_columns": {
+   "processing_queue": {
+    "ok": true,
+    "missing_columns": []
+   },
+   "messages": {
+    "ok": true,
+    "missing_columns": []
+   },
+   "alerts": {
+    "ok": true,
+    "missing_columns": []
+   },
+   "alert_dedup": {
+    "ok": true,
+    "missing_columns": []
+   },
+   "panel_accounts": {
+    "ok": true,
+    "missing_columns": []
+   },
+   "panel_users": {
+    "ok": true,
+    "missing_columns": []
+   },
+   "panel_sessions": {
+    "ok": true,
+    "missing_columns": []
+   },
+   "audit_logs": {
+    "ok": true,
+    "missing_columns": []
+   },
+   "dead_letters": {
+    "ok": true,
+    "missing_columns": []
+   }
+  },
+  "indexes": {
+   "messages": {
+    "indexes_found": [
+     "idx_msg_chat",
+     "idx_msg_hash",
+     "idx_msg_keyword",
+     "idx_msg_sender",
+     "idx_msg_sender_time",
+     "idx_msg_time",
+     "messages_message_hash_key",
+     "messages_pkey"
+    ],
+    "missing": []
+   },
+   "alerts": {
+    "indexes_found": [
+     "alerts_message_hash_key",
+     "alerts_pkey",
+     "idx_alr_account",
+     "idx_alr_confidence",
+     "idx_alr_created_at",
+     "idx_alr_decision",
+     "idx_alr_keyword",
+     "idx_alr_sender",
+     "idx_alr_sender_created",
+     "idx_alr_status_created",
+     "idx_alr_time",
+     "idx_alr_time_sender"
+    ],
+    "missing": []
+   },
+   "processing_queue": {
+    "indexes_found": [
+     "idx_pq_inflight_stale",
+     "idx_pq_pick",
+     "idx_queue_prio",
+     "idx_queue_status",
+     "processing_queue_pkey",
+     "uq_queue_active_dedup"
+    ],
+    "missing": []
+   },
+   "audit_logs": {
+    "indexes_found": [
+     "audit_logs_pkey",
+     "idx_audit_action",
+     "idx_audit_actor",
+     "idx_audit_time"
+    ],
+    "missing": []
+   }
+  },
+  "rls": {
+   "blocked_chats": {
+    "enabled": true,
+    "forced": true,
+    "policies": [
+     "br7_app_full",
+     "br7_maint_tmp"
+    ]
+   },
+   "alert_dedup": {
+    "enabled": true,
+    "forced": true,
+    "policies": [
+     "br7_app_full",
+     "br7_maint_tmp"
+    ]
+   },
+   "panel_sessions": {
+    "enabled": true,
+    "forced": true,
+    "policies": [
+     "br7_maint_tmp",
+     "br7_app_full"
+    ]
+   },
+   "rules": {
+    "enabled": true,
+    "forced": true,
+    "policies": [
+     "br7_app_full",
+     "br7_maint_tmp"
+    ]
+   },
+   "dead_letters": {
+    "enabled": true,
+    "forced": true,
+    "policies": [
+     "br7_maint_tmp",
+     "br7_app_full"
+    ]
+   },
+   "blocked_senders": {
+    "enabled": true,
+    "forced": true,
+    "policies": [
+     "br7_maint_tmp",
+     "br7_app_full",
+     "br7_alerts_blocklist"
+    ]
+   },
+   "audit_logs": {
+    "enabled": true,
+    "forced": true,
+    "policies": [
+     "br7_app_full",
+     "br7_maint_tmp"
+    ]
+   },
+   "panel_users": {
+    "enabled": true,
+    "forced": true,
+    "policies": [
+     "br7_app_full",
+     "br7_maint_tmp"
+    ]
+   },
+   "sender_contacts": {
+    "enabled": true,
+    "forced": true,
+    "policies": [
+     "br7_maint_tmp",
+     "br7_app_full"
+    ]
+   },
+   "system_health": {
+    "enabled": true,
+    "forced": true,
+    "policies": [
+     "br7_maint_tmp",
+     "br7_app_full"
+    ]
+   },
+   "spam_watch": {
+    "enabled": true,
+    "forced": true,
+    "policies": [
+     "br7_app_full",
+     "br7_maint_tmp"
+    ]
+   },
+   "spam_ignore": {
+    "enabled": true,
+    "forced": true,
+    "policies": [
+     "br7_maint_tmp",
+     "br7_app_full"
+    ]
+   },
+   "sources": {
+    "enabled": true,
+    "forced": true,
+    "policies": [
+     "br7_maint_tmp",
+     "br7_app_full"
+    ]
+   },
+   "allowed_entities": {
+    "enabled": true,
+    "forced": true,
+    "policies": [
+     "br7_app_full",
+     "br7_maint_tmp"
+    ]
+   },
+   "features": {
+    "enabled": true,
+    "forced": true,
+    "policies": [
+     "br7_app_full",
+     "br7_maint_tmp"
+    ]
+   },
+   "notifications": {
+    "enabled": true,
+    "forced": true,
+    "policies": [
+     "br7_app_full",
+     "br7_maint_tmp"
+    ]
+   },
+   "panel_accounts": {
+    "enabled": true,
+    "forced": true,
+    "policies": [
+     "br7_maint_tmp",
+     "br7_app_full"
+    ]
+   },
+   "telegram_usernames_history": {
+    "enabled": true,
+    "forced": true,
+    "policies": [
+     "br7_maint_tmp",
+     "br7_app_full"
+    ]
+   },
+   "users": {
+    "enabled": true,
+    "forced": true,
+    "policies": [
+     "br7_maint_tmp",
+     "br7_app_full"
+    ]
+   },
+   "group_memberships": {
+    "enabled": true,
+    "forced": true,
+    "policies": [
+     "br7_maint_tmp",
+     "br7_app_full"
+    ]
+   },
+   "processing_queue": {
+    "enabled": true,
+    "forced": true,
+    "policies": [
+     "br7_maint_tmp",
+     "br7_app_full"
+    ]
+   },
+   "sender_stats": {
+    "enabled": true,
+    "forced": true,
+    "policies": [
+     "br7_maint_tmp",
+     "br7_app_full"
+    ]
+   },
+   "app_settings": {
+    "enabled": true,
+    "forced": true,
+    "policies": [
+     "br7_app_full",
+     "br7_maint_tmp"
+    ]
+   },
+   "messages": {
+    "enabled": true,
+    "forced": true,
+    "policies": [
+     "br7_app_full",
+     "br7_maint_tmp"
+    ]
+   },
+   "alerts": {
+    "enabled": true,
+    "forced": true,
+    "policies": [
+     "br7_maint_tmp",
+     "br7_app_full"
+    ]
+   },
+   "dashboard_users": {
+    "enabled": true,
+    "forced": true,
+    "policies": [
+     "br7_app_full",
+     "br7_maint_tmp"
+    ]
+   },
+   "dashboard_accounts": {
+    "enabled": true,
+    "forced": true,
+    "policies": [
+     "br7_maint_tmp",
+     "br7_app_full"
+    ]
+   },
+   "filter_decisions": {
+    "enabled": true,
+    "forced": true,
+    "policies": [
+     "br7_maint_tmp",
+     "br7_app_full"
+    ]
+   },
+   "schema_migrations": {
+    "enabled": true,
+    "forced": false,
+    "policies": []
+   },
+   "group_messages": {
+    "enabled": true,
+    "forced": true,
+    "policies": [
+     "br7_maint_tmp",
+     "br7_app_full"
+    ]
+   },
+   "message_analysis": {
+    "enabled": true,
+    "forced": true,
+    "policies": [
+     "br7_maint_tmp",
+     "br7_app_full"
+    ]
+   },
+   "user_activity": {
+    "enabled": true,
+    "forced": true,
+    "policies": [
+     "br7_app_full",
+     "br7_maint_tmp"
+    ]
+   },
+   "sender_access": {
+    "enabled": true,
+    "forced": true,
+    "policies": [
+     "br7_maint_tmp",
+     "br7_app_full"
+    ]
+   },
+   "sender_account_hashes": {
+    "enabled": true,
+    "forced": true,
+    "policies": [
+     "br7_app_full",
+     "br7_maint_tmp"
+    ]
+   }
+  },
+  "schemas": [
+   "auth",
+   "br7",
+   "extensions",
+   "graphql",
+   "graphql_public",
+   "pg_temp_12",
+   "pg_temp_36",
+   "pgbouncer",
+   "public",
+   "realtime",
+   "storage",
+   "vault"
+  ],
+  "pg_version_num": "170011"
+ },
+ "drift": [],
+ "notes": [
+  "دور الاتصال غير متوقع: br7_maint (الموثق: br7_app)"
+ ],
+ "finished_utc": "2026-11-24T18:33:19.788033+00:00",
+ "verdict": "MATCH"
+}

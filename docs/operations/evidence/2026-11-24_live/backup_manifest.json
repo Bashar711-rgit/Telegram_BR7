@@ -1,0 +1,212 @@
+{
+ "tool": "supabase_backup.py",
+ "version": "v16.3.0",
+ "started_utc": "2026-11-24T18:30:02.111265+00:00",
+ "mode": "read_only_copy",
+ "target": "public schema (all base tables)",
+ "server": "PostgreSQL 17.11 on aarch64-unknown-linux-gnu, compiled by gcc (GCC) 15.2.0, 64-bit",
+ "tables": {
+  "alert_dedup": {
+   "rows": 158,
+   "file": "alert_dedup.csv.gz",
+   "bytes_gz": 4812,
+   "sha256_gz": "adf56adc342f4a65f9d7312666ccaf3dde1f7ea5253638d1f1a59b082380afa0"
+  },
+  "alerts": {
+   "rows": 2505,
+   "file": "alerts.csv.gz",
+   "bytes_gz": 275261,
+   "sha256_gz": "809882f802b4754a91f23c94ee7e9c89369bc8c9f0dc5187ac9b93d7a664e373"
+  },
+  "allowed_entities": {
+   "rows": 0,
+   "file": "allowed_entities.csv.gz",
+   "bytes_gz": 75,
+   "sha256_gz": "bb8299b577adb8aebad2be2f5f425582e9e5a5447af436dcec35ea80c5f209ab"
+  },
+  "app_settings": {
+   "rows": 7,
+   "file": "app_settings.csv.gz",
+   "bytes_gz": 16240,
+   "sha256_gz": "b132015ebfc844835154b446087a8551e8ea40dead4d6ee22560602534dfbf7e"
+  },
+  "audit_logs": {
+   "rows": 99,
+   "file": "audit_logs.csv.gz",
+   "bytes_gz": 2530,
+   "sha256_gz": "a8ae3fde5974c698b8844a7e51e70a14e972ce4c5a46d10ebf8dd026f87adca8"
+  },
+  "blocked_chats": {
+   "rows": 0,
+   "file": "blocked_chats.csv.gz",
+   "bytes_gz": 67,
+   "sha256_gz": "e271a39ba6695006c16e2128509286d4deaf722427ec895a31463ed43e8ffcca"
+  },
+  "blocked_senders": {
+   "rows": 11,
+   "file": "blocked_senders.csv.gz",
+   "bytes_gz": 261,
+   "sha256_gz": "63d8d76658ef1da4231e70cc744f48db795fb2bac1cb2b7bf0afab28ac0d58c5"
+  },
+  "dashboard_accounts": {
+   "rows": 0,
+   "file": "dashboard_accounts.csv.gz",
+   "bytes_gz": 152,
+   "sha256_gz": "91cd9359d093b068ca4b495a64a2d89df118cc3fd95a06636076eb30b3c27eb8"
+  },
+  "dashboard_users": {
+   "rows": 0,
+   "file": "dashboard_users.csv.gz",
+   "bytes_gz": 101,
+   "sha256_gz": "df6b2c7a1824101abc635cabd0139f270b5a9724b60d58a1d619205a30e54b26"
+  },
+  "dead_letters": {
+   "rows": 5509,
+   "file": "dead_letters.csv.gz",
+   "bytes_gz": 917848,
+   "sha256_gz": "6eaf5400864f616029510377e65a3098ab841ab0a097d7f8126d9518beade38c"
+  },
+  "features": {
+   "rows": 0,
+   "file": "features.csv.gz",
+   "bytes_gz": 59,
+   "sha256_gz": "1967846d135d17068905b17916c978dc584d3c15e0d308effca28bd8eab761c8"
+  },
+  "filter_decisions": {
+   "rows": 6706,
+   "file": "filter_decisions.csv.gz",
+   "bytes_gz": 570511,
+   "sha256_gz": "5d9379e60d3895a3846f6ec7d9f15202c64de4674923321f5637261a9038ea90"
+  },
+  "group_memberships": {
+   "rows": 85528,
+   "file": "group_memberships.csv.gz",
+   "bytes_gz": 1505460,
+   "sha256_gz": "343c4b38d306c2493be532d2b6598030e34dfe9a3845e4a2ce0a50dac9899ff8"
+  },
+  "group_messages": {
+   "rows": 218813,
+   "file": "group_messages.csv.gz",
+   "bytes_gz": 13616429,
+   "sha256_gz": "21126c895e96162e793493994661b0b692702686f327152419100d38cbd22c1d"
+  },
+  "message_analysis": {
+   "rows": 12045,
+   "file": "message_analysis.csv.gz",
+   "bytes_gz": 699864,
+   "sha256_gz": "df562e4606ee1db065f8857d78fcabf9edc07f6386a16a48a0b455b22193afa9"
+  },
+  "messages": {
+   "rows": 218627,
+   "file": "messages.csv.gz",
+   "bytes_gz": 14109298,
+   "sha256_gz": "ef582b9b23c8742b7417d824fc0ab6f1afa1409e354a330f3329aa34cacae9ef"
+  },
+  "notifications": {
+   "rows": 120,
+   "file": "notifications.csv.gz",
+   "bytes_gz": 2233,
+   "sha256_gz": "c85e45cda36b068b4dbd51e68cbdcd825173f7d3ca3a38ea1c32b6715697d438"
+  },
+  "panel_accounts": {
+   "rows": 1,
+   "file": "panel_accounts.csv.gz",
+   "bytes_gz": 933,
+   "sha256_gz": "e0c1a7e9586762d49d81c76b73160abd6d89a693139bd75b316719ad3a1e9d4b"
+  },
+  "panel_sessions": {
+   "rows": 10,
+   "file": "panel_sessions.csv.gz",
+   "bytes_gz": 1196,
+   "sha256_gz": "d7110bed23faf6dbd611a4bbbcedfaf97da38c6dff29ad60ea11a331cc6e2d31"
+  },
+  "panel_users": {
+   "rows": 1,
+   "file": "panel_users.csv.gz",
+   "bytes_gz": 420,
+   "sha256_gz": "00eff14606f5b25020a8f9bfcbcd228f2aeb551aa3b1de922f72593dbd33b908"
+  },
+  "processing_queue": {
+   "rows": 20,
+   "file": "processing_queue.csv.gz",
+   "bytes_gz": 3543,
+   "sha256_gz": "b8192c51546fc63eab31d99cf832ca8967514cc0cfae41ec931a83bbc6a884ee"
+  },
+  "rules": {
+   "rows": 0,
+   "file": "rules.csv.gz",
+   "bytes_gz": 93,
+   "sha256_gz": "2ab3fc2fa887f1085947c017dcbaec66f38d458bbe6c0c405c4c4fd5f278fe17"
+  },
+  "sender_access": {
+   "rows": 91792,
+   "file": "sender_access.csv.gz",
+   "bytes_gz": 2193586,
+   "sha256_gz": "8ac8a2d893344bf14a19e9e4bd01df54343bb1b455f682ec9786f787e489f980"
+  },
+  "sender_account_hashes": {
+   "rows": 0,
+   "file": "sender_account_hashes.csv.gz",
+   "bytes_gz": 90,
+   "sha256_gz": "31615cfd399c447afc4d998dc016eb9b1c0662514bb74b0c09f135ac817750fe"
+  },
+  "sender_contacts": {
+   "rows": 69431,
+   "file": "sender_contacts.csv.gz",
+   "bytes_gz": 4230251,
+   "sha256_gz": "017bcb1aa26ca4f52a67ad8bbebaf470705764815a091da3fe5d4ce79cb0931f"
+  },
+  "sender_stats": {
+   "rows": 69525,
+   "file": "sender_stats.csv.gz",
+   "bytes_gz": 1548217,
+   "sha256_gz": "3772b42d04ebfbc2713dac7a51aff2803635784135844881474ac714423097a8"
+  },
+  "sources": {
+   "rows": 0,
+   "file": "sources.csv.gz",
+   "bytes_gz": 108,
+   "sha256_gz": "bf7edb12bda4348e80166c5e676af7abcbfb19ea637d42e7f98c509f7c81b17a"
+  },
+  "spam_ignore": {
+   "rows": 6838,
+   "file": "spam_ignore.csv.gz",
+   "bytes_gz": 139201,
+   "sha256_gz": "b18a4a412789d9db7a6eb045d081a6df36bb47d1ba6764b027194b715019daf8"
+  },
+  "spam_watch": {
+   "rows": 27613,
+   "file": "spam_watch.csv.gz",
+   "bytes_gz": 706027,
+   "sha256_gz": "c69fe09a3d35f4c2865757a08b406251d6158123d05c8055f10cceb4f585a930"
+  },
+  "system_health": {
+   "rows": 3,
+   "file": "system_health.csv.gz",
+   "bytes_gz": 177,
+   "sha256_gz": "79fc162df36f7607d84d5a6b6c5a539e6365ab72b481ed25a279d52b48df230a"
+  },
+  "telegram_usernames_history": {
+   "rows": 1414,
+   "file": "telegram_usernames_history.csv.gz",
+   "bytes_gz": 30603,
+   "sha256_gz": "72edbf3f49170bbc62275757c976d90e4d4c71032010165a009e102a4c19130e"
+  },
+  "user_activity": {
+   "rows": 85354,
+   "file": "user_activity.csv.gz",
+   "bytes_gz": 1918745,
+   "sha256_gz": "60bf9706b051d456434638be69ba1cc582302ea5efd028dbfcebfee062a3e065"
+  },
+  "users": {
+   "rows": 69698,
+   "file": "users.csv.gz",
+   "bytes_gz": 2057852,
+   "sha256_gz": "edbd638adb44965ce1de18e1b28cb4980645c0ae185510e92fa56587a77c24b3"
+  }
+ },
+ "failures": [],
+ "finished_utc": "2026-11-24T18:30:47.389275+00:00",
+ "total_rows": 971828,
+ "verdict": "COMPLETE"
+}

@@ -1,6 +1,7 @@
 # SUPABASE STATE — حالة قاعدة البيانات الدائمة (v16.3.0)
 
 التاريخ: 2026-11-24 | المهمة: تنفيذ وتجهيز وربط Supabase بمشروع Telegram_BR7
+**تحديث 2026-11-24 المسائي: التنفيذ الحي اكتمل — §5 يوثق كل ما نُفذ على Supabase الحية.**
 
 ## 1. الحقيقة الإنتاجية الحالية (متحقق منها حياً)
 
@@ -67,33 +68,41 @@ messages, alerts, sender_stats, sender_contacts, system_health, blocked_senders,
 - `scripts/supabase_migrate_sqlite.py` → MIGRATED (transform التواريخ/الأنواع + setval sequences + حارس manifest)
 - `scripts/supabase_rls_v16.sql` → enabled=30 forced=30 policies=30
 
-## 5. الإجراء الحي المتبقي (يحتاج DATABASE_URL من المالك فقط)
+## 5. التنفيذ الحي المنفذ على Supabase (2026-11-24 مساءً — مكتمل)
 
-الأدوات جاهزة ومجربة؛ للتنفيذ على Supabase الحية:
+**المشروع**: telegram-br7-db (ref: `heclpjexqqomuwmxlysw`، Region: ap-northeast-1، PostgreSQL 17.11، status ACTIVE_HEALTHY).
 
-```bash
-# 1) النسخة الاحتياطية قبل أي تعديل
-DATABASE_URL='<pooler-dsn>' python scripts/supabase_backup.py --out /tmp/br7_backup
+### 5.1 مسار الوصول المستخدم (بدون أي سر مكشوف)
+- كلمة مرور postgres المُرسلة من المالك **رفضها الخادم** (`InvalidPasswordError` بكل الصيغ، عبر Session Pooler) — لم تُعاد الضبط (المنصة تمنع `ALTER ROLE` على الأدوار المحمية حتى بدور postgres).
+- كل العمليات نُفذت عبر **Management API** (`/v1/projects/{ref}/database/query` بدور postgres ذي BYPASSRLS) + **دور صيانة مؤقت** `br7_maint` (LOGIN، منح SELECT/INSERT/UPDATE/DELETE على جداول br7_app + متتالياته) — **حُذف الدور وسياساته ومنحه ومنحه الافتراضي بالكامل بعد الانتهاء (صفر بقايا، مُتحقق)**.
+- كلمة مرور br7_app لم تُلمس إطلاقاً — اتصال Render مستمر طول الجلسة.
 
-# 2) التدقيق القرائي الحي (المخطط/الأعمدة/الفهارس/RLS/الأعداد)
-DATABASE_URL='<pooler-dsn>' python scripts/supabase_verify.py
+### 5.2 ما نُفذ فعلياً على الحي (بترتيب الضوابط)
+1. **تأكيد الإنتاج**: messages=218,579→218,646+ خلال الدقائق (كتابة حية)، alerts=2,505→2,506 — القاعدة هي إنتاج البوت لا شك.
+2. **النسخة الاحتياطية الكاملة أولاً** (`scripts/supabase_backup.py` عبر br7_maint): **COMPLETE — 971,828 صف في 33 جدولاً + schema_migrations.json — صفر فشل**، manifest بأعداد وSHA256 لكل ملف. أثر آخر: docs/operations/evidence/2026-11-24_live/.
+3. **التدقيق القرائي** (`scripts/supabase_verify.py`): **MATCH، EXIT=0** قبل RLS وبعده — 30 جدولاً متوقعاً كلها موجودة، الأعمدة الحرجة سليمة، الفهارس الحرجة موجودة، زمن استجابة ~116ms.
+4. **RLS v16 على الحي** (`scripts/supabase_rls_v16.sql` — عبر المالك br7_app):
+   - ENABLE+FORCE RLS + سياسة `br7_app_full (FOR ALL TO br7_app USING(true) WITH CHECK(true))` على **33 جدولاً** (شاملة panel_users/panel_sessions/panel_accounts/telegram_usernames_history التي كانت enabled-بلا-إجبار-بلا-سياسات).
+   - **REVOKE ALL** (جداول/دوال/متتاليات) من `anon`/`authenticated`/`service_role` — بما فيها منح المنصة على schema_migrations — **صفر منح جمهوري متبقٍ**.
+   - `REVOKE CREATE ON SCHEMA public FROM PUBLIC`: **لا حاجة** — الـACL يظهر `=U` (PUBLIC بلا CREATE أصلاً)، وbr7_app يملك CREATE صريحاً (`UC`) فبقاء إنشاء الجداول المستقبلي مضمون.
+   - سياسة `br7_alerts_blocklist (INSERT)` على blocked_senders **محفوظة** لم تُمس.
+   - `schema_migrations` (ملك postgres — منصة): enabled بلا إجبار — تُركت كما هي عمداً.
+5. **قرار ترحيل SQLite الموثق بالأدلة**: telegram_bot.db المحلي يحوي **7 صفوف اختبار فقط** (message_hash='hash_integration_1'، «نص اختبار تكامل»، 4 عناصر طابور in_flight من اختبار محلي، 2 سجل أسماء وهمية) — DRY_RUN أظهر «PLANNED، المُدرج 0» وكل جداول الإنتاج ممتلئة أصلاً في Supabase. **قرار: عدم الحقن** — إدخال عناصر طابور اختبار إلى طابور الإنتاج الحي سيجعل العامل يعالج أحداثاً وهمية. ملف SQLite لم يُمس. تقرير DRY_RUN محفوظ في الأدلة.
+6. **الحزمة الوظيفية الحية 6/6 PASS** (عبر br7_maint قبل حذفه): (1) messages CRUD ✓ (2) منع تكرار ON CONFLICT — إدخال مزدوج=صف واحد ✓ (3) app_settings roundtrip بقيمة عربية ✓ (4) دورة حياة queue ذرية insert→claim→ack داخل معاملة ✓ (5) تزامن 6 كتّاب عبر Pool: 60/60 صف، 60 hash مميزاً — صفر فقد/تكرار ✓ (6) تنظيف كامل مُتحقق ✓. **دليل حي إضافي**: عامل الطابور الإنتاجي سحب صف اختبار مُدخل خلال <1 ثانية.
+7. **التنظيف**: DROP POLICY br7_maint_tmp (33 جدولاً) + إلغاء Default Privileges + REVOKE كل المنح + **DROP ROLE br7_maint — role_exists=0**.
 
-# 3) فرض RLS على الجداول الثلاثين + القديمة (مرة واحدة — idempotent)
-DATABASE_URL='<pooler-dsn>' python -c "import asyncio,asyncpg; ..."
-# (أو عبر Supabase SQL Editor بلصق محتوى scripts/supabase_rls_v16.sql)
-
-# 4) (اختياري) ترحيل أي SQLite محلي — الافتراضي DRY_RUN
-DATABASE_URL='<pooler-dsn>' python scripts/supabase_migrate_sqlite.py --sqlite telegram_bot.db
-```
+### 5.3 التحقق النهائي بعد كل شيء
+- `supabase_verify.py`: **MATCH، صفر انحراف** — RLS: enabled=34 / forced=33 / policies=67 (33 br7_app_full + 33 br7_maint_tmp المؤقتة ثم حُذفت + 1 br7_alerts_blocklist).
+- البوت الحي بعد RLS والتنظيف: `/health` = `{"status":"ok","database":"ok","db_healthy":true}` و`/health/full`: monitors 2/2، main_client up، queue سليم، filter يعالج — **المهمة 9 النشر لا تحتاج أي تغيير في Render** (DATABASE_URL مضبوط منذ v11.8.x بدور br7_app).
 
 ## 6. نشر Render (المرحلة 9)
 
 - `DATABASE_URL` **مضبوط فعلاً في Render** ومتصل بـSupabase — لا متغيرات جديدة مطلوبة.
-- هذه المرحلة لم تغيّر أي كود تشغيلي (scripts/docs فقط) — لا نشر إجباري؛ أي دفع لاحق سيبني نفس السلوك.
+- دفع docs/scripts فقط — نفس السلوك التشغيلي؛ إعادة البناء بعد الدفع طبيعية.
 
-## 7. مواضع صادقة غير منجزة/معلقة
+## 7. مواضع صادقة متبقية/معلقة
 
-1. **D-1 (قرار مالك)**: مخطط `br7` الموازي (44 جدولاً، بلا صلاحيات لـbr7_app) — الحذف تعديل مدمر يتطلب نسخة احتياطية + موافقة صريحة؛ لم يُمس.
-2. **RLS v16 على الحي**: السكربت جاهز ومجرب على PG16 — تنفيذه الفعلي على Supabase يحتاج DSN المالك (أو لصقه في SQL Editor).
-3. **النسخة الاحتياطية الحية**: نفس الشيء — الأداة جاهزة، DSN المالك هو المتغير الوحيد الغائب.
-4. PG المحلي 16.2 مقابل Supabase 17 — لا فروق مطلوبة في هذا المخطط (لا اعتماد على ميزات 17).
+1. **D-1 (قرار مالك)**: مخطط `br7` الموازي (44 جدولاً) — تعديل مدمر يتطلب موافقة صريحة؛ لم يُمس.
+2. **كلمة مرور postgres**: المرسلة من المالك مرفوضة من الخادم ولم يُمكن تدويرها برمجياً (قيد منصة على ALTER ROLE للأدوار المحمية). إذا لزم مالك وصول superuser مباشر مستقبلاً: Supabase Dashboard → Database → Settings → Reset database password.
+3. **schema_migrations**: enabled-بلا-إجبار-بلا-سياسات (ملك منصة postgres) — غير ضمن متوقع التطبيق؛ غير مكشوفة للجمهور بعد سحب المنح.
+4. PG المحلي 16.2 مقابل Supabase 17 — لا فروق مطلوبة في هذا المخطط.
