@@ -50,7 +50,7 @@ type Opts = {
 };
 
 function json(status: number, body: unknown, rid: string): NextResponse {
-  const res = NextResponse.json(body);
+  const res = NextResponse.json(body, { status });
   res.headers.set('x-request-id', rid);
   res.headers.set('Cache-Control', 'no-store');
   return res;
