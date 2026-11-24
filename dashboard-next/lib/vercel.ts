@@ -28,7 +28,13 @@ async function call<T>(path: string, init: RequestInit = {}, retries = 0): Promi
 }
 
 export async function listDeployments(limit = 8): Promise<ExternalResult<Array<Record<string, unknown>>>> {
-  return call(`/v6/deployments?project=${pid()}&limit=${limit}`, {}, 1);
+  const r = await call<{ deployments?: Array<Record<string, unknown>> }>(
+    `/v6/deployments?project=${pid()}&limit=${limit}`,
+    {},
+    1,
+  );
+  if (r.status !== 200 || !r.data) return { status: r.status, data: null, error: r.error };
+  return { status: 200, data: Array.isArray(r.data.deployments) ? r.data.deployments : [] };
 }
 
 export async function getDeployment(id: string): Promise<ExternalResult<Record<string, unknown>>> {
