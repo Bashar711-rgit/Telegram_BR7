@@ -1018,3 +1018,22 @@ Stage Summary:
 - فرع feature/bot-control-center @ c24df07 مدفوع — Preview dpl_H9eoqVTK7eoewzKLQ9uk8mzEki43 READY @ c24df07
 - تحقق حي على Preview: دخول المالك 200 · bot/status حي (running/queue 4/not_suspended) · الصفحات 200 · 401 بلا جلسة · ترويسات أمنية 3/3
 - لم يُمَس: main، الإنتاج، Render، Supabase (إلا الكتابات المدققة صافيها صفر والحساب الجديد بأمر المالك) — الدمج ينتظر اعتماد المالك (نشر Production)
+
+## v16.5.0-bot-control-center-merge — دمج مركز التحكم في main (2026-11-24، بموافقة المالك «نعم ادمج»)
+
+### ما قبل الدمج (إعادة تحقق إلزامية)
+- المزامنة: HEAD = origin/feature/bot-control-center = 7f25cf7 · main = origin/main = 67ced87 (main لم يتحرك منذ نقطة التفرع ⇒ لا احتمال تعارض)
+- فحص الملفات: `git diff main...HEAD --name-only` خارج dashboard-next/ وworklog.md = صفر — لا لمس لأي ملف تشغيل للبوت
+- PHASE 4 قبيل الدمج: tsc --noEmit = 0 · npm run build = نجاح (كل مسارات /bot/* و/account ضمن المخرجات) · ESLint = «No ESLint warnings or errors»
+
+### الدمج (commit d108d98، --no-ff)
+- `67ced87..d108d98` — 33 ملفاً، +3835 سطراً، بلا تعارض: 14 صفحة /bot/* + 9 مسارات /api/bot/* + change-password + /account + lib/bot/* + BOT_CONTROL_CONTRACTS.md
+- الدفع: origin/main = d108d98 (PUSH_OK)
+
+### النشر والتحقق الحي بعد الدمج
+- نشر Vercel الإنتاجي: dpl_AABkgyRt4Q2F7cnSa2cdk5vP9R8b (target=production، sha=d108d98) — BUILDING ثم **READY** خلال ~50 ثانية (polling عبر /api/overview)
+- ملاحظة اعتماد: توكن Vercel API في /tmp فقد بعد تنظيف البيئة — التحقق تم عبر API اللوحة نفسها (/api/overview بالجلسة) وهو مصدر موثوق لأنه يقرأ Vercel بالتوكن المخزن خادمياً
+- دخول المالك على الإنتاج الجديد: balghanme@gmail.com → 200 {ok:true, role:super_admin} (بـ Origin/Referer لتجاوز CSRF المتوقع)
+- الصفحات حية بالجلسة: /bot (200، «مركز التحكم/حالة المحرك») · /bot/control (200) · /bot/sources (200) · /bot/engine (200) · /account (200)
+- المسارات الحية: /api/bot/status → {state:running, derivedFrom:health_ok+db_ok+main_client_up, uptime 84s, monitors 2/2, queue 12, floodWait 0, render not_suspended} · /api/bot/capabilities → ok مع تصنيف live/live_persistent/contract كاملاً
+- الأمن سليم بعد الدمج: /api/bot/status بلا جلسة = 401 · ترويسات CSP/HSTS/XFO/nosniff كما هي · Render: {status:ok, db_healthy:true} لم يُمس
