@@ -1,0 +1,91 @@
+/**
+ * Capability manifest — the machine-readable truth of what is LIVE vs CONTRACT.
+ * Rendered by /bot overview and /bot/commands; keeps the UI honest by construction.
+ */
+
+export type Capability = {
+  id: string;
+  area: string;
+  title: string;
+  mode: 'live' | 'live_persistent' | 'contract';
+  mechanism?: string;
+  depends?: string;
+};
+
+export const CAPABILITIES: Capability[] = [
+  // Engine control
+  { id: 'engine.status', area: 'control', title: 'حالة المحرك الحية (Running/Degraded/Stopped/Starting/Error)', mode: 'live', mechanism: '/health + /health/full + Render service — اشتقاق لحظي' },
+  { id: 'engine.restart', area: 'control', title: 'إعادة تشغيل المحرك', mode: 'live', mechanism: 'Render restart endpoint' },
+  { id: 'engine.pause_filtering', area: 'control', title: 'إيقاف المعالجة (مثابر)', mode: 'live_persistent', mechanism: 'dashboard:ops.filtering_paused', depends: 'التطبيق الفوري: منفذ أوامر Render (§3.1)' },
+  { id: 'engine.resume_filtering', area: 'control', title: 'استئناف المعالجة (مثابر)', mode: 'live_persistent', mechanism: 'dashboard:ops.filtering_paused=false', depends: '§3.1' },
+  { id: 'engine.emergency_stop_send', area: 'control', title: 'إيقاف الإرسال طوارئ (مثابر)', mode: 'live_persistent', mechanism: 'dashboard:ops.alerts_paused=true', depends: '§3.1' },
+  { id: 'engine.resume_send', area: 'control', title: 'استئناف الإرسال (مثابر)', mode: 'live_persistent', mechanism: 'dashboard:ops.alerts_paused=false', depends: '§3.1' },
+  { id: 'engine.start_stop', area: 'control', title: 'Start / Stop فوري للمحرك', mode: 'contract', depends: 'منفذ أوامر Render (§3.1) — لا إيقاف خدمة Render كلياً' },
+  { id: 'engine.maintenance', area: 'control', title: 'وضع الصيانة الفوري', mode: 'contract', depends: '§3.1 (النسخة المثابرة متاحة عبر pause)' },
+  { id: 'engine.reload_config', area: 'control', title: 'إعادة تحميل الإعدادات على العملية الحارة', mode: 'contract', depends: '§3.2' },
+
+  // Accounts
+  { id: 'accounts.read', area: 'accounts', title: 'قراءة الحسابات وتفاصيلها الكاملة', mode: 'live', mechanism: 'panel_accounts (منح قائم)' },
+  { id: 'accounts.update', area: 'accounts', title: 'تعديل الاسم/الأولوية/المراقبة/الحالة/الحساب الرئيسي', mode: 'live', mechanism: 'PATCH panel_accounts (منح قائم)' },
+  { id: 'accounts.link', area: 'accounts', title: 'إضافة حساب (هاتف→OTP→2FA→جلسة مشفرة)', mode: 'contract', depends: 'تدفق Telethon على Render (§3.3) — الواجهة جاهزة والحقول موثقة' },
+  { id: 'accounts.delete_reauth_test', area: 'accounts', title: 'حذف/إعادة مصادقة/اختبار اتصال', mode: 'contract', depends: '§3.3' },
+
+  // Sources
+  { id: 'sources.crud', area: 'sources', title: 'إضافة/تعديل/حذف/تفعيل المصادر + متعددة + CSV', mode: 'live', mechanism: '/api/db/sources (منح قائم)' },
+  { id: 'sources.check', area: 'sources', title: 'فحص وصول المصدر/إعادة اتصال', mode: 'contract', depends: '§3.4' },
+
+  // Keywords
+  { id: 'keywords.read', area: 'keywords', title: 'قراءة سجل الكلمات الكامل (20 مجموعة)', mode: 'live', mechanism: 'dashboard:keywords_json' },
+  { id: 'keywords.write', area: 'keywords', title: 'إضافة/حذف كلمات + كشف التكرار (حقيقي ومثابر)', mode: 'live_persistent', mechanism: 'كتابة السجل + audit', depends: 'البناء الحار على المحرك: §3.2 (يُطبق عند الإقلاع/إعادة التحميل)' },
+  { id: 'keywords.categories', area: 'keywords', title: 'تصنيفات جديدة غير المحركية', mode: 'live', mechanism: 'مجموعات custom:* داخل السجل' },
+
+  // Engine analysis
+  { id: 'engine.test_bench', area: 'analysis', title: 'مقعد اختبار التحليل برسالة حقيقية', mode: 'contract', depends: '§3.5' },
+  { id: 'engine.profiles', area: 'analysis', title: 'حفظ/مقارنة/استعادة ملفات الإعدادات', mode: 'live', mechanism: 'app_settings KV (فهي الحفظ) — التطبيق على المحرك: §3.2' },
+  { id: 'engine.weights_write', area: 'analysis', title: 'تعديل الأوزان الحارة على المحرك', mode: 'contract', depends: '§3.2 + مخطط filter_weights' },
+
+  // Rules
+  { id: 'rules.crud', area: 'rules', title: 'CRUD القواعد + أولوية + تفعيل', mode: 'live', mechanism: '/api/db/rules (منح قائم)' },
+  { id: 'rules.test', area: 'rules', title: 'اختبار القاعدة على رسالة حقيقية', mode: 'contract', depends: '§3.5' },
+
+  // Alerts
+  { id: 'alerts.read_stats', area: 'alerts', title: 'قراءة التنبيهات + معدل نجاح الإشعارات + الأخطاء', mode: 'live', mechanism: 'alerts (منح قراءة)' },
+  { id: 'alerts.destinations', area: 'alerts', title: 'إدارة وجهات مستقلة (جدول مخصص)', mode: 'contract', depends: 'جدول notification_destinations (§4) — التوجيه الحالي يعمل عبر rules حي' },
+  { id: 'alerts.template', area: 'alerts', title: 'تخصيص قالب البطاقة', mode: 'contract', depends: 'قالب البطاقة مجمّد في unified_alerts/card.py — يتطلب عقد تعديل' },
+  { id: 'alerts.resend', area: 'alerts', title: 'إعادة إرسال تنبيه', mode: 'contract', depends: '§3.1' },
+  { id: 'alerts.block_sender', area: 'alerts', title: 'حظر مرسل من بطاقة التنبيه', mode: 'live', mechanism: 'blocked_senders POST (منح قائم)' },
+
+  // Blocked
+  { id: 'blocked.crud', area: 'blocked', title: 'حظر/إلغاء حظر مرسلين + قائمة موثوقين', mode: 'live', mechanism: 'blocked_senders + allowed_entities (منح قائم)' },
+  { id: 'blocked.chats_read', area: 'blocked', title: 'قراءة blocked_chats', mode: 'contract', depends: 'منح SELECT (الجدول موجود، المنح غير مضبوط في هذه المرحلة)' },
+  { id: 'blocked.temporary', area: 'blocked', title: 'حظر مؤقت بمدة', mode: 'contract', depends: 'عمود expires_at (§4)' },
+
+  // Quality
+  { id: 'quality.stats', area: 'quality', title: 'إحصاءات الجودة من القرارات الحقيقية (قبول/رفض/ثقة/أسباب/تكرار)', mode: 'live', mechanism: 'filter_decisions (منح قراءة)' },
+  { id: 'quality.precision_recall', area: 'quality', title: 'Precision / Recall / F1', mode: 'live', mechanism: 'يُحسب فقط عند وجود بيانات مرجعية — يعرض «غير متاح» بدونها (لا اختراع)' },
+  { id: 'quality.feedback', area: 'quality', title: 'تعليم FP/FN + إعادة تحليل', mode: 'contract', depends: 'message_feedback (§3.6) — عمود feedback موجود في filter_decisions لكن الكتابة غير مصرح بها في هذه المرحلة' },
+
+  // Performance
+  { id: 'perf.live', area: 'performance', title: 'مقاييس حية: طابور/معالجة/زمن/uptime/مراقبون/FloodWait', mode: 'live', mechanism: '/health/full' },
+  { id: 'perf.system', area: 'performance', title: 'CPU/Memory + processing_queue + dead_letters', mode: 'contract', depends: 'منح قراءة + §3.8' },
+  { id: 'perf.job_actions', area: 'performance', title: 'إعادة محاولة مهمة/تنظيف طابور', mode: 'contract', depends: '§3.7' },
+
+  // Settings
+  { id: 'settings.kv', area: 'settings', title: 'قراءة/تعديل إعدادات KV (أسرار مموّهة لغير المدراء)', mode: 'live', mechanism: 'app_settings (منح قائم)' },
+
+  // Commands
+  { id: 'commands.ledger', area: 'commands', title: 'سجل أوامر بدورة حياة + Idempotency + تدقيق دائم', mode: 'live', mechanism: 'ledger داخلي + audit_logs (الأمري restart/ops تنفذ فعلاً)' },
+  { id: 'commands.executor', area: 'commands', title: 'تنفيذ فوري شامل (start/stop/reload/DLQ...)', mode: 'contract', depends: '§3.1' },
+
+  // Auth
+  { id: 'auth.owner_account', area: 'auth', title: 'حساب المالك balghanme@gmail.com (super_admin)', mode: 'live', mechanism: 'Supabase Auth + dashboard_users (أمر المالك)' },
+  { id: 'auth.change_password', area: 'auth', title: 'تغيير كلمة المرور الذاتي من اللوحة', mode: 'live', mechanism: 'تحقق كلمة المرور الحالية ثم تحديث عبر service_role + audit' },
+];
+
+export function capabilitiesByArea(): Record<string, Capability[]> {
+  const out: Record<string, Capability[]> = {};
+  for (const c of CAPABILITIES) {
+    (out[c.area] ||= []).push(c);
+  }
+  return out;
+}

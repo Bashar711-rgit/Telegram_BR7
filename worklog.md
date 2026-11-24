@@ -990,3 +990,31 @@ Stage Summary:
 - تعارض وحيد في worklog.md حُلّ بالاحتفاظ بمحتوى main ثم إلحاق أقسام dashboard-v2 بالترتيب الزمني.
 - أمان الدمج (تحقق قبل التنفيذ): ملفات الفرع خارج dashboard-next/ هي .gitignore وvercel.json وworklog.md حصراً — صفر تغيير في ملفات تشغيل البوت (unified_alerts/dashboard/alert_bot/main.py/... كلها من main كما هي) — نتيجة بناء Render ستطابق الإنتاج الحالي.
 - تنظيف ما قبل الدمج: توكن API استعيد إلى .secrets/github_token (chmod 600، .gitignore يغطيه سطر 43) + وسم اختبار test-tag-20261124 حُذف من GitHub (204 ثم 404 مؤكد) ومحلياً.
+
+## v16.5.0-bot-control-center — مركز التحكم الكامل بالبوت على Vercel (2026-11-24)
+
+### PHASE 0 — الفحص (قراءة فقط)
+- الفرع feature/bot-control-center من main @ 67ced87 — 34 جدول Supabase حي عبر OpenAPI + اختبار منح service_role فعلي: 11 جدولاً مقروءاً (panel_accounts/sources/rules/app_settings/blocked_senders/allowed_entities/messages/alerts/filter_decisions/audit_logs/dashboard_users)، والبقية 403 (بلا منح — موثق كعقد)
+- اكتشاف حاسم: dashboard:ops = {filtering_paused, alerts_paused} يُفحص في المسار الحارس لكل رسالة (monitors.py:2330/2893) من الذاكرة ويُمَدّ من app_settings عند الإقلاع (hydrate_dashboard) — وdashboard:keywords_json هو سجل الكلمات الكامل (36 مجموعة) — و/health/full يعيد مقاييس حية كاملة (queue/filters/uptime/FloodWait/latency)
+
+### PHASE 1 — المعمارية والعقود (BOT_CONTROL_CONTRACTS.md)
+- تصنيف صادق كامل: 24 وظيفة حية + 6 حية-مثابرة + 18 بعقد تكامل دقيق (§3.1-§3.8): منفذ أوامر Render، تدفق Telethon للإضافة، مقعد اختبار التحليل، DLQ/queue، مقاييس نظام، message_feedback — مع مخططات SQL مقترحة صريحة «لن تُنفذ في هذه المرحلة»
+
+### PHASE 2/3 — التنفيذ (commit c24df07)
+- lib/bot: engine.ts (اشتقاق حالة المحرك لحظياً: running/degraded/starting/stopped/error من /health+/health/full+Render — لا قيمة مخزنة أبداً)، keywords.ts (قراءة/كتابة السجل + كشف تكرار بالتطبيع العربي الآمن + ملفات Profile KV)، commands.ts (سجل أوامر بدورة حياة §16 + Idempotency 409 + restart حي + ops مثابر + pending_render_executor صادق)، capabilities.ts (سجل القدرات الآلي)
+- 9 مسارات API: /api/bot/{status,ops,commands,keywords,capabilities,profiles,quality,alerts-stats} + /api/auth/change-password — كلها فوق withApi (جلسة HMAC→RBAC حي→CSRF→rate-limit→Zod strict→envelope→audit مموّه)
+- 14 صفحة /bot/* + /account + مجموعة تنقل «مركز التحكم بالبوت» (RTL، responsive، حالات تحميل/فراغ/خطأ، نوافذ تأكيد للمحذور)
+- حساب المالك بأمر صريح: balghanme@gmail.com (auth user + dashboard_users id=3 super_admin + audit 201) — دخول حي 200 على الإنتاج والـPreview — وتغيير كلمة المرور الذاتي حقيقي (تحقق ثم تحديث ثم audit مموّه)
+
+### PHASE 4 — الاختبارات الحية (محلياً)
+- tsc نظيف + build ناجح (كل الصفحات) + ESLint «No ESLint warnings or errors» + grep أسرار CLEAN
+- قراءات حية: status (running/queue 9) · capabilities (24/6/18) · keywords (36 مجموعة/45 كلمة/صفر تكرار) · quality (1000 قرار: 237 مقبول/628 مراجعة/135 تجاهل — متوسط ثقة 0.5519 — Precision/Recall تُعرض غير متاح بصدق) · alerts-stats (98.4% نجاح إرسال)
+- كتابات صافيها صفر: keywords add (رفض مكرر حرفي + مكرر مطبَّع) ثم delete · ops toggle→revert (dashboard:ops عاد false/false، كلاهما مدقق)
+- أمن مثبت: 401 بلا جلسة · 403 csrf_rejected بلا Origin · 400 invalid_body لحقل غير معروف · 409 duplicate_command لنفس المفتاح · viewer→commands/ops = 403 forbidden وviewer→status = 200 · change-password بكلمة خاطئة = 403 current_password_invalid
+- إصلاح أثناء الاختبار: عمود duplicate غير موجود في filter_decisions (كان في message_analysis) — أُزيل والاعتماد على معدل تكرار msg_hash الحقيقي
+- ملاحظة إصلاحية: viewer وجد enabled=0 من اختبار المرحلة 6 السابقة — أُعيد تفعيله عبر مسار /api/settings/users الحقيقي (مدقق)
+
+### PHASE 5/6 — الفرع والـPreview
+- فرع feature/bot-control-center @ c24df07 مدفوع — Preview dpl_H9eoqVTK7eoewzKLQ9uk8mzEki43 READY @ c24df07
+- تحقق حي على Preview: دخول المالك 200 · bot/status حي (running/queue 4/not_suspended) · الصفحات 200 · 401 بلا جلسة · ترويسات أمنية 3/3
+- لم يُمَس: main، الإنتاج، Render، Supabase (إلا الكتابات المدققة صافيها صفر والحساب الجديد بأمر المالك) — الدمج ينتظر اعتماد المالك (نشر Production)
