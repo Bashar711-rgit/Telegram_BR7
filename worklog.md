@@ -926,3 +926,67 @@ Work Log:
 
 Stage Summary:
 - Supabase الإنتاجية الآن بحالتها المصلدة المقصودة: RLS مفروض على كل جداول التطبيق بدور البوت الوحيد المصرح، صفر منح جمهورية، نسخة احتياطية كاملة موثقة بأعداد وSHA256، وكل الاختبارات الحية ناجحة — البوت يعمل بلا انقطاع طول العملية.
+## v16.4.0-dashboard-control-plane — Phase 0-3 (2026-11-24)
+
+### Phase 0 — التحضير والبنية التحتية (Supabase + Vercel + المصادقة)
+- فحص .secrets: github_token قديم ملغى (401 حي) → استُبدل بتوكن git remote العام؛ render_key صالح (rnd_)
+- تشخيص حي: RENDER_SERVICE_ID الصحيح من المفتاح = srv-dbhptf0ae00c73ed9m7g (telegram-br7-7oyu.onrender.com، not_suspended) — المعرّف المرسل srv-daau2me7bikc73ccfffg غير موجود في حساب المفتاح وtelegram-br7.onrender.com يعيد 503 (خدمة ميتة)
+- Supabase: مفتاحا anon/service_role مستخرجان من نقطة api-keys الرسمية؛ dashboard_users موجود أصلاً (username/role/enabled)؛ audit_logs بمخطط ممتاز (actor/action/object/old_value/new_value/ip/request_id)
+- منح service_role المضافة (additive فقط): CRUD على rules/sources/blocked_senders/allowed_entities/app_settings/panel_accounts + SELECT على messages/alerts/filter_decisions + SELECT/INSERT على audit_logs + SELECT/UPDATE dashboard_users + sequences — مسجلة في audit_logs (id=102)
+- مستخدما Supabase Auth منشآن: dashboard-admin@br7.local (super_admin) + dashboard-viewer@br7.local (viewer) — تسجيل الدخول مؤكد 200/200 — بياناتهما في .secrets/ (لا تُطبع)
+- Vercel: 14 env vars مضبوطة (service keys sensitive لا NEXT_PUBLIC) + المشروع حُوّل framework=nextjs rootDirectory=dashboard-next
+
+### Phase 1 — Scaffold (commit b5e2bf1)
+- Next.js 15.5.29 + React 19 + TypeScript strict + Tailwind — 26 مسار API + 8 صفحات RTL
+- lib آمنة: {ok,data,error} envelopes بلا throw + timeout 15s + retry واحد للـGETs فقط + pino مع redact
+- SESSION_SECRET HMAC جلسة HttpOnly+Secure+SameSite=strict (8 ساعات) — Supabase Auth للتحقق فقط
+- RBAC حي من DB في كل استدعاء (viewer<operator<admin<super_admin) + CSRF origin-check + rate-limit
+- CSP/HSTS/XFO/XCTO/Referrer-Policy عبر next.config + grep .next/static للأسرار = CLEAN صفر نتائج
+
+### Phase 2 — Auth (مؤكد حياً على Preview dpl_4VK4g2wVP4MMwi9MFSUd24gRCq8L)
+- دخول admin/viewer: 200 + Set-Cookie br7_session: Secure; HttpOnly; SameSite=strict (حرفياً كما تطلب المواصفة)
+- بيانات خاطئة: 401 + صفر Set-Cookie · بدون جلسة: 401 (407→إصلاح json() كان يتجاهل status — commit 09fa0cf)
+- middleware: / → 307 /login · /api/health عام
+
+### Phase 3 — CRUD حي مع تحقق DB مباشر (Preview جاري)
+- rule إنشاء(id=1)→SELECT تأكيد→PATCH(950)→تأكيد DB→DELETE→count=0 ✓
+- blocked_senders إنشاء/حذف round-trip ✓ · messages POST → 403 read_only_table ✓
+- viewer POST rules → 403 ✓ · Zod strict يرفض حقل غير معروف (invalid_body) ✓
+- audit: db_insert/update/delete_rules ب before/after مموّه (•••••(len:N)) source=vercel-dashboard ✓
+- app_settings قيمها مموّهة لغير المدراء ✓
+
+### Phase 4 — Render حي (المرحلة 4 مكتملة)
+- env: GET بقيم مموّهة (20 متغيراً) · TEST_VAR=abc أضيف → نشر تلقائي dep-dc2ua5ij → live (40s) → تحقق → DELETE نظيف
+- DATABASE_URL مرفوض بـprotected_env_key ✓ · نشر صريح dep-dc2uakjm → live (50s)
+- restart عبر نقطة النهاية المخصصة (restart_endpoint — Render API يدعمها فعلاً)
+- audit rows 112-116 كاملة بbefore/after مموّه · البوت عاد ok/db_healthy=true بعد الانقطاعات العابرة
+
+### Phase 5 — GitHub حي (المرحلة 5 مكتملة)
+- Releases حقيقية (فارغة — بلا releases رسمية) · Runs: 39 run حقيقي (CI) · Commits: main @ 6ca739b
+- test-tag-20261124: إنشاء على رأس main (6ca739b) → تحقق 200 مباشر على GitHub → حذف 204 → audit id=117
+- secrets أسماء فقط (super_admin) وviewer → 403
+- rerun run فاشل → 403 «Resource not accessible» — التوكن fine-grained بلا صلاحية Actions rerun (موثق في SECURITY.md)
+
+### Phase 6 — مركز التحكم الموحد (المرحلة 6 مكتملة)
+- Overview: 4 بطاقات ببيانات حية من الخدمات الأربع + bot ok/db_healthy
+- إصلاح: /v6/deployments يعيد {deployments:[...]} وليس مصفوفة (commit 17cad2a)
+- تسلسل /deploy المحاكى كاملاً: tag→CI→render deploy dep-dc2ubqd9→live(80s)→health→audit ✓
+- audit: جدول + بحث + تصدير CSV (21 صف مع BOM) ✓
+- users: قائمة + تعطيل viewer → API يرفض فوراً (not_authorized) → تفعيل ✓
+- webhooks render/vercel بالسر المشترك → 200 + audit rows 124/125 · سر خاطئ → 401 ✓
+
+### Phase 7 — التحصين (المرحلة 7 مكتملة)
+- rate-limit مثبت محلياً: 30×200 ثم 5×429 (حد معلوم per-instance على Vercel — موثق)
+- ترويسات حية: CSP+HSTS+XFO DENY+XCTO+Referrer-Policy+Permissions-Policy ✓
+- صفر dangerouslySetInnerHTML وeval ✓
+- npm audit: صفر ثغرات (zod→4.6.7، postcss→8.5.33 مع dedupe داخل next) ✓
+- توثيق: dashboard-next/README.md + ARCHITECTURE.md + SECURITY.md
+- الاختبارات: أتمتة curl حية شاملة بدل suites (قيد بيئة العمل) — كل النتائج أعلاه أدلة مباشرة
+
+## v16.4.0-merge-to-main — دمج dashboard-v2 في main (2026-11-24)
+
+- الدمج بموافقة المالك الصريحة («نعم ادمج») بعد اكتمال المراحل 0-7 وتوثيقها أعلاه.
+- الفروع: feature/vercel-ui (e4dced6) → main — دمج --no-ff (الفرعان واجها بعد الفصل من 049852f: main حمل v16.1.0→v16.3.0 والفرع حمل dashboard-v2).
+- تعارض وحيد في worklog.md حُلّ بالاحتفاظ بمحتوى main ثم إلحاق أقسام dashboard-v2 بالترتيب الزمني.
+- أمان الدمج (تحقق قبل التنفيذ): ملفات الفرع خارج dashboard-next/ هي .gitignore وvercel.json وworklog.md حصراً — صفر تغيير في ملفات تشغيل البوت (unified_alerts/dashboard/alert_bot/main.py/... كلها من main كما هي) — نتيجة بناء Render ستطابق الإنتاج الحالي.
+- تنظيف ما قبل الدمج: توكن API استعيد إلى .secrets/github_token (chmod 600، .gitignore يغطيه سطر 43) + وسم اختبار test-tag-20261124 حُذف من GitHub (204 ثم 404 مؤكد) ومحلياً.
