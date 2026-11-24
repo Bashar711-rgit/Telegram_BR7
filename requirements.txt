@@ -20,6 +20,9 @@ asyncpg>=0.28.0,<1.0.0            # PostgreSQL (async)
 
 # ========== Security ==========
 cryptography>=41.0.0              # Fernet encryption
+# v16.1.0 (المرحلة 1 — لوحة التحكم الشاملة): مصادقة متعددة المستخدمين
+argon2-cffi>=23.1.0,<26.0.0      # Argon2id لتجزئة كلمات مرور اللوحة (احتياط تلقائي: scrypt)
+pyotp>=2.9.0,<3.0.0              # المصادقة الثنائية TOTP (احتياط: رموز استرداد فقط)
 
 # ========== JSON Processing ==========
 orjson>=3.9.0,<4.0.0              # Faster JSON (fallback to stdlib)

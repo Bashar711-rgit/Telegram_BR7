@@ -407,6 +407,7 @@ class EnhancedDatabase:
             await self._migrate_sender_access()
             await self._migrate_intel_entities()
             await self._migrate_queue_inflight()
+            await self._migrate_panel_auth()
             await self._ensure_queue_dedup_index()
             await self._create_indexes()
             self.is_connected = True
@@ -1490,6 +1491,77 @@ class EnhancedDatabase:
             logger.info(
                 f"Database migration v12.1.0: processing_queue inflight (+{added} columns)"
             )
+
+    async def _migrate_panel_auth(self) -> None:
+        """v16.1.0 (المرحلة 1): panel_users + panel_sessions + إثراء audit_logs.
+
+        Additive بحت: CREATE IF NOT EXISTS، وأعمدة audit الجديدة تُضاف
+        بفحص وجود للمحركين (SQLite لا يدعم ADD COLUMN IF NOT EXISTS).
+        المرجع التوثيقي: migrations/0006_panel_auth.sql
+        """
+        stmts = """
+            CREATE TABLE IF NOT EXISTS panel_users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                password_algo TEXT NOT NULL DEFAULT 'argon2id',
+                display_name TEXT DEFAULT '',
+                role TEXT NOT NULL DEFAULT 'viewer',
+                is_active INTEGER DEFAULT 1,
+                must_change_password INTEGER DEFAULT 0,
+                totp_enabled INTEGER DEFAULT 0,
+                totp_secret_encrypted TEXT DEFAULT '',
+                recovery_codes TEXT DEFAULT '[]',
+                created_at REAL DEFAULT 0,
+                updated_at REAL DEFAULT 0,
+                last_login_at REAL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS panel_sessions (
+                token_hash TEXT PRIMARY KEY,
+                csrf_hash TEXT NOT NULL DEFAULT '',
+                user_id INTEGER NOT NULL,
+                username TEXT DEFAULT '',
+                role TEXT DEFAULT 'viewer',
+                must_change INTEGER DEFAULT 0,
+                ip TEXT DEFAULT '',
+                user_agent TEXT DEFAULT '',
+                created_at REAL DEFAULT 0,
+                last_seen REAL DEFAULT 0,
+                expires_at REAL DEFAULT 0,
+                revoked_at REAL
+            );
+        """
+        for stmt in stmts.split(";"):
+            s = stmt.strip()
+            if not s:
+                continue
+            try:
+                await self._execute(s)
+            except Exception as e:
+                logger.warning(
+                    f"panel_auth migration skipped: {type(e).__name__}: {str(e)[:140]}")
+        await self._commit()
+        for name, decl in (("ip", "TEXT DEFAULT ''"),
+                           ("user_agent", "TEXT DEFAULT ''"),
+                           ("request_id", "TEXT DEFAULT ''")):
+            try:
+                if self.db_type == "postgresql":
+                    rows = await self._fetchall(
+                        "SELECT column_name FROM information_schema.columns "
+                        "WHERE table_name = 'audit_logs'", ())
+                    exists = name in {str((r or {}).get("column_name") or "")
+                                      for r in rows or []}
+                else:
+                    rows = await self._fetchall("PRAGMA table_info(audit_logs)", ())
+                    exists = name in {str((r or {}).get("name") or "")
+                                      for r in rows or []}
+                if not exists:
+                    await self._execute(f"ALTER TABLE audit_logs ADD COLUMN {name} {decl}")
+            except Exception as e:
+                logger.warning(
+                    f"audit enrichment column {name} skipped: {type(e).__name__}")
+        await self._commit()
+        logger.info("Database migration v16.1.0: panel auth tables ready")
 
     @staticmethod
     def _claim_payload(event_id: Any, raw: Any) -> dict:
@@ -4079,11 +4151,15 @@ class EnhancedDatabase:
     # ─── Audit Log ─────────────────────────────────────────────────────────
     async def record_audit(self, actor: str, action: str, object_type: str = "",
                            object_id: str = "", old_value: str = "", new_value: str = "",
-                           source: str = "botpanel") -> bool:
+                           source: str = "botpanel", ip: Any = None,
+                           user_agent: Any = None, request_id: Any = None) -> bool:
+        """تدقيق — v16.1.0: أعمدة ip/user_agent/request_id اختيارية مع
+        رجوع آمن للشكل القديم إن لم تكن الأعمدة موجودة بعد."""
         try:
             await self._execute(
-                "INSERT INTO audit_logs (actor, action, object_type, object_id, old_value, new_value, source)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO audit_logs (actor, action, object_type, object_id, "
+                "old_value, new_value, source, ip, user_agent, request_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     str(actor or "unknown")[:120],
                     str(action or "unknown")[:120],
@@ -4092,13 +4168,33 @@ class EnhancedDatabase:
                     str(old_value or "")[:2000],
                     str(new_value or "")[:2000],
                     str(source or "botpanel")[:40],
+                    str(ip or "")[:64],
+                    str(user_agent or "")[:200],
+                    str(request_id or "")[:32],
                 ),
             )
             await self._commit()
             return True
-        except Exception as e:
-            logger.debug(f"record_audit skipped: {e}")
-            return False
+        except Exception:
+            try:
+                await self._execute(
+                    "INSERT INTO audit_logs (actor, action, object_type, object_id, "
+                    "old_value, new_value, source) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        str(actor or "unknown")[:120],
+                        str(action or "unknown")[:120],
+                        str(object_type or "")[:120],
+                        str(object_id or "")[:200],
+                        str(old_value or "")[:2000],
+                        str(new_value or "")[:2000],
+                        str(source or "botpanel")[:40],
+                    ),
+                )
+                await self._commit()
+                return True
+            except Exception as e:
+                logger.debug(f"record_audit skipped: {e}")
+                return False
 
     @staticmethod
     def _audit_filters(where: List[str], params: List[Any], action: Optional[str] = None,

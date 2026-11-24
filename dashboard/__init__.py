@@ -26,9 +26,15 @@ Telegram_BR7 — Lightweight Control Dashboard (v15.1.0)
     الحرج، ويُحفظ أثرها في app_settings (سطر واحد) ليبقى بعد إعادة التشغيل.
 
 الوحدات الست: الحالة / الحسابات / الكلمات / المجموعات / التنبيهات / الإعدادات
-المصادقة: bashar / bashar123r (قابلة للتجاوز عبر DASHBOARD_USERNAME /
-          DASHBOARD_PASSWORD) — جلسات HttpOnly SameSite=Strict + CSRF
-          (X-CSRF-Token) + Rate Limit + قفل تسجيل الدخول بعد المحاولات.
+المصادقة (v16.1.0 — المرحلة 1): مستخدمون متعددون بأدوار Owner/Admin/
+          Operator/Viewer في panel_users (Argon2id/scrypt) + جلسات هجينة
+          (ذاكرة + panel_sessions) + CSRF مفصول عن الجلسة + TOTP ورموز
+          استرداد + قفل دخول لكل IP ولكل مستخدم + RBAC على الـBackend.
+          التهيئة الأولى: يُنشأ Owner من DASHBOARD_USERNAME/DASHBOARD_PASSWORD
+          عند أول إقلاع بجدول فارغ، ويُجبر على تغيير كلمة المرور فوراً
+          (بوابة password_change_required) — لا بيانات دخول افتراضية في
+          مسار الدخول بعد الآن. جلسات HttpOnly SameSite=Strict + Rate
+          Limit + Audit مُغنى بـIP/UA/request_id.
 
 ملاحظة تاريخية: لوحة سابقة (FastAPI/uvicorn، 4595 سطراً) أُزيلت في v14.0
 لثقلها — هذه النسخة مبنية بفلسفة معاكسة عمداً: نفس aiohttp، صفر deps،

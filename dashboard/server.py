@@ -41,14 +41,64 @@ from dashboard.state import (
     DEFAULT_LOGIN_LOCKOUT_SECONDS,
     DEFAULT_LOGIN_RATE_PER_MIN,
     DEFAULT_SESSION_TTL_SECONDS,
+    DEFAULT_MAX_SESSIONS,
     DASH,
 )
+from dashboard.auth.routes import setup_auth_routes
 
 COOKIE_NAME = "br7dash"
 # v15.2.0-fix: مرآة CSRF غير HttpOnly — النمط المزدوج يتطلب أن يقرأ JS التوكِن
 # ليرسله في الترويسة؛ HttpOnly وحدها تجعل كل عمليات التعديل 403 في المتصفح الحقيقي.
 CSRF_COOKIE_NAME = "br7dash_csrf"
 _LOGIN_PUBLIC_PATHS = {"/admin/api/login", "/admin/api/session"}
+
+# v16.1.0 (المرحلة 1): مسارات مسموحة أثناء بوابة «كلمة المرور الافتراضية»
+_MUST_CHANGE_ALLOWED = frozenset({
+    "/admin/api/auth/me",
+    "/admin/api/auth/change-password",
+    "/admin/api/logout",
+    "/admin/api/session",
+    "/admin/api/login",
+})
+
+# v16.1.0: خريطة صلاحيات المسارات على الـBackend (§6.2) — القراءة للكل
+# (عرض البيانات)، والتعديل حسب الوحدة؛ المصادقة تدير نفسها داخلياً.
+_ROUTE_PERM_PREFIX = (
+    ("/admin/api/accounts", "accounts.manage"),
+    ("/admin/api/groups", "sources.manage"),
+    ("/admin/api/blocked", "sources.manage"),
+    ("/admin/api/people", "sources.manage"),
+    ("/admin/api/keywords", "filtering.manage"),
+    ("/admin/api/playground", "filtering.manage"),
+    ("/admin/api/rules", "filtering.manage"),
+    ("/admin/api/alerts", "alerts.manage"),
+    ("/admin/api/users", "users.manage"),
+)
+
+
+def _route_perm(path: str, method: str) -> str:
+    """الصلاحية المطلوبة لمسار — '' تعني أي جلسة مصادقة (عرض)."""
+    m = (method or "").upper()
+    if (path.startswith("/admin/api/auth/") or path.startswith("/admin/api/login")
+            or path.startswith("/admin/api/session")):
+        return ""
+    if path.startswith("/admin/api/ops/backup"):
+        return "data.manage"
+    if path.startswith("/admin/api/ops"):
+        return "ops.dangerous" if m in ("POST", "PUT", "DELETE") else ""
+    if m in ("POST", "PUT", "DELETE"):
+        for prefix, perm in _ROUTE_PERM_PREFIX:
+            if path.startswith(prefix):
+                return perm
+    return ""
+
+
+def _role_allows(role: str, perm: str) -> bool:
+    try:
+        from dashboard.auth.permissions import role_allows as _ra
+        return bool(_ra(role, perm))
+    except Exception:
+        return False
 
 try:  # أوقات الاختبار قد لا تكون env مضبوطة — قيم state الافتراضية كافية
     from config import CFG as _CFG
@@ -73,10 +123,10 @@ def _json(data: Any, status: int = 200) -> web.Response:
     return resp
 
 
-def _cfg_secret(name_user: str, name_pass: str) -> tuple:
-    u = str(_cfg_val("DASHBOARD_USERNAME", "bashar") or "bashar")
-    p = str(_cfg_val("DASHBOARD_PASSWORD", "bashar123r") or "bashar123r")
-    return u, p
+def _cfg_username() -> str:
+    """اسم المستخدم للعرض/الممثل التدقيقي القديم فقط — التحقق فعلياً عبر
+    panel_users (Argon2id) منذ v16.1.0؛ لا كلمات مرور هنا إطلاقاً."""
+    return str(_cfg_val("DASHBOARD_USERNAME", "bashar") or "bashar")
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -93,7 +143,7 @@ def setup_dashboard(app: web.Application, bot: Any) -> None:
     except Exception:  # pragma: no cover
         _dash_bot_version = "15.2.0"
     DASH.version = str(_dash_bot_version)
-    DASH.username, _pw = _cfg_secret("DASHBOARD_USERNAME", "DASHBOARD_PASSWORD")
+    DASH.username = _cfg_username()
 
     # أصول الواجهة تُقرأ من القرص مرة واحدة فقط عند التركيب
     assets_dir = Path(__file__).resolve().parent / "assets"
@@ -109,6 +159,13 @@ def setup_dashboard(app: web.Application, bot: Any) -> None:
     api_rate_per_min = int(_cfg_val("DASHBOARD_API_RATE_PER_MIN", DEFAULT_API_RATE_PER_MIN))
     login_rate_per_min = int(_cfg_val("DASHBOARD_LOGIN_RATE_PER_MIN", DEFAULT_LOGIN_RATE_PER_MIN))
     lockout_s = int(_cfg_val("DASHBOARD_LOGIN_LOCKOUT_SECONDS", DEFAULT_LOGIN_LOCKOUT_SECONDS))
+    # v16.1.0: توصيل إعدادات الجلسة الفعلية بالمخزن (كانت منفصلة في v15.1)
+    try:
+        DASH.sessions.configure(
+            ttl_seconds,
+            int(_cfg_val("DASHBOARD_MAX_SESSIONS", DEFAULT_MAX_SESSIONS)))
+    except Exception:
+        pass
     bridge_timeout = float(_cfg_val("DASHBOARD_BRIDGE_TIMEOUT_S", 25.0))
 
     DASH.api_rate = type(DASH.api_rate)(api_rate_per_min)
@@ -196,14 +253,17 @@ def setup_dashboard(app: web.Application, bot: Any) -> None:
     def _session_token(request: web.Request) -> Optional[str]:
         return request.cookies.get(COOKIE_NAME)
 
-    def _audit_bg(action: str, object_id: str = "", new_value: str = "") -> None:
-        """تدقيق بدون انتظار — فشل-آمن، لا يحجب الاستجابة أبداً."""
+    def _audit_bg(action: str, object_id: str = "", new_value: str = "",
+                  actor: str = "", ip: str = "", ua: str = "") -> None:
+        """تدقيق بدون انتظار — فشل-آمن، لا يحجب الاستجابة أبداً.
+        v16.1.0: دعم actor صريح + إثراء IP/UA (§13)."""
         loop = getattr(bot, "_main_loop", None)
         if loop is None or loop.is_closed():
             return
         try:
             asyncio.run_coroutine_threadsafe(
-                api_db_audit(api, action, object_id, new_value), loop
+                api_db_audit(api, action, object_id, new_value,
+                             actor=actor, ip=ip, user_agent=ua), loop
             )
         except Exception:
             pass
@@ -242,65 +302,8 @@ def setup_dashboard(app: web.Application, bot: Any) -> None:
         resp.headers["X-Content-Type-Options"] = "nosniff"
         return resp
 
-    # ── المصادقة ────────────────────────────────────────────────────────
-    async def api_session(request: web.Request) -> web.Response:
-        token = _session_token(request)
-        valid = DASH.sessions.validate(token)
-        if valid:
-            return _json({"authenticated": True, "username": DASH.username,
-                          "version": DASH.version, "ops": DASH.ops.snapshot()})
-        return _json({"authenticated": False, "version": DASH.version})
-
-    async def api_login(request: web.Request) -> web.Response:
-        ip = _client_ip(request)
-        if DASH.guard.is_locked(ip):
-            rem = DASH.guard.remaining_lock(ip)
-            return _json({
-                "error": "locked",
-                "note": f"محاولات فاشلة كثيرة — أعد المحاولة بعد {rem} ثانية",
-            }, 429)
-        if not DASH.login_rate.allow(ip):
-            return _json({"error": "rate_limited", "note": "محاولات كثيرة جداً"}, 429)
-        try:
-            body = await body_json(request)
-        except DashboardHTTPError as e:
-            return _json(e.payload, e.status)
-        username = str(body.get("username") or "")
-        password = str(body.get("password") or "")
-        try:
-            from security import constant_time_equals
-            ok_u = constant_time_equals(username, DASH.username)
-            ok_p = constant_time_equals(password, _pw)
-        except Exception:
-            ok_u = ok_p = False
-        if not (ok_u and ok_p):
-            DASH.guard.record_failure(ip)
-            return _json({"error": "invalid_credentials"}, 401)
-        DASH.guard.record_success(ip)
-        token = _secrets.token_urlsafe(32)
-        DASH.sessions.create(token, ip)
-        _audit_bg("dashboard.login", "session", ip)
-        resp = _json({"ok": True, "username": DASH.username, "version": DASH.version,
-                      "csrf": token})
-        resp.set_cookie(
-            COOKIE_NAME, token, max_age=ttl_seconds, httponly=True,
-            samesite="Strict", path="/admin", secure=_is_https(request),
-        )
-        # مرآة CSRF مقروءة للـ JS (نفس التوكِن، حماية SameSite=Strict كما هي)
-        resp.set_cookie(
-            CSRF_COOKIE_NAME, token, max_age=ttl_seconds, httponly=False,
-            samesite="Strict", path="/admin", secure=_is_https(request),
-        )
-        return resp
-
-    async def api_logout(request: web.Request) -> web.Response:
-        token = _session_token(request)
-        DASH.sessions.drop(token)
-        _audit_bg("dashboard.logout", "session", _client_ip(request))
-        resp = _json({"ok": True})
-        resp.del_cookie(COOKIE_NAME, path="/admin")
-        resp.del_cookie(CSRF_COOKIE_NAME, path="/admin")
-        return resp
+    # v16.1.0: المصادقة نُقلت إلى dashboard/auth/routes.py
+    # (جلسات DB + أدوار RBAC + TOTP + CSRF مفصول) — يُسجَّل أسفل setup_dashboard
 
     # ── الوحدة 1: الحالة ────────────────────────────────────────────────
     async def api_overview(request: web.Request) -> web.Response:
@@ -723,30 +726,60 @@ def setup_dashboard(app: web.Application, bot: Any) -> None:
             return await handler(request)
 
         ip = _client_ip(request)
+        request_id = _secrets.token_hex(6)
 
         if path.startswith("/admin/api"):
-            if path not in _LOGIN_PUBLIC_PATHS:
+            # v16.1.0: حد المعدل يشمل المسارات العامة أيضاً (إلا login الذي
+            # له حد خاص داخل المعالج) — إغلاق ثغرة /session غير المحدودة.
+            if path != "/admin/api/login":
                 if not DASH.api_rate.allow(ip):
                     resp = _json({"error": "rate_limited"}, 429)
                     resp.headers["Retry-After"] = "30"
+                    resp.headers["X-Request-Id"] = request_id
                     return resp
 
             token = _session_token(request)
-            valid = DASH.sessions.validate(token)
+            sess = DASH.sessions.validate(token)
+            request["dash_session"] = sess or {}
             public = path in _LOGIN_PUBLIC_PATHS
-            if not valid and not public:
+            if sess is None and not public:
                 return _json({"error": "unauthorized"}, 401)
-            if request.method in ("POST", "PUT", "DELETE") and not public:
-                supplied = request.headers.get("X-CSRF-Token", "")
-                try:
-                    from security import constant_time_equals
-                    csrf_ok = bool(token) and constant_time_equals(supplied, token)
-                except Exception:
-                    csrf_ok = False
-                if not csrf_ok:
-                    return _json({"error": "csrf_required"}, 403)
+            if sess is not None:
+                # بوابة «كلمة المرور الافتراضية»: لا وصول إلا لمسارات الحساب
+                if sess.get("must_change") and path not in _MUST_CHANGE_ALLOWED:
+                    resp = _json({"error": "password_change_required",
+                                  "note": "غيّر كلمة المرور الافتراضية قبل أي عملية أخرى"},
+                                 428)
+                    resp.headers["X-Request-Id"] = request_id
+                    return resp
+                # v16.1.0: CSRF مفصول عن الجلسة (§6.3) — مزدوج الإرسال +
+                # هاش مخزّن في الجلسة، مقارنة زمن-ثابت للطبقتين.
+                if request.method in ("POST", "PUT", "DELETE") and not public:
+                    supplied = request.headers.get("X-CSRF-Token", "")
+                    cookie_c = request.cookies.get(CSRF_COOKIE_NAME, "")
+                    try:
+                        from security import constant_time_equals
+                        double_ok = bool(supplied) and constant_time_equals(cookie_c, supplied)
+                    except Exception:
+                        double_ok = False
+                    server_ok = DASH.sessions.csrf_matches(token, supplied)
+                    if not (double_ok and server_ok):
+                        resp = _json({"error": "csrf_required"}, 403)
+                        resp.headers["X-Request-Id"] = request_id
+                        return resp
+                # RBAC على الـBackend (§6.2) — إخفاء الواجهة ليس حماية
+                perm = _route_perm(path, request.method)
+                if perm and not _role_allows(str(sess.get("role") or "viewer"), perm):
+                    resp = _json({"error": "forbidden",
+                                  "note": "لا تملك صلاحية لهذه العملية"}, 403)
+                    resp.headers["X-Request-Id"] = request_id
+                    return resp
 
         resp = await handler(request)
+        try:
+            resp.headers.setdefault("X-Request-Id", request_id)
+        except Exception:
+            pass
         try:
             resp.headers.setdefault("X-Content-Type-Options", "nosniff")
             if path == "/admin" or path.startswith("/admin/assets"):
@@ -760,6 +793,30 @@ def setup_dashboard(app: web.Application, bot: Any) -> None:
             pass
         return resp
 
+    # ── v16.1.0: مسارات المصادقة/المستخدمين/الأمان (المرحلة 1) ──────────
+    class _AuthCtx:
+        __slots__ = ("bot", "api", "dash", "bridge_call", "bridge_error",
+                     "body_json", "client_ip", "is_https", "json",
+                     "cookie_name", "csrf_cookie_name", "ttl_seconds",
+                     "version", "audit_bg")
+
+    _actx = _AuthCtx()
+    _actx.bot = bot
+    _actx.api = api
+    _actx.dash = DASH
+    _actx.bridge_call = _bridge_call
+    _actx.bridge_error = _BridgeError
+    _actx.body_json = body_json
+    _actx.client_ip = _client_ip
+    _actx.is_https = _is_https
+    _actx.json = _json
+    _actx.cookie_name = COOKIE_NAME
+    _actx.csrf_cookie_name = CSRF_COOKIE_NAME
+    _actx.ttl_seconds = ttl_seconds
+    _actx.version = DASH.version
+    _actx.audit_bg = _audit_bg
+    setup_auth_routes(app, _actx)
+
     app.middlewares.append(dash_middleware)
 
     # ── المسارات ────────────────────────────────────────────────────────
@@ -767,9 +824,7 @@ def setup_dashboard(app: web.Application, bot: Any) -> None:
     r.add_get("/admin", admin_index)
     r.add_get("/admin/assets/{name}", admin_asset)
 
-    r.add_get("/admin/api/session", api_session)
-    r.add_post("/admin/api/login", api_login)
-    r.add_post("/admin/api/logout", api_logout)
+    # v16.1.0: session/login/logout سُجلت داخل setup_auth_routes (أدناه)
 
     r.add_get("/admin/api/overview", api_overview)
 
@@ -840,10 +895,14 @@ def setup_dashboard(app: web.Application, bot: Any) -> None:
 
 
 async def api_db_audit(api: DashboardAPI, action: str, object_id: str,
-                       new_value: str) -> None:
-    """تدقيق على الحلقة الرئيسية (يُستدعى fire-and-forget من خيط الصحة)."""
+                       new_value: str, actor: str = "",
+                       ip: str = "", user_agent: str = "") -> None:
+    """تدقيق على الحلقة الرئيسية (يُستدعى fire-and-forget من خيط الصحة).
+    v16.1.0: actor صريح + إثراء IP/UA."""
     from dashboard.api import _audit
     db = getattr(api, "db", None)
     if db is None:
         return
-    await _audit(db, action, "session", object_id, new_value=new_value)
+    await _audit(db, action, "session", object_id, new_value=new_value,
+                 actor=actor or None, ip=ip or None,
+                 user_agent=user_agent or None)

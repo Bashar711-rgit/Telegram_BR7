@@ -24,6 +24,10 @@ from typing import Any, Dict, List, Optional
 # ─────────────────────────────────────────────────────────────────────────
 DEFAULT_SESSION_TTL_SECONDS = 8 * 3600
 DEFAULT_MAX_SESSIONS = 10
+
+# v16.1.0 (المرحلة 1): الجلسات هجينة — ذاكرة حية + مثابرة panel_sessions.
+# الاستيراد آمن على المسار الحرج: auth.sessions = stdlib حصراً.
+from dashboard.auth.sessions import AuthSessionStore
 DEFAULT_API_RATE_PER_MIN = 120
 DEFAULT_LOGIN_RATE_PER_MIN = 5
 DEFAULT_LOGIN_LOCKOUT_SECONDS = 900
@@ -289,6 +293,7 @@ class DashboardState:
 
     __slots__ = (
         "assets", "ops", "sessions", "api_rate", "login_rate", "guard",
+        "guard_user",
         "overview_cache", "groups_cache", "alerts_cache", "errors_cache",
         "identity_cache", "membership_cache", "cpu_last", "cpu_lock",
         "username", "version",
@@ -297,10 +302,13 @@ class DashboardState:
     def __init__(self) -> None:
         self.assets: Dict[str, bytes] = {}
         self.ops = DashboardOps()
-        self.sessions = SessionStore()
+        # v16.1.0: جلسات هجينة (ذاكرة + DB) — نفس الاسم والواجهة المتوافقة
+        self.sessions = AuthSessionStore()
         self.api_rate = RateLimiter(DEFAULT_API_RATE_PER_MIN)
         self.login_rate = RateLimiter(DEFAULT_LOGIN_RATE_PER_MIN)
         self.guard = LoginGuard()
+        # v16.1.0: قفل ثانٍ حسب اسم المستخدم (حماية من تخمين حساب واحد موزعاً)
+        self.guard_user = LoginGuard()
         self.overview_cache = OverviewCache()
         # كاشات تبويبات (TTL قصيرة — تُملأ عند فتح التبويب فقط)
         self.groups_cache = OverviewCache(ttl_seconds=45)

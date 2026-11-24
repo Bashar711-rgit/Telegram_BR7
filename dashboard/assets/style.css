@@ -325,3 +325,37 @@ footer.copyright {
   .tab { padding: 8px 12px; font-size: 13px; }
   .searchbar { min-width: 140px; flex: 1; }
 }
+
+/* ═════════ المصادقة والمستخدمون (P1-UI) ═════════ */
+.error-box {
+  color: #ffb4b4; background: #3a1616; border: 1px solid #7a2e2e;
+  border-radius: 8px; padding: 8px 10px; margin-bottom: 10px; font-size: 13px;
+}
+.success-box {
+  color: #b7e6c6; background: #143a2c; border: 1px solid #2f6b4f;
+  border-radius: 8px; padding: 8px 10px; margin-bottom: 10px; font-size: 13px;
+}
+.copybox {
+  display: flex; align-items: center; gap: 8px; background: var(--bg2);
+  border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; margin: 6px 0;
+}
+.copybox code {
+  direction: ltr; flex: 1; font-size: 12px; word-break: break-all; color: var(--text);
+}
+.copybox .btn { flex-shrink: 0; }
+.kvlist {
+  display: grid; grid-template-columns: auto 1fr; gap: 6px 14px;
+  font-size: 13px; align-items: baseline; padding: 4px 0;
+}
+.kvlist > span { color: var(--muted); font-size: 12px; }
+.kvlist > b { word-break: break-word; }
+.rcodes { display: flex; flex-wrap: wrap; gap: 6px; direction: ltr; margin: 8px 0; }
+.rcodes code {
+  background: var(--bg2); border: 1px dashed var(--line); border-radius: 8px;
+  padding: 6px 10px; font-size: 13px; letter-spacing: 1px;
+}
+.totp-note { color: var(--muted); font-size: 12.5px; line-height: 1.9; margin: 6px 0; }
+.muted-note { color: var(--muted); font-size: 12.5px; margin: 0 0 10px; line-height: 1.8; }
+.modal.must { z-index: 70; } /* فوق شاشة الدخول والـ toast — بوابة الإجبار */
+.modal.must .modal-card { max-width: 430px; }
+.table select { min-height: 30px; font-size: 12px; padding: 4px 8px; }

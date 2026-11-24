@@ -104,9 +104,19 @@ async function api(path, opts) {
 /* ── المصادقة ── */
 let authed = false;
 let username = "";
+/* P1-UI: سياق المستخدم الحالي والصلاحيات (تُملأ من /login و /session و /auth/me) */
+let myPermissions = [];
+let myRole = "";
+let myUserId = null;
+let mustChangePw = false;
+let meCache = null;
+let sessScope = "self";
+let usrRoles = [];
+const ROLE_AR = { owner: "المالك", admin: "مدير", operator: "مشغل", viewer: "مشاهد" };
 
 function showLogin() {
   authed = false;
+  resetAuthState();
   $("loginOverlay").classList.remove("hidden");
 }
 function hideLogin() {
@@ -118,33 +128,45 @@ $("loginForm").addEventListener("submit", async (ev) => {
   ev.preventDefault();
   $("loginBtn").disabled = true;
   const errBox = $("loginError");
+  const okBox = $("loginSuccess");
   errBox.classList.add("hidden");
-  const r = await api("/admin/api/login", {
-    method: "POST",
-    body: { username: $("loginUser").value.trim(), password: $("loginPass").value },
-  });
+  okBox.classList.add("hidden");
+  const totp = $("loginTotp").value.trim();
+  const body = { username: $("loginUser").value.trim(), password: $("loginPass").value };
+  if (totp) body.totp_code = totp; /* P1-UI: رمز المصادقة الثنائية الاختياري */
+  const r = await api("/admin/api/login", { method: "POST", body });
   $("loginBtn").disabled = false;
-  if (r.ok && r.data.ok) {
+  const d = r.data || {};
+  if (r.ok && d.ok) {
     $("loginPass").value = "";
-    if (r.data.csrf) sessionStorage.setItem("br7dash_csrf", r.data.csrf);
+    $("loginTotp").value = "";
+    if (d.csrf) sessionStorage.setItem("br7dash_csrf", d.csrf);
+    setAuthContext(d);
     hideLogin();
-    username = r.data.username;
-    $("versionBadge").textContent = "v" + (r.data.version || "");
+    username = d.username;
+    $("versionBadge").textContent = "v" + (d.version || "");
     toast("تم تسجيل الدخول");
     loadOpsBanner();
     switchTab(currentTab);
+    if (d.must_change_password) openMustPwModal(); /* بوابة تغيير كلمة المرور الإجبارية */
+  } else if (d.error === "totp_required") {
+    errBox.textContent = d.note || "هذا الحساب محمي بالتحقق بخطوتين — أدخل رمز تطبيق المصادقة ثم أعد الدخول";
+    errBox.classList.remove("hidden");
+    $("loginTotp").focus();
+  } else if (d.error === "locked" || d.error === "rate_limited") {
+    errBox.textContent = d.note || "تم تجاوز عدد المحاولات — حاول بعد قليل";
+    errBox.classList.remove("hidden");
   } else {
-    errBox.textContent = r.data.note || r.data.error === "invalid_credentials"
-      ? (r.data.note || "بيانات الدخول غير صحيحة")
-      : "تعذر الاتصال — أعد المحاولة";
+    errBox.textContent = d.note || (d.error === "invalid_credentials" ? "بيانات الدخول غير صحيحة" : "تعذر الاتصال — أعد المحاولة");
     errBox.classList.remove("hidden");
   }
 });
 
 $("logoutBtn").addEventListener("click", async () => {
   await api("/admin/api/logout", { method: "POST", body: {} });
-  showLogin();
   sessionStorage.removeItem("br7dash_csrf");
+  resetAuthState();
+  showLogin();
   toast("تم تسجيل الخروج");
 });
 
@@ -864,16 +886,473 @@ async function refreshQueueMemInfo() {
   } catch { /* بلا صوت */ }
 }
 
+/* ═════════ P1-UI: المصادقة متعددة المستخدمين — تبويبا الأمان والمستخدمين ═════════ */
+
+/* ── سياق الجلسة الحالية والصلاحيات ── */
+function setAuthContext(d) {
+  if (d && d.username) username = d.username;
+  myRole = (d && d.role) || myRole || "";
+  if (d && Array.isArray(d.permissions)) myPermissions = d.permissions;
+  mustChangePw = !!(d && d.must_change_password);
+  applyPermissionsUI();
+}
+
+function resetAuthState() {
+  myPermissions = [];
+  myRole = "";
+  myUserId = null;
+  mustChangePw = false;
+  meCache = null;
+  $("mustPwModal").classList.add("hidden");
+  applyPermissionsUI();
+}
+
+/* بوابة الصلاحيات: إظهار/إخفاء تبويب المستخدمين حسب users.manage */
+function applyPermissionsUI() {
+  const canUsers = myPermissions.includes("users.manage");
+  const tabBtn = document.querySelector('.tab[data-tab="users"]');
+  if (tabBtn) tabBtn.classList.toggle("hidden", !canUsers);
+  if (!canUsers && currentTab === "users") switchTab("overview");
+}
+
+function showLoginWithMsg(msg) {
+  showLogin();
+  const okBox = $("loginSuccess");
+  okBox.textContent = msg;
+  okBox.classList.remove("hidden");
+}
+
+/* ── طبقة API للاستجابات الموحدة {success, data, error, note} ── */
+async function apiData(path, opts) {
+  const r = await api(path, opts);
+  const d = r.data || {};
+  if (r.ok && d.success) return { ok: true, status: r.status, data: d.data || {}, note: d.note || "" };
+  return { ok: false, status: r.status, error: d.error || "خطأ غير متوقع", note: d.note || "" };
+}
+function apiFailMsg(res) { return (res && (res.note || res.error)) || "خطأ غير متوقع"; }
+
+/* ── نسخ إلى الحافظة (بدون مكتبات وبدون موارد خارجية) ── */
+function copyText(txt, label) {
+  const done = () => toast("✅ تم النسخ" + (label ? " — " + label : ""));
+  const legacy = () => {
+    const ta = document.createElement("textarea");
+    ta.value = txt;
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand("copy"); done(); } catch (e) { toast("تعذر النسخ — انسخ يدوياً", true); }
+    document.body.removeChild(ta);
+  };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(txt).then(done).catch(legacy);
+  } else legacy();
+}
+document.addEventListener("click", (ev) => {
+  const btn = ev.target.closest("[data-copy]");
+  if (!btn) return;
+  copyText(btn.dataset.copy || "", btn.dataset.copyLabel || "");
+});
+
+/* ── تبويب الأمان: حسابي (auth/me) ── */
+async function ensureMe(force) {
+  if (meCache && !force) return meCache;
+  const res = await apiData("/admin/api/auth/me");
+  if (!res.ok) return null;
+  meCache = res.data;
+  const u = res.data.user || {};
+  if (u.id != null) myUserId = u.id;
+  if (u.role) myRole = u.role;
+  mustChangePw = !!u.must_change_password;
+  if (Array.isArray(res.data.permissions)) myPermissions = res.data.permissions;
+  return meCache;
+}
+
+function renderSecMe(d) {
+  const u = (d && d.user) || {};
+  const s = (d && d.session) || {};
+  $("secMe").innerHTML = `<div class="kvlist">
+    <span>اسم المستخدم</span><b>${esc(u.username || "—")}</b>
+    <span>الاسم المعروض</span><b>${esc(u.display_name || "—")}</b>
+    <span>الدور</span><b>${esc(ROLE_AR[u.role] || u.role || "—")}</b>
+    <span>المصادقة الثنائية</span><b>${u.totp_enabled ? "مفعّلة ✅" : "غير مفعّلة"}</b>
+    <span>آخر دخول</span><b>${fmtTs(u.last_login_at)}</b>
+    <span>أُنشئ الحساب</span><b>${fmtTs(u.created_at)}</b>
+    <span>IP الجلسة الحالية</span><b>${esc(s.ip || "—")}</b>
+    <span>بداية الجلسة</span><b>${fmtTs(s.created_at)}</b>
+  </div>`;
+  const on = !!u.totp_enabled;
+  $("totpStatus").innerHTML = on ? '<span class="pill ok">مفعّلة</span>' : '<span class="pill warn">غير مفعّلة</span>';
+  const tbtn = $("totpToggleBtn");
+  tbtn.textContent = on ? "تعطيل" : "تفعيل";
+  tbtn.classList.toggle("primary", !on);
+  tbtn.classList.toggle("danger", on);
+  tbtn.dataset.enabled = on ? "1" : "0";
+}
+
+tabLoaders.security = async function () {
+  const me = await ensureMe();
+  if (me) renderSecMe(me);
+  $("sessScopeBtn").classList.toggle("hidden", myRole !== "owner");
+  await loadSessions();
+};
+
+async function refreshSecurity() {
+  meCache = null;
+  const me = await ensureMe(true);
+  if (me) renderSecMe(me);
+  await loadSessions();
+}
+
+/* ── تبويب الأمان: الجلسات النشطة ── */
+async function loadSessions() {
+  const res = await apiData(`/admin/api/auth/sessions?scope=${encodeURIComponent(sessScope)}`);
+  if (!res.ok) { toast(apiFailMsg(res), true); return; }
+  renderSessions(res.data);
+}
+
+function renderSessions(d) {
+  const list = d.sessions || [];
+  const rows = list.map((s) => {
+    const curBadge = s.current ? ' <span class="pill ok">الحالية</span>' : "";
+    const stBadge = s.revoked ? '<span class="pill bad">ملغاة</span>' : '<span class="pill ok">نشطة</span>';
+    const act = (!s.revoked && !s.current)
+      ? `<button class="btn sm danger" data-sessact="revoke" data-hash="${esc(s.token_hash || "")}">إبطال</button>`
+      : "—";
+    return `<tr>
+      <td><b>${esc(s.username || "—")}</b>${curBadge}</td>
+      <td>${esc(ROLE_AR[s.role] || s.role || "—")}</td>
+      <td><code>${esc(s.ip || "—")}</code></td>
+      <td title="${esc(s.user_agent || "")}">${esc(String(s.user_agent || "—").slice(0, 36))}</td>
+      <td>${fmtTs(s.last_seen)}</td>
+      <td>${fmtTs(s.expires_at)}</td>
+      <td>${stBadge}</td>
+      <td>${act}</td>
+    </tr>`;
+  }).join("");
+  $("sessTable").innerHTML = "<thead><tr><th>المستخدم</th><th>الدور</th><th>IP</th><th>المتصفح</th><th>آخر ظهور</th><th>ينتهي</th><th>الحالة</th><th>إجراء</th></tr></thead><tbody>" +
+    (rows || "<tr><td colspan='8'>لا جلسات</td></tr>") + "</tbody>";
+  $("sessScopeNote").textContent = sessScope === "all" ? "تُعرض جلسات جميع المستخدمين" : "تُعرض جلساتك فقط";
+}
+
+$("sessRefresh").addEventListener("click", () => loadSessions().catch(() => {}));
+$("sessScopeBtn").addEventListener("click", () => {
+  sessScope = sessScope === "self" ? "all" : "self";
+  $("sessScopeBtn").textContent = sessScope === "all" ? "عرض جلساتي فقط" : "عرض كل المستخدمين";
+  loadSessions().catch(() => {});
+});
+$("sessRevokeAll").addEventListener("click", async () => {
+  const go = await confirmModal("إبطال جميع الجلسات الأخرى (ما عدا جلستك الحالية)؟ سيُجبر أصحابها على تسجيل الدخول من جديد.", "إبطال الكل");
+  if (!go) return;
+  const res = await apiData("/admin/api/auth/sessions/revoke-all", { method: "POST", body: {} });
+  if (res.ok) toast(`✅ أُبطلت ${res.data.revoked_count ?? 0} جلسة — جلستك الحالية محفوظة`);
+  else toast(apiFailMsg(res), true);
+  loadSessions().catch(() => {});
+});
+$("sessTable").addEventListener("click", async (ev) => {
+  const btn = ev.target.closest("button[data-sessact]");
+  if (!btn) return;
+  const go = await confirmModal("إبطال هذه الجلسة؟ سيُجبر مستخدمها على تسجيل الدخول من جديد.", "إبطال");
+  if (!go) return;
+  btn.disabled = true;
+  const res = await apiData("/admin/api/auth/sessions/revoke", { method: "POST", body: { token_hash: btn.dataset.hash } });
+  if (res.ok) toast("✅ أُبطلت الجلسة");
+  else toast(apiFailMsg(res), true);
+  loadSessions().catch(() => {});
+});
+
+/* ── تبويب الأمان: تغيير كلمة المرور ── */
+function pwValidate(cur, nw, nw2) {
+  if (!cur || !nw) return "أدخل كلمة المرور الحالية والجديدة";
+  if (nw !== nw2) return "كلمتا المرور الجديدتان غير متطابقتين";
+  return "";
+}
+
+$("pwForm").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const e = $("pwError");
+  e.classList.add("hidden");
+  const msg = pwValidate($("pwCurrent").value, $("pwNew").value, $("pwNew2").value);
+  if (msg) { e.textContent = msg; e.classList.remove("hidden"); return; }
+  $("pwSaveBtn").disabled = true;
+  const res = await apiData("/admin/api/auth/change-password", {
+    method: "POST",
+    body: { current_password: $("pwCurrent").value, new_password: $("pwNew").value },
+  });
+  $("pwSaveBtn").disabled = false;
+  if (res.ok) {
+    sessionStorage.removeItem("br7dash_csrf");
+    $("pwForm").reset();
+    resetAuthState();
+    showLoginWithMsg("✅ " + ((res.data && res.data.message) || "تم تغيير كلمة المرور — سجّل الدخول من جديد"));
+  } else {
+    e.textContent = apiFailMsg(res);
+    e.classList.remove("hidden");
+  }
+});
+
+/* ── بوابة تغيير كلمة المرور الإجبارية (تغطي اللوحة، غير قابلة للإغلاق) ── */
+function openMustPwModal() {
+  ["mpCurrent", "mpNew", "mpNew2"].forEach((id) => { $(id).value = ""; });
+  const e = $("mpError");
+  e.textContent = "";
+  e.classList.add("hidden");
+  $("mustPwModal").classList.remove("hidden");
+  setTimeout(() => $("mpCurrent").focus(), 60);
+}
+
+async function submitMustPassword() {
+  const e = $("mpError");
+  e.classList.add("hidden");
+  const msg = pwValidate($("mpCurrent").value, $("mpNew").value, $("mpNew2").value);
+  if (msg) { e.textContent = msg; e.classList.remove("hidden"); return; }
+  $("mpSaveBtn").disabled = true;
+  const res = await apiData("/admin/api/auth/change-password", {
+    method: "POST",
+    body: { current_password: $("mpCurrent").value, new_password: $("mpNew").value },
+  });
+  $("mpSaveBtn").disabled = false;
+  if (res.ok) {
+    sessionStorage.removeItem("br7dash_csrf");
+    $("mustPwModal").classList.add("hidden");
+    resetAuthState();
+    showLoginWithMsg("✅ " + ((res.data && res.data.message) || "تم تغيير كلمة المرور — سجّل الدخول من جديد"));
+  } else {
+    e.textContent = apiFailMsg(res);
+    e.classList.remove("hidden");
+  }
+}
+$("mpSaveBtn").addEventListener("click", submitMustPassword);
+["mpCurrent", "mpNew", "mpNew2"].forEach((id) => {
+  $(id).addEventListener("keydown", (e) => { if (e.key === "Enter") submitMustPassword(); });
+});
+
+/* ── تبويب الأمان: المصادقة الثنائية TOTP ── */
+$("totpToggleBtn").addEventListener("click", async () => {
+  if ($("totpToggleBtn").dataset.enabled === "1") {
+    $("totpSetupBox").classList.add("hidden");
+    $("totpRecoveryBox").classList.add("hidden");
+    $("totpDisablePass").value = "";
+    $("totpDisableBox").classList.remove("hidden");
+    setTimeout(() => $("totpDisablePass").focus(), 60);
+  } else {
+    $("totpDisableBox").classList.add("hidden");
+    await totpStartSetup();
+  }
+});
+
+async function totpStartSetup() {
+  const res = await apiData("/admin/api/auth/totp/setup", { method: "POST", body: {} });
+  if (!res.ok) { toast(apiFailMsg(res), true); return; }
+  const d = res.data;
+  $("totpUri").textContent = d.otpauth_uri || "—";
+  $("totpSecret").textContent = d.secret || "—";
+  $("totpUriCopy").dataset.copy = d.otpauth_uri || "";
+  $("totpSecretCopy").dataset.copy = d.secret || "";
+  $("totpCodeInput").value = "";
+  $("totpSetupBox").classList.remove("hidden");
+  setTimeout(() => $("totpCodeInput").focus(), 60);
+}
+
+$("totpCancelBtn").addEventListener("click", () => $("totpSetupBox").classList.add("hidden"));
+
+$("totpEnableBtn").addEventListener("click", async () => {
+  const code = $("totpCodeInput").value.trim();
+  if (!code) { toast("أدخل الرمز من تطبيق المصادقة", true); return; }
+  $("totpEnableBtn").disabled = true;
+  const res = await apiData("/admin/api/auth/totp/enable", { method: "POST", body: { code } });
+  $("totpEnableBtn").disabled = false;
+  if (!res.ok) { toast(apiFailMsg(res), true); return; }
+  $("totpSetupBox").classList.add("hidden");
+  renderRecoveryCodes(res.data.recovery_codes || []);
+  toast("✅ فُعّلت المصادقة الثنائية — احفظ رموز الاسترداد الآن");
+  refreshSecurity().catch(() => {});
+});
+
+$("totpCodeInput").addEventListener("keydown", (e) => { if (e.key === "Enter") $("totpEnableBtn").click(); });
+
+function renderRecoveryCodes(codes) {
+  $("totpDisableBox").classList.add("hidden");
+  $("totpRecoveryCodes").innerHTML = (codes || []).map((c) => `<code>${esc(c)}</code>`).join("");
+  $("totpRecoveryCopy").dataset.copy = (codes || []).join("\n");
+  $("totpRecoveryCopy").dataset.copyLabel = "رموز الاسترداد";
+  $("totpRecoveryBox").classList.remove("hidden");
+}
+
+$("totpRecoveryDone").addEventListener("click", () => $("totpRecoveryBox").classList.add("hidden"));
+$("totpDisableCancel").addEventListener("click", () => $("totpDisableBox").classList.add("hidden"));
+
+async function totpDisableNow() {
+  const pass = $("totpDisablePass").value;
+  if (!pass) { toast("أدخل كلمة المرور لتأكيد التعطيل", true); return; }
+  $("totpDisableConfirm").disabled = true;
+  const res = await apiData("/admin/api/auth/totp/disable", { method: "POST", body: { password: pass } });
+  $("totpDisableConfirm").disabled = false;
+  $("totpDisablePass").value = "";
+  if (!res.ok) { toast(apiFailMsg(res), true); return; }
+  $("totpDisableBox").classList.add("hidden");
+  toast("✅ عُطّلت المصادقة الثنائية");
+  refreshSecurity().catch(() => {});
+}
+$("totpDisableConfirm").addEventListener("click", totpDisableNow);
+$("totpDisablePass").addEventListener("keydown", (e) => { if (e.key === "Enter") totpDisableNow(); });
+
+/* ── تبويب المستخدمون (صلاحية users.manage فقط) ── */
+/* نافذة إدخال كلمة مرور — بنفس نمط promptModal لكن الحقل مخفي */
+function promptPasswordModal(msg, okLabel) {
+  $("modalBody").innerHTML = esc(msg) +
+    '<br><input id="modalInput" type="password" style="width:100%;margin-top:12px" autocomplete="new-password">';
+  $("modalOk").textContent = okLabel || "حفظ";
+  $("modal").classList.remove("hidden");
+  return new Promise((res) => { modalResolver = res; });
+}
+
+function roleOptions(selected) {
+  return usrRoles.map((r) =>
+    `<option value="${esc(r)}"${r === selected ? " selected" : ""}>${esc(ROLE_AR[r] || r)}</option>`).join("");
+}
+
+tabLoaders.users = async function () {
+  if (!myPermissions.includes("users.manage")) { switchTab("overview"); return; }
+  await ensureMe();
+  await loadUsers();
+};
+
+async function loadUsers() {
+  const res = await apiData("/admin/api/users");
+  if (!res.ok) { toast(apiFailMsg(res), true); return; }
+  usrRoles = (res.data.roles && res.data.roles.length) ? res.data.roles : ["owner", "admin", "operator", "viewer"];
+  $("usrAddRole").innerHTML = roleOptions("");
+  $("usrAddRole").value = usrRoles.includes("admin") ? "admin" : (usrRoles[0] || "viewer");
+  const users = res.data.users || [];
+  $("usrNote").textContent = `${users.length} مستخدم مسجّل`;
+  renderUsers(users);
+}
+
+function renderUsers(users) {
+  const rows = users.map((u) => {
+    const isSelf = (myUserId != null && u.id === myUserId) || (u.username && u.username === username);
+    const activePill = u.is_active ? '<span class="pill ok">نشط</span>' : '<span class="pill bad">معطّل</span>';
+    const mc = u.must_change_password ? ' <span class="pill warn">يغيّر كلمة المرور</span>' : "";
+    const totpPill = u.totp_enabled ? '<span class="pill ok">TOTP</span>' : '<span class="pill muted">بدون TOTP</span>';
+    const roleSel = `<select data-usrsel="${u.id}" data-prev="${esc(u.role)}" data-uname="${esc(u.username)}">${roleOptions(u.role)}</select>`;
+    const acts = [
+      `<button class="btn sm" data-usrcode="rename" data-id="${u.id}" data-name="${esc(u.display_name || "")}" data-uname="${esc(u.username)}">تعديل الاسم</button>`,
+      `<button class="btn sm" data-usrcode="resetpw" data-id="${u.id}" data-uname="${esc(u.username)}">كلمة مرور جديدة</button>`,
+      `<button class="btn sm ${u.is_active ? "warn" : "primary"}" data-usrcode="active" data-id="${u.id}" data-en="${u.is_active ? 1 : 0}" data-uname="${esc(u.username)}">${u.is_active ? "تعطيل" : "تفعيل"}</button>`,
+    ];
+    if (!isSelf) { /* لا زر حذف على حسابك الحالي */
+      acts.push(`<button class="btn sm danger" data-usrcode="delete" data-id="${u.id}" data-uname="${esc(u.username)}">حذف</button>`);
+    }
+    return `<tr>
+      <td><b>${esc(u.username)}</b>${isSelf ? ' <span class="pill muted">أنت</span>' : ""}${mc}</td>
+      <td>${esc(u.display_name || "—")}</td>
+      <td>${roleSel}</td>
+      <td>${activePill}</td>
+      <td>${totpPill}</td>
+      <td>${fmtTs(u.last_login_at)}</td>
+      <td>${fmtTs(u.created_at)}</td>
+      <td>${acts.join(" ")}</td>
+    </tr>`;
+  }).join("");
+  $("usrTable").innerHTML = "<thead><tr><th>المستخدم</th><th>الاسم المعروض</th><th>الدور</th><th>الحالة</th><th>TOTP</th><th>آخر دخول</th><th>أُنشئ</th><th>إجراءات</th></tr></thead><tbody>" +
+    (rows || "<tr><td colspan='8'>لا مستخدمين</td></tr>") + "</tbody>";
+}
+
+$("usrRefresh").addEventListener("click", () => loadUsers().catch(() => {}));
+
+$("usrTable").addEventListener("change", async (ev) => {
+  const sel = ev.target.closest("select[data-usrsel]");
+  if (!sel) return;
+  const id = Number(sel.dataset.usrsel);
+  const prevRole = sel.dataset.prev || "";
+  const newRole = sel.value;
+  const uname = sel.dataset.uname || ("#" + id);
+  if (newRole === prevRole) return;
+  const go = await confirmModal(`تغيير دور «${uname}» من «${ROLE_AR[prevRole] || prevRole}» إلى «${ROLE_AR[newRole] || newRole}»؟ تُطبَّق الصلاحيات فوراً.`, "تغيير الدور");
+  if (!go) { sel.value = prevRole; return; }
+  const res = await apiData("/admin/api/users/update", { method: "POST", body: { user_id: id, role: newRole } });
+  if (res.ok) toast(`✅ صار دور «${uname}»: ${ROLE_AR[newRole] || newRole}`);
+  else toast(apiFailMsg(res), true);
+  loadUsers().catch(() => {});
+});
+
+$("usrTable").addEventListener("click", async (ev) => {
+  const btn = ev.target.closest("button[data-usrcode]");
+  if (!btn) return;
+  const act = btn.dataset.usrcode;
+  const id = Number(btn.dataset.id);
+  const uname = btn.dataset.uname || ("#" + id);
+  if (act === "rename") {
+    const name = await promptModal(`الاسم المعروض الجديد لـ «${uname}»:`, "الاسم", btn.dataset.name || "", "حفظ");
+    if (!name) return;
+    const res = await apiData("/admin/api/users/update", { method: "POST", body: { user_id: id, display_name: name } });
+    if (res.ok) toast("✅ حُدّث الاسم المعروض");
+    else toast(apiFailMsg(res), true);
+    loadUsers().catch(() => {});
+  } else if (act === "resetpw") {
+    const np = await promptPasswordModal(`كلمة مرور جديدة للمستخدم «${uname}»:`, "إعادة التعيين");
+    if (!np) return;
+    const res = await apiData("/admin/api/users/reset-password", { method: "POST", body: { user_id: id, new_password: np } });
+    if (res.ok) toast(`✅ أُعيد تعيين كلمة مرور «${uname}» — سيُطلب منه تغييرها عند الدخول`);
+    else toast(apiFailMsg(res), true);
+  } else if (act === "active") {
+    const enable = btn.dataset.en !== "1";
+    const go = await confirmModal(enable
+      ? `تفعيل المستخدم «${uname}»؟`
+      : `تعطيل المستخدم «${uname}»؟ لن يتمكن من الدخول وتُبطل جلساته.`, enable ? "تفعيل" : "تعطيل");
+    if (!go) return;
+    const res = await apiData("/admin/api/users/update", { method: "POST", body: { user_id: id, is_active: enable } });
+    if (res.ok) toast(enable ? `✅ فُعّل «${uname}»` : `⛔ عُطّل «${uname}»`);
+    else toast(apiFailMsg(res), true);
+    loadUsers().catch(() => {});
+  } else if (act === "delete") {
+    /* تأكيد خطير بنفس نمط حذف الطابور: تأكيد + كتابة اسم المستخدم يدوياً */
+    const go1 = await confirmModal(`حذف المستخدم «${uname}» نهائياً؟ تُبطل جميع جلساته ولا يمكن التراجع.`, "متابعة الحذف");
+    if (!go1) return;
+    const typed = await promptModal(`عملية حساسة — اكتب اسم المستخدم «${uname}» للتأكيد النهائي:`, "", "", "تأكيد نهائي");
+    if (typed === null) return;
+    if ((typed || "").trim() !== uname) { toast("الاسم المكتوب لا يطابق — أُلغيت العملية", true); return; }
+    const res = await apiData("/admin/api/users/delete", { method: "POST", body: { user_id: id } });
+    if (res.ok) toast(`✅ حُذف المستخدم «${uname}»`);
+    else toast(apiFailMsg(res), true);
+    loadUsers().catch(() => {});
+  }
+});
+
+$("usrAddBtn").addEventListener("click", async () => {
+  const uname = $("usrAddUsername").value.trim();
+  const pass = $("usrAddPass").value;
+  const role = $("usrAddRole").value;
+  const disp = $("usrAddDisplay").value.trim();
+  if (!uname || !pass) { toast("أدخل اسم المستخدم وكلمة المرور", true); return; }
+  $("usrAddBtn").disabled = true;
+  const res = await apiData("/admin/api/users/create", {
+    method: "POST",
+    body: { username: uname, password: pass, role, display_name: disp },
+  });
+  $("usrAddBtn").disabled = false;
+  if (res.ok) {
+    toast(`✅ أُنشئ المستخدم «${uname}» بدور ${ROLE_AR[role] || role}`);
+    $("usrAddUsername").value = "";
+    $("usrAddPass").value = "";
+    $("usrAddDisplay").value = "";
+    loadUsers().catch(() => {});
+  } else toast(apiFailMsg(res), true);
+});
+
 /* ── الإقلاع ── */
 (async function boot() {
   const r = await api("/admin/api/session");
   const d = r.data || {};
   $("versionBadge").textContent = "v" + (d.version || "");
   if (d.authenticated) {
+    setAuthContext(d);
     hideLogin();
     username = d.username || "";
     loadOpsBanner().catch(() => {});
     switchTab("overview");
+    if (d.must_change_password) openMustPwModal(); /* بوابة تغيير كلمة المرور الإجبارية */
   } else {
     showLogin();
   }

@@ -205,17 +205,26 @@ def _parse_group_input(raw: str) -> Tuple[Optional[int], Optional[str]]:
 
 async def _audit(db: Any, action: str, object_type: str = "",
                  object_id: str = "", old_value: str = "",
-                 new_value: str = "") -> None:
-    """تدقيق العمليات الإدارية — جدول audit_logs الموجود (فشل-آمن)."""
+                 new_value: str = "", actor: Optional[str] = None,
+                 ip: Optional[str] = None, user_agent: Optional[str] = None,
+                 request_id: Optional[str] = None) -> None:
+    """تدقيق العمليات الإدارية — جدول audit_logs الموجود (فشل-آمن).
+
+    v16.1.0 (المرحلة 1): actor صريح (المستخدم صاحب الجلسة) بدل اسم
+    المالك عند الإقلاع، + إثراء ip/user_agent/request_id عند توفرها.
+    """
     try:
         await db.record_audit(
-            actor=f"dashboard:{DASH.username}",
+            actor=str(actor or f"dashboard:{DASH.username}")[:120],
             action=action,
             object_type=object_type,
             object_id=object_id,
             old_value=str(old_value)[:200] if old_value else "",
             new_value=str(new_value)[:200] if new_value else "",
             source="dashboard",
+            ip=ip,
+            user_agent=user_agent,
+            request_id=request_id,
         )
     except Exception:
         pass
@@ -1997,5 +2006,36 @@ async def hydrate_dashboard(bot: Any) -> None:
         try:
             from loguru import logger
             logger.warning(f"dashboard keywords hydrate skipped: {type(e).__name__}")
+        except Exception:
+            pass
+    # ══ v16.1.0 (المرحلة 1): تهيئة مستخدمي اللوحة + استرجاع الجلسات النشطة ══
+    try:
+        from loguru import logger
+        from dashboard.auth import users as _auth_users
+        from dashboard.auth import passwords as _auth_pw
+        from dashboard.auth.sessions import AuthSessionStore as _AuthStore
+        if not isinstance(DASH.sessions, _AuthStore):
+            DASH.sessions = _AuthStore()
+        if await _auth_users.count_users(db) == 0:
+            from config import CFG as _cfg_c
+            _uname = str(getattr(_cfg_c, "DASHBOARD_USERNAME", "") or "").strip() or "bashar"
+            _pw = str(getattr(_cfg_c, "DASHBOARD_PASSWORD", "") or "")
+            if _pw:
+                _u = await _auth_users.create_user(
+                    db, _uname, _auth_pw.hash_password(_pw),
+                    _auth_pw.backend_name(), "owner",
+                    display_name="Owner", must_change=1)
+                if _u is not None:
+                    logger.info(
+                        f"dashboard auth: owner '{_uname}' seeded (Argon2id) — "
+                        "كلمة المرور الأولية تتطلب التغيير عند أول دخول")
+        _rows = await _auth_users.list_active_session_rows(db)
+        _n = DASH.sessions.hydrate(_rows)
+        if _n:
+            logger.info(f"dashboard auth: {_n} active session(s) restored from DB")
+    except Exception as e:
+        try:
+            from loguru import logger
+            logger.warning(f"dashboard auth hydrate skipped: {type(e).__name__}: {str(e)[:120]}")
         except Exception:
             pass

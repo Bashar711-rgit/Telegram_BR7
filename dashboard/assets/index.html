@@ -15,11 +15,15 @@
     <h1>Telegram BR7</h1>
     <p style="color:var(--muted);margin:0 0 16px">لوحة التحكم — تسجيل الدخول</p>
     <div id="loginError" class="error hidden" role="alert"></div>
+    <div id="loginSuccess" class="success-box hidden" role="status"></div>
     <label class="field">اسم المستخدم
       <input id="loginUser" type="text" autocomplete="username" required>
     </label>
     <label class="field">كلمة المرور
       <input id="loginPass" type="password" autocomplete="current-password" required>
+    </label>
+    <label class="field">رمز المصادقة الثنائية (اختياري)
+      <input id="loginTotp" type="text" inputmode="numeric" maxlength="8" autocomplete="one-time-code" placeholder="6 أرقام — فقط إن كانت مفعّلة لحسابك">
     </label>
     <button type="submit" class="btn primary" id="loginBtn" style="width:100%">دخول</button>
   </form>
@@ -53,6 +57,8 @@
   <button data-tab="alerts" class="tab">🔔 التنبيهات</button>
   <button data-tab="features" class="tab">🧩 الميزات</button>
   <button data-tab="ops" class="tab">⚙️ الإعدادات</button>
+  <button data-tab="security" class="tab">🛡️ الأمان</button>
+  <button data-tab="users" class="tab hidden">🧑‍🤝‍🧑 المستخدمون</button>
 </nav>
 
 <main>
@@ -351,6 +357,102 @@
     </div>
   </section>
 
+  <!-- ═══ الوحدة 11: الأمان (P1-UI) ═══ -->
+  <section id="tab-security" class="panel">
+    <div class="grid2">
+      <div class="card">
+        <h3>👤 حسابي</h3>
+        <div id="secMe"><small>جارٍ التحميل…</small></div>
+      </div>
+      <div class="card">
+        <h3>🔐 تغيير كلمة المرور</h3>
+        <div id="pwError" class="error-box hidden" role="alert"></div>
+        <form id="pwForm" autocomplete="off">
+          <label class="field">كلمة المرور الحالية
+            <input id="pwCurrent" type="password" autocomplete="current-password" required>
+          </label>
+          <label class="field">كلمة المرور الجديدة
+            <input id="pwNew" type="password" autocomplete="new-password" required>
+          </label>
+          <label class="field">تأكيد كلمة المرور الجديدة
+            <input id="pwNew2" type="password" autocomplete="new-password" required>
+          </label>
+          <button type="submit" class="btn primary" id="pwSaveBtn">حفظ كلمة المرور الجديدة</button>
+          <small style="display:block;margin-top:8px;line-height:1.8">عند النجاح يُنهي الخادم جميع الجلسات (بما فيها جلستك) وتُعاد تلقائياً إلى شاشة الدخول.</small>
+        </form>
+      </div>
+    </div>
+    <div class="card">
+      <h3>🔑 المصادقة الثنائية (TOTP)</h3>
+      <div class="toolbar">
+        <span id="totpStatus"><span class="pill muted">—</span></span>
+        <button id="totpToggleBtn" class="btn sm primary">تفعيل</button>
+      </div>
+      <div id="totpSetupBox" class="hidden">
+        <p class="totp-note">افتح تطبيق المصادقة (Google Authenticator أو Authy أو ما شابه) وأضف حساباً جديداً: الصق الرابط التالي في الخانة المخصصة، أو أدخل المفتاح يدوياً. ثم اكتب الرمز المكوّن من 6 أرقام هنا للتفعيل.</p>
+        <div class="copybox"><code id="totpUri">—</code><button class="btn sm" id="totpUriCopy" data-copy-label="رابط otpauth">نسخ الرابط</button></div>
+        <div class="copybox"><code id="totpSecret">—</code><button class="btn sm" id="totpSecretCopy" data-copy-label="المفتاح السري">نسخ المفتاح</button></div>
+        <label class="field" style="max-width:220px">رمز التحقق (6 أرقام)
+          <input id="totpCodeInput" type="text" inputmode="numeric" maxlength="8" autocomplete="one-time-code" placeholder="123456">
+        </label>
+        <div class="toolbar">
+          <button id="totpEnableBtn" class="btn primary sm">تفعيل المصادقة الثنائية</button>
+          <button id="totpCancelBtn" class="btn ghost sm">إلغاء</button>
+        </div>
+      </div>
+      <div id="totpDisableBox" class="hidden">
+        <p class="totp-note">تعطيل المصادقة الثنائية يتطلب تأكيد كلمة مرور حسابك:</p>
+        <label class="field" style="max-width:260px">كلمة المرور
+          <input id="totpDisablePass" type="password" autocomplete="current-password">
+        </label>
+        <div class="toolbar">
+          <button id="totpDisableConfirm" class="btn danger sm">تأكيد التعطيل</button>
+          <button id="totpDisableCancel" class="btn ghost sm">إلغاء</button>
+        </div>
+      </div>
+      <div id="totpRecoveryBox" class="hidden">
+        <div class="banner warn">⚠️ رموز الاسترداد تظهر <b>مرة واحدة فقط</b> — احفظها الآن في مكان آمن، لن تظهر مجدداً. تُستخدم للدخول عند فقدان تطبيق المصادقة.</div>
+        <div id="totpRecoveryCodes" class="rcodes"></div>
+        <div class="toolbar">
+          <button id="totpRecoveryCopy" class="btn sm primary" data-copy-label="رموز الاسترداد">نسخ كل الرموز</button>
+          <button id="totpRecoveryDone" class="btn sm">حفظت الرموز — إخفاء</button>
+        </div>
+      </div>
+    </div>
+    <div class="card">
+      <h3>💻 الجلسات النشطة</h3>
+      <div class="toolbar">
+        <button id="sessRefresh" class="btn sm">تحديث</button>
+        <button id="sessScopeBtn" class="btn sm hidden">عرض كل المستخدمين</button>
+        <button id="sessRevokeAll" class="btn sm danger">إبطال كل الجلسات الأخرى</button>
+        <span id="sessScopeNote" style="color:var(--muted);font-size:12px"></span>
+      </div>
+      <div class="tablewrap"><table id="sessTable" class="table"></table></div>
+    </div>
+  </section>
+
+  <!-- ═══ الوحدة 12: المستخدمون (P1-UI — تظهر مع صلاحية users.manage فقط) ═══ -->
+  <section id="tab-users" class="panel">
+    <div class="card">
+      <h3>➕ إضافة مستخدم</h3>
+      <div class="toolbar">
+        <input id="usrAddUsername" type="text" placeholder="اسم المستخدم" style="max-width:170px" autocomplete="off">
+        <input id="usrAddPass" type="password" placeholder="كلمة المرور" style="max-width:170px" autocomplete="new-password">
+        <select id="usrAddRole"></select>
+        <input id="usrAddDisplay" type="text" placeholder="الاسم المعروض (اختياري)" style="max-width:200px">
+        <button id="usrAddBtn" class="btn primary sm">إضافة</button>
+      </div>
+      <small style="color:var(--muted);font-size:12px;display:block">الأدوار: المالك (كامل) · مدير (إدارة بلا مستخدمين) · مشغل (تشغيل) · مشاهد (قراءة فقط) — تُطبَّق الصلاحيات فعلياً على الخادم.</small>
+    </div>
+    <div class="card">
+      <div class="toolbar">
+        <button id="usrRefresh" class="btn sm">تحديث</button>
+        <span id="usrNote" style="color:var(--muted);font-size:12px"></span>
+      </div>
+      <div class="tablewrap"><table id="usrTable" class="table"></table></div>
+    </div>
+  </section>
+
 </main>
 
 <footer class="copyright">Telegram BR7 · Admin Center Dashboard v15.8.0 · فصل كامل عن مسار استقبال الرسائل</footer>
@@ -439,6 +541,25 @@
         </div>
       </div>
     </div>
+  </div>
+</div>
+
+<!-- ═══ بوابة تغيير كلمة المرور الإجبارية (P1-UI) — تغطي اللوحة ولا تُغلق ═══ -->
+<div id="mustPwModal" class="modal must hidden" role="dialog" aria-modal="true">
+  <div class="modal-card">
+    <h3 style="margin-top:0">🔒 تغيير كلمة المرور مطلوب</h3>
+    <p class="muted-note">يجب تغيير كلمة مرورك قبل متابعة استخدام اللوحة — هذه الخطوة إجبارية ولا يمكن تخطيها.</p>
+    <div id="mpError" class="error-box hidden" role="alert"></div>
+    <label class="field">كلمة المرور الحالية
+      <input id="mpCurrent" type="password" autocomplete="current-password">
+    </label>
+    <label class="field">كلمة المرور الجديدة
+      <input id="mpNew" type="password" autocomplete="new-password">
+    </label>
+    <label class="field">تأكيد كلمة المرور الجديدة
+      <input id="mpNew2" type="password" autocomplete="new-password">
+    </label>
+    <button id="mpSaveBtn" class="btn primary" style="width:100%">حفظ كلمة المرور الجديدة</button>
   </div>
 </div>
 
