@@ -187,6 +187,7 @@ class AccountLinkManager:
         find_existing_cb: Callable[[str, Optional[int]], Awaitable[Optional[Dict[str, Any]]]],
         save_account_cb: Callable[[Dict[str, Any]], Awaitable[Optional[int]]],
         activate_cb: Callable[[int, Dict[str, Any]], Awaitable[None]],
+        excluded_env_phones_cb: Optional[Callable[[], List[str]]] = None,
     ) -> None:
         self._ops: Dict[str, LinkOperation] = {}
         self._failed_starts: Dict[str, List[float]] = {}
@@ -195,6 +196,8 @@ class AccountLinkManager:
         self._find_existing_cb = find_existing_cb
         self._save_account_cb = save_account_cb
         self._activate_cb = activate_cb
+        # v16.2.0: أرقام env المستبعدة نهائياً — يُسمح بإعادة تسجيلها
+        self._excluded_env_phones_cb = excluded_env_phones_cb
 
     # ─── دورة حياة المدير ────────────────────────────────────────────────
 
@@ -266,11 +269,22 @@ class AccountLinkManager:
         return None
 
     def _env_account_phones(self) -> List[str]:
-        """أرقام حسابات البيئة (لمنع التكرار مع مصدر env)."""
+        """أرقام حسابات البيئة (لمنع التكرار مع مصدر env).
+        v16.2.0: المستبعد نهائياً من اللوحة لا يُحسب مكرراً — حتى يمكن
+        حذف الحساب الميت ثم إعادة تسجيل رقمه نفسه."""
         try:
             from config import ACCOUNTS
 
-            return [_norm_key(a.get("phone", "")) for a in ACCOUNTS if a.get("phone")]
+            excluded: set = set()
+            try:
+                excluded = {re.sub(r"\D", "", str(x))
+                            for x in (self._excluded_env_phones_cb() or [])}
+            except Exception:
+                excluded = set()
+            return [
+                _norm_key(a.get("phone", "")) for a in ACCOUNTS
+                if a.get("phone") and _norm_key(a.get("phone", "")) not in excluded
+            ]
         except Exception:
             return []
 

@@ -382,7 +382,11 @@ def setup_dashboard(app: web.Application, bot: Any) -> None:
         else:
             link_manager.mark_error(int(row_id), (res or {}).get("error") or "فشل تفعيل الحساب")
 
-    link_manager = _LinkManager(_link_find_existing, _link_save_account, _link_activate)
+    link_manager = _LinkManager(
+        _link_find_existing, _link_save_account, _link_activate,
+        excluded_env_phones_cb=lambda: list(
+            getattr(bot, "_excluded_env_phones", set()) or set()),
+    )
     link_manager.start_sweeper()
 
     async def api_account_add_start(request: web.Request) -> web.Response:
@@ -480,6 +484,25 @@ def setup_dashboard(app: web.Application, bot: Any) -> None:
             return _json(e.payload, e.status)
         if result.get("ok"):
             _audit_bg("dashboard.account_delete", object_id=str(row_id))
+        return _json(result)
+
+    # v16.2.0: حذف حساب env نهائياً (استبعاد دائم يدوم عبر النشرات)
+    async def api_account_env_exclude(request: web.Request) -> web.Response:
+        body = await body_json(request)
+        prefix = str(body.get("prefix") or "")[:64]
+        if not prefix:
+            return _json({"error": "invalid_prefix"}, 400)
+
+        async def _do():
+            return await bot.exclude_env_account(prefix)
+
+        try:
+            result = await _bridge_call(_do)
+        except _BridgeError as e:
+            return _json(e.payload, e.status)
+        if result.get("ok"):
+            _audit_bg("dashboard.account_env_exclude", object_type="account",
+                      object_id=str(prefix), new_value="excluded_permanently")
         return _json(result)
 
     # ── الوحدة 3: الكلمات + Playground ──────────────────────────────────
@@ -798,7 +821,8 @@ def setup_dashboard(app: web.Application, bot: Any) -> None:
         __slots__ = ("bot", "api", "dash", "bridge_call", "bridge_error",
                      "body_json", "client_ip", "is_https", "json",
                      "cookie_name", "csrf_cookie_name", "ttl_seconds",
-                     "version", "audit_bg")
+                     "version", "audit_bg",
+                     "env_username", "env_password")  # v16.2.0 شفاء المالك
 
     _actx = _AuthCtx()
     _actx.bot = bot
@@ -815,6 +839,10 @@ def setup_dashboard(app: web.Application, bot: Any) -> None:
     _actx.ttl_seconds = ttl_seconds
     _actx.version = DASH.version
     _actx.audit_bg = _audit_bg
+    # v16.2.0: بيانات env لشفاء المالك الذاتي — تعيش في ذاكرة العملية فقط
+    # (هي أصلاً في CFG بنفس العملية)، ولا تعود في أي استجابة HTTP.
+    _actx.env_username = str(_cfg_val("DASHBOARD_USERNAME", "") or "").strip()
+    _actx.env_password = str(_cfg_val("DASHBOARD_PASSWORD", "") or "")
     setup_auth_routes(app, _actx)
 
     app.middlewares.append(dash_middleware)
@@ -842,6 +870,7 @@ def setup_dashboard(app: web.Application, bot: Any) -> None:
     r.add_post("/admin/api/accounts/row/toggle", api_account_row_toggle)
     r.add_post("/admin/api/accounts/row/reconnect", api_account_row_reconnect)
     r.add_post("/admin/api/accounts/row/delete", api_account_row_delete)
+    r.add_post("/admin/api/accounts/env/exclude", api_account_env_exclude)
 
     r.add_get("/admin/api/keywords", api_keywords)
     r.add_post("/admin/api/keywords/save", api_keywords_save)

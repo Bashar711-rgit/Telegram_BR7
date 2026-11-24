@@ -309,7 +309,9 @@ function renderAccounts(d) {
     const isPanel = a.kind === "panel";
     const conn = isPanel
       ? (ACC_STATUS_AR[a.status] || '<span class="pill muted">—</span>')
-      : (a.connected ? '<span class="pill ok">متصل</span>' : '<span class="pill bad">منفصل</span>');
+      : (a.terminal_error
+          ? '<span class="pill bad">متوقف نهائياً</span>'
+          : (a.connected ? '<span class="pill ok">متصل</span>' : '<span class="pill bad">منفصل</span>'));
     const term = a.terminal_error ? ` <span class="pill bad" title="${esc(a.terminal_error)}">نهائي</span>` : "";
     const ident = a.identity ? `<small>${esc(a.identity.first_name || "")}${a.identity.username ? " · @" + esc(a.identity.username) : ""} · ${esc(a.identity.id || "")}</small>` : '<small>لم يُختبر</small>';
     const mem = a.membership ? (a.membership.status === "ok" ? '<span class="pill ok">عضو</span>' : `<span class="pill bad">${esc(a.membership.status)}</span>`) : '<span class="pill muted">لم يُفحص</span>';
@@ -327,6 +329,9 @@ function renderAccounts(d) {
       actions = `<button class="btn sm" data-act="test" data-name="${esc(a.name)}">اختبار</button>
         <button class="btn sm" data-act="membership" data-name="${esc(a.name)}">عضوية</button>
         <button class="btn sm" data-act="reconnect" data-name="${esc(a.name)}">إعادة ربط</button>`;
+      if (a.prefix) {
+        actions += ` <button class="btn sm danger" data-act="envDelete" data-prefix="${esc(a.prefix)}" data-name="${esc(a.name)}">حذف نهائي</button>`;
+      }
     }
     const kindBadge = isPanel ? ' <span class="pill muted">لوحة</span>' : ' <span class="pill muted">env</span>';
     return `<tr>
@@ -377,7 +382,15 @@ $("accTable").addEventListener("click", async (ev) => {
       const go = await confirmModal("حذف الحساب وجلسته المشفّرة نهائياً؟ لا يمكن التراجع. (آخر حساب نشط محمي من الحذف)", "حذف نهائي");
       if (!go) return;
       const r = await api("/admin/api/accounts/row/delete", { method: "POST", body: { row_id: Number(btn.dataset.row) } });
-      if (r.ok && r.data.ok) toast("✅ تم حذف الحساب");
+      if (r.ok && r.data.ok) toast("✅ تم حذف الحساب — يمكن الآن إعادة تسجيل نفس الرقم عبر «إضافة حساب»");
+      else toast("❌ " + ((r.data || {}).error || "فشل الحذف"), true);
+    } else if (act === "envDelete") {
+      const go = await confirmModal(
+        `حذف الحساب «${btn.dataset.name}» نهائياً من النظام؟\nسيُفصل ويُستبعد حتى بعد إعادة التشغيل، ويمكن بعدها إعادة تسجيل رقمه عبر «إضافة حساب» بدون تعديل متغيرات Render.`,
+        "حذف نهائي");
+      if (!go) return;
+      const r = await api("/admin/api/accounts/env/exclude", { method: "POST", body: { prefix: btn.dataset.prefix } });
+      if (r.ok && r.data.ok) toast("✅ حُذف الحساب نهائياً — أعد تسجيل رقمه عبر «إضافة حساب»");
       else toast("❌ " + ((r.data || {}).error || "فشل الحذف"), true);
     }
     tabLoaders.accounts().catch(() => {});

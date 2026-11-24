@@ -181,6 +181,44 @@ def setup_auth_routes(app: "web.Application", ctx: Any) -> None:
         except Exception:
             return _json({"error": "internal_error"}, 500)
 
+        # ── v16.2.0: شفاء ذاتي للمالك ─────────────────────────────────────
+        # لو جدول panel_users فارغ تماماً (فشلت تهيئة المالك عند إقلاع سابق
+        # — ترحيل/توقيت مثلاً) تُقبل بيانات env دفعة واحدة ويُنشأ المالك
+        # فوراً بدل بقائه مقفلاً خارجاً بلا أي مستخدم. لا تأثير إطلاقاً
+        # إن وُجد أي مستخدم محلي — فحص count_users == 0 حصراً.
+        if user is None and username:
+            try:
+                async def _cq():
+                    return await auth_users.count_users(api.db)
+
+                _n_users = int(await ctx.bridge_call(_cq))
+            except Exception:
+                _n_users = -1
+            if _n_users == 0:
+                _env_u = str(getattr(ctx, "env_username", "") or "").strip()
+                _env_p = str(getattr(ctx, "env_password", "") or "")
+                if (_env_u and _env_p
+                        and username.lower() == _env_u.lower()
+                        and _secrets.compare_digest(password, _env_p)):
+
+                    async def _mk():
+                        return await auth_users.create_user(
+                            api.db, _env_u,
+                            passwords.hash_password(_env_p),
+                            passwords.backend_name(), "owner",
+                            display_name="Owner", must_change=1)
+
+                    try:
+                        _u = await ctx.bridge_call(_mk)
+                    except Exception:
+                        _u = None
+                    if _u is not None:
+                        user = dict(_u)
+                        ctx.audit_bg("dashboard.owner_selfheal", "panel_user",
+                                     str(_u.get("id") or ""),
+                                     actor="dashboard:bootstrap", ip=ip,
+                                     ua=_ua(request))
+
         ok = False
         if user and int(user.get("is_active") or 0) == 1:
             ok = passwords.verify_password(password, str(user.get("password_hash") or ""))

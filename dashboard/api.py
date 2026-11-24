@@ -486,6 +486,10 @@ class DashboardAPI:
         items: List[Dict[str, Any]] = []
         for m in (getattr(bot, "monitors", None) or []):
             acc = getattr(m, "account", {}) or {}
+            # v16.2.0-fix: مراقبات حسابات اللوحة تُعرض من صفوف DB أدناه —
+            # كان الحساب النشط من اللوحة يظهر مرتين (صف عام + صف لوحة).
+            if str(acc.get("source") or "") == "panel":
+                continue
             name = str(acc.get("name", "?"))
             st = getattr(m, "_stats", {}) or {}
             recon: Dict[str, Any] = {}
@@ -501,6 +505,8 @@ class DashboardAPI:
             if mem and (now - mem.get("ts", 0.0)) > MEMBERSHIP_TTL_SECONDS:
                 mem = None
             items.append({
+                "kind": "env",
+                "prefix": str(acc.get("prefix") or "")[:32],
                 "name": name,
                 "phone_masked": _mask_phone(acc.get("phone")),
                 "is_main": bool(acc.get("is_main")),

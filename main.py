@@ -546,6 +546,10 @@ class EnhancedTelegramBot:
         self.health = HealthMonitor(self)
         # v15.2.0: كاش صفوف حسابات اللوحة للإقلاع (قراءة واحدة عند boot)
         self._panel_rows_cache: Optional[List[Dict[str, Any]]] = None
+        # v16.2.0: حسابات env المستبعدة نهائياً من اللوحة (مفاتيح أرقام بلا +)
+        # تُحمّل من app_settings عند الإقلاع — الاستبعاد يدوم عبر النشرات.
+        self._excluded_env_phones: set = set()
+        self._excluded_env_loaded: bool = False
 
         # ── Background task lifecycle (M-05 / M-16) ─────────────────────
         # Every task this module creates is tracked here so shutdown can
@@ -2328,6 +2332,102 @@ class EnhancedTelegramBot:
         logger.info(f"Panel account deleted (row {row_id})")
         return {"ok": True}
 
+    # ═══ v16.2.0: حذف حساب env نهائياً (استبعاد دائم يدوم عبر النشرات) ═══
+    # الحساب الميت نهائياً (AuthKeyDuplicated مثلاً) لا يُصلحه اتصال مجدد —
+    # المالك يحذفه من اللوحة ثم يعيد تسجيل نفس الرقم عبر معالج الربط.
+    _EXCLUDED_ENV_KEY = "dashboard:excluded_env_phones"
+
+    async def _load_excluded_env_phones(self) -> None:
+        if self._excluded_env_loaded:
+            return
+        self._excluded_env_loaded = True
+        try:
+            row = await self.db._fetchone(
+                "SELECT value FROM app_settings WHERE key = ?",
+                (self._EXCLUDED_ENV_KEY,))
+            import json as _json_mod
+            raw = (row or {}).get("value") if row else None
+            items = _json_mod.loads(raw) if raw else []
+            if isinstance(items, list):
+                self._excluded_env_phones = {
+                    re.sub(r"\D", "", str(x)) for x in items
+                    if re.sub(r"\D", "", str(x))}
+            if self._excluded_env_phones:
+                logger.info(
+                    f"Excluded env accounts loaded: {len(self._excluded_env_phones)} "
+                    "phone(s) — تُتخطى عند الإقلاع")
+        except Exception as e:
+            logger.warning(f"excluded env phones load skipped (fail-safe): {type(e).__name__}: {e}")
+
+    async def _persist_excluded_env_phones(self) -> None:
+        try:
+            import json as _json_mod
+            payload = _json_mod.dumps(sorted(self._excluded_env_phones))
+            await self.db._execute(
+                "INSERT INTO app_settings (key, value) VALUES (?, ?) "
+                "ON CONFLICT (key) DO UPDATE SET value = excluded.value, "
+                "updated_at = CURRENT_TIMESTAMP",
+                (self._EXCLUDED_ENV_KEY, payload))
+            await self.db._commit()
+        except Exception as e:
+            logger.error(f"excluded env phones persist failed: {type(e).__name__}: {e}")
+
+    async def exclude_env_account(self, prefix: str) -> Dict[str, Any]:
+        """
+        حذف نهائي لحساب env من منظومة المراقبة (v16.2.0).
+
+        يقطع المراقب ويزيله من القائمة، ويحفظ رقمه في app_settings
+        لكي يُتخطى عند كل إقلاع لاحق. متغيرات Render نفسها لا تُمسّ —
+        استعادة الحساب تتطلب حذف مفتاح الاستبعاد أو تعديل env يدوياً.
+        حماية «آخر حساب متصل»: يُرفض استبعاد الوحيد المتصل.
+        """
+        pref = str(prefix or "").strip().upper()
+        if not pref:
+            return {"ok": False, "error": "معرّف الحساب مفقود"}
+        target = None
+        for m in list(self.monitors):
+            acc = getattr(m, "account", {}) or {}
+            if str(acc.get("source") or "") == "panel":
+                continue  # حساب لوحة — يُحذف عبر delete_panel_account
+            if str(acc.get("prefix") or "").upper() == pref:
+                target = m
+                break
+        if target is None:
+            return {"ok": False, "error": "لم يُعثر على حساب env بهذا المعرّف"}
+        acc = getattr(target, "account", {}) or {}
+        phone_key = re.sub(r"\D", "", str(acc.get("phone") or ""))
+        if getattr(target, "is_connected", False):
+            active_count = sum(
+                1 for m in self.monitors if getattr(m, "is_connected", False))
+            if active_count <= 1:
+                return {"ok": False,
+                        "error": "لا يمكن حذف آخر حساب متصل — أضف حساباً بديلاً وفعّله أولاً"}
+        try:
+            await target.disconnect()
+        except Exception:
+            pass
+        try:
+            self.monitors.remove(target)
+        except ValueError:
+            pass
+        if self.main_client is getattr(target, "client", None):
+            self.main_client = None
+            for mm in self.monitors:
+                if getattr(mm, "is_connected", False):
+                    self.main_client = mm.client
+                    break
+        persisted = False
+        if phone_key:
+            self._excluded_env_phones.add(phone_key)
+            await self._persist_excluded_env_phones()
+            persisted = True
+        logger.info(
+            f"Env account excluded permanently: {acc.get('name')} "
+            f"(prefix={pref}, phone_key={phone_key[:4]}***)")
+        return {"ok": True, "excluded": True, "prefix": pref,
+                "persisted": persisted,
+                "note": "الحساب حُذف نهائياً ويُتخطى عند كل إقلاع — يمكن الآن إعادة تسجيل رقمه من اللوحة"}
+
     async def reconnect_account(self, kind: str, ref: Any) -> Dict[str, Any]:
         """إعادة اتصال حساب (env أو panel) دون إعادة نشر — عبر المراقب القائم."""
         monitors = list(self.monitors)
@@ -2502,6 +2602,16 @@ class EnhancedTelegramBot:
         # ═══ v14.10.0: دمج حسابات اللوحة (DB — جلسات مشفّرة) مع حسابات env ═══
         # env أولوية؛ صف بلا مراقبة مُفعّلة يبقى محفوظاً بلا اتصال (متوقف).
         # الفشل كله فشل-آمن: مشكلة اللوحة لا توقف الإقلاع ولا تقلّل حسابات env.
+        # v16.2.0: تحميل المستبعدات قبل الدمج — حساب env محذوف نهائياً من
+        # اللوحة لا يُبنى له مراقب ولا يُحسب مكرراً عند إعادة تسجيل رقمه.
+        await self._load_excluded_env_phones()
+        if self._excluded_env_phones:
+            accounts = [
+                a for a in accounts
+                if str(a.get("source") or "") == "panel"
+                or re.sub(r"\D", "", str(a.get("phone") or "")) not in self._excluded_env_phones
+            ]
+
         try:
             if self._panel_rows_cache is None:
                 self._panel_rows_cache = await self.db.get_panel_accounts()
