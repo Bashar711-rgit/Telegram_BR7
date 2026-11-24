@@ -882,3 +882,28 @@ Stage Summary:
 - **النسخة**: BOT_VERSION بقي 16.2.0 عمداً (اختبار توقع الإصدار في
   test_dashboard_v15_1.py يطالب 15.8.0 — عطل مسبق على main سيُصلح مع
   رفع الإصدار الموحد القادم).
+
+---
+Task ID: v16.3.0-supabase (supabase-hardening: prepare-verify-backup-migrate)
+Agent: Z.ai Code (main orchestrator)
+Task: مرحلة Supabase فقط — تنفيذ وتجهيز وربط قاعدة البيانات الدائمة، بلا Vercel ولا إعادة تصميم لوحة ولا تحسينات جانبية
+
+Work Log:
+- [الفحص — الحقيقة الإنتاجية]: المشروع **متصل بـSupabase PostgreSQL فعلاً منذ v11.8.x**: DATABASE_URL مضبوط في Render (مُتحقق حياً من /admin/api/ops/env بجلسة مالك)، DB_POOL_MAX=5، DB_TYPE يحوّل تلقائياً إلى postgresql عند وجود DATABASE_URL (config.py:791)، دور الاتصال br7_app عبر Session Pooler (aws-0-ap-northeast-1:5432, sslmode=require, statement_cache_size=0)، المخطط الفعلي public، دليل كتابة حية: 8,448 رسالة اليوم + 106 تنبيهاً (صفر فشل) + حساب لوحة بجلسة مشفرة.
+- [جرد المخطط v16.3.0]: 30 جدولاً ينشئها الإقلاع تلقائياً على PG (_create_tables + _migrate_panel_auth + ترحيلات) + 31 فهرساً (_create_indexes). تصحيحان مهمان للتوثيق القديم: إيصال alerts هو **message_hash** وبصمة alert_dedup هي **fingerprint** (أسماء v12+). المخطط الموازي br7 (44 جدولاً بلا صلاحيات) بقي كما هو — قرار المالك D-1 معلق.
+- [أدوات المرحلة — الأربعة]:
+  * scripts/supabase_verify.py — تدقيق حي قراءة-فقط: جرد الجداول المتوقعة مقابل الحية، الأعمدة الحرجة (مطابقة حرفية للـDDL الحالي)، الفهارس الحرجة بالأسماء، حالة RLS/السياسات، pings زمن الاستجابة، دور الاتصال، المخططات، خروج JSON اختياري، حكم MATCH/DRIFT مع exit code.
+  * scripts/supabase_backup.py — نسخة احتياطية منطقية كاملة: COPY CSV لكل جداول public عبر asyncpg (لا يعتمد psql/pg_dump غير المتوفرين) + gzip + manifest.json (الأعداد + SHA256 + الطوابع) — قراءة-فقط على DB.
+  * scripts/supabase_migrate_sqlite.py — ترحيل SQLite→PG Idempotent: تقاطع الأعمدة مع المخطط الحي، ON CONFLICT DO NOTHING (لا تكرار أبداً)، تحويل أنواع SQLite النصية إلى أنواع PG (timestamps/booleans/أرقام — asyncpg صارم)، setval sequences بحارس عمود id، تحقق أعداد قبل/بعد، DRY_RUN افتراضي، --apply رافض العمل بلا --backup-manifest صالح (عقد النسخة الاحتياطية).
+  * scripts/supabase_rls_v16.sql — تحديث حماية RLS لتغطية v16.3.0: الجداول الثلاثون الحالية + panel_users/panel_sessions/panel_accounts/telegram_usernames_history التي كانت خارج قائمة v11.8.1 + الأسماء القديمة إن وجدت (dashboard_*/filter_decisions) — FORCE RLS + سياسة br7_app كاملة + REVOKE للأدوار العامة محمول على الأدوار الموجودة (محمول لـPG خام وSupabase معاً)، idempotent كلياً.
+- [بيئة الاختبار — PG حقيقي]: PostgreSQL 16.2 محلي عبر pgserver (Supabase = 17 — لا اعتماد على ميزات 17)، دور br7_app مفروز الصلاحيات مع GRANT USAGE/CREATE على public (نفس ما تتطلبه بيئة Supabase)، DSN TCP حقيقي بمعرف DATABASE_URL — كل الاختبارات عبر كود الإنتاج الفعلي لا SQL يدوي.
+- [الاختبارات الفعلية العشر — كلها ناجحة]: (1) connect كامل: 30 جدولاً + ترحيلات + فهارس ✓ (2) CRUD حقيقي: try_insert_message/upsert/queue add-claim-ack/app_settings ✓ (3) استمرارية بعد إعادة تشغيل كاملة: الأعداد كما هي ✓ (4) استرجاع الحسابات: get_panel_accounts ✓ (5) إعدادات roundtrip بقيمة عربية ✓ (6) مسار post-filter للـDB ✓ (7) تخزين الرسائل/التنبيهات بإيصال message_hash ✓ (8) انقطاع فعلي: إيقاف الخادم → ping=False بلا انهيار → إعادة إقلاع → _reconnect=True → البيانات سليمة ✓ (9) تزامن 6 كتّاب × 20 عبر Pool: 120/120 في 0.05s، distinct=120 ✓ (10) صفر فقد/تكرار + idempotent migration (إعادة التشغيل لا تكرر) ✓.
+- [إصلاحات أثناء الاختبار — كلها في الأدوات لا في الكود التشغيلي]: REQUIRED_COLUMNS طُابقت على الـDDL الحقيقي (message_hash/fingerprint وليس الأسماء القديمة)، copy_from_table يستلزم output=، pg_get_serial_sequence يرفع UndefinedColumn على جدول بلا id → حارس، REVOKE على أدوار Supabase الغائبة في PG خام → DO-block محمول.
+- [الحد الصادق]: تنفيذ verify/backup/RLS **على Supabase الحية** يتطلب DATABASE_URL من المالك (لا يوجد token Render ولا DSN محفوظ في البيئة — والقيم السرية مقنّعة بالتصميم في اللوحة). الأدوات الأربعة مجربة كاملة على PG حقيقي وجاهزة للتشغيل الفوري. ترحيل بيانات فعلية غير ضروري: بيانات الإنتاج كلها في Supabase أصلاً؛ SQLite المحلي (telegram_bot.db) بيانات اختبار قديمة (6 صفوف) أُدخل منها عينات بالأداة كإثبات عمل.
+- [النشر]: لا تغيير تشغيلي في هذه المرحلة (scripts/docs فقط) — DATABASE_URL مضبوط والخدمة تعمل على Supabase؛ لا نشر إجباري.
+
+Stage Summary:
+- Supabase PostgreSQL هي قاعدة البيانات الدائمة الفعلية لمشروع Telegram_BR7 — متصلة وتعمل الآن، والوظائف الأساسية كلها تكتب فيها حية (رسائل/تنبيهات/حسابات لوحة/جلسات/audit).
+- متطلبات مواصفة Database Manager الثمانية كلها موجودة في database.py منذ إصدارات سابقة ومُثبتة الآن باختبارات فعلية على PG حقيقي (Pool/إعادة اتصال/معالجة أخطاء/معاملات/مهلات/إعادة محاولة/منع تكرار/إغلاق صحيح).
+- حزمة التجهيز النهائية للأمان الإنتاجي جاهزة ومجربة: RLS v16 للجداول الثلاثين + النسخة الاحتياطية + التدقيق الحي + أداة الترحيل — التنفيذ الحي متبقي على DSN المالك (الخطوات موثقة في docs/operations/SUPABASE_STATE.md §5).
+- كود التشغيل لم يُلمس — صفر مخاطر نشر.
