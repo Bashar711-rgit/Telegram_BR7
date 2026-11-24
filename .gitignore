@@ -38,3 +38,10 @@ venv/
 .DS_Store
 Thumbs.db
 keywords_dashboard.json
+
+# control-plane secrets & local env
+.secrets
+.secrets/
+dashboard-next/.env*
+dashboard-next/node_modules/
+dashboard-next/.next/
