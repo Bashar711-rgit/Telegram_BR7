@@ -382,7 +382,7 @@ class TestOverviewAndAccounts:
         assert d["accounts"]["total"] == 1
         assert d["accounts"]["connected"] == 1
         assert "chart_24h" in d and len(d["chart_24h"]) == 24
-        assert d["bot_version"] == "15.7.1"
+        assert d["bot_version"] == "15.8.0"
         assert "staleness" in d
 
     @pytest.mark.asyncio
@@ -883,7 +883,7 @@ class TestVersion:
     def test_bot_version_bumped(self):
         # v15.7.0: Admin Center Dashboard — الترقية تُحدّث توقع الإصدار (اتفاق المشروع)
         from config import BOT_VERSION, BOT_CODENAME
-        assert BOT_VERSION == "15.7.1"
+        assert BOT_VERSION == "15.8.0"
         assert (
             "Dashboard" in BOT_CODENAME or "Panel" in BOT_CODENAME
             or "Silence" in BOT_CODENAME or "Throughput" in BOT_CODENAME
@@ -893,4 +893,4 @@ class TestVersion:
 
     def test_dashboard_version_marker(self):
         from dashboard import DASHBOARD_VERSION
-        assert DASHBOARD_VERSION == "15.7.1"
+        assert DASHBOARD_VERSION == "15.8.0"

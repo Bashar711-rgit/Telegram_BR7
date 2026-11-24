@@ -736,16 +736,20 @@ class EnhancedTelegramBot:
                             except Exception:
                                 pass
                     # ══ v12.1.0 التزامن الصلب: الحماة (ack) ══
+                    # ══ v15.8.0: ack دفعي — بلا commit لكل حدث ══
                     # المعالجة اكتملت أو حُوّلت لـDLQ (المسؤولية انتقلت):
-                    # احذف الصف in_flight — بدون ack يُسترد لاحقاً كـ
-                    # _recovered (at-least-once). فشل الـack نفسه آمن:
-                    # الصف يبقى في الطابور ويُعاد فحصه دورياً.
+                    # المعرف يدخل مخزن الذاكرة ومهمة acker تحذفها دفعات
+                    # (executemany + commit واحد). لو تحطمت العملية قبل
+                    # التصفير: الصف يُسترد عبر recover_stale_inflight
+                    # (at-least-once كما سابقاً) وطبقة dedup تمنع تكرار
+                    # التنبيه. فشل الدفع آمن: الصف يبقى ويُعاد فحصه دورياً.
                     try:
                         _qid = event_data.get("_queue_id")
                         if _qid is not None:
-                            await self.db.ack_queue_event(_qid)
+                            self._pending_acks.append(int(_qid))
+                            self._ack_wake.set()
                     except Exception as _ack_err:
-                        logger.debug(f"ack failed (fail-safe): {type(_ack_err).__name__}")
+                        logger.debug(f"ack buffer push failed (fail-safe): {type(_ack_err).__name__}")
                     internal_queue.task_done()
                     # v9.12 (audit M-07 / M-05 related): clear the local
                     # reference after successful processing so the
@@ -794,10 +798,57 @@ class EnhancedTelegramBot:
         ]
         workers = [asyncio.create_task(worker(i), name=f"worker_{i}") for i in range(CFG.PROCESSING_WORKERS)]
 
+        # ══ v15.8.0: مخزن الاكات الدفعي + مهمة التصفير ══
+        # commit واحد لكل دفعة (≤512) بدل commit لكل حدث — الاختناق P0
+        # المقاس (db_latency 913ms على SELECT 1 + P50 لاق 240 ثانية).
+        # كل السياستَين في _ack_flush_ids — المهام ترسل معرفات فقط.
+        self._pending_acks = deque()  # type: Deque[int]
+        self._ack_wake = asyncio.Event()
+
+        async def acker():
+            while self.is_running:
+                try:
+                    await asyncio.wait_for(self._ack_wake.wait(), timeout=0.5)
+                except asyncio.TimeoutError:
+                    pass
+                if self._pending_acks:
+                    ids = []
+                    while self._pending_acks and len(ids) < 512:
+                        ids.append(self._pending_acks.popleft())
+                    try:
+                        await self._ack_flush_ids(ids)
+                    except Exception as e:
+                        logger.debug(f"acker flush skipped: {type(e).__name__}: {e}")
+                if not self._pending_acks:
+                    self._ack_wake.clear()
+
+        acker_task = asyncio.create_task(acker(), name="ack_flusher")
+
         try:
-            await asyncio.gather(*producers, *workers, return_exceptions=True)
+            await asyncio.gather(*producers, *workers, acker_task, return_exceptions=True)
         except asyncio.CancelledError:
             pass
+        finally:
+            # تصفير أخير عند الإيقاف — الأفضل جهد؛ ما بقي يُسترد لاحقاً
+            # (recover_stale_inflight) بلا تكرار تنبيهات (طبقة dedup)
+            try:
+                remaining = []
+                while self._pending_acks and len(remaining) < 512:
+                    remaining.append(self._pending_acks.popleft())
+                if remaining:
+                    await self._ack_flush_ids(remaining)
+            except Exception:
+                pass
+
+    async def _ack_flush_ids(self, ids) -> int:
+        """v15.8.0: تصفير دفعة اكات عبر ack_queue_events_batch — فشل-آمن
+        (الصفوف غير المحذوفة تبقى قابلة للاسترداد). تعيد عدد المحذوف."""
+        deleted = 0
+        try:
+            deleted = int(await self.db.ack_queue_events_batch(list(ids)))
+        except Exception as e:
+            logger.debug(f"ack batch flush failed (rows stay recoverable): {type(e).__name__}: {e}")
+        return deleted
 
     # ─── v15.5.0 متحكم تخفيف الحمل (Load-Shedding / Drain Mode) ───────────────
     async def _load_shed_loop(self) -> None:

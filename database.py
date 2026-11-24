@@ -1239,6 +1239,9 @@ class EnhancedDatabase:
             "CREATE INDEX IF NOT EXISTS idx_alr_sender   ON alerts(sender_id)",
             "CREATE INDEX IF NOT EXISTS idx_snd_rep      ON sender_stats(reputation_score)",
             "CREATE INDEX IF NOT EXISTS idx_queue_prio   ON processing_queue(priority DESC, created_at ASC)",
+            # v15.8.0: recover_stale_inflight يفحص in_flight المنتهية كل دورة —
+            # بلا فهرس كان full-scan على الجدول الكامل كل مرة
+            "CREATE INDEX IF NOT EXISTS idx_queue_status ON processing_queue(status, claimed_at)",
             "CREATE INDEX IF NOT EXISTS idx_dead_resolved ON dead_letters(resolved)",
             "CREATE INDEX IF NOT EXISTS idx_dead_created  ON dead_letters(created_at)",
             "CREATE INDEX IF NOT EXISTS idx_alr_keyword   ON alerts(keyword)",
@@ -1651,6 +1654,87 @@ class EnhancedDatabase:
             logger.debug(f"ack_queue_event({event_id}) failed: {type(e).__name__}: {e}")
             self._queue_mirror_dirty = True
             return False
+
+    async def ack_queue_events_batch(self, ids: List[Any]) -> int:
+        """══ v15.8.0: حذف دفعي للاكات — قاتل الاختناق P0 ══
+
+        المشكلة المقاسة (Render حي): كل حدث كان يحتاج DELETE + commit
+        خاصاً تحت _queue_lock على اتصال aiosqlite واحد بقرص بطيء —
+        db_latency(SELECT 1) وصلت 913ms والطابور ثابت ~360-400 مع
+        تأخير نهاية-إلى-نهاية P50 = 240 ثانية. الـack الفردي كان يستهلك
+        commit كاملاً لكل حدث على المسار الحرج المشترك.
+
+        الحل: العمال يدفعون معرفات مكتملة إلى مخزن في الذاكرة، وهذه الدالة
+        تحذفها كلها بـexecutemany واحدة + commit واحد (حتى 512 دفعة).
+
+        دلالة at-least-once محفوظة حرفياً كما في ack الفردي:
+        * لو تحطمت العملية قبل الـflush: الصف يبقى pending/in_flight →
+          recover_stale_inflight يعيده → طبقة الحماية المزدوجة تمنع
+          التكرار (alert_exists receipt للـ_recovered + claim_alert_fingerprint
+          داخل نافذة 86400ث تمنع إرسال تنبيه ثانٍ) — تأخير لا تكرار.
+        * معرفات محذوفة مسبقاً (purge الطابور) → DELETE لا تجد شيئاً —
+          لا خطأ ولا أثر جانبي.
+        * المرآة تنقص بعدد المحذوف الفعلي داخل القفل (نفس عقد ack الفردي
+          v14.5.1 — منع انحراف N-2 بين اكين متزامنين).
+        """
+        if not ids:
+            return 0
+        clean: List[int] = []
+        seen = set()
+        for i in ids[:512]:
+            try:
+                eid = int(i)
+                if eid > 0 and eid not in seen:
+                    seen.add(eid)
+                    clean.append(eid)
+            except (TypeError, ValueError):
+                continue
+        if not clean:
+            return 0
+        deleted = 0
+        try:
+            if self.db_type == "sqlite":
+                async with self._queue_lock:
+                    cursor = await self._sqlite_conn.executemany(
+                        "DELETE FROM processing_queue WHERE id = ?",
+                        [(eid,) for eid in clean],
+                    )
+                    # sqlite3 يجمّع rowcount عبر executemany (موثق رسمياً:
+                    # "number of modifications are summed up into rowcount")
+                    deleted = int(cursor.rowcount or 0)
+                    await self._sqlite_conn.commit()
+                    if deleted:
+                        self._queue_size_mirror = max(
+                            0, self._queue_size_mirror - deleted
+                        )
+            else:
+                async with self._pool.acquire() as conn:
+                    result = await conn.execute(
+                        "DELETE FROM processing_queue WHERE id = ANY($1::bigint[])",
+                        clean,
+                    )
+                    try:
+                        deleted = int(str(result).split()[-1])
+                    except (ValueError, IndexError):
+                        deleted = 0
+                if deleted:
+                    async with self._queue_lock:
+                        self._queue_size_mirror = max(
+                            0, self._queue_size_mirror - deleted
+                        )
+            try:
+                from unified_alerts.stats import get_unified_stats as _gus
+                _gus().inc("acks_flushed", deleted)
+            except Exception:
+                pass
+            return deleted
+        except Exception as e:
+            self._queue_mirror_dirty = True
+            logger.error(
+                f"ack_queue_events_batch failed ({len(clean)} ids): "
+                f"{type(e).__name__}: {e}"
+            )
+            return deleted
 
     async def queue_size(self) -> int:
         try:

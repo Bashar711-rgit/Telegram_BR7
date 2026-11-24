@@ -587,7 +587,7 @@ class TestDashboardHTTPv157:
         assert r.status == 200
         body = await r.text()
         for marker in ("tab-blocked", "tab-people", "tab-rules", "tab-features",
-                       "v15.7.1"):
+                       "v15.8.0"):
             assert marker in body, marker
 
     async def test_blocked_full_flow_http(self, dash_env, db):

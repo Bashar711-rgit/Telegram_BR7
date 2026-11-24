@@ -1285,7 +1285,7 @@ class Config:
 #     الحدث الطازج يُسلّم متأخراً بدل إسقاطه (قتل نمط stale_dropped_
 #     queue_wait=285 أسقاط من بوت حي). فوق التشبع يبقى صمام القبول
 #     عند الالتقاط هو الحارس (تكلفة صفر كما v15.4.1).
-BOT_VERSION: Final = "15.7.1"
+BOT_VERSION: Final = "15.8.0"
 BOT_CODENAME: Final = "Admin Center Dashboard — blocked lists / people browser / rules CRUD / feature switches / bulk ops + search, all DB-driven hot-applied, zero touch to the message path"
 
 # =============================================================================
