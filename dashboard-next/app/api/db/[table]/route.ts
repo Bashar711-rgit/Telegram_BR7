@@ -60,6 +60,7 @@ export const POST = withApi(
     const row: Record<string, unknown> = { ...(parsed.data as Record<string, unknown>) };
     if (ent.selectCols.includes('created_by')) row.created_by = email;
     if (ent.selectCols.includes('added_by')) row.added_by = email;
+    if (ent.selectCols.includes('blocked_by')) row.blocked_by = email;
 
     const sb = requireService();
     const { data, error } = await sb.from(ent.table).insert(row).select(ent.selectCols.join(',')).single();

@@ -845,3 +845,32 @@ Stage Summary:
   PRODUCER_WORKERS=4، MAX_ALERTS_PER_MINUTE=60، MAX_ALERTS_PER_HOUR=3600،
   ALERT_BURST_SIZE=20، ALERT_COOLDOWN=10، MAX_EVENT_AGE_SECONDS=60،
   SIMILARITY_WINDOW_SECONDS=900 (اختياري — الافتراضي في الكود 900).
+
+## v16.4.0-dashboard-control-plane — Phase 0-3 (2026-11-24)
+
+### Phase 0 — التحضير والبنية التحتية (Supabase + Vercel + المصادقة)
+- فحص .secrets: github_token قديم ملغى (401 حي) → استُبدل بتوكن git remote العام؛ render_key صالح (rnd_)
+- تشخيص حي: RENDER_SERVICE_ID الصحيح من المفتاح = srv-dbhptf0ae00c73ed9m7g (telegram-br7-7oyu.onrender.com، not_suspended) — المعرّف المرسل srv-daau2me7bikc73ccfffg غير موجود في حساب المفتاح وtelegram-br7.onrender.com يعيد 503 (خدمة ميتة)
+- Supabase: مفتاحا anon/service_role مستخرجان من نقطة api-keys الرسمية؛ dashboard_users موجود أصلاً (username/role/enabled)؛ audit_logs بمخطط ممتاز (actor/action/object/old_value/new_value/ip/request_id)
+- منح service_role المضافة (additive فقط): CRUD على rules/sources/blocked_senders/allowed_entities/app_settings/panel_accounts + SELECT على messages/alerts/filter_decisions + SELECT/INSERT على audit_logs + SELECT/UPDATE dashboard_users + sequences — مسجلة في audit_logs (id=102)
+- مستخدما Supabase Auth منشآن: dashboard-admin@br7.local (super_admin) + dashboard-viewer@br7.local (viewer) — تسجيل الدخول مؤكد 200/200 — بياناتهما في .secrets/ (لا تُطبع)
+- Vercel: 14 env vars مضبوطة (service keys sensitive لا NEXT_PUBLIC) + المشروع حُوّل framework=nextjs rootDirectory=dashboard-next
+
+### Phase 1 — Scaffold (commit b5e2bf1)
+- Next.js 15.5.29 + React 19 + TypeScript strict + Tailwind — 26 مسار API + 8 صفحات RTL
+- lib آمنة: {ok,data,error} envelopes بلا throw + timeout 15s + retry واحد للـGETs فقط + pino مع redact
+- SESSION_SECRET HMAC جلسة HttpOnly+Secure+SameSite=strict (8 ساعات) — Supabase Auth للتحقق فقط
+- RBAC حي من DB في كل استدعاء (viewer<operator<admin<super_admin) + CSRF origin-check + rate-limit
+- CSP/HSTS/XFO/XCTO/Referrer-Policy عبر next.config + grep .next/static للأسرار = CLEAN صفر نتائج
+
+### Phase 2 — Auth (مؤكد حياً على Preview dpl_4VK4g2wVP4MMwi9MFSUd24gRCq8L)
+- دخول admin/viewer: 200 + Set-Cookie br7_session: Secure; HttpOnly; SameSite=strict (حرفياً كما تطلب المواصفة)
+- بيانات خاطئة: 401 + صفر Set-Cookie · بدون جلسة: 401 (407→إصلاح json() كان يتجاهل status — commit 09fa0cf)
+- middleware: / → 307 /login · /api/health عام
+
+### Phase 3 — CRUD حي مع تحقق DB مباشر (Preview جاري)
+- rule إنشاء(id=1)→SELECT تأكيد→PATCH(950)→تأكيد DB→DELETE→count=0 ✓
+- blocked_senders إنشاء/حذف round-trip ✓ · messages POST → 403 read_only_table ✓
+- viewer POST rules → 403 ✓ · Zod strict يرفض حقل غير معروف (invalid_body) ✓
+- audit: db_insert/update/delete_rules ب before/after مموّه (•••••(len:N)) source=vercel-dashboard ✓
+- app_settings قيمها مموّهة لغير المدراء ✓
