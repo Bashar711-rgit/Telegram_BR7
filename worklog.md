@@ -874,3 +874,31 @@ Stage Summary:
 - viewer POST rules → 403 ✓ · Zod strict يرفض حقل غير معروف (invalid_body) ✓
 - audit: db_insert/update/delete_rules ب before/after مموّه (•••••(len:N)) source=vercel-dashboard ✓
 - app_settings قيمها مموّهة لغير المدراء ✓
+
+### Phase 4 — Render حي (المرحلة 4 مكتملة)
+- env: GET بقيم مموّهة (20 متغيراً) · TEST_VAR=abc أضيف → نشر تلقائي dep-dc2ua5ij → live (40s) → تحقق → DELETE نظيف
+- DATABASE_URL مرفوض بـprotected_env_key ✓ · نشر صريح dep-dc2uakjm → live (50s)
+- restart عبر نقطة النهاية المخصصة (restart_endpoint — Render API يدعمها فعلاً)
+- audit rows 112-116 كاملة بbefore/after مموّه · البوت عاد ok/db_healthy=true بعد الانقطاعات العابرة
+
+### Phase 5 — GitHub حي (المرحلة 5 مكتملة)
+- Releases حقيقية (فارغة — بلا releases رسمية) · Runs: 39 run حقيقي (CI) · Commits: main @ 6ca739b
+- test-tag-20261124: إنشاء على رأس main (6ca739b) → تحقق 200 مباشر على GitHub → حذف 204 → audit id=117
+- secrets أسماء فقط (super_admin) وviewer → 403
+- rerun run فاشل → 403 «Resource not accessible» — التوكن fine-grained بلا صلاحية Actions rerun (موثق في SECURITY.md)
+
+### Phase 6 — مركز التحكم الموحد (المرحلة 6 مكتملة)
+- Overview: 4 بطاقات ببيانات حية من الخدمات الأربع + bot ok/db_healthy
+- إصلاح: /v6/deployments يعيد {deployments:[...]} وليس مصفوفة (commit 17cad2a)
+- تسلسل /deploy المحاكى كاملاً: tag→CI→render deploy dep-dc2ubqd9→live(80s)→health→audit ✓
+- audit: جدول + بحث + تصدير CSV (21 صف مع BOM) ✓
+- users: قائمة + تعطيل viewer → API يرفض فوراً (not_authorized) → تفعيل ✓
+- webhooks render/vercel بالسر المشترك → 200 + audit rows 124/125 · سر خاطئ → 401 ✓
+
+### Phase 7 — التحصين (المرحلة 7 مكتملة)
+- rate-limit مثبت محلياً: 30×200 ثم 5×429 (حد معلوم per-instance على Vercel — موثق)
+- ترويسات حية: CSP+HSTS+XFO DENY+XCTO+Referrer-Policy+Permissions-Policy ✓
+- صفر dangerouslySetInnerHTML وeval ✓
+- npm audit: صفر ثغرات (zod→4.6.7، postcss→8.5.33 مع dedupe داخل next) ✓
+- توثيق: dashboard-next/README.md + ARCHITECTURE.md + SECURITY.md
+- الاختبارات: أتمتة curl حية شاملة بدل suites (قيد بيئة العمل) — كل النتائج أعلاه أدلة مباشرة
