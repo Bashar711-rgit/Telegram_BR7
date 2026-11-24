@@ -877,26 +877,7 @@ class EnhancedDatabase:
             s = stmt.strip()
             if s:
                 if self.db_type == "postgresql":
-                    s = (
-                        s.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "BIGSERIAL PRIMARY KEY")
-                        .replace("sender_id INTEGER PRIMARY KEY", "sender_id BIGINT PRIMARY KEY")
-                        .replace("chat_id INTEGER PRIMARY KEY", "chat_id BIGINT PRIMARY KEY")
-                        .replace("sender_id INTEGER,", "sender_id BIGINT,")
-                        .replace("chat_id INTEGER,", "chat_id BIGINT,")
-                        .replace("tg_user_id INTEGER,", "tg_user_id BIGINT,")
-                        .replace("INTEGER NOT NULL", "BIGINT NOT NULL")
-                        .replace("access_hash INTEGER,", "access_hash BIGINT,")
-                        .replace("last_chat_id INTEGER,", "last_chat_id BIGINT,")
-                        .replace("last_message_id INTEGER,", "last_message_id BIGINT,")
-                        .replace("last_seen REAL,", "last_seen DOUBLE PRECISION,")
-                        .replace("last_updated REAL,", "last_updated DOUBLE PRECISION,")
-                        .replace("REAL DEFAULT (unixepoch())", "DOUBLE PRECISION DEFAULT EXTRACT(EPOCH FROM NOW())")
-                        .replace("DATETIME DEFAULT CURRENT_TIMESTAMP", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
-                        .replace("DATETIME", "TIMESTAMP")
-                        .replace("REAL NOT NULL", "DOUBLE PRECISION NOT NULL")
-                        .replace("REAL DEFAULT", "DOUBLE PRECISION DEFAULT")
-                        .replace("REAL,", "DOUBLE PRECISION,")
-                    )
+                    s = self._pg_translate_ddl(s)
                 try:
                     await self._execute(s)
                 except Exception as stmt_err:
@@ -1492,6 +1473,32 @@ class EnhancedDatabase:
                 f"Database migration v12.1.0: processing_queue inflight (+{added} columns)"
             )
 
+    @staticmethod
+    def _pg_translate_ddl(s: str) -> str:
+        """ترجمة DDL من لهجة SQLite إلى PostgreSQL — نفس السلسلة التي كانت
+        داخل _create_tables (استُخرجت v16.1.0 لتستخدمها الترحيلات الجديدة
+        أيضاً: _migrate_panel_auth وغيرها — لا تكرار ولا انحراف)."""
+        return (
+            s.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "BIGSERIAL PRIMARY KEY")
+            .replace("sender_id INTEGER PRIMARY KEY", "sender_id BIGINT PRIMARY KEY")
+            .replace("chat_id INTEGER PRIMARY KEY", "chat_id BIGINT PRIMARY KEY")
+            .replace("sender_id INTEGER,", "sender_id BIGINT,")
+            .replace("chat_id INTEGER,", "chat_id BIGINT,")
+            .replace("tg_user_id INTEGER,", "tg_user_id BIGINT,")
+            .replace("INTEGER NOT NULL", "BIGINT NOT NULL")
+            .replace("access_hash INTEGER,", "access_hash BIGINT,")
+            .replace("last_chat_id INTEGER,", "last_chat_id BIGINT,")
+            .replace("last_message_id INTEGER,", "last_message_id BIGINT,")
+            .replace("last_seen REAL,", "last_seen DOUBLE PRECISION,")
+            .replace("last_updated REAL,", "last_updated DOUBLE PRECISION,")
+            .replace("REAL DEFAULT (unixepoch())", "DOUBLE PRECISION DEFAULT EXTRACT(EPOCH FROM NOW())")
+            .replace("DATETIME DEFAULT CURRENT_TIMESTAMP", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+            .replace("DATETIME", "TIMESTAMP")
+            .replace("REAL NOT NULL", "DOUBLE PRECISION NOT NULL")
+            .replace("REAL DEFAULT", "DOUBLE PRECISION DEFAULT")
+            .replace("REAL,", "DOUBLE PRECISION,")
+        )
+
     async def _migrate_panel_auth(self) -> None:
         """v16.1.0 (المرحلة 1): panel_users + panel_sessions + إثراء audit_logs.
 
@@ -1535,6 +1542,8 @@ class EnhancedDatabase:
             s = stmt.strip()
             if not s:
                 continue
+            if self.db_type == "postgresql":
+                s = self._pg_translate_ddl(s)
             try:
                 await self._execute(s)
             except Exception as e:
