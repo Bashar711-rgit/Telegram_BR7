@@ -170,17 +170,17 @@ export const READ_ONLY_ENTITIES: Record<string, EntityDef> = {
   // v17.1.0: كيانات القراءة الجديدة (service_role يتجاوز RLS — قراءة فقط، بلا كتابة من اللوحة)
   sender_stats: {
     key: 'sender_stats', table: 'sender_stats', pk: 'sender_id', label: 'إحصائيات المرسلين', readOnly: true,
-    selectCols: ['sender_id', 'messages_count', 'alerts_count', 'first_seen', 'last_seen', 'updated_at'],
+    selectCols: ['sender_id', 'total_messages', 'alerts_sent', 'valid_requests', 'invalid_requests', 'reputation_score', 'last_alert_time', 'first_seen', 'updated_at'],
     orderDefault: 'sender_id',
   },
   blocked_chats: {
-    key: 'blocked_chats', table: 'blocked_chats', pk: 'id', label: 'المحادثات المحظورة', readOnly: true,
-    selectCols: ['id', 'chat_id', 'reason', 'blocked_by', 'blocked_at'],
-    orderDefault: 'id',
+    key: 'blocked_chats', table: 'blocked_chats', pk: 'chat_id', label: 'المحادثات المحظورة', readOnly: true,
+    selectCols: ['chat_id', 'reason', 'blocked_by', 'blocked_at'],
+    orderDefault: 'chat_id',
   },
   notifications: {
     key: 'notifications', table: 'notifications', pk: 'id', label: 'الإشعارات', readOnly: true,
-    selectCols: ['id', 'type', 'title', 'body', 'status', 'created_at', 'sent_at'],
+    selectCols: ['id', 'ntype', 'title', 'body', 'severity', 'object_type', 'object_id', 'is_read', 'created_at'],
     orderDefault: 'id',
   },
 };
