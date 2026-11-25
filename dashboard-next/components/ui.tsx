@@ -47,6 +47,56 @@ export function useMe() {
   return { me: data, loading };
 }
 
+/**
+ * useEngineSSE — بث حي (SSE) لحالة المحرك على /api/bot/stream.
+ * EventSource يعيد الاتصال تلقائياً بعد انغلاق نافذة الـ serverless (~55 ثانية).
+ * يعيد آخر حالة + مؤشر اتصال البث — تكميلي للـ polling وليس بديلاً عنه.
+ */
+export type EngineSSEState = {
+  state: string;
+  derivedFrom?: string[];
+  full?: { uptime?: number; monitorsUp?: number; monitorsTotal?: number } | null;
+  render?: { suspended?: string; latestDeployStatus?: string } | null;
+  ops?: { filtering_paused: boolean; alerts_paused: boolean };
+  updatedAt?: string;
+} | null;
+
+export function useEngineSSE(onMessage?: (s: NonNullable<EngineSSEState>) => void) {
+  const [live, setLive] = React.useState<EngineSSEState>(null);
+  const [connected, setConnected] = React.useState(false);
+  React.useEffect(() => {
+    let es: EventSource | null = null;
+    let stopped = false;
+    const connect = () => {
+      if (stopped) return;
+      es = new EventSource('/api/bot/stream');
+      es.addEventListener('open', () => setConnected(true));
+      es.addEventListener('status', (e) => {
+        setConnected(true);
+        try {
+          const d = JSON.parse((e as MessageEvent).data) as NonNullable<EngineSSEState>;
+          setLive(d);
+          onMessage?.(d);
+        } catch {
+          /* تجاهل إطار تالف */
+        }
+      });
+      es.addEventListener('error', () => {
+        setConnected(false);
+        es?.close();
+        setTimeout(connect, 3000); // إعادة اتصال مؤجلة — انقطاع معلن بصدق
+      });
+    };
+    connect();
+    return () => {
+      stopped = true;
+      es?.close();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  return { live, connected };
+}
+
 export function Gate({ role, min, children }: { role?: string; min: Role; children: React.ReactNode }) {
   if (!role) return null;
   if (!hasMin(role, min)) {

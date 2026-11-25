@@ -44,7 +44,7 @@ const Body = z.object({ key: z.string().min(1).max(100).regex(/^[A-Za-z0-9_.]+$/
  * المفاتيح المحمية مرفوضة؛ أي تعديل يُشغّل نشراً تلقائياً (تطبيق على المحرك).
  */
 export const POST = withApi(
-  { name: 'render_env_set', minRole: 'admin', rate: { limit: 10, windowMs: 60000 } },
+  { name: 'render_env_set', minRole: 'admin', idempotent: true, rate: { limit: 10, windowMs: 60000 } },
   async ({ email, body, rid }) => {
     const parsed = Body.safeParse(body);
     if (!parsed.success) return err(`invalid_body: ${parsed.error.issues[0]?.message || 'validation'}`, 400);

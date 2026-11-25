@@ -15,7 +15,7 @@ const Body = z.object({ key: z.string().min(1).max(100).regex(/^[A-Za-z0-9_.]+$/
  * القيمة تُقرأ مفكوكة خادمياً فقط ولا تعود للعميل أبداً.
  */
 export const POST = withApi(
-  { name: 'render_env_restore', minRole: 'admin', rate: { limit: 8, windowMs: 60000 } },
+  { name: 'render_env_restore', minRole: 'admin', idempotent: true, rate: { limit: 8, windowMs: 60000 } },
   async ({ email, body, rid }) => {
     const parsed = Body.safeParse(body);
     if (!parsed.success) return err(`invalid_body: ${parsed.error.issues[0]?.message || 'validation'}`, 400);

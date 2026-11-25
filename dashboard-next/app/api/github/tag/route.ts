@@ -10,7 +10,7 @@ const Body = z.object({ tag: z.string().min(1).max(80).regex(/^[A-Za-z0-9._\-\/]
 
 /** POST /api/github/tag — admin+. Creates a lightweight tag on current main HEAD. */
 export const POST = withApi(
-  { name: 'github_tag', minRole: 'admin', rate: { limit: 10, windowMs: 300000 } },
+  { name: 'github_tag', minRole: 'admin', idempotent: true, rate: { limit: 10, windowMs: 300000 } },
   async ({ email, body, rid }) => {
     const parsed = Body.safeParse(body);
     if (!parsed.success) return err(`invalid_body: ${parsed.error.issues[0]?.message || 'validation'}`, 400);

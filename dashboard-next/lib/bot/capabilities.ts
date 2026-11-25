@@ -40,6 +40,12 @@ export const CAPABILITIES: Capability[] = [
   { id: 'infra.deploy', area: 'infra', title: 'تشغيل نشر Render من اللوحة (مع/بلا تفريغ الكاش)', mode: 'live', mechanism: 'Render API /deploys' },
   { id: 'infra.restart', area: 'infra', title: 'إعادة تشغيل الخدمة من اللوحة', mode: 'live', mechanism: 'restart endpoint أو deploy fallback' },
 
+  // Sync — طبقة المزامنة (متطلب §5 من عقد المالك)
+  { id: 'sync.idempotency', area: 'sync', title: 'مفاتيح عدم التكرار للعمليات الحساسة (x-idempotency-key — إعادة الطلب تعيد نفس النتيجة بلا تنفيذ ثانٍ)', mode: 'live', mechanism: 'app_settings[idem:*] TTL 24سا — db_post/patch/delete، env، accounts/row، users، tag، reconcile + أوامر المحرك بلجر مسبق' },
+  { id: 'sync.reconcile', area: 'sync', title: 'تسوية DB↔المحرك: فجوات المراقبين والأيتام وانحراف المرآة + إصلاح أيتام idempotent', mode: 'live', mechanism: 'POST /api/bot/reconcile — monitor_detail v17.1.0 (row_id/phone) + /service/accounts/row/stop' },
+  { id: 'sync.sse', area: 'sync', title: 'بث حي لحالة المحرك (SSE كل 10 ثوانٍ + إعادة اتصال تلقائية)', mode: 'live', mechanism: 'GET /api/bot/stream — اشتقاق لحظي getBotStatus — صفحة التحكم تعرضه حياً' },
+  { id: 'sync.preview_guard', area: 'sync', title: 'فصل البيئات: نشرات المعاينة للقراءة فقط افتراضياً (حارس VERCEL_ENV + شارة مرئية)', mode: 'live', mechanism: 'withApi يرفض أي mutation في preview إلا بـ PREVIEW_ALLOW_MUTATIONS=1 على بيئة المعاينة' },
+
   // Sources
   { id: 'sources.crud', area: 'sources', title: 'إضافة/تعديل/حذف/تفعيل المصادر + متعددة + CSV', mode: 'live', mechanism: '/api/db/sources (منح قائم)' },
   { id: 'sources.check', area: 'sources', title: 'فحص وصول المصدر/إعادة اتصال', mode: 'contract', depends: '§3.4' },

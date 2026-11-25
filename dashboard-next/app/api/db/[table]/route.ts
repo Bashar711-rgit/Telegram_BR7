@@ -47,7 +47,7 @@ export const GET = withApi(
 
 /** POST /api/db/:table — admin+ , Zod-strict, unknown fields rejected. */
 export const POST = withApi(
-  { name: 'db_post', minRole: 'admin', rate: { limit: 30, windowMs: 60000 } },
+  { name: 'db_post', minRole: 'admin', idempotent: true, rate: { limit: 30, windowMs: 60000 } },
   async ({ req, email, body, seg, rid }) => {
     const { table } = await seg.params;
     const ent = getEntity(table);

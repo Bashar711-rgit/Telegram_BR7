@@ -14,7 +14,7 @@ function idFor(entPk: string, raw: string): string | number {
 
 /** PATCH /api/db/:table/:id — admin+, partial strict schema, audit before/after (masked). */
 export const PATCH = withApi(
-  { name: 'db_patch', minRole: 'admin', rate: { limit: 30, windowMs: 60000 } },
+  { name: 'db_patch', minRole: 'admin', idempotent: true, rate: { limit: 30, windowMs: 60000 } },
   async ({ req, email, body, seg, rid }) => {
     const { table, id } = await seg.params;
     const ent = getEntity(table);
@@ -49,7 +49,7 @@ export const PATCH = withApi(
 
 /** DELETE /api/db/:table/:id — admin+, audit with before snapshot. */
 export const DELETE = withApi(
-  { name: 'db_delete', minRole: 'admin', rate: { limit: 30, windowMs: 60000 } },
+  { name: 'db_delete', minRole: 'admin', idempotent: true, rate: { limit: 30, windowMs: 60000 } },
   async ({ req, email, seg, rid }) => {
     const { table, id } = await seg.params;
     const ent = getEntity(table);

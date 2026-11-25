@@ -29,7 +29,7 @@ export const GET = withApi({ name: 'users_get', minRole: 'super_admin' }, async 
 
 /** POST — super_admin: create Supabase Auth user + registry row. */
 export const POST = withApi(
-  { name: 'users_create', minRole: 'super_admin', rate: { limit: 10, windowMs: 300000 } },
+  { name: 'users_create', minRole: 'super_admin', idempotent: true, rate: { limit: 10, windowMs: 300000 } },
   async ({ email: actor, body, rid }) => {
     const parsed = CreateBody.safeParse(body);
     if (!parsed.success) return err(`invalid_body: ${parsed.error.issues[0]?.message || 'validation'}`, 400);
@@ -61,7 +61,7 @@ export const POST = withApi(
 
 /** PATCH — super_admin: change role / enable-disable (revocation takes effect on next API call). */
 export const PATCH = withApi(
-  { name: 'users_patch', minRole: 'super_admin', rate: { limit: 20, windowMs: 60000 } },
+  { name: 'users_patch', minRole: 'super_admin', idempotent: true, rate: { limit: 20, windowMs: 60000 } },
   async ({ email: actor, body, rid }) => {
     const parsed = PatchBody.safeParse(body);
     if (!parsed.success) return err(`invalid_body: ${parsed.error.issues[0]?.message || 'validation'}`, 400);

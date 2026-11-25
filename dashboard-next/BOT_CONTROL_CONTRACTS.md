@@ -137,6 +137,24 @@ POST   /api/render/env/restore    {key} → mirrorGetPlain خادمياً فقط
 المسار — الطريقة المفضلة لإضافة الحسابات تبقى معالج الربط الحي (§3.3).
 ```
 
+### §3.10 طبقة المزامنة (v17.1.0 — منفذة حياً)
+```
+1) عدم التكرار: أي مسار معلم idempotent يقبل x-idempotency-key — إعادة الطلب
+   بنفس المفتاح تعيد نفس الاستجابة المخزنة (ترويسة x-idempotent-replay:true)
+   بلا تنفيذ ثانٍ. المخزن app_settings["idem:<route>:<key>"] TTL 24 سا.
+   المسارات: db_post/db_patch/db_delete، render_env_set/delete/restore،
+   bot_accounts_row، users_create/patch، github_tag، bot_reconcile.
+   أوامر المحرك لها idempotency خاصة بلجر الأوامر (idempotencyKey في body).
+2) التسوية: POST /api/bot/reconcile {fix?} — يقارن panel_accounts (DB) مع
+   monitor_detail للمحرك (v17.1.0 فيه row_id/phone) + انحراف مرآة env + أعلام ops.
+   fix=true يوقف الأيتام عبر /service/accounts/row/stop (idempotent) — لا spawn تلقائي.
+3) البث الحي: GET /api/bot/stream (SSE، viewer+) — getBotStatus كل 10 ثوانٍ،
+   نافذة 55 ثانية ثم إعادة اتصال تلقائية من EventSource — عرض حي في /bot/control.
+4) فصل البيئات: VERCEL_ENV=preview → كل mutations مرفوضة (preview_readonly)
+   إلا بضبط PREVIEW_ALLOW_MUTATIONS=1 على بيئة المعاينة تحديداً + شارة مرئية
+   في الهيكل. الإنتاج لا يتأثر. /api/env-info يكشف البيئة للواجهة.
+```
+
 ### §3.4 عقد المصادر — `POST /admin/api/sources/{chat_id}/check` → {reachable, member_status, error?}
 ### §3.5 عقد مقعد الاختبار — `POST /admin/api/engine/analyze`
 ```json

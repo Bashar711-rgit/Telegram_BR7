@@ -11,7 +11,7 @@ export const dynamic = 'force-dynamic';
  * المفاتيح المحمية (DATABASE_URL، SECRET_KEY، SESSION_*) مرفوضة تلقائياً.
  */
 export const DELETE = withApi(
-  { name: 'render_env_delete', minRole: 'admin', rate: { limit: 10, windowMs: 60000 } },
+  { name: 'render_env_delete', minRole: 'admin', idempotent: true, rate: { limit: 10, windowMs: 60000 } },
   async ({ email, seg, rid }) => {
     const { key } = await seg.params;
     if (!key || !/^[A-Za-z0-9_.]+$/.test(key)) return err('invalid_key', 400);

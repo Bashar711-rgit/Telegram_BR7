@@ -33,7 +33,7 @@ type DeleteOutcome = {
  *   الحذف لا يلمس جلسات env (ACCOUNT_*) — تُدار من صفحة Render في اللوحة.
  */
 export const POST = withApi(
-  { name: 'bot_accounts_row', minRole: 'admin', mutating: true, rate: { limit: 12, windowMs: 60000 } },
+  { name: 'bot_accounts_row', minRole: 'admin', mutating: true, idempotent: true, rate: { limit: 12, windowMs: 60000 } },
   async ({ body, email, role, rid, req }) => {
     const parsed = schema.safeParse(body);
     if (!parsed.success) return err(`invalid_body: ${parsed.error.issues[0]?.message || 'validation'}`, 400);

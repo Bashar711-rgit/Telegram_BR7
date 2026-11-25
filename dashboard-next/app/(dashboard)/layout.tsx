@@ -25,8 +25,17 @@ export default async function DashboardLayout({ children }: { children: React.Re
   }
   if (!enabled) redirect('/login');
 
+  // فصل البيئات: شارة واضحة على نشرات المعاينة — التغييرات هناك للقراءة افتراضياً
+  const vercelEnv = String(process.env.VERCEL_ENV || 'development');
+  const isPreview = vercelEnv === 'preview';
+
   return (
     <div className="flex min-h-screen flex-col">
+      {isPreview && (
+        <div className="bg-panel-warn/15 px-4 py-1.5 text-center text-xs font-bold text-panel-warn" role="status">
+          بيئة معاينة (Preview) — للقراءة فقط افتراضياً؛ لا تلمس الإنتاج أو المحرك الحي. الإنتاج: telegram-br-7.vercel.app
+        </div>
+      )}
       <Nav email={payload.sub} role={role} />
       <main className="mx-auto w-full max-w-7xl flex-1 px-4 py-6">{children}</main>
       <footer className="mt-auto border-t border-panel-border py-3 text-center text-xs text-panel-muted">
