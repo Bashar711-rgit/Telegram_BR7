@@ -29,8 +29,16 @@ export const CAPABILITIES: Capability[] = [
   { id: 'accounts.update', area: 'accounts', title: 'تعديل الاسم/الأولوية/الحالة/الحساب الرئيسي', mode: 'live', mechanism: 'PATCH panel_accounts (منح قائم)' },
   { id: 'accounts.link', area: 'accounts', title: 'إضافة حساب (هاتف→OTP→2FA→جلسة مشفرة) + تفعيل فوري', mode: 'live', mechanism: 'تدفق Telethon الحقيقي (link_manager) عبر بوابة الخدمة /service/accounts — سر مشترك §3.1 — الجلسة Fernet دائمة' },
   { id: 'accounts.toggle_hot', area: 'accounts', title: 'تفعيل/إيقاف المراقبة فوراً على المحرك (spawn/stop)', mode: 'live', mechanism: '/service/accounts/row/toggle عبر بوابة الخدمة' },
-  { id: 'accounts.delete', area: 'accounts', title: 'حذف حساب (super_admin) + إيقاف مراقبه', mode: 'live', mechanism: '/service/accounts/row/delete عبر بوابة الخدمة' },
+  { id: 'accounts.delete', area: 'accounts', title: 'حذف حساب (super_admin) + إيقاف مراقبه', mode: 'live', mechanism: 'مسار مزدوج من اللوحة: المحرك أولاً (إيقاف فوري + حماية آخر حساب نشط) وإذا نائم المحرك حذف مباشر من panel_accounts في Supabase (المصدر الموثوق) — يعمل دائماً من اللوحة' },
   { id: 'accounts.test_reauth', area: 'accounts', title: 'اختبار اتصال دوري مجدول/إعادة مصادقة آلية', mode: 'contract', depends: '§3.3 المتبقي — الإصلاح اليدوي متاح: حذف ثم إعادة إضافة' },
+
+  // Infrastructure — كل الإعدادات من اللوحة (حفظ مزدوج Render + Supabase)
+  { id: 'infra.env_read', area: 'infra', title: 'قراءة متغيرات بيئة Render من اللوحة (مموّهة دائماً)', mode: 'live', mechanism: 'Render API /env-vars + حالة المرآة' },
+  { id: 'infra.env_write', area: 'infra', title: 'إضافة/تعديل/حذف متغيرات env من اللوحة — حفظ مزدوج', mode: 'live_persistent', mechanism: 'Render API (مصدر التشغيل) + مرآة AES-256-GCM في app_settings (Supabase) + نشر تلقائي' },
+  { id: 'infra.env_restore', area: 'infra', title: 'استعادة متغير env من مرآة Supabase إلى Render (علاج drift/حذف خاطئ)', mode: 'live', mechanism: 'mirrorGetPlain خادمياً فقط + upsertEnvVar + نشر تلقائي' },
+  { id: 'infra.env_sessions', area: 'infra', title: 'إدارة جلسات الحسابات عبر env (ACCOUNT_*/MAIN_SESSION_STRING) من اللوحة', mode: 'live_persistent', mechanism: 'نفس حفظ env المزدوج — الطريقة المفضلة تبقى معالج الربط الحي' },
+  { id: 'infra.deploy', area: 'infra', title: 'تشغيل نشر Render من اللوحة (مع/بلا تفريغ الكاش)', mode: 'live', mechanism: 'Render API /deploys' },
+  { id: 'infra.restart', area: 'infra', title: 'إعادة تشغيل الخدمة من اللوحة', mode: 'live', mechanism: 'restart endpoint أو deploy fallback' },
 
   // Sources
   { id: 'sources.crud', area: 'sources', title: 'إضافة/تعديل/حذف/تفعيل المصادر + متعددة + CSV', mode: 'live', mechanism: '/api/db/sources (منح قائم)' },

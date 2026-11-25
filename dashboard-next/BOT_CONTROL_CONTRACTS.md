@@ -104,9 +104,38 @@ POST /service/accounts/row/toggle     {row_id, enable} → spawn/stop فوري �
 # الوسيط في اللوحة (Vercel): /api/bot/accounts/link (POST start|code|password|cancel + GET status)
 # و/api/bot/accounts/row — جلسة HMAC + RBAC admin/super_admin + CSRF + Zod strict + audit بلا أسرار.
 ```
-قيود المنفذ: OTP/كلمة المرور تعيشان في ذاكرة link_manager حصراً ولا تُسجَّلان في أي audit،
+قيود المنفذ: OTP/كلمة مرور 2FA تعيشان في ذاكرة link_manager حصراً ولا تُسجَّلان في أي audit،
 Session مشفرة Fernet (SECRET_KEY_OVERRIDE إلزامي للدم عبر النشرات) ولا تعود للواجهة أبداً.
 المتبقي عقداً: اختبار اتصال دوري مجدول + إعادة مصادقة آلية (الإصلاح اليدوي: حذف ثم إعادة إضافة).
+
+### §3.3-ب حذف الحساب — مسار مزدوج من اللوحة (v17.0.0 — DB-first fallback)
+```
+POST /api/bot/accounts/row {row_id, action:"delete"}  (super_admin)
+1) المحرك أولاً:  POST /service/accounts/row/delete — إيقاف فوري للمراقب
+   + حماية «آخر حساب نشط» (تُحترم: الرفض يُعاد للواجهة ولا يُحذف الصف خلسة).
+2) المحرك نائم/بعيد المنال (free tier ينام بعد 15 دقيقة) → حذف مباشر من
+   panel_accounts في Supabase (المصدر الموثوق — المحرك يقرأ منها عند الإقلاع
+   والمراقب يُبنى ديناميكياً) → monitorStop:"deferred_engine_asleep".
+3) المحرك يقول «الحساب غير موجود» → حذف DB idempotent → already_gone.
+كل الفرع تُسجَّل في audit_logs مع لقطة الصف قبل الحذف وحالة إيقاف المراقب.
+لا يلمس جلسات env (ACCOUNT_*) — تُدار من اللوحة عبر §3.9.
+```
+
+### §3.9 حفظ مزدوج لمتغيرات البيئة — Render + مرآة Supabase (v17.0.0 — منفذ حياً)
+```
+المبدأ: القيمة تعيش على Render (مصدر التشغيل) وتُنسَخ مشفّرة في Supabase:
+  app_settings["render:env:<KEY>"] = {alg:"AES-256-GCM", v, iv, tag, updatedAt}
+  المفتاح = HMAC-SHA256(SESSION_SECRET, "br7-env-mirror-v1") — لا نص صريح أبداً.
+
+GET    /api/render/env            → vars مموّهة + mirrored/mirrorUpdatedAt + mirrorOnly (drift)
+POST   /api/render/env            {key, value} → upsertEnvVar + mirrorSet + نشر تلقائي (admin+)
+DELETE /api/render/env/:key       → deleteEnvVar + mirrorDelete (تنظيف مزدوج) (admin+)
+POST   /api/render/env/restore    {key} → mirrorGetPlain خادمياً فقط → upsertEnvVar + نشر (admin+)
+المفاتيح المحمية (DATABASE_URL|SECRET_KEY|SESSION_*) مرفوضة دائماً (PROTECTED_ENV_RE).
+فشل المرآة لا يُفشل العملية (Render هو التشغيل) — يُسجَّل dualPersist في audit.
+جلسات env (ACCOUNT_*_SESSION_STRING / MAIN_SESSION_STRING) تُدار من اللوحة بنفس
+المسار — الطريقة المفضلة لإضافة الحسابات تبقى معالج الربط الحي (§3.3).
+```
 
 ### §3.4 عقد المصادر — `POST /admin/api/sources/{chat_id}/check` → {reachable, member_status, error?}
 ### §3.5 عقد مقعد الاختبار — `POST /admin/api/engine/analyze`

@@ -255,10 +255,15 @@ export default function BotAccounts() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ row_id: deleting.id, action: 'delete' }),
     });
-    const j = (await r.json()) as { ok: boolean; error?: string };
+    const j = (await r.json()) as { ok: boolean; error?: string; data?: { monitorStop?: string } };
     setBusy(false);
     if (j.ok) {
-      setOkMsg(`حُذف الحساب #${deleting.id} فعلياً من panel_accounts وأُوقفت مراقبته على المحرك`);
+      const stop = j.data?.monitorStop;
+      setOkMsg(
+        stop === 'deferred_engine_asleep'
+          ? `حُذف الحساب #${deleting.id} فعلياً من panel_accounts — المحرك نائم حالياً فيتوقف مراقبه تلقائياً عند استيقاظه`
+          : `حُذف الحساب #${deleting.id} فعلياً من panel_accounts وأُوقفت مراقبته على المحرك`,
+      );
       setDeleting(null);
       reload();
     } else {
@@ -398,14 +403,14 @@ export default function BotAccounts() {
         {deleting && (
           <div className="space-y-3">
             <div className="text-sm">
-              سيُحذف الصف <b>{deleting.phone}</b> نهائياً من panel_accounts وسيُوقَف مراقبه فوراً على المحرك.
+              سيُحذف الصف <b>{deleting.phone}</b> نهائياً من panel_accounts. الحذف يتم من اللوحة مباشرة: إن كان المحرك مستيقظاً يُوقَف مراقبه فوراً، وإن كان نائماً يتوقف مراقبه تلقائياً عند استيقاظه.
               {deleting.status === 'needs_relogin' && (
                 <div className="mt-2 rounded-lg border border-panel-border bg-panel-bg p-2 text-xs text-panel-muted">
-                  هذا الحساب حالته needs_relogin (جلسته غير قابلة لفك التشفير) — حذفه ثم إعادة إضافته عبر المعالج هو مسار الإصلاح الصحيح.
+                  هذا الحساب حالته needs_relogin (جلسته غير قابلة لفك التشفير) — حذفه ثم إعادة إضافته عبر المعالج أعلاه هو مسار الإصلاح الصحيح، كله من اللوحة بلا خروج.
                 </div>
               )}
             </div>
-            <ContractNote>الحذف لا يلمس جلسات env (ACCOUNT_*) — تلك تُدار من متغيرات البيئة على Render.</ContractNote>
+            <ContractNote>الحذف لا يلمس جلسات env (ACCOUNT_*) — وهي تُدار الآن من اللوحة أيضاً: صفحة Render في القائمة الرئيسية (إضافة/تعديل/حذف/استعادة مع حفظ مزدوج على Render وSupabase).</ContractNote>
             <div className="flex justify-end gap-2">
               <Btn variant="ghost" onClick={() => setDeleting(null)}>إلغاء</Btn>
               <Btn disabled={busy} onClick={deleteRow}>{busy ? 'جارٍ الحذف…' : 'حذف نهائي'}</Btn>

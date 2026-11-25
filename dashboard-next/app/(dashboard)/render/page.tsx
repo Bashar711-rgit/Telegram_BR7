@@ -5,7 +5,14 @@ import { api, useApi, useMe, Btn, Card, Badge, Modal, Input, Spinner, deployTone
 
 type ServiceInfo = { configured: boolean; reachable: boolean; id?: string; name?: string; suspended?: boolean; url?: string };
 type DeploysInfo = { configured: boolean; reachable: boolean; deploys?: Array<Record<string, unknown>> };
-type EnvInfo = { configured: boolean; reachable: boolean; vars?: Array<{ key: string; value: string }> };
+type EnvInfo = {
+  configured: boolean;
+  reachable: boolean;
+  status?: number;
+  error?: string;
+  vars?: Array<{ key: string; value: string; mirrored?: boolean; mirrorUpdatedAt?: string | null; mirrorBroken?: boolean }>;
+  mirrorOnly?: Array<{ key: string; updatedAt: string; broken?: boolean }>;
+};
 
 export default function RenderPage() {
   const service = useApi<ServiceInfo>('/api/render/service', 30000);
@@ -60,10 +67,18 @@ export default function RenderPage() {
   const doEnvDelete = async () => {
     if (!deleteKey) return;
     setBusy(true);
-    const r = await api(`/api/render/env/${encodeURIComponent(deleteKey)}`, { method: 'DELETE' });
+    const r = await api<{ mirrorCleared?: boolean }>(`/api/render/env/${encodeURIComponent(deleteKey)}`, { method: 'DELETE' });
     setBusy(false);
     setDeleteKey(null);
-    setNotice(r.ok ? `تم حذف ${deleteKey}` : `فشل: ${r.error}`);
+    setNotice(r.ok ? `تم حذف ${deleteKey} من Render ومن مرآة Supabase (حفظ مزدوج نظيف)` : `فشل: ${r.error}`);
+    env.reload();
+  };
+
+  const doRestore = async (key: string) => {
+    setBusy(true);
+    const r = await api<{ deployTriggered?: boolean }>('/api/render/env/restore', { method: 'POST', body: JSON.stringify({ key }) });
+    setBusy(false);
+    setNotice(r.ok ? `استُعيد ${key} من مرآة Supabase إلى Render${(r as { data: { deployTriggered?: boolean } }).data.deployTriggered ? ' — نشر تلقائي شُغّل' : ''}` : `فشل الاستعادة: ${r.error}`);
     env.reload();
   };
 
@@ -122,7 +137,7 @@ export default function RenderPage() {
       </Card>
 
       <Card
-        title="متغيرات البيئة (القيم مموّهة دائماً)"
+        title="متغيرات البيئة — حفظ مزدوج (Render + مرآة Supabase مشفّرة)"
         actions={
           canAdmin && <Btn onClick={() => { setEnvModal({ mode: 'add', key: '', value: '' }); setConfirm2(false); }}>+ متغير</Btn>
         }
@@ -136,18 +151,29 @@ export default function RenderPage() {
                 <tr>
                   <th className="border-b border-panel-border px-3 py-2 text-left">key</th>
                   <th className="border-b border-panel-border px-3 py-2 text-left">value</th>
+                  <th className="border-b border-panel-border px-3 py-2 text-left">mirror</th>
                   {canAdmin && <th className="border-b border-panel-border px-3 py-2 text-left">actions</th>}
                 </tr>
               </thead>
               <tbody>
                 {(env.data?.vars || []).map((v) => {
                   const protectedKey = /^(DATABASE_URL|SECRET_KEY|SESSION_.*)$/i.test(v.key);
+                  const isAccountSession = /^ACCOUNT_\d+_SESSION_STRING$/i.test(v.key) || /^MAIN_SESSION_STRING$/i.test(v.key);
                   return (
                     <tr key={v.key} className="hover:bg-panel-border/20">
                       <td className="border-b border-panel-border/50 px-3 py-1.5 font-medium">
                         {v.key} {protectedKey && <Badge tone="warn">protected</Badge>}
+                        {isAccountSession && <Badge tone="ok">جلسة حساب</Badge>}
                       </td>
                       <td className="border-b border-panel-border/50 px-3 py-1.5 text-panel-muted">{v.value}</td>
+                      <td className="border-b border-panel-border/50 px-3 py-1.5">
+                        {v.mirrored ? (
+                          <span className="text-panel-ok" title={String(v.mirrorUpdatedAt || '')}>✓ مرآة Supabase</span>
+                        ) : (
+                          <span className="text-panel-muted">—</span>
+                        )}
+                        {v.mirrorBroken && <Badge tone="bad">مرآة تالفة</Badge>}
+                      </td>
                       {canAdmin && (
                         <td className="whitespace-nowrap border-b border-panel-border/50 px-3 py-1.5">
                           {!protectedKey && (
@@ -167,7 +193,31 @@ export default function RenderPage() {
             </table>
           </div>
         )}
-        <p className="mt-2 text-xs text-panel-muted">المفتاح المحمي (DATABASE_URL، SECRET_KEY، SESSION_*) لا يُحذف ولا يُعدل من اللوحة. أي تعديل env يُشغّل نشراً تلقائياً.</p>
+        <p className="mt-2 text-xs text-panel-muted">
+          المفتاح المحمي (DATABASE_URL، SECRET_KEY، SESSION_*) لا يُحذف ولا يُعدل من اللوحة. أي تعديل env يُحفَظ مرّتين: على Render (مصدر التشغيل) وعلى مرآة مشفّرة AES-256-GCM في Supabase (للاستعادة عند الحاجة)، ويُشغّل نشراً تلقائياً. مفاتيح <b>ACCOUNT_*_SESSION_STRING</b> و<b>MAIN_SESSION_STRING</b> هي جلسات حسابات — الطريقة المفضلة لإضافة الحسابات هي معالج «مركز التحكم › الحسابات»، ويمكن تعديل جلسات env يدوياً من هنا أيضاً.
+        </p>
+        {(env.data?.mirrorOnly || []).length > 0 && (
+          <div className="mt-3">
+            <p className="mb-1 text-xs font-bold text-panel-text">مفاتيح موجودة في مرآة Supabase فقط (محذوفة/منحرفة على Render):</p>
+            <div className="max-h-40 overflow-auto rounded-lg border border-panel-border">
+              <table className="w-full text-xs" dir="ltr">
+                <tbody>
+                  {(env.data?.mirrorOnly || []).map((m) => (
+                    <tr key={m.key} className="hover:bg-panel-border/20">
+                      <td className="border-b border-panel-border/50 px-3 py-1.5 font-medium">{m.key}</td>
+                      <td className="border-b border-panel-border/50 px-3 py-1.5 text-panel-muted">آخر حفظ: {String(m.updatedAt).slice(0, 19).replace('T', ' ')}</td>
+                      {canAdmin && (
+                        <td className="border-b border-panel-border/50 px-3 py-1.5">
+                          <button className="text-panel-accent hover:underline" onClick={() => doRestore(m.key)}>استعادة إلى Render</button>
+                        </td>
+                      )}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
       </Card>
 
       <Modal open={envModal !== null} title={envModal?.mode === 'add' ? 'إضافة متغير' : `تعديل ${envModal?.key}`} onClose={() => { setEnvModal(null); setConfirm2(false); }}>
@@ -192,7 +242,7 @@ export default function RenderPage() {
       </Modal>
 
       <Modal open={deleteKey !== null} title="تأكيد حذف متغير" onClose={() => setDeleteKey(null)}>
-        <p className="mb-4 text-sm">سيُحذف المتغير <span className="text-panel-accent">{deleteKey}</span> من Render نهائياً. المتغيرات المحمية مرفوضة تلقائياً.</p>
+        <p className="mb-4 text-sm">سيُحذف المتغير <span className="text-panel-accent">{deleteKey}</span> من Render ومن مرآة Supabase نهائياً. المتغيرات المحمية مرفوضة تلقائياً.</p>
         <div className="flex gap-2">
           <Btn variant="danger" onClick={doEnvDelete} disabled={busy}>{busy ? 'جارٍ…' : 'حذف'}</Btn>
           <Btn variant="ghost" onClick={() => setDeleteKey(null)}>إلغاء</Btn>
