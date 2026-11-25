@@ -1,16 +1,18 @@
 import crypto from 'crypto';
 import { restartService } from '../render';
 import { setOpsFlag } from './engine';
+import { botOpsInstant } from './engine-gateway';
 
 /**
  * Command ledger — §16 lifecycle: Created → Pending → Processing → Completed / Failed.
  *
  * Honesty contract (no fake success, ever):
  * - `restart` executes a REAL Render restart and reports the real result.
- * - pause/resume/emergency_stop_send/resume_send perform a REAL persistent
- *   write (dashboard:ops in app_settings) and report `hot_path: pending_render_executor`
- *   because the running process checks in-memory flags (monitors.py:2330/2893)
- *   and hydrates from DB only at boot.
+ * - pause/resume/maintenance/emergency types (v17.2.0): REAL persistent write
+ *   (dashboard:ops in app_settings) + REAL instant apply on the hot process via
+ *   the engine service gateway (/service/bot/ops §3.1). If the engine is asleep
+ *   the persistent write still stands and the command reports `instant_deferred`
+ *   honestly — it will be applied at next boot (hydrate_dashboard).
  * - Types without a live executor stay in `pending_render_executor` and are
  *   recorded in audit_logs — the ledger below is per-instance; audit is durable.
  */
@@ -19,13 +21,13 @@ export const COMMAND_TYPES = {
   start: 'contract',
   stop: 'contract',
   restart: 'live',
-  pause: 'live_persistent',
-  resume: 'live_persistent',
+  pause: 'live',
+  resume: 'live',
   reload_config: 'contract',
-  maintenance_on: 'live_persistent',
-  maintenance_off: 'live_persistent',
-  emergency_stop_send: 'live_persistent',
-  resume_send: 'live_persistent',
+  maintenance_on: 'live',
+  maintenance_off: 'live',
+  emergency_stop_send: 'live',
+  resume_send: 'live',
 } as const;
 
 export type CommandType = keyof typeof COMMAND_TYPES;
@@ -133,11 +135,23 @@ export async function issueCommand(input: {
       }
       rec.status = 'completed';
       rec.completedAt = new Date().toISOString();
-      rec.result = { persistent: true, flag: ops.flag, value: ops.value, hot_path: 'pending_render_executor' };
-      rec.note =
-        ops.value
-          ? 'كُتب العلم في app_settings (حقيقي ومثابر) — العملية الحارة تُطبّقه عند إقلاع/إعادة تشغيل المحرك؛ التطبيق الفوري يتطلب منفذ التنفيذ (عقد §3.1)'
-          : 'كُتب العلم في app_settings (حقيقي ومثابر) — إزالة الإيقاف تُطبَّق عند إقلاع/إعادة تشغيل المحرك؛ التطبيق الفوري يتطلب منفذ التنفيذ (عقد §3.1)';
+      // v17.2.0 §3.1: تطبيق فوري على العملية الحارة عبر بوابة الخدمة —
+      // الكتابة المثابرة نجحت أعلاه؛ إن كان المحرك نائماً يبقى العلم مثابرًا
+      // ويُطبق عند الإقلاع القادم (hydrate_dashboard) ويُبلّغ بصدق.
+      const flag = ops.flag === 'filtering_paused' ? 'filtering' : 'alerts';
+      const inst = await botOpsInstant(flag, ops.value);
+      const instant = inst.ok;
+      rec.result = {
+        persistent: true,
+        flag: ops.flag,
+        value: ops.value,
+        hot_path: instant ? 'instant_applied' : 'deferred_engine_asleep',
+        engine_status: inst.status,
+        ops: inst.data?.ops ?? null,
+      };
+      rec.note = instant
+        ? `كُتب العلم ومُطبّق فوراً على العملية الحارة (§3.1) — filtering_paused=${inst.data?.ops?.filtering_paused} / alerts_paused=${inst.data?.ops?.alerts_paused}`
+        : `كُتب العلم في app_settings (حقيقي ومثابر) — المحرك غير قابل للوصول الآن (${inst.status === 0 ? 'engine_unreachable' : inst.status}) فسيرُث العلم عند إقلاعه القادم (hydrate_dashboard) بلا حاجة لأي خطوة يدوية`;
       return { ok: true, command: rec };
     }
 

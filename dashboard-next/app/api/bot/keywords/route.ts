@@ -2,9 +2,24 @@ import { z } from 'zod';
 import { withApi, parseSearch } from '@/lib/api';
 import { ok, err } from '@/lib/result';
 import { getRegistry, registryStats, addWord, removeWord } from '@/lib/bot/keywords';
+import { keywordsHotReload } from '@/lib/bot/engine-gateway';
 import { logAudit } from '@/lib/audit';
 
 export const dynamic = 'force-dynamic';
+
+/**
+ * v17.2.0 §3.2: بعد أي كتابة ناجحة في السجل نحاول البناء الحار على المحرك.
+ * المحرك نائم → deferred بصدق (hydrate_dashboard يطبقه عند الإقلاع القادم).
+ */
+async function tryHotReload(): Promise<{ hotPath: string; engine: unknown }> {
+  const h = await keywordsHotReload();
+  return {
+    hotPath: h.ok ? 'instant_rebuilt' : 'deferred_engine_asleep',
+    engine: h.ok
+      ? { reloaded: h.data?.reloaded, groups: h.data?.groups, fast_gate: h.data?.fast_gate ?? null }
+      : { engineStatus: h.status, error: h.error || null },
+  };
+}
 
 /** GET /api/bot/keywords — real registry view + stats + optional search & full group dump. */
 export const GET = withApi(
@@ -47,6 +62,7 @@ export const POST = withApi(
       results.push({ word: w, ok: r.ok, error: r.error });
     }
     const added = results.filter((r) => r.ok).length;
+    const hot = added > 0 ? await tryHotReload() : null;
 
     await logAudit({
       actor: email,
@@ -63,7 +79,12 @@ export const POST = withApi(
       added,
       results,
       persistence: 'app_settings:dashboard:keywords_json',
-      engineApplication: 'عند إقلاع/إعادة تحميل المحرك (hydrate_dashboard → reload_keywords → FastGate rebuild) — hot-reload حي يتطلب عقد §3.2',
+      engineApplication: hot?.hotPath || 'no_change',
+      engine: hot?.engine ?? null,
+      note:
+        hot && hot.hotPath === 'instant_rebuilt'
+          ? 'كُتب السجل وأُعيد بناؤه فوراً على العملية الحارة (reload_keywords + FastGate — §3.2 حي)'
+          : 'كُتب السجل فعلياً — المحرك غير قابل للوصول الآن فسيُبنى عند إقلاعه القادم (hydrate_dashboard) بلا خطوة يدوية',
     });
   },
 );
@@ -81,6 +102,7 @@ export const DELETE = withApi(
 
     const r = await removeWord(parsed.data.category, parsed.data.word);
     if (!r.ok) return err(r.error || 'remove_failed', 400);
+    const hot = await tryHotReload();
 
     await logAudit({
       actor: email,
@@ -93,6 +115,12 @@ export const DELETE = withApi(
       userAgent: req.headers.get('user-agent') || '',
       requestId: rid,
     });
-    return ok({ removed: parsed.data.word, count: r.count, engineApplication: 'عند إقلاع/إعادة تحميل المحرك' });
+    return ok({
+      removed: parsed.data.word,
+      count: r.count,
+      engineApplication: hot.hotPath,
+      engine: hot.engine,
+      note: hot.hotPath === 'instant_rebuilt' ? 'حُذفت وأُعيد البناء الحار فوراً (§3.2 حي)' : 'حُذفت فعلياً — البناء الحار مؤجل لعدم توفر المحرك الآن',
+    });
   },
 );

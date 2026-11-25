@@ -73,21 +73,23 @@
 
 ## 3) العقود الدقيقة للتكامل المستقبلي (Backend على Render)
 
-### §3.1 عقد منفذ الأوامر — `POST /admin/api/commands` على خدمة Render
-```json
-// Request (من Vercel، مع توكن خدمة مشترك x-br7-command-secret)
-{ "command_id": "uuid-v4", "type": "start|stop|restart|pause|resume|reload_config|maintenance_on|maintenance_off|emergency_stop_send|resume_send",
-  "requested_by": "email", "params": {}, "issued_at": "ISO8601" }
-// Response 200
-{ "accepted": true, "state": "processing", "detail": "..." }
-// دلالات إلزامية: Idempotency على command_id، Timeout 30s، Ack قبل التنفيذ،
-// الحالة النهائية تُكتب في bot_commands (عند إنشائه) أو تُرجَع في الاستجابة.
+### §3.1 منفذ الأوامر — v17.2.0: التنفيذ الفوري حي عبر بوابة الخدمة
+```
+# التنفيذ الفوري للإيقاف/الاستئناف أصبح حياً (v17.2.0):
+POST /service/bot/ops   {flag: "filtering"|"alerts", paused: bool}
+   → {ok, applied:"instant", persisted, ops:{filtering_paused, alerts_paused}}
+# اللوحة: كتابة مثابرة في app_settings ثم تطبيق فوري على العملية الحارة.
+# المحرك نائم؟ الكتابة المثابرة تنجح وتُبلغ «deferred — يُورث عند الإقلاع القادم» بصدق.
+# المتبقي عقداً: start/stop كلي للخدمة (مقصود — لا إيقاف خدمة Render).
 ```
 
-### §3.2 عقد Hot-Reload — `POST /admin/api/reload_registry`
-```json
-{ "scope": "keywords|rules|profile", "source": "app_settings:dashboard:keywords_json" }
-// يُعيد بناء المحرك + FastGate (schedule_rebuild) ويُرجع {rebuilt:true, words:N, ms:T}
+### §3.2 Hot-Reload — v17.2.0: حي عبر بوابة الخدمة
+```
+POST /service/keywords/reload  {}
+   → {ok, reloaded, groups:N, fast_gate:{patterns, engine}}
+# يقرأ dashboard:keywords_json → ملف المخصصة → reload_keywords → FastGate rebuild.
+# ملاحظة إصلاحية: reload_keywords متزامنة (sync) — الكود القديم كان يعمل await على
+# نتيجة sync فيفشل TypeError صامتاً (hydrate_dashboard + keywords_save) — أُصلح v17.2.0.
 ```
 
 ### §3.3 تدفق الحسابات (Telethon تفاعلي) — v16.6.0: منفذ حياً
@@ -155,12 +157,18 @@ POST   /api/render/env/restore    {key} → mirrorGetPlain خادمياً فقط
    في الهيكل. الإنتاج لا يتأثر. /api/env-info يكشف البيئة للواجهة.
 ```
 
-### §3.4 عقد المصادر — `POST /admin/api/sources/{chat_id}/check` → {reachable, member_status, error?}
-### §3.5 عقد مقعد الاختبار — `POST /admin/api/engine/analyze`
-```json
-// Request {text, source_id?} — يمر على المحرك الحقيقي بكل مراحله
-// Response: {normalized, detected_keywords[], intent, context, scores:{intent,keyword,context,request,negative,spam,final},
-//            duplicate:{is_dup,of?}, decision:"accept|reject|review", reasons[]}
+### §3.4 المصادر — v17.2.0: حي عبر بوابة الخدمة
+```
+POST /service/sources/check  {chat_id?|username?}
+   → {ok, reachable, entity:{id,title,username,type}, member_status, can_send, error?}
+# فحص حقيقي عبر resolve_chat_entity + get_permissions('me') على العميل الحي — قراءة بلا أثر.
+```
+### §3.5 مقعد الاختبار — v17.2.0: حي عبر بوابة الخدمة
+```
+POST /service/engine/analyze  {text<=2000}
+   → {ok, verdict:{decision,valid,confidence,score,reasons,indirect,urgent,...},
+      classification:{subject,type,classified}, fast_gate:{any_hit,patterns}, latency_ms}
+# EnhancedFilter.analyze + classify_text + FastGate على العملية الحارة — بلا أثر جانبي.
 ```
 ### §3.6 عقد التغذية الراجعة — جدول مقترح `message_feedback(msg_hash FK filter_decisions, label correct_request|false_positive|false_negative, actor, note, created_at)` + `POST /admin/api/engine/feedback` لإعادة التحليل.
 ### §3.7 عقد المهام — `POST /admin/api/jobs/{id}/retry` + `POST /admin/api/queue/purge` + منح قراءة processing_queue/dead_letters/system_health.

@@ -809,7 +809,11 @@ class DashboardAPI:
         KW_FILE.write_text(_json.dumps(new_kw, ensure_ascii=False), encoding="utf-8")
         reload = getattr(self.bot.filter, "reload_keywords", None)
         if reload is not None:
-            await reload(str(KW_FILE))
+            # v17.2.0 fix: reload_keywords متزامنة في EnhancedFilter — الـawait السابق
+            # كان يرمي TypeError صامتاً فيُفشل البناء الحار دون علم (مثبت بالفحص).
+            _ret = reload(str(KW_FILE))
+            if asyncio.iscoroutine(_ret):
+                _ret = await _ret
             # ══ v15.6.0: إعادة بناء البوابة السرعة من القوائم الجديدة ══
             try:
                 from fast_gate import get_fast_gate as _fgg
@@ -1997,7 +2001,10 @@ async def hydrate_dashboard(bot: Any) -> None:
                 KW_FILE.write_text(_json.dumps(data, ensure_ascii=False), encoding="utf-8")
                 reload = getattr(getattr(bot, "filter", None), "reload_keywords", None)
                 if reload is not None:
-                    await reload(str(KW_FILE))
+                    # v17.2.0 fix: نفس إصلاح التزامن أعلاه — استرداد الإقلاع كان فاشلاً صامتاً.
+                    _ret = reload(str(KW_FILE))
+                    if asyncio.iscoroutine(_ret):
+                        _ret = await _ret
                     # ══ v15.6.0: إعادة بناء البوابة السرعة بعد الاسترداد ══
                     try:
                         from fast_gate import get_fast_gate as _fgg

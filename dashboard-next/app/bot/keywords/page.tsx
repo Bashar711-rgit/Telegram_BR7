@@ -26,6 +26,7 @@ export default function BotKeywords() {
   const [okMsg, setOkMsg] = React.useState<string | null>(null);
   const [errMsg, setErrMsg] = React.useState<string | null>(null);
   const [busy, setBusy] = React.useState(false);
+  const [reloading, setReloading] = React.useState(false);
   const [showDups, setShowDups] = React.useState(false);
 
   const wordGroups = (data?.groups || []).filter((g) => g.kind === 'word_list');
@@ -65,10 +66,24 @@ export default function BotKeywords() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ category: confirmWord.group, word: confirmWord.word }),
     });
-    const j = (await r.json()) as { ok: boolean; error?: string };
+    const j = (await r.json()) as { ok: boolean; error?: string; data?: { note?: string } };
     setBusy(false);
-    if (j.ok) { setOkMsg(`حُذفت «${confirmWord.word}» فعلياً من ${confirmWord.group}`); setConfirmWord(null); reload(); }
+    if (j.ok) { setOkMsg(`حُذفت «${confirmWord.word}» فعلياً${j.data?.note ? ` — ${j.data.note}` : ''}`); setConfirmWord(null); reload(); }
     else setErrMsg(`فشل الحذف: ${j.error}`);
+  };
+
+  // v17.2.0 §3.2: البناء الحار الفوري على العملية الحارة
+  const hotReload = async () => {
+    setReloading(true);
+    setOkMsg(null);
+    setErrMsg(null);
+    const r = await fetch('/api/bot/keywords/reload', { method: 'POST', headers: { 'Content-Type': 'application/json' } });
+    const j = (await r.json()) as { ok: boolean; error?: string; data?: { reloaded?: boolean; groups?: number; fastGate?: { patterns?: number } | null; note?: string } };
+    setReloading(false);
+    if (j.ok && j.data) {
+      setOkMsg(`أُعيد البناء فوراً على العملية الحارة — المجموعات: ${j.data.groups ?? '—'} · FastGate: ${j.data.fastGate?.patterns ?? '—'} نمط`);
+      reload();
+    } else setErrMsg(`فشل البناء الحار بصدق: ${j.error || r.status}`);
   };
 
   return (
@@ -78,6 +93,9 @@ export default function BotKeywords() {
         <div className="flex gap-2">
           <Gate role={me?.role} min="operator">
             <Btn onClick={() => { setAddCat(current?.key || 'custom:جدید'); setAddOpen(true); }}>إضافة كلمات</Btn>
+          </Gate>
+          <Gate role={me?.role} min="admin">
+            <Btn variant="ghost" disabled={reloading} onClick={hotReload}>{reloading ? 'جارٍ البناء…' : 'بناء حار على المحرك'}</Btn>
           </Gate>
           <Btn variant="ghost" onClick={() => reload()}>تحديث</Btn>
         </div>
@@ -153,12 +171,10 @@ export default function BotKeywords() {
       <Card title="القدرات">
         <div className="flex flex-wrap items-center gap-2 text-xs">
           <ModeBadge mode="live" /> قراءة/بحث/تكرار/إحصاء — حي
-          <ModeBadge mode="live_persistent" /> إضافة/حذف كلمات — كتابة حقيقية مثابرة
-          <ModeBadge mode="contract" /> البناء الحار على العملية الجارية — عقد §3.2
+          <ModeBadge mode="live" /> إضافة/حذف + بناء حار فوري على العملية الحارة (§3.2 حي)
+          <ModeBadge mode="contract" /> المتبقي: أوزان filter_weights الجدولية
         </div>
-        <ContractNote>
-          الكتابة تنفذ فعلاً في سجل app_settings وتُدقق التكرار (تطبيع عربي آمن: همزات/ألف/ياء/تشكيل دون إفساد المعنى). المحرك يبني من هذا السجل عند الإقلاع (hydrate_dashboard → reload_keywords → FastGate) — البناء الفوري الحار يتطلب منفذ Render (عقد §3.2) وتظهر هذه الملاحظة مع كل عملية كتابة.
-        </ContractNote>
+        <div className="mt-2 text-[11px] text-panel-muted">كل كتابة في السجل تُحاول بناء حار فوراً على المحرك (reload_keywords + FastGate). المحرك نائم؟ تُبلّغ بصدق «مؤجل — يُبنى عند إقلاعه القادم» ولا يظهر نجاح وهمي أبداً. زر «بناء حار» يجبر إعادة البناء يدوياً متى شئت.</div>
       </Card>
 
       <Modal open={addOpen} title={`إضافة كلمات إلى «${addCat}»`} onClose={() => setAddOpen(false)}>

@@ -33,11 +33,12 @@ import hmac
 import json as jsonlib
 import os
 import secrets as _secrets
+import time
 from typing import Any, Callable, Optional
 
 from aiohttp import web
 
-from dashboard.api import DashboardAPI, DashboardHTTPError
+from dashboard.api import DashboardAPI, DashboardHTTPError, KW_FILE
 from dashboard.state import (
     DEFAULT_API_RATE_PER_MIN,
     DEFAULT_LOGIN_LOCKOUT_SECONDS,
@@ -600,6 +601,282 @@ def setup_dashboard(app: web.Application, bot: Any) -> None:
         _audit_bg("service.account_stop", object_id=str(row_id))
         return _json(result)
 
+    # ── v17.2.0: التنفيذ الفوري على العملية الحارة (§3.1/§3.2) + فحص المصادر (§3.4) + مقعد الاختبار (§3.5) ──
+
+    async def svc_bot_ops(request: web.Request) -> web.Response:
+        """§3.1 — تطبيق فوري: إيقاف/استئناف الفلترة أو التنبيهات على العملية
+        الحارة + تثبيت دائم عبر قاعدة المحرك (نفس مسار ops_toggle)."""
+        g = await _svc_guard(request)
+        if g:
+            return g
+        body = await _svc_body(request)
+        if body is None:
+            return _json({"ok": False, "error": "invalid_body"}, 400)
+        flag = str(body.get("flag") or "")
+        paused = bool(body.get("paused"))
+        if flag not in ("filtering", "alerts"):
+            return _json({"ok": False, "error": "unknown_flag"}, 400)
+        if flag == "filtering":
+            DASH.ops.set_filtering(paused)
+        else:
+            DASH.ops.set_alerts(paused)
+
+        async def _do():
+            payload = jsonlib.dumps({
+                "filtering_paused": DASH.ops.filtering_paused,
+                "alerts_paused": DASH.ops.alerts_paused,
+            })
+            await bot.db._execute(
+                "INSERT INTO app_settings (key, value) VALUES (?, ?) "
+                "ON CONFLICT (key) DO UPDATE SET value = excluded.value, "
+                "updated_at = CURRENT_TIMESTAMP",
+                ("dashboard:ops", payload),
+            )
+            await bot.db._commit()
+            return True
+
+        persisted = False
+        try:
+            persisted = bool(await _bridge_call(_do))
+        except _BridgeError:
+            persisted = False
+        _audit_bg("service.bot_ops_instant", object_id=flag,
+                  new_value="paused" if paused else "active")
+        return _json({"ok": True, "flag": flag, "paused": paused,
+                      "applied": "instant", "persisted": persisted,
+                      "ops": DASH.ops.snapshot()})
+
+    async def svc_keywords_reload(request: web.Request) -> web.Response:
+        """§3.2 — إعادة بناء حية لسجل الكلمات: قراءة dashboard:keywords_json
+        → كتابة ملف المخصصة → reload_keywords → إعادة بناء FastGate."""
+        g = await _svc_guard(request)
+        if g:
+            return g
+
+        async def _do():
+            val = await DashboardAPI(bot)._custom_keywords_row()
+            if not val:
+                return {"ok": False, "error": "no_custom_keywords",
+                        "note": "لا يوجد سجل كلمات مخصص في app_settings"}
+            data = jsonlib.loads(val)
+            if not isinstance(data, dict):
+                return {"ok": False, "error": "invalid_keywords_json"}
+            KW_FILE.write_text(jsonlib.dumps(data, ensure_ascii=False), encoding="utf-8")
+            flt = getattr(bot, "filter", None)
+            reloaded = False
+            reload = getattr(flt, "reload_keywords", None) if flt is not None else None
+            if reload is not None:
+                ret = reload(str(KW_FILE))
+                if asyncio.iscoroutine(ret):
+                    ret = await ret
+                reloaded = True
+            try:
+                from fast_gate import get_fast_gate as _fgg
+                _fg = _fgg()
+                if _fg is not None:
+                    _fg.schedule_rebuild()
+            except Exception:
+                pass
+            gate_stats = None
+            try:
+                from fast_gate import get_fast_gate as _fgg2
+                _fg2 = _fgg2()
+                if _fg2 is not None:
+                    gate_stats = {"patterns": _fg2.stats()[0], "engine": _fg2.stats()[1]}
+            except Exception:
+                pass
+            return {"ok": True, "reloaded": reloaded, "groups": len(data),
+                    "fast_gate": gate_stats}
+
+        try:
+            result = await _bridge_call_long(_do, timeout=30.0)
+        except _BridgeError as e:
+            return _json(e.payload, e.status)
+        _audit_bg("service.keywords_hot_reload",
+                  new_value="ok" if result.get("ok") else str(result.get("error") or ""))
+        return _json(result)
+
+    async def svc_sources_check(request: web.Request) -> web.Response:
+        """§3.4 — فحص وصول حقيقي لمصدر عبر عميل تيليجرام الحي:
+        الوصول للكيان + حالة العضوية + صلاحية الإرسال."""
+        g = await _svc_guard(request)
+        if g:
+            return g
+        body = await _svc_body(request)
+        if body is None:
+            return _json({"ok": False, "error": "invalid_body"}, 400)
+        chat_id_raw = str(body.get("chat_id") or "").strip()
+        username = str(body.get("username") or "").strip().lstrip("@")
+        if not chat_id_raw and not username:
+            return _json({"ok": False, "error": "missing_target"}, 400)
+
+        data: dict = {}
+        if chat_id_raw:
+            try:
+                data["chat_id"] = int(chat_id_raw)
+            except ValueError:
+                # قيمة غير رقمية في حقل الرقم تُعامل كاسم مستخدم (صادق لا صامت)
+                data["username"] = chat_id_raw.lstrip("@")
+        if username:
+            data["username"] = username
+
+        async def _do():
+            from monitors import resolve_chat_entity as _rce
+            client = getattr(bot, "main_client", None)
+            if client is None:
+                for mon in getattr(bot, "monitors", []) or []:
+                    if getattr(mon, "is_connected", False) and getattr(mon, "client", None):
+                        client = mon.client
+                        break
+            if client is None:
+                return {"ok": False, "error": "no_live_client",
+                        "note": "لا يوجد عميل تيليجرام متصل حالياً"}
+            try:
+                entity = await asyncio.wait_for(_rce(client, data), timeout=25.0)
+            except asyncio.TimeoutError:
+                return {"ok": False, "error": "resolve_timeout"}
+            except Exception as e:  # noqa: BLE001
+                return {"ok": False, "error": "resolve_failed",
+                        "error_message": f"{type(e).__name__}: {str(e)[:150]}"}
+            if entity is None:
+                return {"ok": True, "reachable": False, "member_status": "unknown",
+                        "note": "تعذر الوصول للكيان من الحساب المراقب الحي"}
+            ent_info = {
+                "id": getattr(entity, "id", None),
+                "title": getattr(entity, "title", None) or getattr(entity, "first_name", None) or "",
+                "username": ("@" + entity.username) if getattr(entity, "username", None) else "",
+                "type": type(entity).__name__,
+            }
+            member_status = "unknown"
+            can_send = None
+            err = None
+            try:
+                perms = await asyncio.wait_for(client.get_permissions(entity, "me"), timeout=15.0)
+                member_status = "member" if getattr(perms, "is_member", False) else "restricted"
+                rights = getattr(perms, "rights", None)
+                if rights is not None:
+                    can_send = not bool(getattr(rights, "send_messages", False))
+            except Exception as e:  # noqa: BLE001
+                name = type(e).__name__
+                if "UserNotParticipant" in name:
+                    member_status = "not_member"
+                else:
+                    err = f"{name}: {str(e)[:150]}"
+            return {"ok": True, "reachable": True, "entity": ent_info,
+                    "member_status": member_status, "can_send": can_send, "error": err}
+
+        try:
+            result = await _bridge_call_long(_do, timeout=45.0)
+        except _BridgeError as e:
+            return _json(e.payload, e.status)
+        if result.get("ok") and result.get("reachable"):
+            _audit_bg("service.source_check",
+                      object_id=str((result.get("entity") or {}).get("id") or username or chat_id_raw)[:64],
+                      new_value=str(result.get("member_status") or ""))
+        return _json(result)
+
+    async def svc_engine_analyze(request: web.Request) -> web.Response:
+        """§3.5 — مقعد اختبار التحليل: تحليل حقيقي عبر الفلتر الحي + المصنّف
+        + البوابة السريعة. قراءة-حسابية بحتة بلا أي أثر جانبي."""
+        g = await _svc_guard(request)
+        if g:
+            return g
+        body = await _svc_body(request)
+        if body is None:
+            return _json({"ok": False, "error": "invalid_body"}, 400)
+        text = str(body.get("text") or "")
+        if not text.strip():
+            return _json({"ok": False, "error": "empty_text"}, 400)
+        text = text[:2000]
+
+        async def _do():
+            t0 = time.perf_counter()
+            flt = getattr(bot, "filter", None)
+            if flt is None or not hasattr(flt, "analyze"):
+                return {"ok": False, "error": "filter_unavailable"}
+            verdict = await asyncio.wait_for(flt.analyze(text), timeout=8.0)
+            cls: dict = {"classified": False}
+            try:
+                from classifier import classify_text as _ct
+                cls = _ct(text)
+            except Exception:
+                pass
+            gate = None
+            try:
+                from fast_gate import get_fast_gate as _fgg
+                _fg = _fgg()
+                if _fg is not None:
+                    gate = {"any_hit": bool(_fg.any_hit(text)),
+                            "patterns": _fg.stats()[0], "engine": _fg.stats()[1]}
+            except Exception:
+                pass
+            latency_ms = round((time.perf_counter() - t0) * 1000, 1)
+            v = dict(verdict) if isinstance(verdict, dict) else {}
+            return {
+                "ok": True,
+                "verdict": {
+                    "decision": v.get("decision"),
+                    "valid": v.get("valid"),
+                    "confidence": v.get("confidence"),
+                    "score": v.get("score"),
+                    "reasons": v.get("reasons"),
+                    "keyword": v.get("keyword"),
+                    "indirect": v.get("indirect"),
+                    "urgent": v.get("urgent"),
+                    "negation_detected": v.get("negation_detected"),
+                    "context_type": v.get("context_type"),
+                    "intent_verb": v.get("intent_verb"),
+                    "academic_object": v.get("academic_object"),
+                    "urgency_marker": v.get("urgency_marker"),
+                    "analysis_time_ms": v.get("analysis_time_ms"),
+                },
+                "classification": cls,
+                "fast_gate": gate,
+                "latency_ms": latency_ms,
+            }
+
+        try:
+            result = await _bridge_call_long(_do, timeout=15.0)
+        except _BridgeError as e:
+            return _json(e.payload, e.status)
+        return _json(result)
+
+    async def svc_db_grant_read(request: web.Request) -> web.Response:
+        """v17.2.0 — منح قراءة للوحة على جداول محددة بقائمة بيضاء صارمة.
+        لا SQL حر إطلاقاً: `GRANT SELECT ON TABLE public.<t> TO service_role`
+        على أسماء جداول من ALLOWED فقط + تحقق حي. idempotent (GRANT متكرر آمن)."""
+        g = await _svc_guard(request)
+        if g:
+            return g
+        body = await _svc_body(request)
+        if body is None:
+            return _json({"ok": False, "error": "invalid_body"}, 400)
+        ALLOWED = ("sender_stats", "blocked_chats", "notifications")
+        tables = body.get("tables") if isinstance(body.get("tables"), list) else [body.get("table")]
+        tables = [str(t).strip() for t in tables if t]
+        if not tables or any(t not in ALLOWED for t in tables):
+            return _json({"ok": False, "error": "table_not_allowed",
+                          "allowed": list(ALLOWED)}, 400)
+
+        async def _do():
+            out = []
+            for t in tables:
+                try:
+                    await bot.db._execute(f'GRANT SELECT ON TABLE public."{t}" TO service_role')
+                    await bot.db._commit()
+                    out.append({"table": t, "granted": True})
+                except Exception as e:  # noqa: BLE001
+                    out.append({"table": t, "granted": False,
+                                "error": f"{type(e).__name__}: {str(e)[:150]}"})
+            return {"ok": True, "results": out}
+
+        try:
+            result = await _bridge_call(_do)
+        except _BridgeError as e:
+            return _json(e.payload, e.status)
+        _audit_bg("service.db_grant_read", new_value=",".join(tables)[:120])
+        return _json(result)
+
     async def api_account_row_toggle(request: web.Request) -> web.Response:
         body = await body_json(request)
         try:
@@ -1058,6 +1335,13 @@ def setup_dashboard(app: web.Application, bot: Any) -> None:
     r.add_post("/service/accounts/row/delete", svc_row_delete)
     r.add_post("/service/accounts/row/toggle", svc_row_toggle)
     r.add_post("/service/accounts/row/stop", svc_row_stop)
+
+    # v17.2.0: تنفيذ فوري على العملية الحارة + فحص مصادر + مقعد اختبار (§3.1/§3.2/§3.4/§3.5)
+    r.add_post("/service/bot/ops", svc_bot_ops)
+    r.add_post("/service/keywords/reload", svc_keywords_reload)
+    r.add_post("/service/sources/check", svc_sources_check)
+    r.add_post("/service/engine/analyze", svc_engine_analyze)
+    r.add_post("/service/db/grant_read", svc_db_grant_read)
 
     r.add_get("/admin/api/keywords", api_keywords)
     r.add_post("/admin/api/keywords/save", api_keywords_save)

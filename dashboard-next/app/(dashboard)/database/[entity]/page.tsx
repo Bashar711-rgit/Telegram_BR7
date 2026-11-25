@@ -89,6 +89,9 @@ const CONFIG: Record<string, { label: string; pk: string; create?: FieldDef[]; e
 
 const PAGE_SIZE = 25;
 
+// v17.2.0: جداول يستوي منحها قراءة اللوحة من الزر مباشرة (بلا SQL يدوي على Supabase)
+const GRANTABLE = ['sender_stats', 'blocked_chats', 'notifications'];
+
 export default function EntityPage() {
   const params = useParams<{ entity: string }>();
   const entity = String(params.entity || '');
@@ -109,6 +112,7 @@ export default function EntityPage() {
   const [editForm, setEditForm] = React.useState<Record<string, string>>({});
   const [deleteRow, setDeleteRow] = React.useState<Row | null>(null);
   const [busy, setBusy] = React.useState(false);
+  const [grantBusy, setGrantBusy] = React.useState(false);
 
   const canWrite = ['admin', 'super_admin'].includes(role);
 
@@ -191,6 +195,25 @@ export default function EntityPage() {
     }
   };
 
+  // v17.2.0: منح قراءة حي عبر قاعدة المحرك (GRANT SELECT بقائمة بيضاء)
+  const doGrant = async () => {
+    setGrantBusy(true);
+    const r = await api<{ results: Array<{ table: string; granted: boolean; error?: string }>; allGranted: boolean }>('/api/db/grant-read', {
+      method: 'POST',
+      body: JSON.stringify({ tables: [entity] }),
+    });
+    setGrantBusy(false);
+    if (r.ok && (r as { data: { allGranted: boolean } }).data.allGranted) {
+      setNotice('نُفّذ GRANT SELECT فعلياً — جارٍ إعادة القراءة…');
+      load();
+    } else {
+      const detail = r.ok
+        ? ((r as { data: { results: Array<{ error?: string }> } }).data.results.map((x) => x.error).filter(Boolean).join(' · ') || 'فشل بلا تفصيل')
+        : r.error;
+      setNotice(`فشل المنح بصدق: ${detail}`);
+    }
+  };
+
   const cols = rows.length > 0 ? Object.keys(rows[0]).slice(0, 8) : [];
 
   return (
@@ -202,6 +225,9 @@ export default function EntityPage() {
             {cfg.note && <span className="text-xs text-panel-muted">{cfg.note}</span>}
             <Input placeholder="filter col:value" value={filter} onChange={(e) => setFilter(e.target.value)} className="!w-44" onKeyDown={(e) => { if (e.key === 'Enter') { setPage(0); load(); } }} />
             {cfg.create && canWrite && <Btn onClick={() => setCreateOpen(true)}>+ إضافة</Btn>}
+            {GRANTABLE.includes(entity) && role === 'super_admin' && (
+              <Btn variant="ghost" disabled={grantBusy} onClick={doGrant}>{grantBusy ? 'جارٍ المنح…' : 'منح قراءة (GRANT حي)'}</Btn>
+            )}
             <Btn variant="ghost" onClick={load}>تحديث</Btn>
           </div>
         }

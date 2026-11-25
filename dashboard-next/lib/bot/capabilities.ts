@@ -16,13 +16,13 @@ export const CAPABILITIES: Capability[] = [
   // Engine control
   { id: 'engine.status', area: 'control', title: 'حالة المحرك الحية (Running/Degraded/Stopped/Starting/Error)', mode: 'live', mechanism: '/health + /health/full + Render service — اشتقاق لحظي' },
   { id: 'engine.restart', area: 'control', title: 'إعادة تشغيل المحرك', mode: 'live', mechanism: 'Render restart endpoint' },
-  { id: 'engine.pause_filtering', area: 'control', title: 'إيقاف المعالجة (مثابر)', mode: 'live_persistent', mechanism: 'dashboard:ops.filtering_paused', depends: 'التطبيق الفوري: منفذ أوامر Render (§3.1)' },
-  { id: 'engine.resume_filtering', area: 'control', title: 'استئناف المعالجة (مثابر)', mode: 'live_persistent', mechanism: 'dashboard:ops.filtering_paused=false', depends: '§3.1' },
-  { id: 'engine.emergency_stop_send', area: 'control', title: 'إيقاف الإرسال طوارئ (مثابر)', mode: 'live_persistent', mechanism: 'dashboard:ops.alerts_paused=true', depends: '§3.1' },
-  { id: 'engine.resume_send', area: 'control', title: 'استئناف الإرسال (مثابر)', mode: 'live_persistent', mechanism: 'dashboard:ops.alerts_paused=false', depends: '§3.1' },
-  { id: 'engine.start_stop', area: 'control', title: 'Start / Stop فوري للمحرك', mode: 'contract', depends: 'منفذ أوامر Render (§3.1) — لا إيقاف خدمة Render كلياً' },
-  { id: 'engine.maintenance', area: 'control', title: 'وضع الصيانة الفوري', mode: 'contract', depends: '§3.1 (النسخة المثابرة متاحة عبر pause)' },
-  { id: 'engine.reload_config', area: 'control', title: 'إعادة تحميل الإعدادات على العملية الحارة', mode: 'contract', depends: '§3.2' },
+  { id: 'engine.pause_filtering', area: 'control', title: 'إيقاف المعالجة (فوري + مثابر)', mode: 'live', mechanism: 'dashboard:ops + تطبيق فوري على العملية الحارة عبر /service/bot/ops (§3.1 حي v17.2.0)' },
+  { id: 'engine.resume_filtering', area: 'control', title: 'استئناف المعالجة (فوري + مثابر)', mode: 'live', mechanism: 'dashboard:ops=false + تطبيق فوري (§3.1 حي)' },
+  { id: 'engine.emergency_stop_send', area: 'control', title: 'إيقاف الإرسال طوارئ (فوري + مثابر)', mode: 'live', mechanism: 'dashboard:ops.alerts_paused + تطبيق فوري (§3.1 حي)' },
+  { id: 'engine.resume_send', area: 'control', title: 'استئناف الإرسال (فوري + مثابر)', mode: 'live', mechanism: 'dashboard:ops.alerts_paused=false + تطبيق فوري (§3.1 حي)' },
+  { id: 'engine.start_stop', area: 'control', title: 'Start / Stop فوري للمحرك', mode: 'contract', depends: 'منفذ أوامر Render (§3.1 المتبقي) — لا إيقاف خدمة Render كلياً؛ البديل الحي: إيقاف المعالجة/الإرسال أعلاه' },
+  { id: 'engine.maintenance', area: 'control', title: 'وضع الصيانة الفوري', mode: 'live', mechanism: 'maintenance_on/off = إيقاف فوري + مثابر للمعالجة (§3.1 حي v17.2.0)' },
+  { id: 'engine.reload_config', area: 'control', title: 'إعادة تحميل سجل الكلمات على العملية الحارة', mode: 'live', mechanism: 'POST /service/keywords/reload → reload_keywords + FastGate rebuild (§3.2 حي v17.2.0)' },
 
   // Accounts
   { id: 'accounts.read', area: 'accounts', title: 'قراءة الحسابات وتفاصيلها الكاملة', mode: 'live', mechanism: 'panel_accounts (منح قائم)' },
@@ -48,21 +48,21 @@ export const CAPABILITIES: Capability[] = [
 
   // Sources
   { id: 'sources.crud', area: 'sources', title: 'إضافة/تعديل/حذف/تفعيل المصادر + متعددة + CSV', mode: 'live', mechanism: '/api/db/sources (منح قائم)' },
-  { id: 'sources.check', area: 'sources', title: 'فحص وصول المصدر/إعادة اتصال', mode: 'contract', depends: '§3.4' },
+  { id: 'sources.check', area: 'sources', title: 'فحص وصول المصدر (حي عبر عميل تيليجرام)', mode: 'live', mechanism: 'POST /service/sources/check — وصول الكيان + حالة العضوية + صلاحية الإرسال (§3.4 حي v17.2.0)' },
 
   // Keywords
   { id: 'keywords.read', area: 'keywords', title: 'قراءة سجل الكلمات الكامل (20 مجموعة)', mode: 'live', mechanism: 'dashboard:keywords_json' },
-  { id: 'keywords.write', area: 'keywords', title: 'إضافة/حذف كلمات + كشف التكرار (حقيقي ومثابر)', mode: 'live_persistent', mechanism: 'كتابة السجل + audit', depends: 'البناء الحار على المحرك: §3.2 (يُطبق عند الإقلاع/إعادة التحميل)' },
+  { id: 'keywords.write', area: 'keywords', title: 'إضافة/حذف كلمات + بناء حار فوري + كشف التكرار', mode: 'live', mechanism: 'كتابة السجل ثم POST /service/keywords/reload (§3.2 حي v17.2.0) — المحرك نائم: deferred بصدق' },
   { id: 'keywords.categories', area: 'keywords', title: 'تصنيفات جديدة غير المحركية', mode: 'live', mechanism: 'مجموعات custom:* داخل السجل' },
 
   // Engine analysis
-  { id: 'engine.test_bench', area: 'analysis', title: 'مقعد اختبار التحليل برسالة حقيقية', mode: 'contract', depends: '§3.5' },
-  { id: 'engine.profiles', area: 'analysis', title: 'حفظ/مقارنة/استعادة ملفات الإعدادات', mode: 'live', mechanism: 'app_settings KV (فهي الحفظ) — التطبيق على المحرك: §3.2' },
-  { id: 'engine.weights_write', area: 'analysis', title: 'تعديل الأوزان الحارة على المحرك', mode: 'contract', depends: '§3.2 + مخطط filter_weights' },
+  { id: 'engine.test_bench', area: 'analysis', title: 'مقعد اختبار التحليل برسالة حقيقية (فلتر + مصنّف + بوابة سريعة)', mode: 'live', mechanism: 'POST /service/engine/analyze على العملية الحارة (§3.5 حي v17.2.0)' },
+  { id: 'engine.profiles', area: 'analysis', title: 'حفظ/مقارنة/استعادة ملفات الإعدادات', mode: 'live', mechanism: 'app_settings KV (فهي الحفظ) — التطبيق الفوري للكلمات عبر §3.2 حي' },
+  { id: 'engine.weights_write', area: 'analysis', title: 'تعديل الأوزان الحارة على المحرك', mode: 'contract', depends: '§3.2 المتبقي + مخطط filter_weights — الأوزان نفسها تعمل عبر reload الكلمات' },
 
   // Rules
   { id: 'rules.crud', area: 'rules', title: 'CRUD القواعد + أولوية + تفعيل', mode: 'live', mechanism: '/api/db/rules (منح قائم)' },
-  { id: 'rules.test', area: 'rules', title: 'اختبار القاعدة على رسالة حقيقية', mode: 'contract', depends: '§3.5' },
+  { id: 'rules.test', area: 'rules', title: 'اختبار القاعدة على رسالة حقيقية', mode: 'live', mechanism: 'نفس مقعد الاختبار الحي (§3.5) — قارن قرار الفلتر مع شرط القاعدة يدوياً من /bot/quality' },
 
   // Alerts
   { id: 'alerts.read_stats', area: 'alerts', title: 'قراءة التنبيهات + معدل نجاح الإشعارات + الأخطاء', mode: 'live', mechanism: 'alerts (منح قراءة)' },
@@ -90,8 +90,8 @@ export const CAPABILITIES: Capability[] = [
   { id: 'settings.kv', area: 'settings', title: 'قراءة/تعديل إعدادات KV (أسرار مموّهة لغير المدراء)', mode: 'live', mechanism: 'app_settings (منح قائم)' },
 
   // Commands
-  { id: 'commands.ledger', area: 'commands', title: 'سجل أوامر بدورة حياة + Idempotency + تدقيق دائم', mode: 'live', mechanism: 'ledger داخلي + audit_logs (الأمري restart/ops تنفذ فعلاً)' },
-  { id: 'commands.executor', area: 'commands', title: 'تنفيذ فوري شامل (start/stop/reload/DLQ...)', mode: 'contract', depends: '§3.1' },
+  { id: 'commands.ledger', area: 'commands', title: 'سجل أوامر بدورة حياة + Idempotency + تدقيق دائم', mode: 'live', mechanism: 'ledger داخلي + audit_logs (الأوامر التنفيذية تنفذ فعلاً فورياً)' },
+  { id: 'commands.executor', area: 'commands', title: 'تنفيذ فوري شامل (pause/resume/maintenance/emergency/restart)', mode: 'live', mechanism: 'بوابة الخدمة /service/bot/ops (§3.1 حي v17.2.0) + Render restart — المتبقي start/stop كلي للخدمة عقد مقصود' },
 
   // Auth
   { id: 'auth.owner_account', area: 'auth', title: 'حساب المالك balghanme@gmail.com (super_admin)', mode: 'live', mechanism: 'Supabase Auth + dashboard_users (أمر المالك)' },

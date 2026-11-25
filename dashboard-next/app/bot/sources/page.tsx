@@ -19,6 +19,15 @@ type Source = {
   created_at: string;
 };
 
+type CheckResult = {
+  reachable?: boolean;
+  entity?: { id?: number; title?: string; username?: string; type?: string } | null;
+  memberStatus?: string | null;
+  canSend?: boolean | null;
+  detail?: string | null;
+  note?: string;
+};
+
 function parseCsvLine(line: string): string[] {
   const out: string[] = [];
   let cur = '';
@@ -55,6 +64,9 @@ export default function BotSources() {
   const [okMsg, setOkMsg] = React.useState<string | null>(null);
   const [errMsg, setErrMsg] = React.useState<string | null>(null);
   const [busy, setBusy] = React.useState(false);
+  const [checkTarget, setCheckTarget] = React.useState<Source | null>(null);
+  const [checkResult, setCheckResult] = React.useState<CheckResult | null>(null);
+  const [checking, setChecking] = React.useState(false);
 
   const [form, setForm] = React.useState({ chat_id: '', username: '', title: '', type: 'group', notes: '', chat_type: '' });
   const [bulkText, setBulkText] = React.useState('');
@@ -149,6 +161,22 @@ export default function BotSources() {
     if (j.ok) { setOkMsg(`حُذف المصدر #${confirmDel.id} فعلياً`); setConfirmDel(null); reload(); } else setErrMsg(`فشل الحذف: ${j.error}`);
   };
 
+  // v17.2.0 §3.4: فحص وصول حي عبر عميل تيليجرام على المحرك
+  const runCheck = async (s: Source) => {
+    setCheckTarget(s);
+    setCheckResult(null);
+    setChecking(true);
+    const r = await fetch('/api/bot/sources/check', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(s.chat_id ? { chat_id: String(s.chat_id) } : { username: s.username || '' }),
+    });
+    const j = (await r.json()) as { ok: boolean; error?: string; data?: CheckResult };
+    setChecking(false);
+    if (j.ok && j.data) setCheckResult(j.data);
+    else setCheckResult({ reachable: false, detail: `فشل الفحص بصدق: ${j.error || r.status}` });
+  };
+
   const exportCsv = () => {
     const rows = filtered;
     const csv = ['chat_id,type,username,title,notes,enabled', ...rows.map((r) => `${r.chat_id},${r.type},${r.username || ''},"${(r.title || '').replace(/"/g, '""')}",${r.notes || ''},${r.enabled}`)].join('\n');
@@ -221,6 +249,7 @@ export default function BotSources() {
                     <td className="p-2">
                       <Gate role={me?.role} min="operator">
                         <div className="flex gap-1">
+                          <Btn variant="ghost" onClick={() => runCheck(s)} disabled={checking}>فحص وصول</Btn>
                           <Btn variant="ghost" onClick={() => toggle(s)} disabled={busy}>{s.enabled === 1 ? 'إيقاف' : 'تفعيل'}</Btn>
                           <Btn variant="ghost" onClick={() => { setEditing(s); setForm({ chat_id: String(s.chat_id), username: s.username || '', title: s.title || '', type: s.type, notes: s.notes || '', chat_type: s.chat_type || '' }); }}>تعديل</Btn>
                           <Btn variant="danger" onClick={() => setConfirmDel(s)}>حذف</Btn>
@@ -238,10 +267,34 @@ export default function BotSources() {
       <Card title="القدرات">
         <div className="flex flex-wrap gap-2 text-xs">
           <ModeBadge mode="live" /> إضافة/تعديل/حذف/تفعيل/متعددة/استيراد وتصدير CSV — كلها تنفذ فعلاً
-          <ModeBadge mode="contract" /> فحص وصول/إعادة اتصال — عقد §3.4 (نقطة المحرك)
+          <ModeBadge mode="live" /> فحص وصول حي عبر عميل تيليجرام على المحرك (§3.4 حي v17.2.0)
         </div>
-        <div className="mt-2 text-[11px] text-panel-muted">تنسيق الاستيراد: chat_id,type,username,title,notes — أو رابط t.me أو @username في العمود الأول (النوع يبقى editable لاحقاً)</div>
+        <div className="mt-2 text-[11px] text-panel-muted">تنسيق الاستيراد: chat_id,type,username,title,notes — أو رابط t.me أو @username في العمود الأول (النوع يبقى editable لاحقاً) · «فحص وصول» يجيب حقيقةً: هل الكيان قابل للوصول؟ هل الحساب المراقب عضو؟ هل يملك صلاحية الإرسال؟</div>
       </Card>
+
+      <Modal open={checkTarget !== null} title={`فحص وصول حي: ${checkTarget?.username || checkTarget?.chat_id || ''}`} onClose={() => { setCheckTarget(null); setCheckResult(null); }}>
+        {checking ? (
+          <div className="text-sm text-panel-muted">جارٍ الفحص الحي عبر عميل تيليجرام على المحرك… (حتى 45 ثانية)</div>
+        ) : checkResult ? (
+          <div className="space-y-2 text-sm">
+            <div>الوصول: {checkResult.reachable ? <Badge tone="ok">قابل للوصول</Badge> : <Badge tone="bad">غير قابل للوصول</Badge>}</div>
+            {checkResult.entity && (
+              <div className="rounded-lg border border-panel-border bg-panel-bg p-3 text-xs" dir="ltr">
+                <div>id: {checkResult.entity.id ?? '—'} · type: {checkResult.entity.type ?? '—'}</div>
+                <div>title: {checkResult.entity.title || '—'} · username: {checkResult.entity.username || '—'}</div>
+              </div>
+            )}
+            <div>
+              العضوية: <b>{checkResult.memberStatus || '—'}</b>
+              {checkResult.memberStatus === 'member' && ' (الحساب المراقب عضو فعلاً)'}
+              {checkResult.memberStatus === 'not_member' && ' (الحساب المراقب ليس عضواً — لن يلتقط الرسائل!)'}
+            </div>
+            <div>صلاحية الإرسال: {checkResult.canSend === null || checkResult.canSend === undefined ? '—' : checkResult.canSend ? 'متاحة ✓' : 'محجوبة ✗'}</div>
+            {checkResult.detail && <div className="text-xs text-panel-muted">تفصيل: {checkResult.detail}</div>}
+            <div className="text-[11px] text-panel-muted">نتيجة حقيقية من تيليجرام عبر المحرك — لا افتراضات.</div>
+          </div>
+        ) : null}
+      </Modal>
 
       <Modal open={adding} title="إضافة مصدر" onClose={() => setAdding(false)}>
         <div className="space-y-2">
