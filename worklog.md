@@ -1037,3 +1037,25 @@ Stage Summary:
 - الصفحات حية بالجلسة: /bot (200، «مركز التحكم/حالة المحرك») · /bot/control (200) · /bot/sources (200) · /bot/engine (200) · /account (200)
 - المسارات الحية: /api/bot/status → {state:running, derivedFrom:health_ok+db_ok+main_client_up, uptime 84s, monitors 2/2, queue 12, floodWait 0, render not_suspended} · /api/bot/capabilities → ok مع تصنيف live/live_persistent/contract كاملاً
 - الأمن سليم بعد الدمج: /api/bot/status بلا جلسة = 401 · ترويسات CSP/HSTS/XFO/nosniff كما هي · Render: {status:ok, db_healthy:true} لم يُمس
+
+## v16.6.0-accounts-live — تفعيل إضافة الحسابات الحقيقية والعمل الدائم (2026-11-25، بأمر المالك)
+
+### الواقع المكتشف (PHASE 0)
+- المحرك يملك أصلاً التدفق الحقيقي كاملاً: dashboard/link_flow.py (AccountLinkManager: هاتف→OTP→2FA→get_me→جلسة StringSession مشفرة Fernet→panel_accounts→spawn فوري بلا إعادة تشغيل) + معالجات /admin/api/accounts/add/* خلف جلسة كوكيز+CSRF
+- الفجوات الثلاث التي منعت «العمل الدائم»: (1) SECRET_KEY_OVERRIDE غير مضبوط — مفتاح Fernet يُولَّد على قرص Render المؤقت ويتغير كل نشر، والدليل الحي: الصف id=5 (+966578568011) status=needs_relogin بخطأ «تعذر فك تشفير الجلسة» (2) معالج الإضافة في اللوحة الجديدة modal ثابت بلا أسلاك (3) لا بوابة خدمة Vercel→المحرك
+
+### تنفيذ المحرك (commit e6136a7 — إضافي حصراً، صفر لمس حلقة الترشيح)
+- بوابة /service/* خارج وسيط /admin داخل _setup_dashboard: 7 مسارات (link_start/link_code/link_password/link_cancel/link_status + row/delete + row/toggle) تعيد استخدام link_manager والجسر الحقيقي — حماية: x-br7-command-secret مقارنة زمن-ثابت + فشل-مغلق 503 بلا ENGINE_COMMAND_SECRET + حد إخفاقات 15/د/IP + تدقيق service.*
+
+### تنفيذ اللوحة (commit 2c566e9)
+- lib/bot/accounts-flow.ts (عميل بوابة الخدمة، فشل-مغلق بلا سر) + /api/bot/accounts/link (POST start|code|password|cancel + GET status: جلسة HMAC+RBAC admin+CSRF+Zod strict+rate 12/د+audit بلا OTP/كلمة مرور/جلسة) + /api/bot/accounts/row (toggle فوري admin، delete super_admin) + معالج 4 خطوات حي في /bot/accounts مع استقصاء status عند مهلة الوسيط أثناء تفعيل المراقبة + زر حذف بتأكيد + حفظ المراقبة عبر toggle الحار بدل PATCH الصامت
+
+### الاعتمادات (العمل الدائم)
+- توليد مفتاح Fernet (44 حرفاً urlsafe-b64) + ENGINE_COMMAND_SECRET (72 hex) محلياً — محفوظان /tmp/new_engine_secrets.env chmod 600، لا دخولا للمستودع
+- Render: PUT env-vars كامل القائمة (22 = 20 الأصلية + 2 جديد) — تنبيه: GET الافتراضي مقسم صفحات (limit=20) أي اختلاف عدّ هو أثر تقسيم وليس فقداناً (تحقق بـlimit=100)
+- ملاحظة تشغيلية: PUT env-vars على Render لا يشغّل نشراً تلقائياً — نشر يدوي POST /deploys مطلوب (73cpb9f0)
+- Vercel: ENGINE_COMMAND_SECRET مضبوط production+preview (يدخل مع النشر التالي)
+
+### الدمج الحي المتبقي
+- Render 73cpb9f0 (build) → تحقق بوابة: 403 بلا سر / 403 بسر خاطئ / 404 op_not_found بسر صحيح
+- دفع worklog يشغّل نشر Vercel بالمتغير → تحقق السلسلة الكاملة عبر API اللوحة (phone_duplicate يثبت Vercel→بوابة→DB بلا SMS)
