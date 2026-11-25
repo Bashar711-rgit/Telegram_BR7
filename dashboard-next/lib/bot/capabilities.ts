@@ -45,6 +45,7 @@ export const CAPABILITIES: Capability[] = [
   { id: 'sync.reconcile', area: 'sync', title: 'تسوية DB↔المحرك: فجوات المراقبين والأيتام وانحراف المرآة + إصلاح أيتام idempotent', mode: 'live', mechanism: 'POST /api/bot/reconcile — monitor_detail v17.1.0 (row_id/phone) + /service/accounts/row/stop' },
   { id: 'sync.sse', area: 'sync', title: 'بث حي لحالة المحرك (SSE كل 10 ثوانٍ + إعادة اتصال تلقائية)', mode: 'live', mechanism: 'GET /api/bot/stream — اشتقاق لحظي getBotStatus — صفحة التحكم تعرضه حياً' },
   { id: 'sync.preview_guard', area: 'sync', title: 'فصل البيئات: نشرات المعاينة للقراءة فقط افتراضياً (حارس VERCEL_ENV + شارة مرئية)', mode: 'live', mechanism: 'withApi يرفض أي mutation في preview إلا بـ PREVIEW_ALLOW_MUTATIONS=1 على بيئة المعاينة' },
+  { id: 'sync.db_transparency', area: 'sync', title: 'شفافية تخزين المحرك: كشف حي إن كانت قاعدته دائمة (PostgreSQL) أو مؤقتة (SQLite تُمسح عند النشر) + منح قراءة GRANT بقائمة بيضاء', mode: 'live', mechanism: '/service/db/info + /service/db/grant_read + لافتة تحذير حقيقية في /bot/engine' },
 
   // Sources
   { id: 'sources.crud', area: 'sources', title: 'إضافة/تعديل/حذف/تفعيل المصادر + متعددة + CSV', mode: 'live', mechanism: '/api/db/sources (منح قائم)' },

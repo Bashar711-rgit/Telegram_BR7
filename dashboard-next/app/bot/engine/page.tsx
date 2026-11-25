@@ -38,6 +38,8 @@ export default function BotEngine() {
   const [testResult, setTestResult] = React.useState<string | null>(null);
   const [okMsg, setOkMsg] = React.useState<string | null>(null);
   const [errMsg, setErrMsg] = React.useState<string | null>(null);
+  // v17.2.0: شفافية تخزين المحرك (دائمة أم مؤقتة) — بصدق كامل
+  const dbInfo = useApi<{ reachable: boolean; dbType: string | null; permanent: boolean | null; note: string | null }>('/api/bot/db-info', 120000);
   const [busy, setBusy] = React.useState(false);
   const [confirmDel, setConfirmDel] = React.useState<string | null>(null);
 
@@ -69,25 +71,29 @@ export default function BotEngine() {
     if (j.ok) { setOkMsg(`حُذف «${confirmDel}» فعلياً`); setConfirmDel(null); reload(); } else setErrMsg(`فشل: ${j.error}`);
   };
 
-  const runTest = () => {
-    // Honest: no engine endpoint in this phase — show the exact contract instead of a fake result.
-    setTestResult(
-      JSON.stringify(
-        {
-          contract: '§3.5 POST /admin/api/engine/analyze',
-          request: { text: testText },
-          expectedResponse: { normalized: '…', detected_keywords: [], intent: '…', scores: { intent: 0, keyword: 0, context: 0, request: 0, negative: 0, spam: 0, final: 0 }, duplicate: { is_dup: false }, decision: 'accept|reject|review', reasons: [] },
-          status: 'ينتظر منفذ المحرك على Render — لا تُقدم أي نتيجة محاكاة',
-        },
-        null,
-        1,
-      ),
-    );
+  const runTest = async () => {
+    // v17.2.0 §3.5 حي: تحليل حقيقي عبر المحرك — بلا محاكاة ولا عقد معلق
+    if (!testText.trim()) return;
+    setTestResult('جارٍ التحليل على المحرك الحي…');
+    const r = await fetch('/api/bot/analyze', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: testText.slice(0, 2000) }),
+    });
+    const j = (await r.json()) as { ok: boolean; error?: string; data?: unknown };
+    if (j.ok && j.data) setTestResult(JSON.stringify(j.data, null, 1));
+    else setTestResult(`فشل بصدق: ${j.error || r.status}`);
   };
 
   return (
     <div className="space-y-4">
       <h1 className="text-lg font-black">محرك التحليل والتصفية</h1>
+      {dbInfo.data?.permanent === false && (
+        <div className="rounded-lg border border-panel-warn/40 bg-panel-warn/10 p-3 text-sm">
+          <b>تنبيه تخزين حقيقي:</b> المحرك يعمل على قاعدة مؤقتة (SQLite على قرص Render) — البيانات المحلية للحسابات المربوطة والسجلات تُمسح عند كل نشر. الاتصال الدائم يتطلب متغير DATABASE_URL — أضفه من صفحة Render في اللوحة (حفظ مزدوج + نشر تلقائي) ليعود الربط بـ Supabase.
+          {dbInfo.data.note ? <div className="mt-1 text-xs text-panel-muted">تفصيل المحرك: {dbInfo.data.note}</div> : null}
+        </div>
+      )}
       {error && <div className="text-sm text-panel-bad">خطأ: {error}</div>}
       <OkText>{okMsg}</OkText>
       <ErrorText>{errMsg}</ErrorText>
@@ -150,21 +156,21 @@ export default function BotEngine() {
           <ContractNote>الحفظ والمقارنة والاستعادة حقيقية (KV مثابر) — تفعيل الملف على العملية الحارة يتطلب منفذ Render (عقد §3.2) — يظهر بصدق ولا يُرجع نجاح تطبيق.</ContractNote>
         </Card>
 
-        <Card title="مقعد اختبار التحليل">
+        <Card title="مقعد اختبار التحليل (حي v17.2.0)">
           <textarea
             rows={4}
             value={testText}
             onChange={(e) => setTestText(e.target.value)}
-            placeholder="الصق رسالة لاختبارها على المحرك الحقيقي عند توفر المنفذ (عقد §3.5)"
+            placeholder="الصق رسالة لاختبارها على المحرك الحي الآن — قرار الفلتر الحقيقي (EnhancedFilter + classifier + FastGate)"
             className="w-full rounded-lg border border-panel-border bg-panel-bg px-3 py-2 text-sm text-panel-text focus:border-panel-accent focus:outline-none"
           />
           <div className="mt-2 flex gap-2">
-            <Btn disabled={!testText.trim()} onClick={runTest}>تحليل (عقد)</Btn>
+            <Btn disabled={!testText.trim()} onClick={runTest}>تحليل حي</Btn>
           </div>
           {testResult && (
             <pre className="mt-2 max-h-72 overflow-auto rounded-lg border border-panel-border bg-panel-bg p-2 text-[11px]" dir="ltr" style={{ scrollbarWidth: 'thin' }}>{testResult}</pre>
           )}
-          <ContractNote>الاختبار على المحرك الحقيقي يتطلب نقطة analyze على Render (عقد §3.5) — الواجهة جاهزة وتعرض العقد الحرفي بدل أي محاكاة.</ContractNote>
+          <div className="mt-2 text-[11px] text-panel-muted">التحليل عبر POST /service/engine/analyze على العملية الحارة — قراءة-حسابية بلا أي أثر جانبي. نفس المقعد متاح أيضاً في /bot/quality.</div>
         </Card>
       </div>
     </div>

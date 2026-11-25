@@ -647,20 +647,38 @@ def setup_dashboard(app: web.Application, bot: Any) -> None:
                       "ops": DASH.ops.snapshot()})
 
     async def svc_keywords_reload(request: web.Request) -> web.Response:
-        """§3.2 — إعادة بناء حية لسجل الكلمات: قراءة dashboard:keywords_json
-        → كتابة ملف المخصصة → reload_keywords → إعادة بناء FastGate."""
+        """§3.2 — إعادة بناء حية لسجل الكلمات.
+        المصدر: إما سجل مُرسل مباشرة من اللوحة (registry — الأدق لأنه يطابق ما
+        كُتب في Supabase فوراً) أو dashboard:keywords_json من قاعدة المحرك.
+        ثم: ملف المخصصة + persist محلي + reload_keywords + FastGate rebuild."""
         g = await _svc_guard(request)
         if g:
             return g
+        body = await _svc_body(request)
+        incoming = body.get("registry") if isinstance(body, dict) else None
 
         async def _do():
-            val = await DashboardAPI(bot)._custom_keywords_row()
-            if not val:
-                return {"ok": False, "error": "no_custom_keywords",
-                        "note": "لا يوجد سجل كلمات مخصص في app_settings"}
-            data = jsonlib.loads(val)
-            if not isinstance(data, dict):
-                return {"ok": False, "error": "invalid_keywords_json"}
+            if isinstance(incoming, dict) and incoming:
+                data = incoming
+            else:
+                val = await DashboardAPI(bot)._custom_keywords_row()
+                if not val:
+                    return {"ok": False, "error": "no_custom_keywords",
+                            "note": "لا سجل مُرسلاً ولا سجل محلي في قاعدة المحرك"}
+                data = jsonlib.loads(val)
+                if not isinstance(data, dict):
+                    return {"ok": False, "error": "invalid_keywords_json"}
+            # تثبيت محلي (مصدر hydrate عند الإقلاع) + ملف المخصصة
+            try:
+                await bot.db._execute(
+                    "INSERT INTO app_settings (key, value) VALUES (?, ?) "
+                    "ON CONFLICT (key) DO UPDATE SET value = excluded.value, "
+                    "updated_at = CURRENT_TIMESTAMP",
+                    ("dashboard:keywords_json", jsonlib.dumps(data, ensure_ascii=False)),
+                )
+                await bot.db._commit()
+            except Exception:
+                pass
             KW_FILE.write_text(jsonlib.dumps(data, ensure_ascii=False), encoding="utf-8")
             flt = getattr(bot, "filter", None)
             reloaded = False
@@ -686,6 +704,7 @@ def setup_dashboard(app: web.Application, bot: Any) -> None:
             except Exception:
                 pass
             return {"ok": True, "reloaded": reloaded, "groups": len(data),
+                    "source": "panel_registry" if isinstance(incoming, dict) and incoming else "engine_db",
                     "fast_gate": gate_stats}
 
         try:
@@ -694,6 +713,35 @@ def setup_dashboard(app: web.Application, bot: Any) -> None:
             return _json(e.payload, e.status)
         _audit_bg("service.keywords_hot_reload",
                   new_value="ok" if result.get("ok") else str(result.get("error") or ""))
+        return _json(result)
+
+    async def svc_db_info(request: web.Request) -> web.Response:
+        """v17.2.0 — شفافية تخزين المحرك: نوع قاعدة البيانات الفعلي.
+        sqlite = مؤقت (يُمسح عند كل نشر) — postgresql = دائم (Supabase).
+        لا يعيد أي أسرار اتصال إطلاقاً."""
+        g = await _svc_guard(request)
+        if g:
+            return g
+
+        async def _do():
+            db = getattr(bot, "db", None)
+            cls = type(db).__name__ if db is not None else "None"
+            # EnhancedDatabase يوفر نوع الاتصال الحقيقي من config
+            try:
+                from config import CFG as _cfg_mod
+                db_type = str(getattr(_cfg_mod, "DB_TYPE", "") or "")
+            except Exception:
+                db_type = ""
+            is_pg = "postgres" in db_type.lower()
+            return {"ok": True, "db_type": db_type or ("postgresql" if is_pg else "sqlite"),
+                    "permanent": is_pg,
+                    "note": ("قاعدة دائمة (PostgreSQL)" if is_pg
+                             else "قاعدة مؤقتة (SQLite على قرص Render) — البيانات المحلية تُمسح عند كل نشر؛ الاتصال الدائم يتطلب DATABASE_URL من صفحة Render في اللوحة")}
+
+        try:
+            result = await _bridge_call(_do)
+        except _BridgeError as e:
+            return _json(e.payload, e.status)
         return _json(result)
 
     async def svc_sources_check(request: web.Request) -> web.Response:
@@ -1342,6 +1390,7 @@ def setup_dashboard(app: web.Application, bot: Any) -> None:
     r.add_post("/service/sources/check", svc_sources_check)
     r.add_post("/service/engine/analyze", svc_engine_analyze)
     r.add_post("/service/db/grant_read", svc_db_grant_read)
+    r.add_get("/service/db/info", svc_db_info)
 
     r.add_get("/admin/api/keywords", api_keywords)
     r.add_post("/admin/api/keywords/save", api_keywords_save)

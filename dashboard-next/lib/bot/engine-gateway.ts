@@ -64,18 +64,31 @@ export function botOpsInstant(flag: 'filtering' | 'alerts', paused: boolean) {
   return gatewayCall<OpsInstantResult>('/service/bot/ops', { flag, paused }, 25000);
 }
 
-// ── §3.2: إعادة بناء حية لسجل الكلمات ──
+// ── §3.2: إعادة بناء حية لسجل الكلمات (السجل يُرسل من اللوحة لأنه مصدر Supabase) ──
 export type KeywordsReloadResult = {
   ok?: boolean;
   reloaded?: boolean;
   groups?: number;
+  source?: string;
   fast_gate?: { patterns?: number; engine?: string | number } | null;
   error?: string;
   note?: string;
 };
 
-export function keywordsHotReload() {
-  return gatewayCall<KeywordsReloadResult>('/service/keywords/reload', {}, 35000);
+export function keywordsHotReload(registry?: Record<string, unknown>) {
+  return gatewayCall<KeywordsReloadResult>('/service/keywords/reload', { registry: registry ?? {} }, 35000);
+}
+
+// ── v17.2.0: شفافية تخزين المحرك (sqlite مؤقت / postgresql دائم) ──
+export type DbInfoResult = {
+  ok?: boolean;
+  db_type?: string;
+  permanent?: boolean;
+  note?: string;
+};
+
+export function engineDbInfo() {
+  return gatewayCall<DbInfoResult>('/service/db/info', {}, 15000);
 }
 
 // ── §3.4: فحص وصول مصدر حقيقي ──

@@ -8,15 +8,17 @@ import { logAudit } from '@/lib/audit';
 export const dynamic = 'force-dynamic';
 
 /**
- * v17.2.0 §3.2: بعد أي كتابة ناجحة في السجل نحاول البناء الحار على المحرك.
- * المحرك نائم → deferred بصدق (hydrate_dashboard يطبقه عند الإقلاع القادم).
+ * v17.2.0 §3.2: بعد أي كتابة ناجحة في السجل نحاول البناء الحار على المحرك —
+ * نرسل السجل الفعلي من Supabase (المصدر الدائم) لأن قاعدة المحرك قد تكون
+ * مؤقتة (SQLite) — المحرك يثبّت محلياً ويبني فوراً ويتطابق مع Supabase.
  */
 async function tryHotReload(): Promise<{ hotPath: string; engine: unknown }> {
-  const h = await keywordsHotReload();
+  const reg = await getRegistry();
+  const h = await keywordsHotReload(reg.ok ? (reg.registry as Record<string, unknown>) : undefined);
   return {
     hotPath: h.ok ? 'instant_rebuilt' : 'deferred_engine_asleep',
     engine: h.ok
-      ? { reloaded: h.data?.reloaded, groups: h.data?.groups, fast_gate: h.data?.fast_gate ?? null }
+      ? { reloaded: h.data?.reloaded, groups: h.data?.groups, source: h.data?.source, fast_gate: h.data?.fast_gate ?? null }
       : { engineStatus: h.status, error: h.error || null },
   };
 }
