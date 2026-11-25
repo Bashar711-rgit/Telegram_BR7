@@ -45,3 +45,4 @@ keywords_dashboard.json
 dashboard-next/.env*
 dashboard-next/node_modules/
 dashboard-next/.next/
+dashboard-next/tsconfig.tsbuildinfo
