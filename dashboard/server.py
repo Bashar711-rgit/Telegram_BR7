@@ -29,7 +29,9 @@ dashboard.server — طبقة HTTP للوحة على خادم الصحة (v15.1.
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json as jsonlib
+import os
 import secrets as _secrets
 from typing import Any, Callable, Optional
 
@@ -422,6 +424,156 @@ def setup_dashboard(app: web.Application, bot: Any) -> None:
         if status is None:
             return _json({"error": "op_not_found", "note": "لا توجد عملية ربط بهذا المعرّف"}, 404)
         return _json({"ok": True, "op": status})
+
+    # ── v16.6.0: بوابة الخدمة Vercel→المحرك لتدفق ربط الحسابات (§3.1/§3.3) ──
+    # لوحة Vercel (بعد جلسة super_admin/admin + CSRF خاصة بها) تنداء مباشرة
+    # مع link_manager عبر سر مشترك x-br7-command-secret (ENGINE_COMMAND_SECRET).
+    # فشل-مغلق: بلا متغير البيئة → 503 لكل مسارات الخدمة. OTP/كلمة المرور
+    # تعيش في ذاكرة link_manager حصراً ولا تُسجَّل هنا ولا تُعيد أبداً.
+    # المسارات تحت /service/* خارج وسيط /admin — البوابة أدناه هي حمايتها.
+    _svc_secret = str(os.getenv("ENGINE_COMMAND_SECRET", "") or "")
+    _svc_fail = type(DASH.api_rate)(15)  # إخفاقات مصادقة الخدمة/دقيقة لكل IP
+
+    async def _svc_guard(request: web.Request) -> Optional[web.Response]:
+        if not _svc_secret:
+            return _json({"ok": False, "error": "service_disabled",
+                          "note": "ENGINE_COMMAND_SECRET غير مضبوط على المحرك"}, 503)
+        supplied = request.headers.get("x-br7-command-secret", "")
+        try:
+            auth_ok = bool(supplied) and hmac.compare_digest(supplied, _svc_secret)
+        except Exception:
+            auth_ok = False
+        if not auth_ok:
+            ip = _client_ip(request)
+            if not _svc_fail.allow(ip):
+                resp = _json({"ok": False, "error": "rate_limited"}, 429)
+                resp.headers["Retry-After"] = "60"
+                return resp
+            _audit_bg("service.auth_denied", object_id=ip[:64])
+            return _json({"ok": False, "error": "forbidden"}, 403)
+        return None
+
+    async def _svc_body(request: web.Request) -> Optional[dict]:
+        try:
+            data = await request.json()
+        except Exception:
+            return None
+        return data if isinstance(data, dict) else None
+
+    def _svc_mask_phone(phone: str) -> str:
+        return (phone[:3] + "***" + phone[-2:]) if len(phone) >= 5 else "***"
+
+    async def svc_link_start(request: web.Request) -> web.Response:
+        g = await _svc_guard(request)
+        if g:
+            return g
+        body = await _svc_body(request)
+        if body is None:
+            return _json({"ok": False, "error": "invalid_body"}, 400)
+        phone = str(body.get("phone") or "")
+        result = await link_manager.start(bot, phone)
+        _audit_bg("service.account_add_start",
+                  object_id=_svc_mask_phone(phone) if phone else "",
+                  new_value="ok" if result.get("ok") else str(result.get("error_code") or ""))
+        return _json(result)
+
+    async def svc_link_code(request: web.Request) -> web.Response:
+        g = await _svc_guard(request)
+        if g:
+            return g
+        body = await _svc_body(request)
+        if body is None:
+            return _json({"ok": False, "error": "invalid_body"}, 400)
+        result = await link_manager.submit_code(str(body.get("op_id") or ""), str(body.get("code") or ""))
+        return _json(result)
+
+    async def svc_link_password(request: web.Request) -> web.Response:
+        g = await _svc_guard(request)
+        if g:
+            return g
+        body = await _svc_body(request)
+        if body is None:
+            return _json({"ok": False, "error": "invalid_body"}, 400)
+        result = await link_manager.submit_password(str(body.get("op_id") or ""), str(body.get("password") or ""))
+        return _json(result)
+
+    async def svc_link_cancel(request: web.Request) -> web.Response:
+        g = await _svc_guard(request)
+        if g:
+            return g
+        body = await _svc_body(request)
+        if body is None:
+            return _json({"ok": False, "error": "invalid_body"}, 400)
+        op_id = str(body.get("op_id") or "")
+        result = await link_manager.cancel(op_id)
+        _audit_bg("service.account_add_cancel", object_id=op_id[:8])
+        return _json(result)
+
+    async def svc_link_status(request: web.Request) -> web.Response:
+        g = await _svc_guard(request)
+        if g:
+            return g
+        op_id = request.query.get("op_id", "")
+        st = link_manager.status(op_id)
+        if st is None:
+            return _json({"ok": False, "error": "op_not_found"}, 404)
+        return _json({"ok": True, "op": st})
+
+    async def svc_row_delete(request: web.Request) -> web.Response:
+        g = await _svc_guard(request)
+        if g:
+            return g
+        body = await _svc_body(request)
+        if body is None:
+            return _json({"ok": False, "error": "invalid_body"}, 400)
+        try:
+            row_id = int(body.get("row_id"))
+        except (TypeError, ValueError):
+            return _json({"ok": False, "error": "invalid_row_id"}, 400)
+
+        async def _do():
+            return await bot.delete_panel_account(row_id)
+
+        try:
+            result = await _bridge_call(_do)
+        except _BridgeError as e:
+            return _json(e.payload, e.status)
+        if result.get("ok"):
+            _audit_bg("service.account_delete", object_id=str(row_id))
+        return _json(result)
+
+    async def svc_row_toggle(request: web.Request) -> web.Response:
+        g = await _svc_guard(request)
+        if g:
+            return g
+        body = await _svc_body(request)
+        if body is None:
+            return _json({"ok": False, "error": "invalid_body"}, 400)
+        try:
+            row_id = int(body.get("row_id"))
+            enable = bool(body.get("enable"))
+        except (TypeError, ValueError):
+            return _json({"ok": False, "error": "invalid_row_id"}, 400)
+
+        async def _do():
+            row = await api.db.get_panel_account(row_id)
+            if not row:
+                return {"ok": False, "error": "الحساب غير موجود"}
+            await api.db.update_panel_account(row_id, monitoring_enabled=enable)
+            if not enable:
+                await bot.stop_panel_account(row_id)
+            else:
+                row2 = dict(row)
+                row2["monitoring_enabled"] = 1
+                return await bot.spawn_panel_account(row2)
+            return {"ok": True, "enable": enable}
+
+        try:
+            result = await _bridge_call_long(_do)
+        except _BridgeError as e:
+            return _json(e.payload, e.status)
+        _audit_bg("service.account_toggle", object_id=str(row_id), new_value=str(enable))
+        return _json(result)
 
     async def api_account_row_toggle(request: web.Request) -> web.Response:
         body = await body_json(request)
@@ -871,6 +1023,15 @@ def setup_dashboard(app: web.Application, bot: Any) -> None:
     r.add_post("/admin/api/accounts/row/reconnect", api_account_row_reconnect)
     r.add_post("/admin/api/accounts/row/delete", api_account_row_delete)
     r.add_post("/admin/api/accounts/env/exclude", api_account_env_exclude)
+
+    # v16.6.0: مسارات الخدمة للوحة Vercel — بوابة السر الخاصة (خارج /admin)
+    r.add_post("/service/accounts/link_start", svc_link_start)
+    r.add_post("/service/accounts/link_code", svc_link_code)
+    r.add_post("/service/accounts/link_password", svc_link_password)
+    r.add_post("/service/accounts/link_cancel", svc_link_cancel)
+    r.add_get("/service/accounts/link_status", svc_link_status)
+    r.add_post("/service/accounts/row/delete", svc_row_delete)
+    r.add_post("/service/accounts/row/toggle", svc_row_toggle)
 
     r.add_get("/admin/api/keywords", api_keywords)
     r.add_post("/admin/api/keywords/save", api_keywords_save)
