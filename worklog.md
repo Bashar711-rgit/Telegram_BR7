@@ -1059,3 +1059,22 @@ Stage Summary:
 ### الدمج الحي المتبقي
 - Render 73cpb9f0 (build) → تحقق بوابة: 403 بلا سر / 403 بسر خاطئ / 404 op_not_found بسر صحيح
 - دفع worklog يشغّل نشر Vercel بالمتغير → تحقق السلسلة الكاملة عبر API اللوحة (phone_duplicate يثبت Vercel→بوابة→DB بلا SMS)
+
+## v16.6.0-accounts-live — تفعيل إضافة الحسابات فعلياً + التحقق الحي (2026-11-25، بأمر المالك «فعلياً والعمل الدائم»)
+
+### اكتشاف تنفيذ متوازٍ وإدارته
+- أثناء الفحص وُجد تنفيذ يتكوّن لحظياً في المستودع (mtimes تتقدم بين القراءات): دورة وكيل متوازية أنجزت المهمة وأدت commitين على main ودفعتها: e6136a7 (محرك) + 2c566e9 (لوحة). رقبت 90 ثانية حتى سكت وارتكز، ثم توليت بناءي: المراجعة الأمنية + ضبط البيئة + التحقق الحي — بلا أي تعارض.
+
+### ما يفعله الكومِتان (مراجعة أمنية نُفذت)
+- المحرك e6136a7: بوابة /service/accounts/* خارج وسيط /admin — حماية سر مشترك ENGINE_COMMAND_SECRET عبر hmac.compare_digest، فشل-مغلق 503 بلا السر، حد إخفاقات 15/د/IP، تدقيق service.* برقم مموّه، 7 مسارات تعيد استخدام link_manager الحقيقي وspawn/stop للحلقة الرئيسية — إضافي بالكامل.
+- اللوحة 2c566e9: /api/bot/accounts/link (start|code|password|cancel + GET status) بجلسة+RBAC admin+CSRF+Zod strict+rate 12/د+تدقيق بلا OTP/كلمة مرور، /api/bot/accounts/row (toggle admin، delete super_admin)، معالج 4 خطوات حي في /bot/accounts مع استقصاء status عند مهلة الوسيط — tsc+build+lint نظيف.
+- العمل الدائم قائم أصلاً وموثق: الجلسة تُحفظ مشفرة Fernet في panel_accounts، والمحرك يدمج حسابات اللوحة عند الإقلاع (merge_panel_accounts) ويفعّل المراقب حياً دون إعادة نشر (spawn_panel_account).
+
+### فجوة تشغيلية اكتُشفت وأُصلحت
+- الرغم من وجود ENGINE_COMMAND_SECRET في Render API، العملية الحية أعادت service_disabled — المتغير وصل بعد بدء النشر (PATCH لا ينشر تلقائياً). أعدت تشغيل الخدمة (POST restart = 200) لتُقرأ البيئة — توقف ~1 دقيقة، والمحرك أظهر degraded صادقاً أثناء إعادة اتصال المراقبين ثم عاد ok/queue 0.
+
+### التحقق الحي الكامل (أدلة)
+- سر خاطئ → 403 forbidden · بلا سر → 403 · بلا متغير (قبل إعادة التشغيل) → 503 service_disabled (الفشل-مغلق يعمل حرفياً)
+- بالسر الصحيح + رقم عاطل +999999999999 على المحرك مباشرة → 200 {error_code: phone_invalid_tg, رسالة عربية} — خطأ تيليجرام حقيقي من send_code_request فعلي، بلا أي أثر جانبي
+- اللوحة: بلا جلسة → 401 · بجلسة المالك → نفس الخطأ الحقيقي عابرين عبر السلسلة كلها (يثبت تطابق سر Vercel مع سر Render + RBAC + CSRF + Zod)
+- /bot/accounts → 200 والمعالج ضمن الحزمة · نشرتا Render (dep-dc3ksk3rjlhs73enj1qg live) وVercel (dpl_FX9F3T6X5EYY9MEc7LdtgV READY) على 2c566e9
