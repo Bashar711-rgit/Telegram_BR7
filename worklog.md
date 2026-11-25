@@ -1102,3 +1102,40 @@ Stage Summary:
 
 ### اكتشاف تشخيصي مهم (للمالك)
 - /health/full بعد الإقلاع كشف 3 حسابات ميتة: Account 1 (env) AuthKeyDuplicated، Account 2 (env) Session expired، والصف #5 needs_relogin — **كلها الآن تُصلَح من اللوحة**: الحذف عبر زر الحذف الجديد، والجلسات عبر صفحة Render (تعديل/حذف/استعادة بحفظ مزدوج)، أو الأفضل: إعادة ربط الأرقام عبر معالج /bot/accounts الحي.
+
+## v17.1.0-sync-e2e — طبقة المزامنة الكاملة + اختبارات E2E موثقة (2026-11-26، الماستر برومبت: تكامل كامل بلا تفاعل وهمي)
+
+### فجوات الفحص الشامل (PHASE 0) التي كانت ناقصة فعلاً وأُنجزت
+- **مفاتيح عدم التكرار (idempotency)**: كانت مفقودة تماماً → نُفّذت في `lib/idempotency.ts` + `withApi(idempotent)` على 8 مسارات حساسة (db_post/patch/delete، render_env_set/delete/restore، bot_accounts_row، users_create/patch، github_tag، bot_reconcile) — مخزن `app_settings[idem:*]` TTL 24 سا + تنظيف كسول + النجاحات فقط تُخزَّن.
+- **التسوية (reconciliation)**: كانت مفقودة → `lib/bot/reconcile.ts` + `POST /api/bot/reconcile {fix?}` — يقارن panel_accounts مع monitor_detail، وfix يوقف الأيتام عبر مسار محرك جديد idempotent `/service/accounts/row/stop` (engine c9f5b58).
+- **التحديث الفوري**: كان polling فقط → `GET /api/bot/stream` (SSE، نافذة 55 ثانية + إعادة اتصال تلقائية) + hook `useEngineSSE` + بطاقة «الحالة الحية» في /bot/control مع زرّي تسوية.
+- **فصل البيئات**: لم يكن موجوداً → حارس في withApi: `VERCEL_ENV=preview` يرفض كل mutations (preview_readonly) إلا بـ `PREVIEW_ALLOW_MUTATIONS=1` على المعاينة فقط + شارة معاينة في الهيكل + `/api/env-info`.
+- **كيانات بلا واجهة**: sender_stats/blocked_chats/notifications أُضيفت قراءة-فقط — **محتاجة GRANT SELECT على Postgres** (فلسفة القائمة البيضاء مقصودة على مستوى القاعدة): سكربت `scripts/supabase_grants_v17.sql` جاهز للمالك؛ حتى تنفيذه يجيب المسار permission denied بصدق (لا نجاح وهمي).
+
+### مصفوفة قبول E2E — نتائج حية على الإنتاج (بجلسة المالك، 0d611a3)
+| # | الاختبار | النتيجة | الدليل الحي |
+|---|---|---|---|
+| 1 | إضافة مصدر | ✅ نجح | POST sources → id:1 حقيقي بـ added_by المالك |
+| 1ب | تكرار بنفس المفتاح | ✅ bلا تنفيذ ثانٍ | `x-idempotent-replay: true` + نفس الصف id:1 |
+| 2 | تعديل مصدر | ✅ نجح | PATCH notes → القيمة الجديدة في الاستجابة والقراءة التالية |
+| 3 | حذف مصدر | ✅ نجح | DELETE → القائمة تعود فارغة من صفوف E2E |
+| 4 | قاعدة اختبارية | ✅ نجح | POST rules → id:2 ثم DELETE → not_found عند التكرار |
+| 5 | إعداد KV | ✅ نجح | app_settings e2e:sync:test → إنشاء/قراءة/حذف كامل |
+| 6 | سلسلة الربط الحية | ✅ خطأ تيليجرام حقيقي | `phone_invalid_tg: الرقم غير صالح لدى تيليجرام` عبر Vercel→بوابة السر→Telethon |
+| 7 | قراءة التنبيهات | ✅ بيانات حية | 984 sent / 98.4% successRate من alerts الفعلية |
+| 8 | بقاء البيانات | ✅ | إعادة القراءات بعد كل عملية — صفر صفوف E2E متبقية |
+| 9 | إعادة تشغيل Render من اللوحة | ✅ | restart_endpoint → starting → ok/True خلال ~55 ثانية |
+| 10 | انقطاع الاتصال | ✅ ميكانيزم | البث الحي يعلن «مقطوع — يعيد الاتصال» + المسارات ترجع engine_unreachable 504 (نمط موثق مسبقاً v16.6.0) |
+| 11 | فشل التنفيذ يُعرض بصدق | ✅ | toggle صف 999999 → «الحساب غير موجود» 400 · جدول مجهول → unknown_table 404 · body تالف → 400 |
+| 12 | سلامة ما بعد النشر | ✅ | نشرتان (0d611a3 Vercel، c9f5b58 Render) حيتان + كل الصفحات 200 + SSE يبث |
+| + | SSE | ✅ | إطارات `event: status` حية: state running، uptime، monitors 1/4 |
+| + | RECONCILE | ✅ | panel_rows:0 (الصف #5 حُذف فعلاً من اللوحة!) · 4 مراقبات env · صفر أيتام · صفر انحراف مرآة · filtering_paused:true مثابر |
+
+### اكتشافات تشغيلية صادقة (للمالك)
+- **جدول sources فارغ حالياً في الإنتاج** — أضف مصادرك من «مركز التحكم › المصادر» (الالتقاط عند الإقلاع التالي أو toggle).
+- **filtering_paused=true مثابر** — المعالجة متوقفة بقرار محفوظ؛ استأنفها من /bot/control إن أردت.
+- الحسابات env: Account 3 متصل حياً، و1/2/4 جلساتها ميتة (AuthKeyDuplicated/Session expired) — تُدار الآن من صفحة Render أو المعالج.
+- الكيانات الثلاثة الجديدة تعمل فور تنفيذ `scripts/supabase_grants_v17.sql` في Supabase SQL Editor.
+
+### ما لا يزال عقداً (قيود خارجية موثقة — بلا نتائج وهمية)
+- §3.4 فحص وصول المصدر · §3.5 مقعد الاختبار · §3.2 الأوزان الحارة · §3.1 start/stop فوري (النقر يسجل pending بصدق) — بانتظار منافذها على المحرك حسب الأولوية.
