@@ -29,15 +29,16 @@ export async function gatewayCall<T = Record<string, unknown>>(
   path: string,
   body: unknown,
   timeoutMs = 40000,
+  method: 'GET' | 'POST' = 'POST',
 ): Promise<EngineGatewayResult<T>> {
   const s = secret();
   if (!s) {
     return { ok: false, status: 503, data: null, error: 'service_disabled: ENGINE_COMMAND_SECRET غير مضبوط على اللوحة' };
   }
   const r = await fetchJson<T>(`${RENDER_URL()}${path}`, {
-    method: 'POST',
+    method,
     headers: { 'Content-Type': 'application/json', 'x-br7-command-secret': s },
-    body: JSON.stringify(body ?? {}),
+    body: method === 'GET' ? undefined : JSON.stringify(body ?? {}),
     timeoutMs,
   });
   const d = (r.data ?? null) as { ok?: boolean; error?: string } | null;
@@ -88,7 +89,7 @@ export type DbInfoResult = {
 };
 
 export function engineDbInfo() {
-  return gatewayCall<DbInfoResult>('/service/db/info', {}, 15000);
+  return gatewayCall<DbInfoResult>('/service/db/info', {}, 15000, 'GET');
 }
 
 // ── §3.4: فحص وصول مصدر حقيقي ──
