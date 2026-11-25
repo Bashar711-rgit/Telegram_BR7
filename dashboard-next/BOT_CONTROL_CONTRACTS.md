@@ -90,15 +90,23 @@
 // يُعيد بناء المحرك + FastGate (schedule_rebuild) ويُرجع {rebuilt:true, words:N, ms:T}
 ```
 
-### §3.3 عقد تدفق الحسابات (Telethon تفاعلي)
+### §3.3 تدفق الحسابات (Telethon تفاعلي) — v16.6.0: منفذ حياً
 ```
-POST /admin/api/accounts/link_start   {phone}          → {flow_id, state:"waiting_code", flood_wait?:s}
-POST /admin/api/accounts/link_code    {flow_id, code}  → {state:"verifying"|"waiting_password"}
-POST /admin/api/accounts/link_2fa     {flow_id, password} → {state:"ready", account_id}
-POST /admin/api/accounts/{id}/test_connection          → {ok, latency_ms, flood_wait?}
-DELETE /admin/api/accounts/{id} (يُمنع مع مهام غير منتهية — يُرجع 409 pending_tasks)
+# بوابة الخدمة على المحرك (Render) — سر مشترك x-br7-command-secret (ENGINE_COMMAND_SECRET):
+POST /service/accounts/link_start     {phone}          → {ok, op:{op_id, state:"waiting_code", flood_wait?}}
+POST /service/accounts/link_code      {op_id, code}    → {ok, op:{state:"ready"|"waiting_password"|...}}
+POST /service/accounts/link_password  {op_id, password}→ {ok, op:{state:"ready", account_row_id}}
+POST /service/accounts/link_cancel    {op_id}          → {ok, cancelled}
+GET  /service/accounts/link_status?op_id=…             → {ok, op}
+POST /service/accounts/row/delete     {row_id}         → حذف صف + إيقاف المراقب (super_admin في اللوحة)
+POST /service/accounts/row/toggle     {row_id, enable} → spawn/stop فوري على الحلقة الرئيسية
+
+# الوسيط في اللوحة (Vercel): /api/bot/accounts/link (POST start|code|password|cancel + GET status)
+# و/api/bot/accounts/row — جلسة HMAC + RBAC admin/super_admin + CSRF + Zod strict + audit بلا أسرار.
 ```
-قيود: OTP/كلمة المرور تعيشان في الذاكرة حصراً (نفس عقد link_flow الحالي)، Session مشفرة Fernet ولا تعود للواجهة أبداً.
+قيود المنفذ: OTP/كلمة المرور تعيشان في ذاكرة link_manager حصراً ولا تُسجَّلان في أي audit،
+Session مشفرة Fernet (SECRET_KEY_OVERRIDE إلزامي للدم عبر النشرات) ولا تعود للواجهة أبداً.
+المتبقي عقداً: اختبار اتصال دوري مجدول + إعادة مصادقة آلية (الإصلاح اليدوي: حذف ثم إعادة إضافة).
 
 ### §3.4 عقد المصادر — `POST /admin/api/sources/{chat_id}/check` → {reachable, member_status, error?}
 ### §3.5 عقد مقعد الاختبار — `POST /admin/api/engine/analyze`

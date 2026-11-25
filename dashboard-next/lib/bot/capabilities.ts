@@ -26,9 +26,11 @@ export const CAPABILITIES: Capability[] = [
 
   // Accounts
   { id: 'accounts.read', area: 'accounts', title: 'قراءة الحسابات وتفاصيلها الكاملة', mode: 'live', mechanism: 'panel_accounts (منح قائم)' },
-  { id: 'accounts.update', area: 'accounts', title: 'تعديل الاسم/الأولوية/المراقبة/الحالة/الحساب الرئيسي', mode: 'live', mechanism: 'PATCH panel_accounts (منح قائم)' },
-  { id: 'accounts.link', area: 'accounts', title: 'إضافة حساب (هاتف→OTP→2FA→جلسة مشفرة)', mode: 'contract', depends: 'تدفق Telethon على Render (§3.3) — الواجهة جاهزة والحقول موثقة' },
-  { id: 'accounts.delete_reauth_test', area: 'accounts', title: 'حذف/إعادة مصادقة/اختبار اتصال', mode: 'contract', depends: '§3.3' },
+  { id: 'accounts.update', area: 'accounts', title: 'تعديل الاسم/الأولوية/الحالة/الحساب الرئيسي', mode: 'live', mechanism: 'PATCH panel_accounts (منح قائم)' },
+  { id: 'accounts.link', area: 'accounts', title: 'إضافة حساب (هاتف→OTP→2FA→جلسة مشفرة) + تفعيل فوري', mode: 'live', mechanism: 'تدفق Telethon الحقيقي (link_manager) عبر بوابة الخدمة /service/accounts — سر مشترك §3.1 — الجلسة Fernet دائمة' },
+  { id: 'accounts.toggle_hot', area: 'accounts', title: 'تفعيل/إيقاف المراقبة فوراً على المحرك (spawn/stop)', mode: 'live', mechanism: '/service/accounts/row/toggle عبر بوابة الخدمة' },
+  { id: 'accounts.delete', area: 'accounts', title: 'حذف حساب (super_admin) + إيقاف مراقبه', mode: 'live', mechanism: '/service/accounts/row/delete عبر بوابة الخدمة' },
+  { id: 'accounts.test_reauth', area: 'accounts', title: 'اختبار اتصال دوري مجدول/إعادة مصادقة آلية', mode: 'contract', depends: '§3.3 المتبقي — الإصلاح اليدوي متاح: حذف ثم إعادة إضافة' },
 
   // Sources
   { id: 'sources.crud', area: 'sources', title: 'إضافة/تعديل/حذف/تفعيل المصادر + متعددة + CSV', mode: 'live', mechanism: '/api/db/sources (منح قائم)' },
