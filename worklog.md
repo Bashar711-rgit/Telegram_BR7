@@ -1139,3 +1139,57 @@ Stage Summary:
 
 ### ما لا يزال عقداً (قيود خارجية موثقة — بلا نتائج وهمية)
 - §3.4 فحص وصول المصدر · §3.5 مقعد الاختبار · §3.2 الأوزان الحارة · §3.1 start/stop فوري (النقر يسجل pending بصدق) — بانتظار منافذها على المحرك حسب الأولوية.
+
+## v17.2.0-instant-exec — التنفيذ الفوري على العملية الحارة + اكتشاف P0 صادق (2026-11-26، بأمر المالك «اريد منك تنفيذ كل شيء»)
+
+### نطاق الماستر برومبت المنفذ في هذه الجلسة
+المعاينة (Preview) للقراءة فقط من v17.1.0 + طبقة المزامنة كاملة. هذه الجلسة أكملت العقود الأربعة المتبقية (§3.1/§3.2/§3.4/§3.5) حيّاً على المحرك، وأضافت بوابة شفافية ومنح بقائمة بيضاء، واكتشفت وأصلحت انفصال قاعدة بيانات حقيقي.
+
+### المحرك (dashboard/server.py — بوابة الخدمة /service/*، commit 54d8561 + 3f49ae4)
+- **§3.1 POST /service/bot/ops** — تطبيق فوري لإيقاف/استئناف الفلترة/التنبيهات على الذاكرة الحارة + تثبيت في قاعدة المحرك (نفس مسار ops_toggle) + audit.
+- **§3.2 POST /service/keywords/reload** — يقبل registry من اللوحة مباشرة (المصدر الدائم) أو يقرأ من قاعدة المحرك؛ يثبّت محلياً + يكتب ملف المخصصة + reload_keywords + FastGate rebuild.
+- **§3.4 POST /service/sources/check** — resolve_chat_entity + get_permissions('me') على العميل الحي: الوصول + حالة العضوية + صلاحية الإرسال. قراءة بلا أثر.
+- **§3.5 POST /service/engine/analyze** — EnhancedFilter.analyze + classify_text + FastGate على العملية الحارة، نص ≤2000 حرف، بلا أثر جانبي.
+- **GET /service/db/info** — نوع قاعدة المحرك بصدق (بلا أسرار).
+- **POST /service/db/grant_read** — GRANT SELECT TO service_role بقائمة بيضاء صارمة (sender_stats/blocked_chats/notifications فقط، بلا SQL حر).
+- **إصلاح خلل حقيقي مثبت**: reload_keywords متزامنة (sync) بينما الكود كان `await reload(...)` → TypeError صامت يفشل البناء الحار في keywords_save والاسترداد عند الإقلاع (hydrate_dashboard) — أُصلح في الموضعين (iscoroutine-safe).
+
+### اللوحة (dashboard-next — 5 مسارات API جديدة + تحديث 4 + واجهات)
+- lib/bot/engine-gateway.ts: عميل البوابة الموحد (فشل-مغلق بلا سر) + GET support.
+- /api/bot/ops: كتابة مثابرة في Supabase **ثم** تطبيق فوري — المحرك نائم؟ deferred بصدق.
+- /api/bot/keywords (POST/DELETE): بعد أي كتابة ناجحة → إرسال السجل الفعلي من Supabase إلى المحرك → بناء حار فوري؛ /api/bot/keywords/reload جديد (admin).
+- /api/bot/sources/check (operator) + /api/bot/analyze (viewer) + /api/bot/db-info (viewer) + /api/db/grant-read (super_admin).
+- واجهات: زر «بناء حار على المحرك» في /bot/keywords · «فحص وصول» لكل مصدر في /bot/sources مع حوار النتيجة · مقعد اختبار التحليل الحي في /bot/quality و/bot/engine (استُبدل العقد المعلق) · لافتة تحذير تخزين في /bot/engine · زر «منح قراءة (GRANT حي)» في /database/[entity] للجداول الثلاثة.
+- capabilities محدثة بصدق: pause/resume/maintenance/emergency/reload_config → live؛ المتبقي عقداً: start/stop كلي للخدمة + أوزان filter_weights الجدولية + §3.6/3.7/3.8.
+
+### اكتشاف P0 مصدّق بحيّاً — المحرك على SQLite مؤقت (انفصال قاعدة بيانات)
+- فحص GRANT عبر /service/db/grant_read أعاد `OperationalError: near "GRANT": syntax error` — صيغة خطأ **SQLite**.
+- /service/db/info أكد: db_type=sqlite، permanent=false.
+- الدليل المزدوج: كتابة ops عبر المحرك لم تُغيّر صف dashboard:ops في Supabase (بقي updated_at=22:43) بينما كتابة اللوحة حدثته (23:08).
+- الجذر: DATABASE_URL كان حياً على Render بـ 24-11 (دور br7_app عبر Session Pooler — SUPABASE_STATE.md) وفُقد من قائمة env في نشر لاحق (لا env-groups ولا secret-files ولا مرآة — فحص شامل).
+- العواقب الصادقة: بيانات المحرك المحلية (حسابات الربط الجديدة، القرارات، app_settings المحلية) تُمسح عند كل نشر؛ اللوحة تقرأ Supabase (لقطة + كتابات اللوحة).
+- **مسار الاسترداد للمالك — خطوة واحدة**: صفحة /render في اللوحة → إضافة متغير `DATABASE_URL` (نفس قيمة pooler br7_app المخزنة لديك) → حفظ مزدوج تلقائي (Render + مرآة Supabase) + نشر تلقائي → يعود الربط الدائم، وزر المنح وقسم «فحص وصول» وحفظ الحسابات المربوطة يصيرون دائمين فوراً.
+
+### مصفوفة قبول E2E — حية على الإنتاج (بجلسة المالك، fc44329)
+| # | الاختبار | النتيجة | الدليل الحي |
+|---|---|---|---|
+| 1 | §3.5 مقعد الاختبار (محرك مباشرة) | ✅ | accept 0.8475 + reasons [intent_verb:احتاج، academic_object:امتحان، urgency:قبل الامتحان] + urgent:true |
+| 2 | §3.5 عبر اللوحة | ✅ | نفس الحكم عبر /api/bot/analyze بزمن 80.9ms |
+| 3 | §3.1 ops فوري (محرك مباشرة) | ✅ | paused=true ثم false — applied:instant + persisted:true + counters |
+| 4 | §3.1 عبر اللوحة + سلامة Supabase | ✅ | hotPath:instant_applied (engineStatus 200) + صف dashboard:ops تحدّث فعلاً 23:08 |
+| 5 | §3.2 بناء حار (نقل السجل) | ✅ | /api/bot/keywords/reload → groups:37 من panel_registry |
+| 6 | كتابة كلمة → بناء حار تلقائي | ✅ | custom:e2e_v172 → added:1 + instant_rebuilt (38 مجموعة) ثم حذف → instant_rebuilt ثم word_not_found بصدق |
+| 7 | تنظيف صافي صفر | ✅ | السجل عاد 37 مجموعة والطرفان متطابقان |
+| 8 | §3.4 فحص وصول | ✅ | @telegram → Telegram News/Channel/1005640892 + member_status:not_member (حقيقة لا افتراض) |
+| 9 | منح GRANT على sqlite | ✅ صادق | granted:false «near GRANT: syntax error» — يعمل فوراً بعد عودة DATABASE_URL |
+| 10 | شفافية DB عبر اللوحة | ✅ | /api/bot/db-info → sqlite/permanent:false (إصلاح GET 405 في fc44329) |
+| 11 | أمن: بلا جلسة | ✅ | 401 على كل المسارات الخمسة الجديدة |
+| 12 | أمن: CSRF بلا Origin | ✅ | 403 | 
+| 13 | أمن: body تالف | ✅ | 400 invalid_body (Zod) |
+| 14 | أمن: سر خاطئ للمحرك | ✅ | 403 forbidden |
+| 15 | سلامة ما بعد النشر | ✅ | نشرتان Vercel (54d8561/fc44329) + ثلاثة نشرات Render — كل الصفحات 200 والمحرك status:ok |
+| 16 | اختبارات بايثون | ✅ | نفس النتيجة قبل/بعد التغيير (13 failed/56 passed — فشل بيئة محلية سابق موجود، لا تأثير للتغيير) |
+
+### الحالة الحية بعد هذه الجلسة
+- كل مناطق الماستر برومبت الـ16 مغطاة بواجهة + مسارات حية (Dashboard/Accounts/Sources/Monitoring/Filters/AI-Intent/Alerts/Users/Groups/Blocklist/Logs/Bot Control/Database/System Health/Settings/GitHub-Deployment).
+- المتبقي عقداً موثقاً بصدق: start/stop كلي للخدمة (مقصود)، أوزان filter_weights الجدولية، §3.6 التغذية الراجعة، §3.7 مهام الطابور، §3.8 مقاييس نظام، منح الجداول الثلاثة (زر جاهز — يُستكمل مع DATABASE_URL).
