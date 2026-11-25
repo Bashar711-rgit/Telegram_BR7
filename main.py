@@ -1368,6 +1368,10 @@ class EnhancedTelegramBot:
                         rm_snap = None
                 detail.append({
                     "name": name,
+                    # v17.1.0: هوية قابلة للمطابقة لتسوية DB↔المحرك (صفوف اللوحة)
+                    "row_id": (int(acct.get("row_id") or 0) or None) if isinstance(acct, dict) else None,
+                    "phone": (str(acct.get("phone") or "") or None) if isinstance(acct, dict) else None,
+                    "source": (str(acct.get("source") or "") or None) if isinstance(acct, dict) else None,
                     "connected": bool(getattr(m, "is_connected", False)),
                     "last_error": str(getattr(m, "_last_connect_error", "") or "")[:180],
                     "flood_wait_s": round(flood_until - time.time()) if flood_until > time.time() else None,

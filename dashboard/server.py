@@ -575,6 +575,31 @@ def setup_dashboard(app: web.Application, bot: Any) -> None:
         _audit_bg("service.account_toggle", object_id=str(row_id), new_value=str(enable))
         return _json(result)
 
+    async def svc_row_stop(request: web.Request) -> web.Response:
+        # v17.1.0: إيقاف مراقب صف حسب row_id — idempotent (صحة التسوية):
+        # مراقب غير موجود = نجاح صامت (لا حالة فاشلة وهمية ولا خطأ زائف).
+        g = await _svc_guard(request)
+        if g:
+            return g
+        body = await _svc_body(request)
+        if body is None:
+            return _json({"ok": False, "error": "invalid_body"}, 400)
+        try:
+            row_id = int(body.get("row_id"))
+        except (TypeError, ValueError):
+            return _json({"ok": False, "error": "invalid_row_id"}, 400)
+
+        async def _do():
+            stopped = await bot.stop_panel_account(int(row_id))
+            return {"ok": True, "stopped": bool(stopped)}
+
+        try:
+            result = await _bridge_call(_do)
+        except _BridgeError as e:
+            return _json(e.payload, e.status)
+        _audit_bg("service.account_stop", object_id=str(row_id))
+        return _json(result)
+
     async def api_account_row_toggle(request: web.Request) -> web.Response:
         body = await body_json(request)
         try:
@@ -1032,6 +1057,7 @@ def setup_dashboard(app: web.Application, bot: Any) -> None:
     r.add_get("/service/accounts/link_status", svc_link_status)
     r.add_post("/service/accounts/row/delete", svc_row_delete)
     r.add_post("/service/accounts/row/toggle", svc_row_toggle)
+    r.add_post("/service/accounts/row/stop", svc_row_stop)
 
     r.add_get("/admin/api/keywords", api_keywords)
     r.add_post("/admin/api/keywords/save", api_keywords_save)
