@@ -1078,3 +1078,27 @@ Stage Summary:
 - بالسر الصحيح + رقم عاطل +999999999999 على المحرك مباشرة → 200 {error_code: phone_invalid_tg, رسالة عربية} — خطأ تيليجرام حقيقي من send_code_request فعلي، بلا أي أثر جانبي
 - اللوحة: بلا جلسة → 401 · بجلسة المالك → نفس الخطأ الحقيقي عابرين عبر السلسلة كلها (يثبت تطابق سر Vercel مع سر Render + RBAC + CSRF + Zod)
 - /bot/accounts → 200 والمعالج ضمن الحزمة · نشرتا Render (dep-dc3ksk3rjlhs73enj1qg live) وVercel (dpl_FX9F3T6X5EYY9MEc7LdtgV READY) على 2c566e9
+
+## v17.0.0-giant-panel-dual-persist — «لوحة تحكم عملاقة»: كل إعداد من اللوحة مع حفظ مزدوج Render+Supabase (2026-11-26، بأمر المالك بعد شكوى حوار حذف الحساب #5)
+
+### المحفز
+- المالك واجه حوار حذف الحساب #5 (needs_relogin) يذكر أن جلسات env (ACCOUNT_*) «تُدار من متغيرات البيئة على Render» فاعترض: يريد كل شيء من داخل اللوحة، وبقيم محفوظة على Render وعلى Supabase معاً.
+
+### ما نُفّذ (commit 019662b — 9 ملفات، +424/−39)
+- **مرآة env مشفّرة**: `lib/bot/env-mirror.ts` — كل متغير env يُحفظ على Render (مصدر التشغيل) ومرآته AES-256-GCM في `app_settings["render:env:<KEY>"]` (مفتاح HMAC من SESSION_SECRET، لا نص صريح أبداً). فشل المرآة لا يُفشل العملية (يُسجَّل dualPersist في audit).
+- **مسارات env**: GET /api/render/env مدموج (vars مموّهة + mirrored/mirrorUpdatedAt + mirrorOnly لكشف drift) · POST يكتب المرآة مع النشر التلقائي · DELETE ينظف المرآة (تنظيف مزدوج) · **POST /api/render/env/restore** جديد: استعادة من المرآة إلى Render (قراءة مفكوكة خادمياً فقط).
+- **حذف الحساب مسار مزدوج**: المحرك أولاً (إيقاف فوري + حماية «آخر حساب نشط» تُحترم)، وإن نائم المحرك (free tier بعد 15 دقيقة) → حذف مباشر من panel_accounts في Supabase (المصدر الموثوق) → `monitorStop:"deferred_engine_asleep"`، و«الحساب غير موجود» → already_gone idempotent. audit بكل فرع مع لقطة الصف.
+- **واجهة /render**: عمود mirror (✓ مرآة Supabase) + قسم «مفاتيح في المرآة فقط» مع زر استعادة + شارة «جلسة حساب» على ACCOUNT_*_SESSION_STRING/MAIN_SESSION_STRING + توثيق الحفظ المزدوج.
+- **واجهة /bot/accounts**: نص حوار الحذف يوضح أن كل شيء من اللوحة (استيقاظ المحرك = إيقاف فوري، نومه = توقف مؤجل) وإعادة الإضافة عبر المعالج كله بلا خروج.
+- **capabilities**: قسم infra جديد — env_read/env_restore (live)، env_write/env_sessions (live_persistent)، deploy/restart (live) + تحديث آلية accounts.delete.
+- **العقود**: §3.3-ب حذف مزدوج + §3.9 حفظ مزدوج env في BOT_CONTROL_CONTRACTS.md.
+
+### التحقق الحي (أدلة)
+- النشر حي خلال ~50 ثانية من الدفع (حقول mirror ظاهرة في GET).
+- دورة كاملة من طرف إلى طرف: POST BR7_PANEL_TEST → `{mirrored:true, mirrorError:null}` + صف مشفّر فعلاً (alg AES-256-GCM) → GET أظهر `mirrored:true` مع timestamp → DELETE → `{deleted:true, mirrorCleared:true}`.
+- نشر env من اللوحة فعلّاً: deploy `dep-dc3led9aek` (trigger=api) صار live — أول نشر يُشغَّل بالكامل من اللوحة.
+- capabilities حية: قسم infra بست مدخلات + accounts.delete live.
+- المحرك عاد `status:ok db_healthy:true` بعد نشرين متتاليين (كود ثم env) — التذبذب العابر كان أثناء تداخل النشرين.
+
+### اكتشاف تشخيصي مهم (للمالك)
+- /health/full بعد الإقلاع كشف 3 حسابات ميتة: Account 1 (env) AuthKeyDuplicated، Account 2 (env) Session expired، والصف #5 needs_relogin — **كلها الآن تُصلَح من اللوحة**: الحذف عبر زر الحذف الجديد، والجلسات عبر صفحة Render (تعديل/حذف/استعادة بحفظ مزدوج)، أو الأفضل: إعادة ربط الأرقام عبر معالج /bot/accounts الحي.
