@@ -1264,3 +1264,25 @@ Stage Summary:
 
 ### الحالة الختامية
 PostgreSQL الدائمة: **عادت ومُثبتة** (اتصال + كتابة + استمرارية عبر إعادة تشغيل). التنبيهات: النمط النشط + توجيه سليم. المراقبة: Account 3 وحده (حالة نظيفة). **الباقي الوحيد: ربط الحسابات الثلاثة من اللوحة** (+966550849788، +966531659570، +966598361020) — بشرط المالك «لا ربط قبل اجتياز اختبارات القاعدة» اجتِزتُ كل الاختبارات، فالربط جاهز للبدء بأكواد الهواتف. PANEL_API_ID/HASH جاهزة. اختياري متبقٍ: ALERT_BOT_TOKEN للأزرار.
+
+---
+
+## 2026-11-28 (13:46–13:56 UTC) — تحقق ثانٍ مستقل من PostgreSQL + فحص آمن لتدفق الربط (جاهزية كاملة)
+
+### التحقق الثاني (بعد قطع سياق الجلسة — أُثبتت السلسلة مرتين مستقلتين)
+1. **اتصال asyncpg محلي** بكلمة المالك عبر Session Pooler: نجح من أول محاولة — current_user=br7_app، current_database=postgres.
+2. **عدّادات أساس**: messages=233,903 / group_messages=234,016 / alerts=2,691 / message_analysis=12,882 / panel_accounts=0 / alert_dedup=166.
+3. **كتابة+حذف**: جدول فحص `_br7_conn_check` (CREATE/INSERT/SELECT/DELETE) — نجح كاملاً.
+4. **DSN المرمَّز (`%21`) عبر asyncpg مباشرة**: نجح — يطابق ما يفكه parse_database_url في config.py (unquote + sslmode=require → سياق SSL).
+5. **DATABASE_URL أُعيد كتابتها بقيمة مطابقة** (PUT → HTTP 200، env أصبح 25 متغيراً) → Deploy `dep-dc5dmnr3t69s73abvkb0` → live 13:49:17.
+6. **إعادة تشغيل ثانية** `dep-dc5dp656e07s73adhotg` → live 13:53:34 → `/service/db/info`: postgresql/permanent:true → عدّادات بعد الإقلاع: messages=233,934 (+7) / group_messages=234,047 (+7) / message_analysis=12,883 (+1) / alerts=2,691 (ثابتة) — **استمرارية مثبتة مرة ثانية، لا أصفار ولا فقدان**.
+7. `/health/full` بعد اكتمال الإقلاع: status=ok، database=ok، monitors_up=1/1، main_client=up، queue=2 ok. (degraded عابر خلال ~دقيقة الإقلاع — pool يُبنى، ثم ok).
+
+### فحص آمن لتدفق الربط من اللوحة (بلا إرسال كود فعلي)
+- المحرك: POST /service/accounts/link_start برقم غير صالح → `phone_invalid` برسالة عربية سليمة (سلسلة link_manager حية)؛ GET link_status → op_not_found (طبيعي).
+- اللوحة: POST /api/bot/accounts/link → 401 unauthenticated بدون جلسة (المسار موجود ومحمي، minRole=admin، Zod strict).
+- Supabase: panel_accounts فارغة وجاهزة (16 عموداً incl. api_id/api_hash_encrypted/session_encrypted)؛ app_settings→dashboard:excluded_env_phones بالقيم المحدثة (966550849788، 966531659570، 966598361020 + قديم محذوف 966578568011)؛ PANEL_API_ID/HASH موجودتان في env.
+- **نموذج الربط**: /bot/accounts → زر «إضافة حساب» → معالج (هاتف → OTP → 2FA إن وجدت → جلسة مشفرة Fernet → حفظ دائم في panel_accounts + تفعيل فوري على المحرك).
+
+### الحالة الختامية
+قاعدة المحرك: PostgreSQL دائمة، مُثبتة مرتين مستقلتين (اتصال+كتابة+استمرارية عبر إعادتي تشغيل). شرط المالك «لا ربط قبل اجتياز اختبارات القاعدة» اجتاز مرتين. **الربط من اللوحة مفتوح الآن**: الحسابات الثلاثة (+966550849788، +966531659570، +966598361020) تُربط بالكامل من واجهة اللوحة — التدخل الوحيد: إدخال كود OTP الذي يرسله تيليجرام لكل هاتف (إلزامي أمنياً) وكلمة 2FA إن وُجدت.
